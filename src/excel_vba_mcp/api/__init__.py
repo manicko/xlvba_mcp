@@ -10,6 +10,12 @@ from excel_vba_mcp.api.compile_tools import (
     vba_compile,
     vba_get_compile_diagnostics,
 )
+from excel_vba_mcp.api.macro_tools import (
+    macro_get_last_result,
+    macro_list,
+    macro_run,
+    set_macro_service,
+)
 from excel_vba_mcp.api.vba_tools import (
     set_vba_project_service,
     vba_export_project,
@@ -34,7 +40,11 @@ __all__ = [
     "excel_list_workbooks",
     "excel_open",
     "excel_save",
+    "macro_get_last_result",
+    "macro_list",
+    "macro_run",
     "set_compile_service",
+    "set_macro_service",
     "set_vba_project_service",
     "vba_compile",
     "vba_export_project",

@@ -10,11 +10,19 @@ from excel_vba_mcp.application.compile_service import (
     CompileResult,
     CompileService,
 )
+from excel_vba_mcp.application.macro_service import (
+    BackgroundSafetyRegistry,
+    MacroInfo,
+    MacroService,
+)
 from excel_vba_mcp.application.session_service import SessionService
 
 __all__ = [
+    "BackgroundSafetyRegistry",
     "CompileDiagnostics",
     "CompileResult",
     "CompileService",
+    "MacroInfo",
+    "MacroService",
     "SessionService",
 ]

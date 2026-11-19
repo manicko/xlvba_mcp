@@ -31,8 +31,9 @@ from mcp.server.mcpserver import MCPServer
 from excel_vba_mcp import __version__
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
-from excel_vba_mcp.api import compile_tools, test_tools, vba_tools, workbook_tools
+from excel_vba_mcp.api import compile_tools, macro_tools, test_tools, vba_tools, workbook_tools
 from excel_vba_mcp.api.compile_tools import vba_compile, vba_get_compile_diagnostics
+from excel_vba_mcp.api.macro_tools import macro_get_last_result, macro_list, macro_run
 from excel_vba_mcp.api.test_tools import (
     snapshot_create,
     snapshot_diff,
@@ -58,6 +59,7 @@ from excel_vba_mcp.api.workbook_tools import (
     excel_save,
 )
 from excel_vba_mcp.application.compile_service import CompileService
+from excel_vba_mcp.application.macro_service import BackgroundSafetyRegistry, MacroService
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
 from excel_vba_mcp.application.vba_project_service import VBAProjectService
@@ -145,6 +147,23 @@ _DESC_VBA_COMPILE = (
 _DESC_VBA_GET_COMPILE_DIAGNOSTICS = (
     "Return the last compile diagnostics (is_compile=false) without forcing a compile re-run."
 )
+_DESC_MACRO_LIST = (
+    "List the callable macro candidates of an open workbook: each public "
+    "Sub/Function of a standard/class module with its name, module, kind and "
+    "background_safe classification (BG06)."
+)
+_DESC_MACRO_RUN = (
+    "Run one approved, background-safe macro of an execute-mode workbook. The "
+    "macro runs only when it is approved (deny-by-default), classified "
+    "background_safe for the current workbook hash (BG06) and passes the "
+    "interactive-UI preflight (R13); otherwise a truthful blocked result is "
+    "returned and the macro is NOT dispatched. Never dismisses a dialog or reports "
+    "a waiting macro as passed."
+)
+_DESC_MACRO_GET_LAST_RESULT = (
+    "Return the cached last macro run result (status, duration, return value, "
+    "structured error) without re-running the macro."
+)
 
 
 @dataclasses.dataclass
@@ -157,6 +176,7 @@ class _Runtime:
     snapshot: SnapshotService
     vba: VBAProjectService
     compile: CompileService
+    macro: MacroService
     path_policy: PathPolicy
     approval: ApprovalPolicy
     audit: AuditLogger
@@ -216,6 +236,10 @@ def _build_runtime() -> _Runtime:
         approval=approval,
     )
     compile_service = CompileService(worker, session, vba, path_policy, audit)
+    # background_safe starts empty (deny-by-default, BG06): no procedure is
+    # eligible for background execution until it is explicitly classified for the
+    # current workbook hash and verified on a disposable copy.
+    macro_service = MacroService(worker, session, approval, BackgroundSafetyRegistry(), audit)
     return _Runtime(
         worker=worker,
         app_adapter=app_adapter,
@@ -223,6 +247,7 @@ def _build_runtime() -> _Runtime:
         snapshot=snapshot,
         vba=vba,
         compile=compile_service,
+        macro=macro_service,
         path_policy=path_policy,
         approval=approval,
         audit=audit,
@@ -264,6 +289,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         test_tools.set_snapshot_service(runtime.snapshot)
         vba_tools.set_vba_project_service(runtime.vba)
         compile_tools.set_compile_service(runtime.compile)
+        macro_tools.set_macro_service(runtime.macro)
     try:
         yield runtime
     finally:
@@ -271,6 +297,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         test_tools.set_snapshot_service(None)
         vba_tools.set_vba_project_service(None)
         compile_tools.set_compile_service(None)
+        macro_tools.set_macro_service(None)
         await _safe_shutdown(runtime.worker)
         runtime.audit.close()
 
@@ -338,6 +365,13 @@ def _register_tools(server: MCPServer) -> None:
         vba_get_compile_diagnostics,
         name="vba_get_compile_diagnostics",
         description=_DESC_VBA_GET_COMPILE_DIAGNOSTICS,
+    )
+    server.add_tool(macro_list, name="macro_list", description=_DESC_MACRO_LIST)
+    server.add_tool(macro_run, name="macro_run", description=_DESC_MACRO_RUN)
+    server.add_tool(
+        macro_get_last_result,
+        name="macro_get_last_result",
+        description=_DESC_MACRO_GET_LAST_RESULT,
     )
 
 

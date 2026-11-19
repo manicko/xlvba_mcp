@@ -12,11 +12,13 @@ from excel_vba_mcp.adapters.excel.com_worker import (
     WorkerStatus,
     WorkerUnavailableError,
 )
+from excel_vba_mcp.adapters.excel.macro_runner import MacroRunner
 from excel_vba_mcp.adapters.excel.vbide_adapter import VBIDEAdapter
 
 __all__ = [
     "ExcelAppAdapter",
     "ExcelComWorker",
+    "MacroRunner",
     "Section",
     "VBIDEAdapter",
     "WorkerStatus",
