@@ -54,6 +54,14 @@ VB_COMPONENT_USER_FORM = 3
 
 # VBA source for each component. Fixed strings keep the generated source
 # deterministic; only the surrounding binary container is opaque.
+#
+# ``modTest`` carries the deterministic test procedures used by the
+# ``Application.Run`` PoC (task_005):
+#   * ``AddNumbers`` / ``NoArgs`` / ``Echo``  - scalar/return/argument cases.
+#   * ``MakeArray``                         - Variant array return (serializable).
+#   * ``RaiseError``                        - unhandled runtime error (Err.Raise).
+#   * ``ShowMsg`` / ``ShowForm``            - interactive UI (must be preflight
+#     blocked, never executed in background mode; see addendum BG06/BG09).
 MOD_TEST_SOURCE = """\
 Option Explicit
 
@@ -67,6 +75,22 @@ End Function
 
 Public Sub Echo(ByVal s As String)
     Debug.Print s
+End Sub
+
+Public Function MakeArray() As Variant
+    MakeArray = Array(1, 2, 3)
+End Function
+
+Public Sub RaiseError()
+    Err.Raise 1234, "modTest", "boom"
+End Sub
+
+Public Sub ShowMsg()
+    MsgBox "interactive", vbInformation, "probe"
+End Sub
+
+Public Sub ShowForm()
+    frmTest.Show
 End Sub
 """
 
