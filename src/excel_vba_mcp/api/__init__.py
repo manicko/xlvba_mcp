@@ -1,10 +1,15 @@
-"""MCP tool handlers (task_012, task_016).
+"""MCP tool handlers (task_012, task_016, task_020).
 
 Thin, async tool functions that validate arguments and delegate to the
 application layer. This package **never touches COM** (ARCH-009): no
 ``pythoncom`` / ``win32com`` import lives under ``api/``.
 """
 
+from excel_vba_mcp.api.compile_tools import (
+    set_compile_service,
+    vba_compile,
+    vba_get_compile_diagnostics,
+)
 from excel_vba_mcp.api.vba_tools import (
     set_vba_project_service,
     vba_export_project,
@@ -29,8 +34,11 @@ __all__ = [
     "excel_list_workbooks",
     "excel_open",
     "excel_save",
+    "set_compile_service",
     "set_vba_project_service",
+    "vba_compile",
     "vba_export_project",
+    "vba_get_compile_diagnostics",
     "vba_get_references",
     "vba_list_components",
     "vba_list_procedures",

@@ -31,7 +31,8 @@ from mcp.server.mcpserver import MCPServer
 from excel_vba_mcp import __version__
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
-from excel_vba_mcp.api import test_tools, vba_tools, workbook_tools
+from excel_vba_mcp.api import compile_tools, test_tools, vba_tools, workbook_tools
+from excel_vba_mcp.api.compile_tools import vba_compile, vba_get_compile_diagnostics
 from excel_vba_mcp.api.test_tools import (
     snapshot_create,
     snapshot_diff,
@@ -56,6 +57,7 @@ from excel_vba_mcp.api.workbook_tools import (
     excel_open,
     excel_save,
 )
+from excel_vba_mcp.application.compile_service import CompileService
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
 from excel_vba_mcp.application.vba_project_service import VBAProjectService
@@ -132,6 +134,17 @@ _DESC_VBA_INSERT_CODE = (
     "position is 'declarations', 'before_procedure:<name>' or "
     "'after_procedure:<name>'. Same guard chain as replace."
 )
+_DESC_VBA_COMPILE = (
+    "Return a fail-closed compile result for an open workbook. On the validated "
+    "build non-activating compilation is unavailable, so this returns "
+    "status='indeterminate' with reason='NON_ACTIVATING_COMPILE_UNAVAILABLE' and "
+    "partial diagnostics (is_compile=false: broken references, protection, "
+    "component inventory, VBOM availability). It never returns compiled or "
+    "compile_error and never shows or activates UI."
+)
+_DESC_VBA_GET_COMPILE_DIAGNOSTICS = (
+    "Return the last compile diagnostics (is_compile=false) without forcing a compile re-run."
+)
 
 
 @dataclasses.dataclass
@@ -143,6 +156,7 @@ class _Runtime:
     session: SessionService
     snapshot: SnapshotService
     vba: VBAProjectService
+    compile: CompileService
     path_policy: PathPolicy
     approval: ApprovalPolicy
     audit: AuditLogger
@@ -201,12 +215,14 @@ def _build_runtime() -> _Runtime:
         snapshot_service=snapshot,
         approval=approval,
     )
+    compile_service = CompileService(worker, session, vba, path_policy, audit)
     return _Runtime(
         worker=worker,
         app_adapter=app_adapter,
         session=session,
         snapshot=snapshot,
         vba=vba,
+        compile=compile_service,
         path_policy=path_policy,
         approval=approval,
         audit=audit,
@@ -247,12 +263,14 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         workbook_tools.set_session_service(runtime.session)
         test_tools.set_snapshot_service(runtime.snapshot)
         vba_tools.set_vba_project_service(runtime.vba)
+        compile_tools.set_compile_service(runtime.compile)
     try:
         yield runtime
     finally:
         workbook_tools.set_session_service(None)
         test_tools.set_snapshot_service(None)
         vba_tools.set_vba_project_service(None)
+        compile_tools.set_compile_service(None)
         await _safe_shutdown(runtime.worker)
         runtime.audit.close()
 
@@ -314,6 +332,12 @@ def _register_tools(server: MCPServer) -> None:
         vba_insert_code,
         name="vba_insert_code",
         description=_DESC_VBA_INSERT_CODE,
+    )
+    server.add_tool(vba_compile, name="vba_compile", description=_DESC_VBA_COMPILE)
+    server.add_tool(
+        vba_get_compile_diagnostics,
+        name="vba_get_compile_diagnostics",
+        description=_DESC_VBA_GET_COMPILE_DIAGNOSTICS,
     )
 
 
