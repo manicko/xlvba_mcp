@@ -28,7 +28,7 @@ High-risk задачи требуют всех четырёх ролей. Для
 |---|---|---|---|
 | R01 | COM STA and message dispatch | Dedicated STA worker with queued calls and message pumping; behavior under `RPC_E_CALL_REJECTED` and modal dialogs | Preserve `com_worker.py` and a single STA worker. Prove its lifecycle on target Windows/Excel; COM proxies never leave the worker. |
 | R02 | VBIDE access and component export | `VBProject / VBComponents / CodeModule`; VBIDE Export; textual parsing as marked heuristic fallback | VBIDE is source of truth. Validate UserForm `.frm` + `.frx`; preserve Document Modules. |
-| R03 | VBE compile command discovery | Localized VBE CommandBars lookup; checked control ID as fallback | Do not rely on a fixed identifier alone. Validate on target Office build and UI language. Never return `compiled` without evidence. |
+| R03 | VBE compile command discovery | **UIA menu expansion + Invoke (primary; validated on Excel 16.0.14332 / en-US 2026-11-19)**; CommandBars / control-ID 578 unavailable on this build | Do not rely on a fixed identifier. On the validated build `VBE.CommandBars["Debug"].Controls` has no Compile and `FindControl(578)` raises E_INVALIDARG; use localized UIA `Debug` → `Compile VBAProject` (ExpandCollapsePattern.Expand + UIA InvokePattern). If UIA cannot expand/find the item, return `indeterminate` (fail closed). Never return `compiled` without evidence. |
 | R04 | Compile error UI extraction | `pywinauto` UIA backend; direct Windows UI Automation only if the first route is insufficient | Start with the specified pywinauto/UIA path. Do not introduce an alternate mechanism without PoC evidence. No coordinate/SendKeys-first solution. |
 | R05 | Macro runtime errors | COM return/exception; COM plus UIA modal-window observation | Keep `Application.Run`. Verify actual error evidence; do not promise the original VBA runtime description when Excel returns a generic COM error. |
 | R06 | Snapshot consistency | `Workbook.SaveCopyAs` for an open workbook; file copy for a closed workbook | Follow the two branches in the specification. Each test case gets its own disposable copy. Snapshot is not a sandbox for external side effects. |
@@ -246,6 +246,13 @@ extra_context: |
   ошибки — compiled; если проект не изменился и команда уже выключена — already_compiled;
   если команда/UIA/диалог не подтверждены — indeterminate. Нельзя выдавать compiled только
   из-за отсутствия COM exception. UIA — основной интерфейс; SendKeys/координаты не основной путь.
+  **Коррекция R03 (2026-11-19, target Excel 16.0.14332 / UI 1033):** CommandBars["Debug"] не
+  содержит Compile, FindControl(578) → E_INVALIDARG. Рабочий путь — UIA: MenuItem "Debug"
+  (type 50011) → Expand() → MenuItem "Compile VBAProject" (literal) → Invoke (UIA_InvokePattern
+  10000). Диалог ошибки — окно #32770 "Microsoft Visual Basic for Applications", текст
+  "Compile error:\n\n..."; выбранный токен читать из code pane (AutomationId "Bottom VBA Editor
+  Code Pane", type 50030) через TextPattern, т.к. TextPattern.GetSelection() на диалоге не работает.
+  Если UIA не видит/не разворачивает меню — indeterminate (fail closed).
 files:
   - path: tests/fixtures/CompileErrorProject.xlsm
     targets: [{type: fixture, name: CompileErrorProject}]
@@ -1028,6 +1035,10 @@ extra_context: |
   Сначала искать Compile control по доступной локализованной подписи/структуре меню; control ID
   использовать как fallback только после проверки наличия и ожидаемой подписи. UIA watcher
   запускается до compile. Нельзя сообщать compiled только из-за отсутствия COM exception.
+  **Коррекция R03 (2026-11-19):** на target build (16.0.14332 / UI 1033) primary — UIA menu
+  expansion (`Debug` MenuItem → `Compile VBAProject` Invoke); CommandBars/ID-578 не работают.
+  Реализацию command lookup вынести в `adapters/windows_ui/vbe_compile_ui.py`; при недоступности
+  UIA возвращать COMPILE_INDETERMINATE.
 files:
   - path: src/excel_vba_mcp/application/compile_service.py
     targets:
