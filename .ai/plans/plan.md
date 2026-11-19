@@ -6,6 +6,8 @@
 
 **Specification source:** `excel_vba_mcp_technical_spec.docx` (далее — Спецификация). План не меняет и не расширяет заданную архитектуру.
 
+**Authoritative addendum:** `.ai/plans/plan_addendum_background_execution.md` — *Non-Intrusive Background Excel Execution*. Excel/VBA must run hidden and non-activating in the current interactive user session; no VM, container, separate Windows session/desktop, or Windows Service. Where the addendum conflicts with this plan, **the addendum prevails**. Affected tasks are amended per addendum §4; new risks R11–R14 and acceptance criteria BG01–BG09 apply.
+
 **В объёме:** этап 1 и обязательная инфраструктура Workbook / Excel Session. Этап 2 в задачи реализации не декомпозируется.
 
 **Out of scope for Stage 1:** полный Range/Cells API; PivotTables; Charts и Slicers; Connections и Power Query; Data Model / Power Pivot; дополнительные объекты Excel; полноценные UI-click тесты ActiveX. Для проверки выходов разрешены только явно указанные read-only assertions.
@@ -35,7 +37,27 @@ High-risk задачи требуют всех четырёх ролей. Для
 | R07 | ListObject mutations | `ListRows` / `ListColumns` plus postcondition checks | Mutate the ListObject, not adjacent cells. Ambiguous row updates/deletes must not execute. |
 | R08 | Non-range Names | Attempt `RefersToRange` in an isolated error branch; retain `RefersTo` for non-range Names | Do not assume every Name points to a Range; do not evaluate formulas with `eval`. |
 | R09 | ActiveX event mapping | Enumerate `OLEObjects`; find probable `ControlName_Event` procedure in the corresponding Document Module | Label inferred mappings as probable; no automatic ActiveX click testing in MVP. |
-| R10 | Untrusted VBA and external effects | Approval or allowlist by workbook path/hash + procedure; interactive user session | Snapshot does not roll back databases, email, network/file side effects. No Windows Service or unattended Office automation. |
+| R10 | Untrusted VBA and external effects | Approval or allowlist by workbook path/hash + procedure; interactive user session | Snapshot does not roll back databases, email, network/file side effects. No Windows Service or unattended Office automation. **Addendum: no VM/container/separate-session/Windows-Service fallback is permitted.** |
+| R11 | Desktop non-interference | Excel, VBE, a workbook window, or a modal dialog may become visible or steal foreground focus during COM/UI operations. | Prove hidden/non-activating behavior in `task_002`; verify throughout lifecycle in `task_011`, session tests, and `task_037`. Any focus steal or popup is a failed acceptance criterion. |
+| R12 | Hidden VBE compilation | The VBE Compile command may be invocable, but compile errors may produce a modal message or activate the editor. | Research and PoC in `task_004`; no visible UI or VM fallback. Return `COMPILE_INDETERMINATE` if diagnostics cannot be obtained non-intrusively. |
+| R13 | Interactive macro behavior | VBA code, forms, add-ins, or external programs may display UI even when Excel is hidden. | Preflight known UI calls, runtime observation, structured blocked/indeterminate status, no automatic dialog interaction. Do not claim complete static detection. |
+| R14 | Alert suppression side effects | `DisplayAlerts=False` selects default responses for some prompts and can cause unintended actions. | Apply narrowly around operations with known safe defaults; restore prior values on all paths; cover overwrite/save behavior in tests. |
+
+### 3a. Background execution acceptance criteria (BG01–BG09, addendum §7)
+
+These supplement A01–A15 and are **mandatory** for Stage 1 acceptance:
+
+- **BG01 — Same-session execution:** MCP and the automation-owned Excel instance run under the current logged-in user in the current interactive Windows session.
+- **BG02 — No environment isolation:** no VM, container, separate Windows user/session, RDP desktop, alternate desktop, or Windows Service is required or used.
+- **BG03 — No focus theft:** no Excel/VBE-owned window becomes the foreground window during normal operations.
+- **BG04 — No visible popup:** Excel/VBE/workbook/modal windows created by the automation do not appear over the user's active applications.
+- **BG05 — User-session preservation:** user-owned Excel instances and workbooks remain untouched.
+- **BG06 — UI-dependent macro safety:** only procedures explicitly classified `background_safe` for the current workbook hash are eligible for strict background execution; others return a truthful blocked/indeterminate result.
+- **BG07 — Hidden compile evidence:** successful and failed compile cases are distinguished without showing/activating VBE/dialog UI; otherwise compilation remains explicitly unsupported/indeterminate on that tested build and is not reported as passed.
+- **BG08 — Controlled settings:** all temporary Excel Application settings are restored after success, failure, timeout, and cancellation.
+- **BG09 — No blind dialog handling:** no automatic keyboard/mouse input is used to dismiss unexpected dialogs.
+
+**Addendum DAG gates (addendum §6):** `task_002` = Desktop Non-Interference Go/No-Go (blocks `task_010`); `task_004` = Hidden Compilation Go/No-Go (blocks `task_020`); `task_005` = Background Macro Execution Go/No-Go (gates `task_022`); `task_011/013/015/021/023/036` include desktop non-interference regression checks; `task_037` aggregates the evidence. Excel COM execution remains serialized through the single STA worker.
 
 ## 4. Execution DAG
 
@@ -133,15 +155,20 @@ description: >
   сериализованный доступ, открытие/закрытие тестовой книги и независимость от пользовательской сессии.
 goals:
   - зафиксировать Windows build, Office build, bitness и язык VBE
-  - подтвердить отдельный Excel instance через DispatchEx
+  - подтвердить automation-owned Excel instance через DispatchEx (не VM/separate session)
   - проверить CoInitializeEx(COINIT_APARTMENTTHREADED) и корректное завершение COM
   - проверить STA message pumping и поведение при COM/UI событиях
+  - BG: automation-owned Excel остаётся СКРЫТЫМ (Visible=False) и не активируется
+  - BG: зафиксировать foreground-окна до/после и подтвердить отсутствие focus steal
   - зафиксировать Go/No-Go и HRESULT
 extra_context: |
   Все COM proxies создаются, читаются и освобождаются в одном STA worker. Инициализация:
   pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED); создание Excel через
   win32com.client.DispatchEx("Excel.Application"); завершение с закрытием owned workbooks,
   Quit и освобождением ссылок в finally. COM proxies не передаются в MCP слой.
+  **Addendum (BG01–BG05, R11):** PoC доказывает hidden/non-activating поведение harness в текущей
+  interactive-сессии, а НЕ изоляцию VM/сессии. DispatchEx сохраняется как automation-owned instance.
+  Зафиксировать Application.Visible, foreground window до/после и отсутствие видимых Excel/VBE окон.
 files:
   - path: tests/integration_excel/test_excel_instance_poc.py
     targets:
@@ -154,11 +181,12 @@ changes:
   - action: record_compatibility_result
     description: Зафиксировать build/bitness/language, COM behavior, failures and Go/No-Go.
 acceptance_criteria:
-  - отдельный Excel instance создан и идентифицирован
+  - отдельный automation-owned Excel instance создан и идентифицирован
   - существующая пользовательская Excel-сессия не затронута
   - open/close/Quit не оставляют orphaned owned Excel process
   - COM proxies остаются в создавшем их STA thread
   - поведение message pump и ограничения задокументированы
+  - BG03/BG04/BG05: automation-owned Excel скрыт (Visible=False), не становится foreground, не показывает окон; user desktop остаётся usable
 tests_to_run: ["test_excel_instance_poc.py on target Windows/Excel"]
 agents:
   - researcher: required_before_poc; compare compatible STA/message-pump practices
@@ -234,12 +262,12 @@ description: >
   Проверить на целевом Office build вызов VBE Debug → Compile и извлечение реального compile
   error dialog, выбранного контекста и screenshot средствами UI Automation.
 goals:
-  - проверить поиск Compile command через VBE CommandBars
-  - проверить локализованную подпись/структуру и control ID fallback только после проверки
-  - сравнить pywinauto UIA с прямым Windows UI Automation только при необходимости
-  - отличать compiled, compile_error, already_compiled и indeterminate
-  - подтвердить, что следующий COM вызов блокируется до разрешения modal dialog
-  - зафиксировать UI language, selectors, dialog text и screenshot
+  - вызвать VBE Compile БЕЗ показа/активации Excel или VBE (hidden, non-activating)
+  - отличать compiled, compile_error, already_compiled и indeterminate по неинтрузивным признакам
+  - если диагностика compile error требует видимого/активного UI — вернуть COMPILE_INDETERMINATE, не false compiled
+  - UIA только для read-only наблюдения (без SetFocus/click/type/show/restore)
+  - подтвердить отсутствие focus steal и видимых окон (BG03/BG04/BG07)
+  - screenshot опционален, только если captured без показа/активации окна
 extra_context: |
   В Excel Object Model нет публичного Workbook.CompileProject() / Application.CompileProject().
   Компиляция выполняется командой VBE Debug → Compile. При подтверждённом запуске и отсутствии
@@ -253,6 +281,11 @@ extra_context: |
   "Compile error:\n\n..."; выбранный токен читать из code pane (AutomationId "Bottom VBA Editor
   Code Pane", type 50030) через TextPattern, т.к. TextPattern.GetSelection() на диалоге не работает.
   Если UIA не видит/не разворачивает меню — indeterminate (fail closed).
+  **Addendum (BG07/R12):** compile должен работать при Visible=False; UIA — только read-only
+  observation (никаких click/type/SetFocus). Если compile-error dialog появляется/активируется как
+  unavoidable часть build — PoC FAIL для background-требования → COMPILE_INDETERMINATE, без
+  VM/visible fallback. Реализация с Visible=True и кликом по диалогу НЕ удовлетворяет addendum и
+  подлежит переработке.
 files:
   - path: tests/fixtures/CompileErrorProject.xlsm
     targets: [{type: fixture, name: CompileErrorProject}]
@@ -267,11 +300,11 @@ changes:
   - action: record_open_choice
     description: Зафиксировать работавший вариант, fallback, build и непроверенные версии/локали.
 acceptance_criteria:
-  - success fixture returns compiled or truthful indeterminate
-  - error fixture never returns false compiled
-  - dialog text and screenshot are captured
-  - selected token/context is captured when the UIA provider exposes it
-  - no COM operation runs while compile dialog is unresolved
+  - compile вызывается при Visible=False, без активации Excel/VBE
+  - success fixture → compiled или truthful indeterminate; error fixture никогда не false compiled
+  - compile error диагностика собирается non-intrusively; иначе COMPILE_INDETERMINATE
+  - selected token/context captured when the UIA read-only provider exposes it (optional)
+  - no COM operation runs while a dialog is unresolved; no focus steal / no visible window (BG03/BG04/BG07/BG09)
 tests_to_run: ["test_vbe_compile_poc.py against success and compile-error fixtures"]
 agents:
   - researcher: required_before_poc; compare VBE command lookup and UIA paths within specified adapter
