@@ -31,7 +31,13 @@ from mcp.server.mcpserver import MCPServer
 from excel_vba_mcp import __version__
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
-from excel_vba_mcp.api import workbook_tools
+from excel_vba_mcp.api import test_tools, workbook_tools
+from excel_vba_mcp.api.test_tools import (
+    snapshot_create,
+    snapshot_diff,
+    snapshot_list,
+    snapshot_restore,
+)
 from excel_vba_mcp.api.workbook_tools import (
     excel_close,
     excel_get_status,
@@ -40,9 +46,11 @@ from excel_vba_mcp.api.workbook_tools import (
     excel_save,
 )
 from excel_vba_mcp.application.session_service import SessionService
+from excel_vba_mcp.application.snapshot_service import SnapshotService
 from excel_vba_mcp.security.approval import ApprovalPolicy
 from excel_vba_mcp.security.audit import AuditLogger
 from excel_vba_mcp.security.path_policy import PathPolicy
+from excel_vba_mcp.storage.snapshot_store import SnapshotStore
 
 logger = logging.getLogger("excel_vba_mcp.server")
 
@@ -50,6 +58,7 @@ logger = logging.getLogger("excel_vba_mcp.server")
 _ENV_ROOTS = "EXCEL_VBA_MCP_ROOTS"
 _ENV_AUDIT = "EXCEL_VBA_MCP_AUDIT_LOG"
 _ENV_WORK_DIR = "EXCEL_VBA_MCP_WORK_DIR"
+_ENV_SNAPSHOT_DIR = "EXCEL_VBA_MCP_SNAPSHOT_DIR"
 
 # Tool descriptions surfaced over MCP (kept explicit for a stable contract).
 _DESC_OPEN = (
@@ -63,6 +72,17 @@ _DESC_CLOSE = (
 _DESC_SAVE = "Explicitly save an open workbook's working copy."
 _DESC_STATUS = "Return session/workbook status (busy, read-only, dirty, active operation)."
 _DESC_LIST = "List currently open workbooks from session bookkeeping."
+_DESC_SNAPSHOT_CREATE = (
+    "Create an immutable snapshot of a workbook (SaveCopyAs for open books, file "
+    "copy for closed) with manifest and SHA-256."
+)
+_DESC_SNAPSHOT_LIST = "List snapshots and their metadata."
+_DESC_SNAPSHOT_RESTORE = (
+    "Restore a working session from a snapshot: close the current working copy "
+    "without saving, then open the snapshot baseline. Does NOT undo external "
+    "macro side effects."
+)
+_DESC_SNAPSHOT_DIFF = "Compare two snapshots by manifest metadata and file hash."
 
 
 @dataclasses.dataclass
@@ -72,6 +92,7 @@ class _Runtime:
     worker: ExcelComWorker
     app_adapter: ExcelAppAdapter
     session: SessionService
+    snapshot: SnapshotService
     path_policy: PathPolicy
     approval: ApprovalPolicy
     audit: AuditLogger
@@ -115,10 +136,18 @@ def _build_runtime() -> _Runtime:
         audit,
         work_dir=_resolve_runtime_path(_ENV_WORK_DIR, _default_work_dir()),
     )
+    snapshot = SnapshotService(
+        SnapshotStore(_resolve_runtime_path(_ENV_SNAPSHOT_DIR, _default_snapshot_dir())),
+        session,
+        worker,
+        path_policy,
+        audit,
+    )
     return _Runtime(
         worker=worker,
         app_adapter=app_adapter,
         session=session,
+        snapshot=snapshot,
         path_policy=path_policy,
         approval=approval,
         audit=audit,
@@ -131,6 +160,10 @@ def _default_audit_path() -> Path:
 
 def _default_work_dir() -> Path:
     return Path(tempfile.gettempdir()) / "excel_vba_mcp" / "work"
+
+
+def _default_snapshot_dir() -> Path:
+    return Path(tempfile.gettempdir()) / "excel_vba_mcp" / "snapshots"
 
 
 @asynccontextmanager
@@ -153,10 +186,12 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         await _safe_shutdown(runtime.worker)
     else:
         workbook_tools.set_session_service(runtime.session)
+        test_tools.set_snapshot_service(runtime.snapshot)
     try:
         yield runtime
     finally:
         workbook_tools.set_session_service(None)
+        test_tools.set_snapshot_service(None)
         await _safe_shutdown(runtime.worker)
         runtime.audit.close()
 
@@ -188,6 +223,10 @@ def _register_tools(server: MCPServer) -> None:
     server.add_tool(excel_save, name="excel_save", description=_DESC_SAVE)
     server.add_tool(excel_get_status, name="excel_get_status", description=_DESC_STATUS)
     server.add_tool(excel_list_workbooks, name="excel_list_workbooks", description=_DESC_LIST)
+    server.add_tool(snapshot_create, name="snapshot_create", description=_DESC_SNAPSHOT_CREATE)
+    server.add_tool(snapshot_list, name="snapshot_list", description=_DESC_SNAPSHOT_LIST)
+    server.add_tool(snapshot_restore, name="snapshot_restore", description=_DESC_SNAPSHOT_RESTORE)
+    server.add_tool(snapshot_diff, name="snapshot_diff", description=_DESC_SNAPSHOT_DIFF)
 
 
 _configure_logging()
