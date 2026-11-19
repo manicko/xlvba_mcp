@@ -79,14 +79,16 @@ description: >
   Использовать каталоги и границы модулей из Спецификации; не добавлять альтернативный runtime/transport.
 goals:
   - создать pyproject.toml и uv.lock с фиксируемыми зависимостями
-  - использовать Python 3.12 x64 как целевой runtime при соответствии SDK
+  - использовать Python 3.14 x64 как целевой runtime (нижняя граница проекта — 3.11;
+    изначальная цель 3.12 ослаблена до 3.14 по решению от 2026-11-19, см. execution log)
   - создать __main__.py, server.py и config.py с минимальным запуском STDIO
   - исключить обычные логи из stdout
   - создать projects, work, snapshots, artifacts и tests
 extra_context: |
   Версии пакетов не следует оставлять плавающими в production. После проверки конкретного
-  окружения зафиксировать точные версии в uv.lock. Стек: Windows 11 x64, Python 3.12 x64
-  (минимум 3.11), uv, официальный MCP Python SDK v2, pywin32, pywinauto, Pydantic v2, pytest.
+  окружения зафиксировать точные версии в uv.lock. Стек: Windows 11 x64, Python 3.14 x64
+  (нижняя граница проекта 3.11; runtime зафиксирован в .venv), uv, официальный MCP Python SDK v2,
+  pywin32, pywinauto, Pydantic v2, pytest.
 files:
   - path: pyproject.toml
     targets: [{type: project_config, name: dependencies and entry points}]
@@ -530,6 +532,13 @@ extra_context: |
   в очередь; параллельные команды Excel сериализуются. Инициализация — CoInitializeEx с
   COINIT_APARTMENTTHREADED; создание — DispatchEx("Excel.Application"); завершение — закрытие
   owned workbooks, Quit и освобождение ссылок в finally.
+  ARCH-009 (binding): sync MCP tools выполняются SDK через anyio worker threads; поэтому api/* НЕ
+  трогают COM, а только валидируют DTO и await ExcelComWorker.submit(). submit() должен быть
+  awaitable с bounded timeout, без блокирующего join() в event loop; зависший worker → running/needs_recovery,
+  а не stall всего сервера. ARCH-005: worker owned by MCPServer(lifespan=...) / main(); shutdown
+  закрывает только owned workbooks → Quit → release → CoUninitialize в finally. ARCH-013: policy
+  видимости — Visible=True для execute/compile/macro сессий, Visible=False только для inventory без UIA;
+  DisplayAlerts менять только через context manager с восстановлением.
 files:
   - path: src/excel_vba_mcp/adapters/excel/com_worker.py
     targets:
@@ -1531,6 +1540,11 @@ files:
       - {type: function, name: shapes_list}
       - {type: function, name: shape_get}
       - {type: function, name: shape_set_on_action}
+  - path: src/excel_vba_mcp/api/control_tools.py
+    targets:
+      - {type: function, name: controls_list}
+      - {type: function, name: control_get}
+      - {type: function, name: control_set_on_action}
 changes:
   - action: add_controls_inventory
     description: Добавить read-only перечисление Shapes, Form Controls и ActiveX OLEObjects.
