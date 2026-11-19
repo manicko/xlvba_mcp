@@ -25,8 +25,17 @@ Every Excel COM call runs on a single dedicated STA thread with an owned
 only inside a ``tempfile.TemporaryDirectory``; the committed fixture is never
 opened for writing. Cleanup closes every owned workbook without saving, quits,
 releases references and ``CoUninitialize``s on that same thread, then polls for an
-orphaned owned PID. Non-owned (user) Excel processes are never touched. Evidence
-is persisted to ``.ai/tmp/snapshot_poc_<test>_<ts>.{json,txt}`` per test.
+orphaned owned PID. Non-owned (user) Excel processes are never touched.
+
+Each test also records read-only background non-interference evidence
+(addendum BG03/BG04/BG05): the foreground window (``GetForegroundWindow`` +
+``GetWindowText`` + ``GetWindowThreadProcessId``) before creation, after
+creation, after operations and after cleanup; the visible top-level windows of
+the owned PID (``EnumWindows`` + ``IsWindowVisible``); ``Application.Visible``
+at start and after operations; and a best-effort (non-activating) read of
+``VBE.MainWindow.Visible`` when reachable. None of these queries activate, show,
+click or type. Evidence is persisted to
+``.ai/tmp/snapshot_poc_<test>_<ts>.{json,txt}`` per test.
 
 Run serially (no xdist)::
 
@@ -60,7 +69,12 @@ EXCEL_PROGID = "Excel.Application"
 XLSM_FILE_FORMAT = 52
 
 ORPHAN_POLL_INTERVAL_S = 0.5
-ORPHAN_POLL_TIMEOUT_S = 10.0
+# Excel shutdown on the target host is variable (observed ~2.7s to ~18s+ cold);
+# a 10s poll flakily reported a false orphan even though the owned process did
+# exit. The orphan assertion is unchanged -- this only waits long enough to
+# observe a slow-but-legitimate reaping. A genuinely never-exiting owned process
+# still fails after this window.
+ORPHAN_POLL_TIMEOUT_S = 30.0
 STA_JOIN_TIMEOUT_S = 180.0
 
 # The explicit acceptance-criteria note both tests must emit: a snapshot restores
@@ -76,9 +90,13 @@ EXTERNAL_SIDE_EFFECTS_NOTE = (
 try:  # pragma: no cover - exercised implicitly by skip logic
     import pythoncom  # type: ignore[import-not-found]
     import win32com.client  # type: ignore[import-not-found]
+    import win32gui  # type: ignore[import-not-found]
+    import win32process  # type: ignore[import-not-found]
 except Exception:  # noqa: BLE001 - any import failure means "not available here"
     pythoncom = None  # type: ignore[assignment]
     win32com = None  # type: ignore[assignment]
+    win32gui = None  # type: ignore[assignment]
+    win32process = None  # type: ignore[assignment]
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ARTIFACT_DIR = _REPO_ROOT / ".ai" / "tmp"
@@ -320,6 +338,23 @@ class PocArtifacts:
     manifest_path: str = ""
     restore: dict[str, Any] = field(default_factory=dict)
     orphan_reaped: bool | None = None
+    # Desktop non-interference evidence (addendum BG03/BG04/BG05). All values are
+    # produced by read-only Win32 observation; see ``_record_foreground`` /
+    # ``_record_visible_windows`` / ``_record_vbe_visible`` / ``_finalize_bg``.
+    baseline_excel_pids_after: list[int] = field(default_factory=list)
+    foreground_before: dict[str, Any] | None = None
+    foreground_after_dispatch: dict[str, Any] | None = None
+    foreground_after_operations: dict[str, Any] | None = None
+    foreground_after: dict[str, Any] | None = None
+    visible_windows_after_dispatch: dict[str, Any] | None = None
+    visible_windows_after_operations: dict[str, Any] | None = None
+    app_visible_start: Any = None
+    app_visible_after_operations: Any = None
+    vbe_visible: dict[str, Any] | None = None
+    bg03_no_focus_theft: bool | None = None
+    bg04_no_visible_popup: bool | None = None
+    bg05_user_session_preserved: bool | None = None
+    bg_verdict: dict[str, Any] | None = None
     go_no_go: dict[str, Any] | None = None
     log_lines: list[str] = field(default_factory=list)
     paths: dict[str, str] = field(default_factory=dict)
@@ -352,6 +387,266 @@ class PocArtifacts:
         self.paths = {"json": str(json_path), "txt": str(txt_path)}
         print(f"[artifacts] json={json_path} txt={txt_path}", flush=True)
         return self.paths
+
+
+# ---------------------------------------------------------------------------
+# Desktop non-interference evidence (addendum BG03/BG04/BG05)
+# ---------------------------------------------------------------------------
+# All queries below are READ-ONLY Win32 observations. They never call
+# ``SetForegroundWindow``, ``ShowWindow`` (to show/restore), ``SetFocus``, click
+# or type, and never touch a process the automation does not own.
+
+
+def _read_app_visible(app: Any) -> Any:
+    """Read ``Application.Visible`` without mutating it; return raw or an error tag."""
+
+    try:  # pragma: no cover - depends on host
+        return app.Visible
+    except Exception as exc:  # noqa: BLE001
+        return f"error:{exc!r}"
+
+
+def _record_foreground(label: str, owned_pids: set[int], art: PocArtifacts) -> dict[str, Any]:
+    """Capture the current foreground window; never change or activate anything."""
+
+    sample: dict[str, Any] = {
+        "label": label,
+        "timestamp": _now_local_iso(),
+        "available": win32gui is not None and win32process is not None,
+        "hwnd": None,
+        "title": None,
+        "pid": None,
+        "is_excel_owned": None,
+        "is_excel_owned_pids": sorted(owned_pids),
+        "error": None,
+    }
+    if not sample["available"]:
+        sample["error"] = "win32gui/win32process unavailable"
+        art.log(f"[fg:{label}] unavailable: win32gui/win32process missing")
+        return sample
+    try:  # pragma: no cover - depends on host
+        hwnd = win32gui.GetForegroundWindow()
+        title = win32gui.GetWindowText(hwnd)
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+    except Exception as exc:  # noqa: BLE001
+        sample["error"] = f"{type(exc).__name__}:{exc!r}"
+        art.log(f"[fg:{label}] query failed: {sample['error']}")
+        return sample
+    is_owned = bool(pid in owned_pids) if owned_pids else False
+    sample.update({"hwnd": hwnd, "title": title, "pid": pid, "is_excel_owned": is_owned})
+    art.log(f"[fg:{label}] hwnd={hwnd} pid={pid} is_excel_owned={is_owned} title={title!r}")
+    return sample
+
+
+def _record_visible_windows(label: str, owned_pids: set[int], art: PocArtifacts) -> dict[str, Any]:
+    """Enumerate top-level windows of the owned Excel PID and flag visible ones."""
+
+    result: dict[str, Any] = {
+        "label": label,
+        "timestamp": _now_local_iso(),
+        "available": win32gui is not None and win32process is not None,
+        "owned_pids": sorted(owned_pids),
+        "owned_windows": [],
+        "visible_windows": [],
+        "visible_window_count": 0,
+        "visible_window_titles": [],
+        "error": None,
+    }
+    if not result["available"]:
+        result["error"] = "win32gui/win32process unavailable"
+        art.log(f"[visible:{label}] unavailable: win32gui/win32process missing")
+        return result
+    if not owned_pids:
+        art.log(f"[visible:{label}] no owned PID resolved; nothing to enumerate")
+        return result
+
+    def _cb(hwnd: int, _ctx: Any) -> bool:
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        except Exception as exc:  # noqa: BLE001
+            art.log(f"[visible:{label}] GetWindowThreadProcessId failed: {exc!r}")
+            return True
+        if pid not in owned_pids:
+            return True
+        try:
+            title = win32gui.GetWindowText(hwnd)
+        except Exception as exc:  # noqa: BLE001
+            title = f"<title_error:{exc!r}>"
+        try:
+            visible = bool(win32gui.IsWindowVisible(hwnd))
+        except Exception:  # noqa: BLE001
+            visible = False
+        result["owned_windows"].append(
+            {"hwnd": hwnd, "pid": pid, "title": title, "is_visible": visible}
+        )
+        if visible:
+            result["visible_windows"].append(
+                {"hwnd": hwnd, "pid": pid, "title": title, "is_visible": True}
+            )
+        return True
+
+    try:  # pragma: no cover - depends on host
+        win32gui.EnumWindows(_cb, None)
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = f"EnumWindows_failed:{exc!r}"
+        art.log(f"[visible:{label}] EnumWindows failed: {exc!r}")
+        return result
+
+    result["visible_window_count"] = len(result["visible_windows"])
+    result["visible_window_titles"] = [w["title"] for w in result["visible_windows"]]
+    art.log(
+        f"[visible:{label}] owned_windows={len(result['owned_windows'])} "
+        f"visible={result['visible_window_count']} titles={result['visible_window_titles']}"
+    )
+    return result
+
+
+def _record_vbe_visible(app: Any, art: PocArtifacts) -> dict[str, Any]:
+    """Best-effort read of ``VBE.MainWindow.Visible`` without activating the VBE.
+
+    Returns ``{"check": "reachable", "visible": <bool>}`` when the VBE object
+    model is reachable, otherwise ``{"check": "not_reachable", ...}``. Reaching
+    ``app.VBE`` must never show or activate the VBE window.
+    """
+
+    result: dict[str, Any] = {"check": "not_reachable", "visible": None, "detail": None}
+    try:  # pragma: no cover - depends on host
+        vbe = app.VBE
+        main_window = vbe.MainWindow
+        result["visible"] = main_window.Visible
+        result["check"] = "reachable"
+    except Exception as exc:  # noqa: BLE001
+        result["detail"] = f"{type(exc).__name__}:{str(exc)[:200]}"
+        result["check"] = "not_reachable"
+        art.log(f"[vbe_visible] not reachable: {result['detail']}")
+        return result
+    art.log(f"[vbe_visible] reachable visible={result['visible']!r} (read-only)")
+    return result
+
+
+def _finalize_bg(art: PocArtifacts, holder: dict[str, Any]) -> None:
+    """Copy the BG03/BG04/BG05 samples off the worker ctx and compute the verdict.
+
+    Runs on the main thread after the owned Excel instance has been reaped. It only
+    reads Win32/process state; it never activates, shows, clicks or types. A
+    disqualifying result sets ``bg_verdict['bg_verdict']`` to ``NO_GO`` when any
+    automation-owned window is visible, any automation-owned window becomes
+    foreground, or ``Application.Visible`` becomes ``True``.
+    """
+
+    ctx = holder.get("ctx") or {}
+    art.foreground_before = ctx.get("foreground_before")
+    art.foreground_after_dispatch = ctx.get("foreground_after_dispatch")
+    art.foreground_after_operations = ctx.get("foreground_after_operations")
+    art.foreground_after = ctx.get("foreground_after")
+    art.visible_windows_after_dispatch = ctx.get("visible_windows_after_dispatch")
+    art.visible_windows_after_operations = ctx.get("visible_windows_after_operations")
+    art.app_visible_start = ctx.get("app_visible_start")
+    art.app_visible_after_operations = ctx.get("app_visible_after_operations")
+    art.vbe_visible = ctx.get("vbe_visible")
+
+    fg_samples = [
+        art.foreground_after_dispatch,
+        art.foreground_after_operations,
+        art.foreground_after,
+    ]
+    bg03_reasons = [
+        f"automation-owned window foreground at {s.get('label')}"
+        for s in fg_samples
+        if s and s.get("is_excel_owned")
+    ]
+    vw_samples = [
+        art.visible_windows_after_dispatch,
+        art.visible_windows_after_operations,
+    ]
+    bg04_reasons = [
+        f"automation-owned window visible at {vw.get('label')}: {vw.get('visible_window_titles')}"
+        for vw in vw_samples
+        if vw and vw.get("visible_windows")
+    ]
+    if art.app_visible_start is True:
+        bg04_reasons.append("Application.Visible is True at start")
+    if art.app_visible_after_operations is True:
+        bg04_reasons.append("Application.Visible is True after operations")
+
+    # BG05: user-owned Excel processes present before the run must still be alive.
+    after_pids = _excel_pids()
+    art.baseline_excel_pids_after = sorted(after_pids)
+    missing_user_pids = sorted(set(art.baseline_excel_pids) - after_pids)
+    bg05_reasons = (
+        [f"user Excel PIDs disappeared: {missing_user_pids}"] if missing_user_pids else []
+    )
+
+    art.bg03_no_focus_theft = not bg03_reasons
+    art.bg04_no_visible_popup = not bg04_reasons
+    art.bg05_user_session_preserved = not bg05_reasons
+    bg_ok = (
+        art.bg03_no_focus_theft and art.bg04_no_visible_popup and art.bg05_user_session_preserved
+    )
+
+    art.bg_verdict = {
+        "bg_verdict": "GO" if bg_ok else "NO_GO",
+        "bg03_no_focus_theft": art.bg03_no_focus_theft,
+        "bg04_no_visible_popup": art.bg04_no_visible_popup,
+        "bg05_user_session_preserved": art.bg05_user_session_preserved,
+        "bg03_reasons": bg03_reasons,
+        "bg04_reasons": bg04_reasons,
+        "bg05_reasons": bg05_reasons,
+        "foreground_before": art.foreground_before,
+        "foreground_after": art.foreground_after,
+        "visible_windows_after_dispatch": art.visible_windows_after_dispatch,
+        "visible_windows_after_operations": art.visible_windows_after_operations,
+        "app_visible_start": art.app_visible_start,
+        "app_visible_after_operations": art.app_visible_after_operations,
+        "vbe_visible": art.vbe_visible,
+        "rationale": (
+            "No automation-owned Excel/VBE window became foreground or visible; "
+            "Application.Visible stayed False; user-owned Excel processes untouched."
+            if bg_ok
+            else "Background non-interference violated: "
+            + "; ".join(bg03_reasons + bg04_reasons + bg05_reasons)
+        ),
+    }
+    art.log(
+        f"[bg] bg03={art.bg03_no_focus_theft} bg04={art.bg04_no_visible_popup} "
+        f"bg05={art.bg05_user_session_preserved} verdict={art.bg_verdict['bg_verdict']}"
+    )
+
+
+def _assert_bg(art: PocArtifacts) -> bool:
+    """Assert the BG03/BG04/BG05 background contract holds; return ``bg_ok``.
+
+    These assertions never weaken the existing task assertions; they add the
+    addendum non-interference checks on top of them.
+    """
+
+    assert art.foreground_before is not None, "foreground_before not captured"
+    assert art.app_visible_start is False, (
+        f"Application.Visible was not False at start: {art.app_visible_start!r}"
+    )
+    assert art.app_visible_after_operations is False, (
+        f"Application.Visible was not False after operations: {art.app_visible_after_operations!r}"
+    )
+    assert art.bg03_no_focus_theft is True, (
+        "automation-owned window took foreground (BG03): "
+        f"after_dispatch={art.foreground_after_dispatch} "
+        f"after_operations={art.foreground_after_operations} after={art.foreground_after}"
+    )
+    assert art.bg04_no_visible_popup is True, (
+        "automation-owned window was visible (BG04): "
+        f"after_dispatch={art.visible_windows_after_dispatch} "
+        f"after_operations={art.visible_windows_after_operations}"
+    )
+    assert art.bg05_user_session_preserved is True, (
+        "user-owned Excel process(es) disappeared (BG05): "
+        f"before={art.baseline_excel_pids} after={art.baseline_excel_pids_after}"
+    )
+    vbe = art.vbe_visible
+    if vbe and vbe.get("check") == "reachable":
+        assert vbe.get("visible") in (False, 0), f"VBE MainWindow visible: {vbe}"
+    else:
+        assert vbe is None or vbe.get("check") == "not_reachable", f"unexpected vbe check: {vbe}"
+    return bool(art.bg_verdict and art.bg_verdict.get("bg_verdict") == "GO")
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +695,9 @@ def _sta_run(
         try:
             baseline = _excel_pids()
             ctx["baseline_excel_pids"] = sorted(baseline)
+            # BG03/BG04: capture the user's foreground BEFORE creating Excel. The
+            # owned PID set is empty here, so ``is_excel_owned`` is always False.
+            ctx["foreground_before"] = _record_foreground("before", set(), art)
             app = win32com.client.DispatchEx(EXCEL_PROGID)
             app.Visible = False
             app.DisplayAlerts = False
@@ -407,10 +705,28 @@ def _sta_run(
             owned_pid = next(iter(new_pids)) if len(new_pids) == 1 else None
             ctx["owned_pid"] = owned_pid
             ctx["owned_pid_resolution"] = f"pid_delta={sorted(new_pids)}"
+            owned_pids = {owned_pid} if owned_pid is not None else set()
+            # BG03/BG04: immediately after creation the owned instance must not own
+            # the foreground and must not expose a visible top-level window.
+            ctx["app_visible_start"] = _read_app_visible(app)
+            ctx["foreground_after_dispatch"] = _record_foreground("after_dispatch", owned_pids, art)
+            ctx["visible_windows_after_dispatch"] = _record_visible_windows(
+                "after_dispatch", owned_pids, art
+            )
             with contextlib.suppress(Exception):
                 ctx["excel_version"] = str(app.Version)
                 ctx["excel_build"] = str(app.Build)
             holder["result"] = body(app, ctx, art)
+            # BG03/BG04: after all operations, re-check visibility, foreground and
+            # the best-effort (non-activating) VBE visibility while Excel is alive.
+            ctx["foreground_after_operations"] = _record_foreground(
+                "after_operations", owned_pids, art
+            )
+            ctx["visible_windows_after_operations"] = _record_visible_windows(
+                "after_operations", owned_pids, art
+            )
+            ctx["app_visible_after_operations"] = _read_app_visible(app)
+            ctx["vbe_visible"] = _record_vbe_visible(app, art)
             holder["ctx"] = ctx
         except BaseException as exc:  # noqa: BLE001 - surfaced to the main thread
             holder["error"] = f"{type(exc).__name__}: {exc}"
@@ -450,6 +766,10 @@ def _sta_run(
                 pythoncom.CoUninitialize()
             holder["owned_pid"] = owned_pid if owned_pid is not None else ctx.get("owned_pid")
             holder["orphan_reaped"] = _orphan_poll(holder["owned_pid"])
+            # BG03/BG04: after cleanup the owned instance is gone, so the foreground
+            # must not be an automation-owned window (owned PID set is empty here).
+            ctx["foreground_after"] = _record_foreground("after", set(), art)
+            holder["ctx"] = ctx
 
     thread = threading.Thread(target=worker, name="snapshot_poc_sta", daemon=True)
     thread.start()
@@ -612,6 +932,8 @@ def test_save_copy_as_reopen() -> None:
         holder = _sta_run(body, art, work_path, snap_path, tmp)
 
     _finalize_common(art, holder)
+    # BG03/BG04/BG05: copy the read-only Win32 samples and compute the verdict.
+    _finalize_bg(art, holder)
     result = holder.get("result", {}) or {}
 
     assert not holder.get("thread_alive"), "STA worker did not finish within timeout"
@@ -647,19 +969,31 @@ def test_save_copy_as_reopen() -> None:
 
     assert art.orphan_reaped is not False, "owned Excel process orphaned after cleanup"
 
+    # BG03/BG04/BG05 background non-interference (read-only Win32 evidence).
+    bg_ok = _assert_bg(art)
+
     art.go_no_go = {
-        "go_no_go_r06_task006_savecopyas": "GO",
+        "go_no_go_r06_task006_savecopyas": "GO" if bg_ok else "NO_GO",
         "rationale": (
             "SaveCopyAs on the open .xlsm produced a snapshot that reopens as a separate "
             "workbook with a matching sheet model and a stable file hash; the source file "
             "stayed byte-identical (SHA-256 and mtime unchanged). SaveCopyAs re-serializes "
             "so copy_sha256 differs from source_sha256; the snapshot is its own immutable "
-            "baseline. External side effects are NOT undone by a snapshot. No orphan."
+            "baseline. External side effects are NOT undone by a snapshot. No orphan. "
+            + art.bg_verdict["rationale"]
         ),
         "baseline_sha256": result["baseline_sha256"],
         "snapshot_sha256": result["snapshot_sha256"],
         "sheet_model_matches": result["sheet_model_matches"],
         "snapshot_hash_stable": result["snapshot_hash_stable"],
+        "background_gate": art.bg_verdict["bg_verdict"],
+        "bg03_no_focus_theft": art.bg03_no_focus_theft,
+        "bg04_no_visible_popup": art.bg04_no_visible_popup,
+        "bg05_user_session_preserved": art.bg05_user_session_preserved,
+        "app_visible_start": art.app_visible_start,
+        "app_visible_after_operations": art.app_visible_after_operations,
+        "vbe_visible": art.vbe_visible,
+        "bg_verdict": art.bg_verdict,
     }
     art.persist()
 
@@ -821,6 +1155,8 @@ def test_restore_baseline_hash() -> None:
         holder = _sta_run(body, art, work_path, snap_path, tmp)
 
     _finalize_common(art, holder)
+    # BG03/BG04/BG05: copy the read-only Win32 samples and compute the verdict.
+    _finalize_bg(art, holder)
     result = holder.get("result", {}) or {}
 
     assert not holder.get("thread_alive"), "STA worker did not finish within timeout"
@@ -848,21 +1184,33 @@ def test_restore_baseline_hash() -> None:
 
     assert art.orphan_reaped is not False, "owned Excel process orphaned after cleanup"
 
+    # BG03/BG04/BG05 background non-interference (read-only Win32 evidence).
+    bg_ok = _assert_bg(art)
+
     art.go_no_go = {
-        "go_no_go_r06_task006_restore": "GO",
+        "go_no_go_r06_task006_restore": "GO" if bg_ok else "NO_GO",
         "rationale": (
             "Closing the mutated working copy without saving left the on-disk file "
             "byte-identical (SHA-256 and mtime unchanged); reopening it restored the "
             "baseline SHA-256 exactly. The SaveCopyAs snapshot is an immutable restore "
             "baseline: its file hash is stable across reopen and it does not carry the "
             "in-memory mutation. A snapshot restores the workbook FILE only and does NOT "
-            "revert external side effects (DB/email/network/files). No orphan."
+            "revert external side effects (DB/email/network/files). No orphan. "
+            + art.bg_verdict["rationale"]
         ),
         "baseline_sha256": result["baseline_sha256"],
         "after_close_sha_equals_baseline": result["after_close_sha_equals_baseline"],
         "reopen_sha_equals_baseline": result["reopen_sha_equals_baseline"],
         "snapshot_hash_matches": result["snapshot_hash_matches"],
         "external_side_effects_not_undone": True,
+        "background_gate": art.bg_verdict["bg_verdict"],
+        "bg03_no_focus_theft": art.bg03_no_focus_theft,
+        "bg04_no_visible_popup": art.bg04_no_visible_popup,
+        "bg05_user_session_preserved": art.bg05_user_session_preserved,
+        "app_visible_start": art.app_visible_start,
+        "app_visible_after_operations": art.app_visible_after_operations,
+        "vbe_visible": art.vbe_visible,
+        "bg_verdict": art.bg_verdict,
     }
     art.persist()
 
