@@ -161,6 +161,25 @@ class ProcedureVisibility(StrEnum):
     UNKNOWN = "unknown"
 
 
+class VbaProcedureKind(StrEnum):
+    """VBA procedure kind (VBIDE ``ProcKind`` codes, spec §6.2)."""
+
+    SUB = "sub"
+    FUNCTION = "function"
+    PROPERTY_GET = "property_get"
+    PROPERTY_LET = "property_let"
+    PROPERTY_SET = "property_set"
+    UNKNOWN = "unknown"
+
+
+class VbaExportStatus(StrEnum):
+    """Outcome of exporting one VBA component (spec §7.2)."""
+
+    OK = "ok"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
 class ReferenceStatus(StrEnum):
     """VBA reference availability (spec §6.2, §7.2)."""
 

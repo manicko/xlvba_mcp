@@ -31,12 +31,21 @@ from mcp.server.mcpserver import MCPServer
 from excel_vba_mcp import __version__
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
-from excel_vba_mcp.api import test_tools, workbook_tools
+from excel_vba_mcp.api import test_tools, vba_tools, workbook_tools
 from excel_vba_mcp.api.test_tools import (
     snapshot_create,
     snapshot_diff,
     snapshot_list,
     snapshot_restore,
+)
+from excel_vba_mcp.api.vba_tools import (
+    vba_export_project,
+    vba_get_references,
+    vba_list_components,
+    vba_list_procedures,
+    vba_project_info,
+    vba_read_component,
+    vba_search_code,
 )
 from excel_vba_mcp.api.workbook_tools import (
     excel_close,
@@ -47,6 +56,7 @@ from excel_vba_mcp.api.workbook_tools import (
 )
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
+from excel_vba_mcp.application.vba_project_service import VBAProjectService
 from excel_vba_mcp.security.approval import ApprovalPolicy
 from excel_vba_mcp.security.audit import AuditLogger
 from excel_vba_mcp.security.path_policy import PathPolicy
@@ -83,6 +93,32 @@ _DESC_SNAPSHOT_RESTORE = (
     "macro side effects."
 )
 _DESC_SNAPSHOT_DIFF = "Compare two snapshots by manifest metadata and file hash."
+_DESC_VBA_PROJECT_INFO = (
+    "Return the VBA project summary: name, protection/lock state, component "
+    "inventory and references (missing references are reported)."
+)
+_DESC_VBA_LIST_COMPONENTS = (
+    "List VBA components with type (standard/class/user_form/document), line "
+    "count, normalized source hash and designer/export flags."
+)
+_DESC_VBA_LIST_PROCEDURES = (
+    "List the procedures of one VBA component via the VBIDE CodeModule API; "
+    "heuristic fallbacks are flagged is_heuristic=true."
+)
+_DESC_VBA_READ_COMPONENT = (
+    "Read the code module of one VBA component (code text + normalized source hash)."
+)
+_DESC_VBA_EXPORT_PROJECT = (
+    "Export every VBA component (.bas/.cls/.frm+.frx) and return the export "
+    "manifest with per-file hashes; Document modules are never removed."
+)
+_DESC_VBA_GET_REFERENCES = (
+    "List VBA project references with Name/GUID/version/path; broken references "
+    "are flagged is_broken=true."
+)
+_DESC_VBA_SEARCH_CODE = (
+    "Search every VBA component's code for a substring or regular expression (bounded results)."
+)
 
 
 @dataclasses.dataclass
@@ -93,6 +129,7 @@ class _Runtime:
     app_adapter: ExcelAppAdapter
     session: SessionService
     snapshot: SnapshotService
+    vba: VBAProjectService
     path_policy: PathPolicy
     approval: ApprovalPolicy
     audit: AuditLogger
@@ -143,11 +180,13 @@ def _build_runtime() -> _Runtime:
         path_policy,
         audit,
     )
+    vba = VBAProjectService(worker, session, path_policy, audit)
     return _Runtime(
         worker=worker,
         app_adapter=app_adapter,
         session=session,
         snapshot=snapshot,
+        vba=vba,
         path_policy=path_policy,
         approval=approval,
         audit=audit,
@@ -187,11 +226,13 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
     else:
         workbook_tools.set_session_service(runtime.session)
         test_tools.set_snapshot_service(runtime.snapshot)
+        vba_tools.set_vba_project_service(runtime.vba)
     try:
         yield runtime
     finally:
         workbook_tools.set_session_service(None)
         test_tools.set_snapshot_service(None)
+        vba_tools.set_vba_project_service(None)
         await _safe_shutdown(runtime.worker)
         runtime.audit.close()
 
@@ -227,6 +268,23 @@ def _register_tools(server: MCPServer) -> None:
     server.add_tool(snapshot_list, name="snapshot_list", description=_DESC_SNAPSHOT_LIST)
     server.add_tool(snapshot_restore, name="snapshot_restore", description=_DESC_SNAPSHOT_RESTORE)
     server.add_tool(snapshot_diff, name="snapshot_diff", description=_DESC_SNAPSHOT_DIFF)
+    server.add_tool(vba_project_info, name="vba_project_info", description=_DESC_VBA_PROJECT_INFO)
+    server.add_tool(
+        vba_list_components, name="vba_list_components", description=_DESC_VBA_LIST_COMPONENTS
+    )
+    server.add_tool(
+        vba_list_procedures, name="vba_list_procedures", description=_DESC_VBA_LIST_PROCEDURES
+    )
+    server.add_tool(
+        vba_read_component, name="vba_read_component", description=_DESC_VBA_READ_COMPONENT
+    )
+    server.add_tool(
+        vba_export_project, name="vba_export_project", description=_DESC_VBA_EXPORT_PROJECT
+    )
+    server.add_tool(
+        vba_get_references, name="vba_get_references", description=_DESC_VBA_GET_REFERENCES
+    )
+    server.add_tool(vba_search_code, name="vba_search_code", description=_DESC_VBA_SEARCH_CODE)
 
 
 _configure_logging()

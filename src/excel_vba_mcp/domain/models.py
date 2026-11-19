@@ -38,6 +38,7 @@ from excel_vba_mcp.domain.statuses import (
     StepStatus,
     TestRunStatus,
     VbaComponentType,
+    VbaExportStatus,
     WorkbookSessionState,
 )
 
@@ -133,9 +134,14 @@ class VbaProcedureInfo(DomainModel):
     visibility: ProcedureVisibility = ProcedureVisibility.UNKNOWN
     start_line: int
     end_line: int
+    code: str = ""
     is_heuristic: bool = Field(
         default=False,
         description="True when extracted via a textual fallback rather than VBIDE.",
+    )
+    source: str = Field(
+        default="code_module",
+        description="Extraction source: 'code_module' (VBIDE API) or 'heuristic'.",
     )
 
 
@@ -161,6 +167,54 @@ class VbaComponentSource(TimestampedModel):
     line_count: int
     source_hash: str
     revision: int = Field(description="Monotonic revision of the component source.")
+
+
+class VbaExportEntry(DomainModel):
+    """One exported component file (spec §7.2 export manifest).
+
+    ``source_hash`` is the SHA-256 of the **normalized code body** (EOL unified
+    to ``\\n``, per-line trailing whitespace trimmed, leading/trailing blank lines
+    dropped). ``file_sha256`` is the SHA-256 of the exported file bytes; the two
+    differ for UserForms because the exported ``.frm`` carries a designer header
+    and ``.frx`` is not byte-reproducible.
+    """
+
+    component_name: str
+    component_type: VbaComponentType
+    file_name: str
+    extension: str
+    file_path: str
+    file_sha256: str | None = None
+    source_hash: str = Field(description="SHA-256 of the normalized code body.")
+    resource_file_name: str | None = Field(
+        default=None, description="Companion .frx name for UserForms."
+    )
+    resource_file_sha256: str | None = Field(
+        default=None, description="SHA-256 of the .frx bytes (not reproducible)."
+    )
+    export_status: VbaExportStatus = VbaExportStatus.OK
+    error: str | None = None
+
+
+class VbaExportManifest(TimestampedModel):
+    """Result of ``vba_export_project`` (spec §7.2)."""
+
+    workbook_id: str
+    out_dir: str
+    components: list[VbaExportEntry] = Field(default_factory=list)
+    source_hash: str | None = Field(
+        default=None,
+        description="Combined SHA-256 over all normalized component code bodies.",
+    )
+
+
+class VbaSearchMatch(DomainModel):
+    """One bounded ``vba_search_code`` hit (spec §6.2)."""
+
+    component_name: str
+    component_type: VbaComponentType
+    line_number: int
+    line_text: str
 
 
 # ---------------------------------------------------------------------------

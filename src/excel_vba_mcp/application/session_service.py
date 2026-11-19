@@ -501,6 +501,17 @@ class SessionService:
 
         return [record.info for record in self._records.values()]
 
+    def list_workbooks_sync(self) -> list[WorkbookInfo]:
+        """Return the currently open workbooks without awaiting (no COM).
+
+        Synchronous, non-COM convenience for application services that already
+        run on the event loop and only need the session bookkeeping (e.g. the
+        read-only VBA project service resolving a ``workbook_id`` before it
+        submits work to the STA worker).
+        """
+
+        return [record.info for record in self._records.values()]
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
