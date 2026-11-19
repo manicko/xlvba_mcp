@@ -1260,6 +1260,11 @@ def owned_excel_session(sta_context: Any) -> Any:
     )
     art.matrix["owned_pid"] = ctx.owned_pid
     art.matrix["owned_pid_resolution"] = ctx.owned_pid_resolution
+    # Planner v3 section 1: explicit alignment statement with the production
+    # com_worker single-STA design (all COM proxies created/used/released on one
+    # STA thread). The dedicated worker thread itself is implemented in task_010.
+    art.matrix["aligned_to_com_worker_single_sta"] = "yes"
+    art.matrix["single_sta_thread_id"] = ctx.sta_thread_id
 
     # Drop the fixture's local ``app`` reference so that ``ctx.app_ref`` is the
     # sole strong owner. If this local survives in the suspended generator frame
