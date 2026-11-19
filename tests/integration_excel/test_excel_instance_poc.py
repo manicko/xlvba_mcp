@@ -174,7 +174,7 @@ class PocArtifacts:
     orphan_poll: list[dict[str, Any]] = field(default_factory=list)
     go_no_go: dict[str, Any] | None = None
     paths: dict[str, str] = field(default_factory=dict)
-    artifact_version: str = "task_002_planner_v3"
+    artifact_version: str = "task_002_planner_v3+bg03_bg05"
 
     def add_step(
         self,
@@ -585,6 +585,158 @@ def _resolve_owned_pid(
 
 
 # ---------------------------------------------------------------------------
+# Desktop non-interference evidence (addendum BG03/BG04/BG05)
+# ---------------------------------------------------------------------------
+# All queries below are READ-ONLY Win32 observations. They never call
+# ``SetForegroundWindow``, ``ShowWindow``, ``SetFocus``, click or type, and never
+# touch a process the automation does not own.
+
+
+def _read_app_visible(app: Any) -> Any:
+    """Read ``Application.Visible`` without mutating it; return raw or an error tag."""
+
+    try:  # pragma: no cover - depends on host
+        return app.Visible
+    except Exception as exc:  # noqa: BLE001
+        return f"error:{exc!r}"
+
+
+def _record_foreground(label: str, owned_pids: set[int], art: PocArtifacts) -> dict[str, Any]:
+    """Capture the current foreground window; never change or activate anything."""
+
+    sample: dict[str, Any] = {
+        "label": label,
+        "timestamp": _now_local_iso(),
+        "available": win32gui is not None and win32process is not None,
+        "hwnd": None,
+        "title": None,
+        "pid": None,
+        "is_excel_owned": None,
+        "is_excel_owned_pids": sorted(owned_pids),
+        "error": None,
+    }
+    if not sample["available"]:
+        sample["error"] = "win32gui/win32process unavailable"
+        art.append_log(f"[fg:{label}] unavailable: win32gui/win32process missing")
+        return sample
+    try:  # pragma: no cover - depends on host
+        hwnd = win32gui.GetForegroundWindow()
+        title = win32gui.GetWindowText(hwnd)
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+    except Exception as exc:  # noqa: BLE001
+        sample["error"] = f"{type(exc).__name__}:{exc!r}"
+        art.append_log(f"[fg:{label}] query failed: {sample['error']}")
+        return sample
+    is_owned = bool(pid in owned_pids) if owned_pids else False
+    sample.update({"hwnd": hwnd, "title": title, "pid": pid, "is_excel_owned": is_owned})
+    art.append_log(f"[fg:{label}] hwnd={hwnd} pid={pid} is_excel_owned={is_owned} title={title!r}")
+    art.add_step(
+        f"foreground_{label}",
+        None,
+        "ok",
+        notes=(f"hwnd={hwnd} pid={pid} is_excel_owned={is_owned} title={title!r} (read-only)"),
+    )
+    return sample
+
+
+def _record_visible_windows(label: str, owned_pids: set[int], art: PocArtifacts) -> dict[str, Any]:
+    """Enumerate top-level windows of the owned Excel PID and flag visible ones."""
+
+    result: dict[str, Any] = {
+        "label": label,
+        "timestamp": _now_local_iso(),
+        "available": win32gui is not None and win32process is not None,
+        "owned_pids": sorted(owned_pids),
+        "owned_windows": [],
+        "visible_windows": [],
+        "visible_window_count": 0,
+        "visible_window_titles": [],
+        "error": None,
+    }
+    if not result["available"]:
+        result["error"] = "win32gui/win32process unavailable"
+        art.append_log(f"[visible:{label}] unavailable: win32gui/win32process missing")
+        return result
+    if not owned_pids:
+        art.append_log(f"[visible:{label}] no owned PID resolved; nothing to enumerate")
+        return result
+
+    def _cb(hwnd: int, _ctx: Any) -> bool:
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        except Exception as exc:  # noqa: BLE001
+            art.append_log(f"[visible:{label}] GetWindowThreadProcessId failed: {exc!r}")
+            return True
+        if pid not in owned_pids:
+            return True
+        try:
+            title = win32gui.GetWindowText(hwnd)
+        except Exception as exc:  # noqa: BLE001
+            title = f"<title_error:{exc!r}>"
+        try:
+            visible = bool(win32gui.IsWindowVisible(hwnd))
+        except Exception as exc:  # noqa: BLE001
+            visible = False
+            art.append_log(f"[visible:{label}] IsWindowVisible failed: {exc!r}")
+        result["owned_windows"].append(
+            {"hwnd": hwnd, "pid": pid, "title": title, "is_visible": visible}
+        )
+        if visible:
+            result["visible_windows"].append(
+                {"hwnd": hwnd, "pid": pid, "title": title, "is_visible": True}
+            )
+        return True
+
+    try:  # pragma: no cover - depends on host
+        win32gui.EnumWindows(_cb, None)
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = f"EnumWindows_failed:{exc!r}"
+        art.append_log(f"[visible:{label}] EnumWindows failed: {exc!r}")
+        return result
+
+    result["visible_window_count"] = len(result["visible_windows"])
+    result["visible_window_titles"] = [w["title"] for w in result["visible_windows"]]
+    art.append_log(
+        f"[visible:{label}] owned_windows={len(result['owned_windows'])} "
+        f"visible={result['visible_window_count']} titles={result['visible_window_titles']}"
+    )
+    art.add_step(
+        f"visible_windows_{label}",
+        None,
+        "ok" if not result["visible_windows"] else "visible_window_present",
+        notes=(
+            f"owned_windows={len(result['owned_windows'])} "
+            f"visible={result['visible_window_count']} titles={result['visible_window_titles']}"
+        ),
+    )
+    return result
+
+
+def _record_vbe_visible(app: Any, sta_thread_id: int | None, art: PocArtifacts) -> dict[str, Any]:
+    """Best-effort read of ``VBE.MainWindow.Visible`` without activating the VBE."""
+
+    result: dict[str, Any] = {"check": "not_reachable", "visible": None, "detail": None}
+    try:  # pragma: no cover - depends on host
+        vbe = app.VBE
+        main_window = vbe.MainWindow
+        result["visible"] = main_window.Visible
+        result["check"] = "reachable"
+    except Exception as exc:  # noqa: BLE001
+        result["detail"] = f"{type(exc).__name__}:{_hresult_hex_from_exc(exc)}:{str(exc)[:200]}"
+        result["check"] = "not_reachable"
+        art.append_log(f"[vbe_visible] not reachable: {result['detail']}")
+        return result
+    art.append_log(f"[vbe_visible] reachable visible={result['visible']!r} (read-only)")
+    art.add_step(
+        "vbe_visible_check",
+        sta_thread_id,
+        "ok" if result["visible"] in (False, 0) else "vbe_visible",
+        notes=f"VBE.MainWindow.Visible={result['visible']!r} (read-only)",
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # STA context and owned session
 # ---------------------------------------------------------------------------
 @dataclass
@@ -609,6 +761,18 @@ class _StaExcelContext:
     # them alive across uninit leaves an orphaned Excel process.
     app_ref: Any = None
     excel_matrix: dict[str, Any] = field(default_factory=dict)
+    affinity_probe: dict[str, Any] | None = None
+    # Desktop non-interference evidence (BG03/BG04/BG05).
+    foreground_before: dict[str, Any] | None = None
+    foreground_after_dispatch: dict[str, Any] | None = None
+    foreground_during: list[dict[str, Any]] = field(default_factory=list)
+    foreground_after: dict[str, Any] | None = None
+    visible_windows_after_dispatch: dict[str, Any] | None = None
+    visible_windows_end: dict[str, Any] | None = None
+    vbe_visible: dict[str, Any] | None = None
+    app_visible_final: Any = None
+    non_interference: dict[str, Any] | None = None
+    user_pids_missing: list[int] = field(default_factory=list)
     go_no_go: dict[str, Any] | None = None
     cleanup_complete: bool = False
 
@@ -1053,7 +1217,8 @@ def _compute_go_no_go(ctx: _StaExcelContext) -> dict[str, Any]:
     before_pids = _pids_from(before.get("excel_processes", []))
     after_pids = _pids_from(after.get("excel_processes", []))
 
-    affinity = ctx.affinity_probe if isinstance(ctx.affinity_probe, dict) else {}
+    affinity_value = getattr(ctx, "affinity_probe", None)
+    affinity = affinity_value if isinstance(affinity_value, dict) else {}
     affinity_performed = bool(affinity.get("performed"))
 
     multiop = art.serialized_multiop_evidence or {}
@@ -1091,8 +1256,15 @@ def _compute_go_no_go(ctx: _StaExcelContext) -> dict[str, Any]:
             "window_snapshot_method",
             "app_visible",
             "app_display_alerts",
+            "foreground_before",
+            "foreground_after",
+            "visible_windows",
+            "vbe_visible",
         )
     )
+
+    # BG03/BG04/BG05 — disqualifying on failure.
+    non_interference = art.matrix.get("non_interference") or {}
 
     reasons: list[str] = []
 
@@ -1114,6 +1286,52 @@ def _compute_go_no_go(ctx: _StaExcelContext) -> dict[str, Any]:
     if not multiop_ok:
         reasons.append("serialized multi-op evidence incomplete")
 
+    # BG03 — no focus theft.
+    fg_after_owned = bool((ctx.foreground_after or {}).get("is_excel_owned"))
+    fg_during_owned = any(s.get("is_excel_owned") for s in (ctx.foreground_during or []))
+    bg03_reasons: list[str] = []
+    if fg_after_owned:
+        bg03_reasons.append("automation-owned Excel/VBE window held foreground after test")
+    if fg_during_owned:
+        bg03_reasons.append("automation-owned Excel/VBE window observed in foreground during test")
+    if bg03_reasons:
+        reasons.extend(f"BG03: {r}" for r in bg03_reasons)
+    # BG04 — no visible automation-owned window.
+    bg04_reasons: list[str] = []
+    for vw_label, vw in (
+        ("after_dispatch", ctx.visible_windows_after_dispatch),
+        ("end", ctx.visible_windows_end),
+    ):
+        if vw and vw.get("visible_windows"):
+            bg04_reasons.append(
+                f"automation-owned window visible at {vw_label}: {vw.get('visible_window_titles')}"
+            )
+    if fg_after_owned and not bg04_reasons:
+        bg04_reasons.append("automation-owned window held foreground (treat as visible popup)")
+    if bg04_reasons:
+        reasons.extend(f"BG04: {r}" for r in bg04_reasons)
+    # BG05 — user session preserved.
+    bg05_reasons = [f"user Excel PIDs disappeared: {user_pids_missing}"] if user_harmed else []
+    if bg05_reasons:
+        reasons.extend(f"BG05: {r}" for r in bg05_reasons)
+
+    non_interference.update(
+        {
+            "bg03_no_focus_theft": not bg03_reasons,
+            "bg04_no_visible_popup": not bg04_reasons,
+            "bg05_user_session_preserved": not bg05_reasons,
+            "foreground_before": ctx.foreground_before,
+            "foreground_during": ctx.foreground_during,
+            "foreground_after": ctx.foreground_after,
+            "visible_windows_after_dispatch": ctx.visible_windows_after_dispatch,
+            "visible_windows_end": ctx.visible_windows_end,
+            "vbe_visible": ctx.vbe_visible,
+            "app_visible_final": art.matrix.get("app_visible"),
+        }
+    )
+    ctx.non_interference = non_interference
+    art.matrix["non_interference"] = non_interference
+
     no_go = bool(reasons)
 
     if no_go:
@@ -1123,6 +1341,12 @@ def _compute_go_no_go(ctx: _StaExcelContext) -> dict[str, Any]:
             "go_no_go_r01_task002": verdict,
             "rationale": rationale,
             "reasons": reasons,
+            "bg03_no_focus_theft": non_interference["bg03_no_focus_theft"],
+            "bg04_no_visible_popup": non_interference["bg04_no_visible_popup"],
+            "bg05_user_session_preserved": non_interference["bg05_user_session_preserved"],
+            "bg03_reasons": bg03_reasons,
+            "bg04_reasons": bg04_reasons,
+            "bg05_reasons": bg05_reasons,
             "follow_ups": [],
         }
 
@@ -1152,7 +1376,9 @@ def _compute_go_no_go(ctx: _StaExcelContext) -> dict[str, Any]:
     else:
         verdict = "GO"
         rationale = (
-            "Core R01 and modal/RPC observation paths exercised; all ACs pass on target build."
+            "Core R01 and modal/RPC observation paths exercised; all ACs pass on target build. "
+            "BG03 no-focus-theft, BG04 no-visible-popup, and BG05 user-session-preserved "
+            "evidence also pass (addendum background-execution gate)."
         )
     return {
         "go_no_go_r01_task002": verdict,
@@ -1160,6 +1386,12 @@ def _compute_go_no_go(ctx: _StaExcelContext) -> dict[str, Any]:
         "reasons": reasons,
         "modal_rpcs_exercised": modal_exercised,
         "rpc_observed": rpc_observed,
+        "bg03_no_focus_theft": non_interference["bg03_no_focus_theft"],
+        "bg04_no_visible_popup": non_interference["bg04_no_visible_popup"],
+        "bg05_user_session_preserved": non_interference["bg05_user_session_preserved"],
+        "bg03_reasons": bg03_reasons,
+        "bg04_reasons": bg04_reasons,
+        "bg05_reasons": bg05_reasons,
         "follow_ups": follow_ups,
     }
 
@@ -1206,6 +1438,10 @@ def owned_excel_session(sta_context: Any) -> Any:
     # Precondition baseline.
     ctx.baseline_before = snapshot_isolation_baseline("baseline_before", art)
 
+    # BG03/BG04/BG05: capture the user's foreground window BEFORE creating Excel.
+    ctx.foreground_before = _record_foreground("before", set(), art)
+    art.matrix["foreground_before"] = ctx.foreground_before
+
     # DispatchEx (owned instance).
     app = win32com.client.DispatchEx(EXCEL_PROGID)
     ctx.app_ref = app
@@ -1248,6 +1484,18 @@ def owned_excel_session(sta_context: Any) -> Any:
     art.matrix.update(ctx.excel_matrix)
     art.matrix["app_visible"] = ctx.app_visible_actual
     art.matrix["app_display_alerts"] = ctx.app_display_alerts_actual
+    # BG03/BG04: immediately after DispatchEx, the owned instance must not own the
+    # foreground and must not expose a visible top-level window.
+    owned_pids = {ctx.owned_pid} if ctx.owned_pid is not None else set()
+    ctx.foreground_after_dispatch = _record_foreground("after_dispatch", owned_pids, art)
+    ctx.foreground_during.append(ctx.foreground_after_dispatch)
+    ctx.visible_windows_after_dispatch = _record_visible_windows("after_dispatch", owned_pids, art)
+    art.matrix["visible_windows"] = ctx.visible_windows_after_dispatch
+    # BG03: sample again after the workbook open/close operations complete.
+    ctx.foreground_during.append(_record_foreground("after_operations", owned_pids, art))
+    # BG04: best-effort VBE visibility (read-only; never activates the VBE).
+    ctx.vbe_visible = _record_vbe_visible(app, ctx.sta_thread_id, art)
+    art.matrix["vbe_visible"] = ctx.vbe_visible
     # N4 snapshot methods (required fields).
     art.matrix["process_snapshot_method"] = (ctx.baseline_before or {}).get(
         "process_snapshot_method_used", "unknown"
@@ -1275,12 +1523,31 @@ def owned_excel_session(sta_context: Any) -> Any:
     try:
         yield ctx
     finally:
+        # BG04: capture visible windows for the owned PID while the workbook
+        # open/close lifecycle has just finished, before cleanup.
+        owned_pids = {ctx.owned_pid} if ctx.owned_pid is not None else set()
+        ctx.visible_windows_end = _record_visible_windows("end", owned_pids, art)
+        ctx.foreground_during.append(_record_foreground("end", owned_pids, art))
+        # BG03/BG05: capture foreground after the owned instance is gone; also
+        # re-read app.Visible (the instance is still alive for one last check).
+        if ctx.app_ref is not None:
+            final_visible = _read_app_visible(ctx.app_ref)
+            ctx.app_visible_final = final_visible
+            art.matrix["app_visible"] = final_visible
+            art.matrix["app_visible_final"] = final_visible
         # Cleanup on the STA thread (planner v3 section 5.5).
         cleanup = _quit_and_cleanup(ctx, ctx.sta_thread_id or threading.get_ident(), art)
         ctx.cleanup_complete = True
         art.matrix["cleanup"] = cleanup
+        # BG03: foreground after full cleanup (owned instance terminated).
+        ctx.foreground_after = _record_foreground("after", owned_pids, art)
+        art.matrix["foreground_after"] = ctx.foreground_after
         # Post-cleanup baseline.
         ctx.baseline_after = snapshot_isolation_baseline("baseline_after", art)
+        # BG05: record user-owned PID disappearance (if any) for the rubric.
+        before_pids = _pids_from((ctx.baseline_before or {}).get("excel_processes", []))
+        after_pids = _pids_from(ctx.baseline_after.get("excel_processes", []))
+        ctx.user_pids_missing = sorted(before_pids - after_pids)
         art.matrix["cleanup_orphan"] = cleanup.get("orphan")
         # Final Go/No-Go verdict computed AFTER cleanup so the orphan outcome and
         # baseline_after are included (planner v3 section 8). Persisted in the
@@ -1291,6 +1558,11 @@ def owned_excel_session(sta_context: Any) -> Any:
                 "busy/modal handling not exercised. "
                 "Pump strategy: PumpWaitingMessages at COM boundaries."
             )
+        # BG03/BG04/BG05: record the final non-interference samples so the gate is
+        # evaluated for every test in this module (not only the dedicated test).
+        # ``app_ref`` is already released by cleanup, so ``app_visible_final``
+        # falls back to the last recorded value.
+        _record_non_interference(ctx)
         verdict = _compute_go_no_go(ctx)
         ctx.go_no_go = verdict
         art.go_no_go = verdict
@@ -1419,3 +1691,145 @@ def test_excel_workbook_open_close_lifecycle(owned_excel_session: Any) -> None:
     art.rpc_observations = []
 
     art.append_log(f"lifecycle complete; open params={params}; steps={len(art.steps)}")
+
+
+# ---------------------------------------------------------------------------
+# Desktop non-interference evidence (BG03/BG04/BG05)
+# ---------------------------------------------------------------------------
+def _record_non_interference(ctx: _StaExcelContext) -> dict[str, Any]:
+    """Record the BG03/BG04/BG05 samples and per-operation foreground samples.
+
+    Read-only: this only calls the recorders above, which query Win32 state and
+    never activate, show, click, or type. It must be safe to call more than once
+    (the last call before ``_compute_go_no_go`` wins).
+    """
+
+    art = ctx.art
+    assert art is not None
+    app = ctx.app_ref
+    owned_pids = {ctx.owned_pid} if ctx.owned_pid is not None else set()
+
+    visible_end = _record_visible_windows("end", owned_pids, art)
+    ctx.visible_windows_end = visible_end
+    ctx.foreground_during.append(_record_foreground("during", owned_pids, art))
+
+    if app is not None:
+        app_visible = _read_app_visible(app)
+        ctx.app_visible_final = app_visible
+        vbe_visible = _record_vbe_visible(app, ctx.sta_thread_id, art)
+    else:
+        # Cleanup already released the owned proxy; reuse the last recorded values.
+        app_visible = ctx.app_visible_final
+        vbe_visible = ctx.vbe_visible
+
+    fg_after = ctx.foreground_after or {}
+    bg03_no_focus_theft = not (
+        bool(fg_after.get("is_excel_owned"))
+        or any(s.get("is_excel_owned") for s in (ctx.foreground_during or []))
+    )
+    vw_after = ctx.visible_windows_after_dispatch or {}
+    bg04_no_visible_popup = not (
+        bool(vw_after.get("visible_windows")) or bool(visible_end.get("visible_windows"))
+    )
+    bg05_user_session_preserved = not bool(ctx.user_pids_missing)
+    if ctx.baseline_after is not None and ctx.baseline_before is not None:
+        # Prefer the observed after-baseline delta when it is available.
+        after_pids = _pids_from(ctx.baseline_after.get("excel_processes", []))
+        before_pids = _pids_from(ctx.baseline_before.get("excel_processes", []))
+        if before_pids:
+            bg05_user_session_preserved = not bool(before_pids - after_pids)
+
+    sample: dict = {
+        "app_visible": app_visible,
+        "foreground_before": ctx.foreground_before,
+        "foreground_during": list(ctx.foreground_during),
+        "foreground_after": fg_after,
+        "visible_windows_after_dispatch": vw_after,
+        "visible_windows_end": visible_end,
+        "vbe_visible": vbe_visible,
+        "bg03_no_focus_theft": bg03_no_focus_theft,
+        "bg04_no_visible_popup": bg04_no_visible_popup,
+        "bg05_user_session_preserved": bg05_user_session_preserved,
+    }
+    art.matrix.update(sample)
+    ctx.vbe_visible = vbe_visible
+    art.add_step(
+        "non_interference_evidence",
+        ctx.sta_thread_id,
+        "ok",
+        notes=(
+            f"bg03={bg03_no_focus_theft} bg04={bg04_no_visible_popup} "
+            f"bg05={bg05_user_session_preserved} app_visible={app_visible!r}"
+        ),
+    )
+    return sample
+
+
+@requires_excel
+@pytest.mark.integration_excel
+def test_excel_automation_instance_non_interference(owned_excel_session: Any) -> None:
+    """BG03/BG04/BG05: hidden, non-activating, and user-session preserving.
+
+    Evidence is read-only Win32 observation: no ``SetForegroundWindow``, no
+    ``ShowWindow(show)``, no clicks/keystrokes, no activation, and no query of a
+    non-owned Excel process beyond the existing process/window snapshots.
+    """
+
+    ctx: _StaExcelContext = owned_excel_session
+    app = ctx.app_ref
+    art = ctx.art
+    assert art is not None
+
+    # Application.Visible must be False at start and after operations.
+    assert ctx.app_visible_actual is False
+    assert _read_app_visible(app) is False
+
+    # Mandatory single-STA evidence (N1/N2) so this run's own artifact satisfies
+    # the same rubric as the other tests in the module.
+    multiop = _run_serialized_multiop_evidence(app, ctx.sta_thread_id, art)
+    art.serialized_multiop_evidence = multiop
+    affinity = _affinity_probe(app, ctx.sta_thread_id, art)
+    ctx.affinity_probe = affinity
+    art.affinity_probe = affinity
+    assert multiop["same_boundary"]
+    assert affinity.get("hresult_hex") == f"0x{RPC_E_WRONG_THREAD:08X}"
+
+    # Foreground after dispatch/operations + owned visible-window enumeration.
+    sample = _record_non_interference(ctx)
+    fg_before = sample["foreground_before"]
+    fg_during = sample["foreground_during"]
+    assert fg_before["hwnd"] is not None, f"foreground_before not captured: {fg_before}"
+    assert fg_during, "no foreground_during samples recorded"
+    for fg in fg_during:
+        assert fg["is_excel_owned"] is False, f"automation-owned window took foreground: {fg}"
+        assert fg["hwnd"] is not None, f"foreground sample not captured: {fg}"
+    assert sample["visible_windows_after_dispatch"]["visible_windows"] == []
+    assert sample["visible_windows_end"]["visible_windows"] == []
+    assert sample["bg03_no_focus_theft"] is True
+    assert sample["bg04_no_visible_popup"] is True
+    assert sample["bg05_user_session_preserved"] is True
+
+    # VBE visibility: reachable -> False; unreachable -> recorded as such.
+    vbe = sample["vbe_visible"]
+    if vbe and vbe.get("check") == "reachable":
+        assert vbe.get("visible") in (False, 0), f"VBE MainWindow visible: {vbe}"
+    else:
+        assert vbe is None or vbe.get("check") == "not_reachable"
+
+    # Record the rubric basis (orphan re-evaluated after fixture cleanup; final
+    # go/no-go is persisted in the fixture teardown artifact).
+    art.modal_notes = (
+        "No modal dialogs or RPC_E_CALL_REJECTED observed during this run; "
+        "busy/modal handling not exercised. Pump strategy: PumpWaitingMessages at COM boundaries."
+    )
+    art.rpc_observations = []
+    ctx.go_no_go = _compute_go_no_go(ctx)
+    art.append_log(
+        f"non-interference test complete; "
+        f"fg_before={fg_before.get('title')!r} "
+        f"fg_last_during={(fg_during[-1] or {}).get('title')!r} "
+        f"visible_windows={sample['visible_windows_end']['visible_window_count']} "
+        f"bg03={sample['bg03_no_focus_theft']} "
+        f"bg04={sample['bg04_no_visible_popup']} "
+        f"bg05={sample['bg05_user_session_preserved']}"
+    )
