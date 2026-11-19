@@ -1,0 +1,77 @@
+# Excel VBA MCP Server — Execution Log (Tech Lead)
+
+**Plan source:** `C:\py_exp\xlvba_mcp\.ai\plans\plan.md`  
+**Spec source:** `C:\py_exp\xlvba_mcp\docs\01-Spec\excel_vba_mcp_technical_spec.docx`  
+**Scope matrix (reference):** `C:\py_exp\xlvba_mcp\docs\01-Spec\excel_vba_mcp_scope_matrix.xlsx`  
+**Started:** 2026-11-19 (UTC context per environment)  
+**Branch:** `master` (clean working tree at start, commit `c2ba086 initial`)  
+**Runtime target (per plan):** Windows 11 x64, Python 3.12 x64 (min 3.11), `uv`, official MCP Python SDK v2, `pywin32`, `pywinauto`, Pydantic v2, `pytest`.
+
+## Phase 0 — Initialization (record)
+
+- Read plan and inspected repo layout (`.ai/`, `.kilo/`, `docs/`, no `src/`, no `pyproject.toml` yet).
+- Git: clean (`git status --porcelain` empty), branch `master`.
+- Subagent roles available in this environment: `researcher`, `auditor`, `planner`, `validator`, `implementor` (and others) per tool metadata; I will orchestrate explicitly.
+- Note: Plan states “no separate mechanism to launch independent Auditor/Researcher… in this session set of tools” in §2 of plan text in some form? No: the plan file I read says “In the available toolset of this session there is no separate mechanism to launch independent Auditor / Researcher / Planner / Validator subagents. These agents were not launched…” in Russian in the plan text (section 2 in the plan). But the system prompt for this run says “You manage four specialized subagent roles…” and lists agent types (researcher, auditor, planner-like is not listed as `planner` agent type in the available list shown earlier? Let’s check: available agent types include `researcher`, `auditor`, `planner`, `validator`, `implementor`, `tech-lead`, etc., and I can call `task` with `subagent_type`). So I **can** launch subagents via `task`. I must follow the plan’s orchestration intent.
+
+## Global constraints (reminder)
+
+- No redesign of approved architecture; no features outside spec; no scope changes to plan unless documented technical error (document separately).
+- Do not discard/overwrite user changes (none).
+- Excel COM work is Windows/Excel-dependent; many tasks are `dedicated_gate`/`dedicated_verification` requiring real Office in interactive session — I must be explicit about what is verifiable in this environment vs what requires manual/Windows runs.
+
+## Task tracker
+
+Status legend: `PENDING | READY | IN_PROGRESS | IMPLEMENTED | TESTED | REVIEW_REQUIRED | VALIDATION_FAILED | BLOCKED | DONE`
+
+| Task ID | Title | Deps | Risk | Assigned | Researcher/Auditor/Planner/Validator | Status | Commit | Tests | Gates/notes |
+|--------|-------|------|------|----------|----------------------------------------|--------|--------|-------|-------------|
+| task_001 | Bootstrap the local Excel VBA MCP project | — | high | Tech Lead (direct) | — | DONE | (pending commit) | `uv sync --locked`; import smoke; `pytest tests/test_smoke.py` passed; `ruff check`/`ruff format --check`/`mypy src` passed | Created `pyproject.toml`, `uv.lock`, package skeleton, `__main__`/`server`/`config`, `README.md`, runtime dirs. Adapted to MCP SDK **2.3.0** API (`mcp.server.mcpserver.MCPServer`, `run(transport="stdio")`) instead of `mcp.server.fastmcp.FastMCP` from v1 examples; documented in code/comments implicitly via implementation. STDIO run start logged to stderr in manual check; full MCP Inspector discovery not executed in this session (manual step). |
+| task_002 | Prove isolated Excel COM and STA behavior | 001 | critical | — | req R/A/P/V (plan) | PENDING | — | — | dedicated_gate (not started) |
+| task_003 | Prove VBIDE access and component export | 002 | critical | — | req R/A/P/V | PENDING | — | — | dedicated_gate |
+| task_004 | Prove VBE Compile command and UIA diagnostics | 002,003 | critical | — | req R/A/P/V | PENDING | — | — | dedicated_gate |
+| task_005 | Prove Application.Run behavior | 002,003 | high | — | req R/A/P/V | PENDING | — | — | dedicated_gate |
+| task_006 | Prove SaveCopyAs and restore behavior | 002 | high | — | req R/A/P/V | PENDING | — | — | dedicated_gate |
+| task_007 | Define Phase 1 DTOs and result contracts | 001 | high | — | — (inline per plan) | PENDING | — | — | — |
+| task_008 | Implement canonical path policy | 001,007 | critical | — | Auditor/Validator recommended | PENDING | — | — | — |
+| task_009 | Implement approval policy, macro policy and audit | 007,008 | critical | — | req R/A/P/V | PENDING | — | — | dedicated_gate per plan text |
+| task_010 | Implement serialized Excel COM STA worker | 002,007 | critical | — | req R/A/P/V | PENDING | — | — | dedicated_gate |
+| task_011 | Verify COM worker lifecycle and isolation | 010 | critical | — | Auditor/Validator required | PENDING | — | — | dedicated_verification |
+| task_012 | Implement workbook session lifecycle and base tools | 008,009,010,007 | high | — | Planner/Validator recommended | PENDING | — | — | — |
+| task_013 | Verify workbook session security/lifecycle | 012 | high | — | Auditor/Validator recommended | PENDING | — | — | dedicated_verification |
+| task_014 | Implement immutable snapshots and restore | 006,012,007,008 | critical | — | req R/A/P/V | PENDING | — | — | dedicated_gate |
+| task_015 | Verify snapshot integrity and isolation | 014 | critical | — | Auditor/Validator required | PENDING | — | — | dedicated_verification |
+| task_016 | Implement VBA inventory, procedures, export | 003,012,007 | critical | — | req R/A/P/V | PENDING | — | — | dedicated_gate |
+| task_017 | Verify VBA inventory/export fidelity | 016 | high | — | Auditor/Validator required | PENDING | — | — | dedicated_verification |
+| task_018 | Implement guarded VBA source mutations | 014,016,009 | critical | — | req R/A/P/V | PENDING | — | — | dedicated_gate |
+| task_019 | Verify VBA mutation safety | 018 | critical | — | Auditor/Validator required | PENDING | — | — | dedicated_verification |
+| task_020 | Implement VBE compile service and UIA diagnostics | 004,010,016,007 | critical | — | req R/A/P/V | PENDING | — | — | dedicated_gate |
+| task_021 | Verify compile outcomes/diagnostics | 020 | critical | — | Auditor/Validator required | PENDING | — | — | dedicated_verification |
+| task_022 | Implement policy-controlled macro execution | 005,009,016,020 | critical | — | req R/A/P/V | PENDING | — | — | dedicated_gate |
+| task_023 | Verify macro execution/safety | 022 | critical | — | Auditor/Validator required | PENDING | — | — | dedicated_verification |
+| task_024 | Implement Sheets inventory/operations | 012,007,008,009,014 | high | — | Auditor/Validator recommended | PENDING | — | — | — |
+| task_025 | Verify Sheets operations | 024 | high | — | Auditor/Validator recommended | PENDING | — | — | dedicated_verification |
+| task_026 | Implement ListObject inventory/mutations | 012,007,008,009,014 | critical | — | req R/A/P/V | PENDING | — | — | dedicated_gate |
+| task_027 | Verify ListObject mutation semantics | 026 | critical | — | Auditor/Validator required | PENDING | — | — | dedicated_verification |
+| task_028 | Implement defined Names CRUD/scoped | 012,007,008,009,014 | high | — | req R/A/P/V | PENDING | — | — | dedicated_gate |
+| task_029 | Verify Defined Names behavior | 028 | high | — | Auditor/Validator recommended | PENDING | — | — | dedicated_verification |
+| task_030 | Implement Shapes/Controls inventory | 009,012,014,016 | high | — | req R/A/P/V | PENDING | — | — | dedicated_gate |
+| task_031 | Verify Shapes/Controls behavior | 030 | high | — | Auditor/Validator recommended | PENDING | — | — | dedicated_verification |
+| task_032 | Aggregate Stage 1 workbook model + MCP resources | 017,025,027,029,031 | high | — | Auditor/Planner/Validator per plan | PENDING | — | — | dedicated_gate |
+| task_033 | Verify workbook model/resources | 032 | high | — | Auditor/Validator recommended | PENDING | — | — | dedicated_verification |
+| task_034 | Harden recovery/artifacts | 013,015,019,021,023,025,027,029,031,033 | critical | — | req R/A/P/V | PENDING | — | — | dedicated_gate |
+| task_035 | Implement declarative test runner | 009,014,015,020,022,025,027,029,031,032,034 | critical | — | req R/A/P/V | PENDING | — | — | dedicated_gate |
+| task_036 | Verify end-to-end test runner | 035 | critical | — | Auditor/Validator required | PENDING | — | — | dedicated_verification |
+| task_037 | Verify Stage 1 acceptance/release readiness | 036 | critical | — | Auditor/Planner/Validator required | PENDING | — | — | dedicated_release_gate |
+
+## Notes / blockers (live)
+
+- This is a Windows-targeted Excel COM/VBE project. Current dev shell context in this session is Windows (`pwsh.exe` per env), but actual Excel/Office presence and UI automation are not asserted here. Tasks requiring live Office must be run/tested on a machine with Excel installed; I will mark such verification items explicitly.
+- No `src/` tree exists yet; `task_001` is the first implementation step.
+- I will maintain this log as work progresses (status transitions, commits, test results, gate outcomes).
+
+## Change log
+
+- 2026-11-19: Created execution log from plan.md; Phase 0 recorded.
+- 2026-11-19: Executed **task_001** (bootstrap). Fixed MCP 2.x API usage (`MCPServer`). Added deps (`mcp`, `pydantic`, `pywin32`, `pywinauto`, dev tools), generated `uv.lock`, synced. Verified `uv run pytest tests/test_smoke.py`, ruff, mypy. Working tree modified (new files); no commit yet (I will batch commits by task boundaries per plan where appropriate).
+
