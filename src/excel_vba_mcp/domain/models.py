@@ -169,6 +169,33 @@ class VbaComponentSource(TimestampedModel):
     revision: int = Field(description="Monotonic revision of the component source.")
 
 
+class VbaMutationResult(TimestampedModel):
+    """Result of a guarded VBA source mutation (replace / insert, spec §7.2).
+
+    Captures the source hash **before** and **after** the mutation together with
+    the export paths written on the STA worker, so a caller can verify that the
+    working copy changed and that the original fixture was never touched. The
+    ``audit_id`` correlates this mutation with its audit-log entry.
+    """
+
+    workbook_id: str
+    component_name: str
+    action: str = Field(description="'replace' or 'insert'.")
+    before_hash: str = Field(description="Normalized SHA-256 of the code body before mutation.")
+    after_hash: str = Field(description="Normalized SHA-256 of the code body after mutation.")
+    before_export_path: str = Field(
+        description="Absolute path of the exported .bas/.cls/.frm file before mutation."
+    )
+    after_export_path: str = Field(
+        description="Absolute path of the exported .bas/.cls/.frm file after mutation."
+    )
+    audit_id: str = Field(description="Audit log event id for this mutation.")
+    procedure: str | None = Field(
+        default=None,
+        description="Affected procedure name for an insert, or None for a full replace.",
+    )
+
+
 class VbaExportEntry(DomainModel):
     """One exported component file (spec §7.2 export manifest).
 

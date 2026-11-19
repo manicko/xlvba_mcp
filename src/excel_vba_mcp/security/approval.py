@@ -236,6 +236,29 @@ class ApprovalPolicy:
             reason="denied by default: no matching allowlist entry or live grant",
         )
 
+    def authorize_vba_write(self, key: ApprovalKey) -> ApprovalDecision:
+        """Authorize a MUTATING VBA write operation (deny-by-default).
+
+        A thin wrapper over :meth:`check` that always classifies the request as
+        ``MUTATING``. Mutating VBA writes (replace / insert) must never be
+        auto-allowed; they require an explicit allowlist entry or a live grant
+        that matches the ``key`` (canonical path + sha256 + action + optional
+        component / procedure). Returns the :class:`ApprovalDecision`; the
+        caller is responsible for raising the appropriate error when
+        ``allowed`` is ``False``.
+
+        Args:
+            key: The identity of the action to authorize. ``sha256`` is the
+                authoritative identity when both the request and the entry carry
+                it; otherwise ``canonical_path`` is used (see :func:`_identity_matches`).
+
+        Returns:
+            An :class:`ApprovalDecision` whose ``allowed`` is ``True`` only when
+            a live allowlist entry or grant matches; ``False`` otherwise.
+        """
+
+        return self.check(key, operation_class=OperationClass.MUTATING)
+
 
 def _grant_is_live(
     grant: ApprovalGrant,

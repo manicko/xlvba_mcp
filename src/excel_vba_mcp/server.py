@@ -41,10 +41,12 @@ from excel_vba_mcp.api.test_tools import (
 from excel_vba_mcp.api.vba_tools import (
     vba_export_project,
     vba_get_references,
+    vba_insert_code,
     vba_list_components,
     vba_list_procedures,
     vba_project_info,
     vba_read_component,
+    vba_replace_component_source,
     vba_search_code,
 )
 from excel_vba_mcp.api.workbook_tools import (
@@ -119,6 +121,17 @@ _DESC_VBA_GET_REFERENCES = (
 _DESC_VBA_SEARCH_CODE = (
     "Search every VBA component's code for a substring or regular expression (bounded results)."
 )
+_DESC_VBA_REPLACE_COMPONENT_SOURCE = (
+    "Replace the entire code module of a Standard/Class VBA component. Guarded "
+    "mutation: requires a writable session, a successful snapshot, a matching "
+    "expected_source_hash (revision check) and an approval grant. Document "
+    "modules and UserForms are rejected."
+)
+_DESC_VBA_INSERT_CODE = (
+    "Insert VBA code at a semantic position in a Standard/Class component. "
+    "position is 'declarations', 'before_procedure:<name>' or "
+    "'after_procedure:<name>'. Same guard chain as replace."
+)
 
 
 @dataclasses.dataclass
@@ -180,7 +193,14 @@ def _build_runtime() -> _Runtime:
         path_policy,
         audit,
     )
-    vba = VBAProjectService(worker, session, path_policy, audit)
+    vba = VBAProjectService(
+        worker,
+        session,
+        path_policy,
+        audit,
+        snapshot_service=snapshot,
+        approval=approval,
+    )
     return _Runtime(
         worker=worker,
         app_adapter=app_adapter,
@@ -285,6 +305,16 @@ def _register_tools(server: MCPServer) -> None:
         vba_get_references, name="vba_get_references", description=_DESC_VBA_GET_REFERENCES
     )
     server.add_tool(vba_search_code, name="vba_search_code", description=_DESC_VBA_SEARCH_CODE)
+    server.add_tool(
+        vba_replace_component_source,
+        name="vba_replace_component_source",
+        description=_DESC_VBA_REPLACE_COMPONENT_SOURCE,
+    )
+    server.add_tool(
+        vba_insert_code,
+        name="vba_insert_code",
+        description=_DESC_VBA_INSERT_CODE,
+    )
 
 
 _configure_logging()

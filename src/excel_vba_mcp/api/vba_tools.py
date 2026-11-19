@@ -23,6 +23,7 @@ from excel_vba_mcp.domain.models import (
     VbaComponentInfo,
     VbaComponentSource,
     VbaExportManifest,
+    VbaMutationResult,
     VbaProcedureInfo,
     VbaProjectInfo,
     VbaReferenceInfo,
@@ -187,14 +188,92 @@ async def vba_search_code(
     return await service.search_code(workbook_id, pattern, regex=regex)
 
 
+async def vba_replace_component_source(
+    workbook_id: str,
+    component: str,
+    new_source: str,
+    expected_source_hash: str,
+) -> VbaMutationResult:
+    """Replace the entire code module of a Standard/Class VBA component.
+
+    Guarded mutation (spec §7.2): requires a writable session, a successful
+    snapshot, a matching ``expected_source_hash`` (revision check) and an
+    approval grant. Document modules and UserForms are rejected. Returns a
+    :class:`VbaMutationResult` with before/after hashes and export paths.
+
+    Args:
+        workbook_id: The id returned by :func:`excel_open`.
+        component: The ``VBComponent.Name`` to replace (Standard/Class only).
+        new_source: The new VBA source text.
+        expected_source_hash: The SHA-256 of the **current** normalized code
+            body (stale-revision guard).
+
+    Returns:
+        A :class:`VbaMutationResult` describing the mutation.
+    """
+
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(component, "component")
+    _require_non_empty(expected_source_hash, "expected_source_hash")
+    service = get_vba_project_service()
+    return await service.replace_component_source(
+        workbook_id,
+        component,
+        new_source,
+        expected_source_hash=expected_source_hash,
+    )
+
+
+async def vba_insert_code(
+    workbook_id: str,
+    component: str,
+    code: str,
+    position: str,
+    expected_source_hash: str,
+) -> VbaMutationResult:
+    """Insert ``code`` at a semantic position in a Standard/Class VBA component.
+
+    ``position`` must be ``"declarations"``, ``"before_procedure:<name>"`` or
+    ``"after_procedure:<name>"``. The line is resolved via the VBIDE CodeModule
+    API; ambiguous text heuristics are rejected. Same guard chain as
+    :func:`vba_replace_component_source`.
+
+    Args:
+        workbook_id: The id returned by :func:`excel_open`.
+        component: The ``VBComponent.Name`` to insert into (Standard/Class only).
+        code: The VBA code text to insert.
+        position: Insertion position spec.
+        expected_source_hash: The SHA-256 of the **current** normalized code
+            body (stale-revision guard).
+
+    Returns:
+        A :class:`VbaMutationResult` describing the mutation.
+    """
+
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(component, "component")
+    _require_non_empty(position, "position")
+    _require_non_empty(expected_source_hash, "expected_source_hash")
+    service = get_vba_project_service()
+    return await service.insert_code(
+        workbook_id,
+        component,
+        code,
+        position=position,
+        expected_source_hash=expected_source_hash,
+    )
+
+
 __all__ = [
     "get_vba_project_service",
     "set_vba_project_service",
     "vba_export_project",
     "vba_get_references",
+    "vba_insert_code",
     "vba_list_components",
     "vba_list_procedures",
     "vba_project_info",
     "vba_read_component",
+    "vba_replace_component_source",
     "vba_search_code",
 ]
