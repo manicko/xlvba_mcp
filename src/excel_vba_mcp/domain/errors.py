@@ -1,0 +1,265 @@
+"""Typed error hierarchy with stable codes and HRESULT preservation (spec §11).
+
+Every error carries a stable ``code`` (one of :class:`ErrorCode`) and, when a
+COM/HRESULT failure is involved, both the raw ``hresult`` int and its
+``0x%08X`` hex form. The original message and optional context are preserved so
+that a caller can build a diagnostic DTO without losing information.
+
+This module does not import ``pywin32``; HRESULT values are treated as plain
+integers so the domain layer stays free of COM dependencies. The COM worker
+(task_010) constructs these errors from real ``com_error`` values.
+"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+from typing import Any
+
+
+class ErrorCode(StrEnum):
+    """Stable, machine-readable error codes from spec §11 (Stage 1)."""
+
+    ACCESS_VBOM_DISABLED = "ACCESS_VBOM_DISABLED"
+    VBA_PROJECT_LOCKED = "VBA_PROJECT_LOCKED"
+    MISSING_REFERENCE = "MISSING_REFERENCE"
+    COM_BUSY = "COM_BUSY"
+    RPC_E_CALL_REJECTED = "RPC_E_CALL_REJECTED"
+    COMPILE_ERROR = "COMPILE_ERROR"
+    COMPILE_INDETERMINATE = "COMPILE_INDETERMINATE"
+    MACRO_BLOCKED = "MACRO_BLOCKED"
+    MACRO_NOT_FOUND = "MACRO_NOT_FOUND"
+    MACRO_RUNTIME_ERROR = "MACRO_RUNTIME_ERROR"
+    MACRO_TIMEOUT = "MACRO_TIMEOUT"
+    EXCEL_HUNG = "EXCEL_HUNG"
+    SNAPSHOT_FAILED = "SNAPSHOT_FAILED"
+    WORKBOOK_READ_ONLY = "WORKBOOK_READ_ONLY"
+    PATH_NOT_ALLOWED = "PATH_NOT_ALLOWED"
+
+
+# Well-known HRESULT values that map to domain codes (hex shown for readability).
+# fmt: off
+_HRESULT_TO_CODE: dict[int, ErrorCode] = {
+    0x80010001: ErrorCode.RPC_E_CALL_REJECTED,        # RPC_E_CALL_REJECTED
+    0x8001010A: ErrorCode.COM_BUSY,                   # RPC_E_SERVERCALL_RETRYLATER
+    0x800A03EC: ErrorCode.MACRO_RUNTIME_ERROR,        # VBA runtime error (Excel)
+    0x800A03ED: ErrorCode.MACRO_NOT_FOUND,            # unable to run / macro not found
+    0x80004005: ErrorCode.MACRO_RUNTIME_ERROR,        # E_FAIL (generic macro failure)
+    0x80040154: ErrorCode.MISSING_REFERENCE,          # REGDB_E_CLASSNOTREG (broken ref)
+    0x8002801C: ErrorCode.ACCESS_VBOM_DISABLED,       # VBIDE access denied (best effort)
+}
+# fmt: on
+
+
+def format_hresult(hresult: int) -> str:
+    """Return the canonical ``0x%08X`` representation of an HRESULT."""
+
+    return f"0x{hresult & 0xFFFFFFFF:08X}"
+
+
+def code_from_hresult(hresult: int, default: ErrorCode | None = None) -> ErrorCode | None:
+    """Map a raw HRESULT to a domain :class:`ErrorCode`.
+
+    Args:
+        hresult: The raw COM HRESULT as an integer.
+        default: Code returned when the HRESULT is not in the known map and the
+            caller wants a fallback; ``None`` means "unknown".
+
+    Returns:
+        The mapped code, or ``default`` when the HRESULT is unrecognized.
+    """
+
+    return _HRESULT_TO_CODE.get(hresult & 0xFFFFFFFF, default)
+
+
+class ExcelVbaMcpError(Exception):
+    """Base error carrying a stable ``code`` and optional HRESULT context.
+
+    Subclasses set :attr:`default_code`; callers may still override ``code`` when
+    construction requires it. The constructor signature is uniform across the
+    hierarchy so the error can be rebuilt from a raw HRESULT without special
+    casing.
+    """
+
+    default_code: ErrorCode = ErrorCode.COM_BUSY
+    default_message: str = "An Excel VBA MCP error occurred."
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        code: ErrorCode | None = None,
+        hresult: int | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        resolved_message = message if message is not None else self.default_message
+        super().__init__(resolved_message)
+        self.code = code if code is not None else self.default_code
+        self.message = resolved_message
+        self.hresult = hresult
+        self.context: dict[str, Any] = dict(context) if context else {}
+
+    @property
+    def hresult_hex(self) -> str | None:
+        """Hex (``0x%08X``) form of :attr:`hresult`, or ``None`` when absent."""
+
+        return format_hresult(self.hresult) if self.hresult is not None else None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable representation (no COM objects)."""
+
+        return {
+            "code": self.code.value,
+            "message": self.message,
+            "hresult": self.hresult,
+            "hresult_hex": self.hresult_hex,
+            "context": self.context,
+        }
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        if self.hresult is not None:
+            return f"[{self.code.value}] {self.message} ({self.hresult_hex})"
+        return f"[{self.code.value}] {self.message}"
+
+
+class AccessVbomDisabledError(ExcelVbaMcpError):
+    """Trust access to the VBA project object model is disabled (spec §7.2, §10)."""
+
+    default_code = ErrorCode.ACCESS_VBOM_DISABLED
+    default_message = "Access to the VBA project object model is disabled."
+
+
+class VbaProjectLockedError(ExcelVbaMcpError):
+    """The VBA project is locked/password-protected; protection must not be bypassed."""
+
+    default_code = ErrorCode.VBA_PROJECT_LOCKED
+    default_message = "The VBA project is locked."
+
+
+class MissingReferenceError(ExcelVbaMcpError):
+    """A VBA reference is broken or missing (spec §7.2)."""
+
+    default_code = ErrorCode.MISSING_REFERENCE
+    default_message = "A required VBA reference is missing or broken."
+
+
+class ComBusyError(ExcelVbaMcpError):
+    """Excel/VBE is busy or rejected a call; do not blindly replay mutations."""
+
+    default_code = ErrorCode.COM_BUSY
+    default_message = "Excel is busy or rejected the call."
+
+
+class RpcCallRejectedError(ComBusyError):
+    """RPC_E_CALL_REJECTED from a busy STA; retry only after checking busy state."""
+
+    default_code = ErrorCode.RPC_E_CALL_REJECTED
+    default_message = "The COM call was rejected (RPC_E_CALL_REJECTED)."
+
+
+class CompileError(ExcelVbaMcpError):
+    """VBE reported a compile error; carry dialog text and selection (spec §8.2)."""
+
+    default_code = ErrorCode.COMPILE_ERROR
+    default_message = "The VBA project failed to compile."
+
+
+class CompileIndeterminateError(ExcelVbaMcpError):
+    """Compile could not be confirmed (command missing, UIA failed, COM hung)."""
+
+    default_code = ErrorCode.COMPILE_INDETERMINATE
+    default_message = "The compile outcome could not be determined."
+
+
+class MacroBlockedError(ExcelVbaMcpError):
+    """The macro is not permitted by Office policy or server policy (spec §7.3)."""
+
+    default_code = ErrorCode.MACRO_BLOCKED
+    default_message = "The macro is blocked by policy."
+
+
+class MacroNotFoundError(ExcelVbaMcpError):
+    """The procedure does not exist or is not a callable entry point."""
+
+    default_code = ErrorCode.MACRO_NOT_FOUND
+    default_message = "The requested macro was not found."
+
+
+class MacroRuntimeError(ExcelVbaMcpError):
+    """The macro executed but ended in a runtime error (spec §7.3)."""
+
+    default_code = ErrorCode.MACRO_RUNTIME_ERROR
+    default_message = "The macro raised a runtime error."
+
+
+class MacroTimeoutError(ExcelVbaMcpError):
+    """The macro exceeded the soft timeout; the session enters recovery (spec §9.4)."""
+
+    default_code = ErrorCode.MACRO_TIMEOUT
+    default_message = "The macro exceeded the soft timeout."
+
+
+class ExcelHungError(ExcelVbaMcpError):
+    """Excel is hung or a modal dialog blocks COM; recovery required (spec §9.4)."""
+
+    default_code = ErrorCode.EXCEL_HUNG
+    default_message = "Excel is unresponsive."
+
+
+class SnapshotFailedError(ExcelVbaMcpError):
+    """A snapshot could not be created; mutating operations must not proceed."""
+
+    default_code = ErrorCode.SNAPSHOT_FAILED
+    default_message = "The snapshot operation failed."
+
+
+class WorkbookReadOnlyError(ExcelVbaMcpError):
+    """The workbook is not writable (read-only open, protection, or lock)."""
+
+    default_code = ErrorCode.WORKBOOK_READ_ONLY
+    default_message = "The workbook is read-only."
+
+
+class PathNotAllowedError(ExcelVbaMcpError):
+    """The path is outside the allowlisted roots (spec §10)."""
+
+    default_code = ErrorCode.PATH_NOT_ALLOWED
+    default_message = "The path is not allowed by policy."
+
+
+def error_from_hresult(
+    hresult: int,
+    message: str,
+    *,
+    context: dict[str, Any] | None = None,
+) -> ExcelVbaMcpError:
+    """Build the most specific typed error for a known HRESULT.
+
+    Falls back to :class:`ExcelVbaMcpError` carrying ``COM_BUSY`` semantics when
+    the HRESULT is unrecognized, so no HRESULT/message information is lost.
+    """
+
+    code = code_from_hresult(hresult, default=ErrorCode.COM_BUSY)
+    assert code is not None  # default guarantees a code
+    factory = _ERROR_BY_CODE.get(code, ExcelVbaMcpError)
+    return factory(message, hresult=hresult, context=context)
+
+
+# Mapping used by ``error_from_hresult`` to construct the typed subclass. The
+# base ``ExcelVbaMcpError`` is the fallback.
+_ERROR_BY_CODE: dict[ErrorCode, type[ExcelVbaMcpError]] = {
+    ErrorCode.ACCESS_VBOM_DISABLED: AccessVbomDisabledError,
+    ErrorCode.VBA_PROJECT_LOCKED: VbaProjectLockedError,
+    ErrorCode.MISSING_REFERENCE: MissingReferenceError,
+    ErrorCode.COM_BUSY: ComBusyError,
+    ErrorCode.RPC_E_CALL_REJECTED: RpcCallRejectedError,
+    ErrorCode.COMPILE_ERROR: CompileError,
+    ErrorCode.COMPILE_INDETERMINATE: CompileIndeterminateError,
+    ErrorCode.MACRO_BLOCKED: MacroBlockedError,
+    ErrorCode.MACRO_NOT_FOUND: MacroNotFoundError,
+    ErrorCode.MACRO_RUNTIME_ERROR: MacroRuntimeError,
+    ErrorCode.MACRO_TIMEOUT: MacroTimeoutError,
+    ErrorCode.EXCEL_HUNG: ExcelHungError,
+    ErrorCode.SNAPSHOT_FAILED: SnapshotFailedError,
+    ErrorCode.WORKBOOK_READ_ONLY: WorkbookReadOnlyError,
+    ErrorCode.PATH_NOT_ALLOWED: PathNotAllowedError,
+}
