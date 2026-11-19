@@ -1,37 +1,215 @@
-"""MCP server bootstrap and lifecycle (STDIO).
+"""MCP server entry point for the Excel VBA MCP server (STDIO transport).
 
-This module defines the MCP server instance. It must not write non-protocol data to
-stdout; all diagnostics go to stderr via logging.
+The module builds the STDIO :class:`MCPServer` and registers the base
+workbook/session tools (task_012). A single :class:`SessionService` runtime is
+owned by the server lifespan (ARCH-005): the dedicated single-STA
+:class:`ExcelComWorker` and its hidden :class:`ExcelAppAdapter` are created once,
+the worker is started on lifespan entry, and ``await worker.shutdown()`` runs in
+``finally`` on exit. All COM lives behind the worker; the tools never touch COM.
+
+The runtime is published to :mod:`excel_vba_mcp.api.workbook_tools` via
+``set_session_service`` so the (stateless) tool handlers can reach it.
+
+Configuration (roots, audit log, work dir) is read from environment variables so
+this module stays dependency-free; extending ``config.py`` with first-class
+settings is deferred to the configuration task. See ``_build_runtime``.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+import os
 import sys
-from typing import Any
+import tempfile
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
 
-from excel_vba_mcp.config import load_config
-
-_config = load_config()
-
-logging.basicConfig(
-    level=_config.server.log_level,
-    stream=sys.stderr,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+from excel_vba_mcp import __version__
+from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
+from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
+from excel_vba_mcp.api import workbook_tools
+from excel_vba_mcp.api.workbook_tools import (
+    excel_close,
+    excel_get_status,
+    excel_list_workbooks,
+    excel_open,
+    excel_save,
 )
-logger = logging.getLogger(__name__)
+from excel_vba_mcp.application.session_service import SessionService
+from excel_vba_mcp.security.approval import ApprovalPolicy
+from excel_vba_mcp.security.audit import AuditLogger
+from excel_vba_mcp.security.path_policy import PathPolicy
 
-mcp = MCPServer("excel-vba-mcp")
+logger = logging.getLogger("excel_vba_mcp.server")
+
+# Environment variable names for the runtime configuration.
+_ENV_ROOTS = "EXCEL_VBA_MCP_ROOTS"
+_ENV_AUDIT = "EXCEL_VBA_MCP_AUDIT_LOG"
+_ENV_WORK_DIR = "EXCEL_VBA_MCP_WORK_DIR"
+
+# Tool descriptions surfaced over MCP (kept explicit for a stable contract).
+_DESC_OPEN = (
+    "Open an allowlisted workbook as a hidden working copy. mode='inspect' "
+    "disables macros; mode='execute' applies macro-by-UI and requires approval. "
+    "The original file is never modified."
+)
+_DESC_CLOSE = (
+    "Close an open workbook. Defaults to NOT saving; set save_changes=true to persist changes."
+)
+_DESC_SAVE = "Explicitly save an open workbook's working copy."
+_DESC_STATUS = "Return session/workbook status (busy, read-only, dirty, active operation)."
+_DESC_LIST = "List currently open workbooks from session bookkeeping."
+
+
+@dataclasses.dataclass
+class _Runtime:
+    """Container for the per-server Excel runtime (owned by the lifespan)."""
+
+    worker: ExcelComWorker
+    app_adapter: ExcelAppAdapter
+    session: SessionService
+    path_policy: PathPolicy
+    approval: ApprovalPolicy
+    audit: AuditLogger
+
+
+def _configured_roots() -> dict[str, str]:
+    """Return PathPolicy roots from ``EXCEL_VBA_MCP_ROOTS`` or a safe default.
+
+    ``EXCEL_VBA_MCP_ROOTS`` is an ``os.pathsep``-separated list of directories.
+    When unset, the current working directory and the system temp directory are
+    used so the server is usable out of the box; production deployments should
+    set an explicit allowlist.
+    """
+
+    raw = os.environ.get(_ENV_ROOTS, "").strip()
+    if raw:
+        dirs = [part.strip() for part in raw.split(os.pathsep) if part.strip()]
+    else:
+        dirs = [str(Path.cwd()), tempfile.gettempdir()]
+    return {f"root_{idx}": d for idx, d in enumerate(dirs)}
+
+
+def _resolve_runtime_path(env_name: str, default: Path) -> Path:
+    raw = os.environ.get(env_name, "").strip()
+    return Path(raw) if raw else default
+
+
+def _build_runtime() -> _Runtime:
+    """Construct the Excel runtime from environment configuration."""
+
+    path_policy = PathPolicy(_configured_roots())
+    app_adapter = ExcelAppAdapter()
+    worker = ExcelComWorker(app_adapter)
+    approval = ApprovalPolicy()  # deny-by-default; grants/allowlist: task_014
+    audit = AuditLogger(_resolve_runtime_path(_ENV_AUDIT, _default_audit_path()))
+    session = SessionService(
+        worker,
+        app_adapter,
+        path_policy,
+        approval,
+        audit,
+        work_dir=_resolve_runtime_path(_ENV_WORK_DIR, _default_work_dir()),
+    )
+    return _Runtime(
+        worker=worker,
+        app_adapter=app_adapter,
+        session=session,
+        path_policy=path_policy,
+        approval=approval,
+        audit=audit,
+    )
+
+
+def _default_audit_path() -> Path:
+    return Path(tempfile.gettempdir()) / "excel_vba_mcp" / "audit.jsonl"
+
+
+def _default_work_dir() -> Path:
+    return Path(tempfile.gettempdir()) / "excel_vba_mcp" / "work"
+
+
+@asynccontextmanager
+async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
+    """Own the Excel runtime: start the worker, publish it, tear it down.
+
+    The worker (and its hidden Excel instance) is started on entry and shut down
+    in ``finally``. If the worker cannot start (e.g. Excel/pywin32 unavailable),
+    the failure is logged to ``stderr`` and the server still starts so that
+    ``server_health`` and tool listing keep working; workbook tools then raise a
+    truthful ``WorkerUnavailableError`` when called. This keeps the STDIO startup
+    smoke test robust across hosts.
+    """
+
+    runtime = _build_runtime()
+    try:
+        await runtime.worker.start()
+    except Exception as exc:  # noqa: BLE001 - degrade gracefully, never crash stdio
+        logger.warning("Excel worker failed to start: %s", exc)
+        await _safe_shutdown(runtime.worker)
+    else:
+        workbook_tools.set_session_service(runtime.session)
+    try:
+        yield runtime
+    finally:
+        workbook_tools.set_session_service(None)
+        await _safe_shutdown(runtime.worker)
+        runtime.audit.close()
+
+
+async def _safe_shutdown(worker: ExcelComWorker) -> None:
+    """Shut the worker down without masking the original error."""
+
+    try:
+        await worker.shutdown()
+    except Exception as exc:  # noqa: BLE001 - shutdown is best-effort
+        logger.warning("Excel worker shutdown error: %s", exc)
+
+
+def _configure_logging() -> None:
+    """Send logs to ``stderr`` only; ``stdout`` is reserved for the protocol."""
+
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
+def _register_tools(server: MCPServer) -> None:
+    """Register the base workbook/session tools on ``server``."""
+
+    server.add_tool(excel_open, name="excel_open", description=_DESC_OPEN)
+    server.add_tool(excel_close, name="excel_close", description=_DESC_CLOSE)
+    server.add_tool(excel_save, name="excel_save", description=_DESC_SAVE)
+    server.add_tool(excel_get_status, name="excel_get_status", description=_DESC_STATUS)
+    server.add_tool(excel_list_workbooks, name="excel_list_workbooks", description=_DESC_LIST)
+
+
+_configure_logging()
+
+mcp: MCPServer = MCPServer("excel-vba-mcp", version=__version__, lifespan=lifespan)
 
 
 @mcp.tool()
-def server_health() -> dict[str, Any]:
-    """Return a minimal health payload for discovery smoke tests.
+def server_health() -> dict[str, str]:
+    """Read-only liveness probe (never touches Excel/COM)."""
 
-    Returns:
-        Dictionary with server status.
-    """
+    return {"status": "ok", "service": "excel-vba-mcp", "version": __version__}
 
-    return {"status": "ok", "server": "excel-vba-mcp"}
+
+# Register the base workbook/session tools at import time so they are present
+# regardless of whether the server is started via ``main()`` here or directly via
+# ``excel_vba_mcp.__main__`` (which calls ``mcp.run`` on this module's ``mcp``).
+_register_tools(mcp)
+
+
+def main() -> None:
+    """Run the MCP server over STDIO."""
+
+    logger.info("Starting Excel VBA MCP server (STDIO)")
+    mcp.run(transport="stdio")
