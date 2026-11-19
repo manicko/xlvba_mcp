@@ -757,7 +757,14 @@ class PocArtifacts:
     def log(self, msg: str) -> None:
         line = f"{_now_local_iso()} {msg}"
         self.log_lines.append(line)
-        print(line, flush=True)
+        # The console may use a legacy code page (e.g. cp1251) that cannot encode
+        # every foreground-window title glyph; printing must never crash the STA
+        # worker. The full UTF-8 evidence is always persisted by ``persist``.
+        try:
+            print(line, flush=True)
+        except Exception:  # noqa: BLE001 - console encoding cannot represent line
+            with contextlib.suppress(Exception):
+                print(line.encode("ascii", "replace").decode("ascii"), flush=True)
 
     def persist(self) -> dict[str, str]:
         _ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
