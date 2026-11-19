@@ -183,7 +183,7 @@ permission:
 
 
     # === DENY: destructive filesystem ===
-    "format*": deny
+    "format *": deny    
     "diskpart*": deny
     "mkfs*": deny
     "mv * /dev/null": deny

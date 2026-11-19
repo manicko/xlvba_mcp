@@ -41,7 +41,7 @@ permission:
      "rm -r*": deny
      "Remove-Item -Recurse -Force*": deny
      "Remove-Item -Force*": deny
-     "format*": deny
+     "format *": deny
      "diskpart*": deny
      "mkfs*": deny
      "mv * /dev/null": deny

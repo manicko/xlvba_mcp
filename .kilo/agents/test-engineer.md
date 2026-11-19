@@ -145,7 +145,7 @@ permission:
     "git cherry-pick*": deny
 
     # === DENY: SYSTEM ===
-    "format*": deny
+    "format *": deny
     "diskpart*": deny
     "mkfs*": deny
     "fdisk*": deny
