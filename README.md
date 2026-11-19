@@ -9,7 +9,7 @@ This repository follows the approved technical specification for Stage 1 (see `d
 ## Requirements
 
 - Windows 11 x64 (target)
-- Python 3.12 x64 recommended (minimum 3.11)
+- Python 3.14 x64 (validated runtime; project floor is 3.11 — 3.11–3.13 are installable but unvalidated)
 - [uv](https://docs.astral.sh/uv/)
 - Microsoft Excel installed for integration work (COM/VBE/pywinauto paths are Windows-only)
 
