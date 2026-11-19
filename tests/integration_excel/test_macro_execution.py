@@ -38,12 +38,15 @@ Run serially (no xdist)::
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
+import json
 import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -62,6 +65,7 @@ from excel_vba_mcp.domain.statuses import (
     MacroRunStatus,
     OperationClass,
     SessionMode,
+    WorkbookSessionState,
 )
 from excel_vba_mcp.security.approval import (
     ApprovalGrant,
@@ -385,6 +389,71 @@ async def _inject_hang(rig: _Rig, working_path: str) -> None:
     )
 
 
+@contextlib.contextmanager
+def _count_execute_dispatches(rig: _Rig) -> Iterator[dict[str, int]]:
+    """Count ``section="execute"`` worker submissions (single-dispatch evidence).
+
+    Wraps the shared worker's ``submit`` so a macro test can assert a macro was
+    dispatched exactly once (no auto-retry) or never dispatched at all (blocked /
+    not-found). Other sections (diagnostic / open / close) are ignored. This is a
+    read-only test probe: it only counts, it never changes what the worker does.
+    """
+
+    original = rig.worker.submit
+    counts = {"execute": 0}
+
+    async def wrapped(
+        fn: Any,
+        *,
+        timeout: float,
+        section: Any = "diagnostic",
+        op_class: Any = OperationClass.READ_ONLY,
+    ) -> Any:
+        if section == "execute":
+            counts["execute"] += 1
+        return await original(fn, timeout=timeout, section=section, op_class=op_class)
+
+    rig.worker.submit = wrapped  # type: ignore[method-assign]
+    try:
+        yield counts
+    finally:
+        del rig.worker.submit
+
+
+async def _run_macro_sampling_foreground(
+    rig: _Rig,
+    workbook_id: str,
+    macro_name: str,
+    *,
+    timeout_s: float,
+    poll_interval_s: float = 0.1,
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Run a macro while sampling the foreground window (BG03 read-only evidence).
+
+    Samples ``GetForegroundWindow`` from the event-loop thread while the macro
+    dispatch is in flight and records any sample whose PID equals the automation-
+    owned PID. It never activates, focuses, clicks, types or dismisses anything.
+
+    Returns:
+        ``(result, owned_foreground_samples)`` where ``owned_foreground_samples``
+        holds every foreground sample owned by the automation PID during the run.
+    """
+
+    owned_pid = rig.worker.get_status().owned_pid
+    task = asyncio.create_task(rig.service.run_macro(workbook_id, macro_name, timeout_s=timeout_s))
+    owned_foreground: list[dict[str, Any]] = []
+    deadline = time.monotonic() + timeout_s + 30.0
+    while not task.done():
+        if time.monotonic() > deadline:
+            break
+        fg = _foreground()
+        if fg is not None and owned_pid is not None and fg["pid"] == owned_pid:
+            owned_foreground.append(fg)
+        await asyncio.sleep(poll_interval_s)
+    result = await task
+    return result, owned_foreground
+
+
 # ---------------------------------------------------------------------------
 # Test 1: success / not-found / preflight blocks + BG03/04/05 + no orphan
 # ---------------------------------------------------------------------------
@@ -558,6 +627,408 @@ async def test_macro_timeout_needs_recovery(tmp_path: Path) -> None:
 
         print(
             f"[macro-timeout] status={result.status.value} error_code={result.error_code} "
+            f"owned_pid={owned_pid}"
+        )
+    finally:
+        # The service does NOT terminate on a plain timeout; the worker is stuck in
+        # the busy loop. Terminate ONLY the owned PID to unblock app.Run, then stop.
+        if owned_pid is not None and _pid_alive(owned_pid):
+            _terminate_owned_pid(owned_pid)
+        await rig.stop()
+
+    assert owned_pid is not None
+    assert _wait_pid_gone(owned_pid), f"owned PID {owned_pid} still alive after shutdown"
+
+
+# ---------------------------------------------------------------------------
+# Test 4 (task_023): successful macro -> return value + duration + serialized
+# ---------------------------------------------------------------------------
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_successful_macro_returns_value_and_duration(tmp_path: Path) -> None:
+    """A background-safe macro returns its value, a positive duration and JSON output.
+
+    Runs ``AddNumbers(2,3)`` and ``MakeArray()`` on a writable EXECUTE session and
+    asserts: the scalar and Variant-array returns are captured, the result DTO is
+    JSON-serializable, and ``duration_ms`` is recorded (> 0). Each macro is
+    dispatched exactly once (no hidden retry). BG03/04/05 and the fixture hash hold.
+    """
+
+    fixture = _fixture_or_skip(_CLEAN_PROJECT)
+    rig = _make_rig(tmp_path, fixture)
+    # Capture the user-owned Excel baseline BEFORE the automation starts so an
+    # owned PID (which the modal path may terminate mid-test) is never counted as
+    # a disappeared user process (BG05).
+    baseline_pids = _excel_pids()
+    await rig.start()
+    owned_pid: int | None = None
+    try:
+        committed_hash = _sha256(fixture)
+        original_hash = _sha256(rig._original)  # type: ignore[arg-type]
+
+        info = await rig.open()
+        assert info.has_vba is True
+        owned_pid = rig.worker.get_status().owned_pid
+        assert owned_pid is not None
+
+        with _count_execute_dispatches(rig) as counts:
+            rig.grant_macro_run("modTest.AddNumbers")
+            rig.classify_safe("modTest.AddNumbers")
+            add = await rig.service.run_macro(info.workbook_id, "modTest.AddNumbers", [2, 3])
+            assert add.status is MacroRunStatus.SUCCESS, f"AddNumbers(2,3) failed: {add}"
+            assert add.return_value == 5, f"AddNumbers(2,3) != 5: {add}"
+            assert add.duration_ms > 0, f"duration not recorded: {add}"
+
+            rig.grant_macro_run("modTest.MakeArray")
+            rig.classify_safe("modTest.MakeArray")
+            arr = await rig.service.run_macro(info.workbook_id, "modTest.MakeArray")
+            assert arr.status is MacroRunStatus.SUCCESS, f"MakeArray failed: {arr}"
+            assert arr.return_value == [1, 2, 3], f"MakeArray != [1,2,3]: {arr}"
+            assert arr.duration_ms > 0, f"duration not recorded: {arr}"
+
+        # Exactly one Application.Run dispatch per macro (no auto-retry on success).
+        assert counts["execute"] == 2, f"expected 2 execute dispatches, got {counts['execute']}"
+
+        # The result DTO is JSON-serializable and carries the return value.
+        add_payload = json.loads(add.model_dump_json())
+        assert add_payload["return_value"] == 5
+        assert add_payload["status"] == MacroRunStatus.SUCCESS.value
+
+        # BG03/BG04 while Excel is alive; BG05 user session preserved.
+        _assert_owned_never_foreground(owned_pid, "macro-success")
+        _assert_no_visible_owned_windows(owned_pid, "macro-success")
+        missing_user_pids = baseline_pids - _excel_pids()
+        assert not missing_user_pids, f"user Excel PIDs disappeared: {missing_user_pids}"
+
+        # Disposable copies only: the temp original and committed fixture are intact.
+        assert _sha256(rig._original) == original_hash, "original must be unchanged"
+        assert _sha256(fixture) == committed_hash, "committed fixture must never change"
+
+        print(
+            f"[macro-success] AddNumbers={add.return_value} duration_ms={add.duration_ms} "
+            f"MakeArray={arr.return_value} duration_ms={arr.duration_ms} "
+            f"owned_pid={owned_pid} dispatches={counts['execute']}"
+        )
+    finally:
+        await rig.stop()
+
+    assert owned_pid is not None
+    assert _wait_pid_gone(owned_pid), f"owned PID {owned_pid} still alive after shutdown"
+
+
+# ---------------------------------------------------------------------------
+# Test 5 (task_023): blocked macros never run (preflight + BG06) + BG03/04/05
+# ---------------------------------------------------------------------------
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_blocked_macro_never_runs(tmp_path: Path) -> None:
+    """Interactive-UI and unclassified macros are blocked BEFORE dispatch.
+
+    ``ShowMsg`` (MsgBox) and ``ShowForm`` (UserForm.Show) are classified safe and
+    approved so they reach the interactive-UI preflight (R13); both must be blocked
+    with ``INTERACTIVE_UI_NOT_SUPPORTED`` and **never dispatched** (no visible
+    window, no side effect). An approved-but-unclassified procedure must be blocked
+    with ``BACKGROUND_SAFETY_NOT_VERIFIED`` (BG06). BG03/04/05 hold throughout.
+    """
+
+    fixture = _fixture_or_skip(_CLEAN_PROJECT)
+    rig = _make_rig(tmp_path, fixture)
+    # Capture the user-owned Excel baseline BEFORE the automation starts so an
+    # owned PID (which the modal path may terminate mid-test) is never counted as
+    # a disappeared user process (BG05).
+    baseline_pids = _excel_pids()
+    await rig.start()
+    owned_pid: int | None = None
+    try:
+        committed_hash = _sha256(fixture)
+        original_hash = _sha256(rig._original)  # type: ignore[arg-type]
+
+        info = await rig.open()
+        owned_pid = rig.worker.get_status().owned_pid
+        assert owned_pid is not None
+
+        with _count_execute_dispatches(rig) as counts:
+            # R13 preflight: known interactive-UI macros are blocked even when
+            # approved and (wrongly) classified background_safe.
+            for macro in ("modTest.ShowMsg", "modTest.ShowForm"):
+                rig.grant_macro_run(macro)
+                rig.classify_safe(macro)
+                blocked = await rig.service.run_macro(info.workbook_id, macro)
+                assert blocked.status is MacroRunStatus.BLOCKED, (
+                    f"{macro} was not blocked: {blocked}"
+                )
+                assert blocked.error_code == "INTERACTIVE_UI_NOT_SUPPORTED", (
+                    f"{macro} error_code={blocked.error_code}"
+                )
+
+            # BG06 deny-by-default: approved but NOT classified -> blocked.
+            rig.grant_macro_run("modTest.Echo")
+            unclassified = await rig.service.run_macro(info.workbook_id, "modTest.Echo", ["hi"])
+            assert unclassified.status is MacroRunStatus.BLOCKED
+            assert unclassified.error_code == "BACKGROUND_SAFETY_NOT_VERIFIED"
+
+        # None of the blocked procedures were dispatched (no macro body ran).
+        assert counts["execute"] == 0, (
+            f"a blocked macro was dispatched {counts['execute']} time(s); it must never run"
+        )
+
+        # No visible owned window and no focus theft (BG03/BG04) after the blocks.
+        _assert_owned_never_foreground(owned_pid, "macro-blocked")
+        _assert_no_visible_owned_windows(owned_pid, "macro-blocked")
+
+        # BG05: user-owned Excel processes are untouched.
+        missing_user_pids = baseline_pids - _excel_pids()
+        assert not missing_user_pids, f"user Excel PIDs disappeared: {missing_user_pids}"
+
+        # No side effect on the disposable copies.
+        assert _sha256(rig._original) == original_hash, "original must be unchanged"
+        assert _sha256(fixture) == committed_hash, "committed fixture must never change"
+
+        print(
+            f"[macro-blocked] blocked=2 unclassified=1 dispatches={counts['execute']} "
+            f"owned_pid={owned_pid}"
+        )
+    finally:
+        await rig.stop()
+
+    assert owned_pid is not None
+    assert _wait_pid_gone(owned_pid), f"owned PID {owned_pid} still alive after shutdown"
+
+
+# ---------------------------------------------------------------------------
+# Test 6 (task_023): missing macro -> MACRO_NOT_FOUND, never dispatched/retried
+# ---------------------------------------------------------------------------
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_not_found_macro(tmp_path: Path) -> None:
+    """An unknown procedure -> ``MACRO_NOT_FOUND`` and is never dispatched.
+
+    ``modTest.Nope`` does not exist in the inventory, so the service resolves it
+    before any dispatch: the result is ``MACRO_NOT_FOUND`` with zero ``execute``
+    submissions (no retry), and the worker stays usable (not NEEDS_RECOVERY).
+    """
+
+    fixture = _fixture_or_skip(_CLEAN_PROJECT)
+    rig = _make_rig(tmp_path, fixture)
+    await rig.start()
+    owned_pid: int | None = None
+    try:
+        info = await rig.open()
+        owned_pid = rig.worker.get_status().owned_pid
+        assert owned_pid is not None
+
+        with _count_execute_dispatches(rig) as counts:
+            missing = await rig.service.run_macro(info.workbook_id, "modTest.Nope")
+
+        assert missing.status is MacroRunStatus.NOT_FOUND, f"expected NOT_FOUND: {missing}"
+        assert missing.error_code == "MACRO_NOT_FOUND", f"error_code={missing.error_code}"
+        assert missing.status is not MacroRunStatus.SUCCESS
+        # Never dispatched => no retry was possible.
+        assert counts["execute"] == 0, (
+            f"a missing macro was dispatched {counts['execute']} time(s); it must not run"
+        )
+
+        # The not-found path is a clean resolve miss, not a hung/recovery state.
+        assert rig.worker.get_status().state is WorkbookSessionState.RUNNING
+
+        print(
+            f"[macro-not-found] status={missing.status.value} "
+            f"error_code={missing.error_code} dispatches={counts['execute']} "
+            f"owned_pid={owned_pid}"
+        )
+    finally:
+        await rig.stop()
+
+    assert owned_pid is not None
+    assert _wait_pid_gone(owned_pid), f"owned PID {owned_pid} still alive after shutdown"
+
+
+# ---------------------------------------------------------------------------
+# Test 7 (task_023): runtime error classified honestly, no false precision,
+#                    BG03 preserved, and a fresh session is usable afterwards
+# ---------------------------------------------------------------------------
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_runtime_error_classified_without_false_precision(tmp_path: Path) -> None:
+    """``RaiseError`` -> ``MACRO_RUNTIME_ERROR`` via owned-PID terminate (BG04).
+
+    The unhandled VBA runtime error raises a modal that blocks ``Application.Run``;
+    the service classifies ``MACRO_RUNTIME_ERROR`` and terminates **only the owned
+    PID** without dismissing the dialog (``dismissed=false``). It is never reported
+    as success, the VBA error number/description is **not fabricated** (Excel does
+    not forward it), BG03 (no focus theft) holds during the modal, and after a
+    worker ``reset()`` a fresh session runs a macro successfully.
+    """
+
+    fixture = _fixture_or_skip(_CLEAN_PROJECT)
+    rig = _make_rig(tmp_path, fixture)
+    # Capture the user-owned baseline BEFORE start: the modal path terminates the
+    # owned PID mid-test, so it must not be counted as a vanished user process.
+    baseline_pids = _excel_pids()
+    await rig.start()
+    old_pid: int | None = None
+    fresh_pid: int | None = None
+    try:
+        committed_hash = _sha256(fixture)
+        original_hash = _sha256(rig._original)  # type: ignore[arg-type]
+
+        info = await rig.open()
+        old_pid = rig.worker.get_status().owned_pid
+        assert old_pid is not None
+
+        rig.grant_macro_run("modTest.RaiseError")
+        rig.classify_safe("modTest.RaiseError")
+
+        with _count_execute_dispatches(rig) as counts:
+            result, owned_foreground = await _run_macro_sampling_foreground(
+                rig, info.workbook_id, "modTest.RaiseError", timeout_s=_MODAL_TIMEOUT_S
+            )
+
+        # Honest classification: never success; single dispatch (no retry).
+        assert result.status is MacroRunStatus.RUNTIME_ERROR, (
+            f"RaiseError did not classify as RUNTIME_ERROR: {result}"
+        )
+        assert result.status is not MacroRunStatus.SUCCESS
+        assert result.error_code == "MACRO_RUNTIME_ERROR"
+        assert counts["execute"] == 1, (
+            f"expected exactly 1 execute dispatch, got {counts['execute']}"
+        )
+
+        # The owned PID was terminated (modal not dismissed; honest BG04 limitation).
+        assert "dismissed=false" in (result.error_text or "").lower(), (
+            f"expected the owned-PID-terminate modal path: {result.error_text!r}"
+        )
+        # No false precision: Excel does not forward the VBA error number/description,
+        # so the service must not invent them.
+        error_text = result.error_text or ""
+        assert "boom" not in error_text.lower(), f"fabricated VBA description: {error_text!r}"
+        assert "1234" not in error_text, f"fabricated VBA error number: {error_text!r}"
+
+        # BG03: the automation-owned PID never held foreground during the modal.
+        assert not owned_foreground, (
+            f"BG03 violation: owned PID {old_pid} held foreground during the modal: "
+            f"{[w['title'] for w in owned_foreground]}"
+        )
+
+        # The service terminated ONLY the owned PID; it is gone (no orphan).
+        assert _wait_pid_gone(old_pid), f"owned PID {old_pid} survived the modal terminate"
+
+        # --- Recovery: rebuild the worker and prove a fresh session is usable. ---
+        await rig.worker.reset()
+        assert rig.worker.get_status().state is WorkbookSessionState.RUNNING
+
+        await rig.session.close_workbook(info.workbook_id)
+        fresh = await rig.open()
+        fresh_pid = rig.worker.get_status().owned_pid
+        assert fresh_pid is not None and fresh_pid != old_pid
+
+        rig.grant_macro_run("modTest.AddNumbers")
+        rig.classify_safe("modTest.AddNumbers")
+        ok = await rig.service.run_macro(fresh.workbook_id, "modTest.AddNumbers", [2, 3])
+        assert ok.status is MacroRunStatus.SUCCESS, f"fresh session unusable: {ok}"
+        assert ok.return_value == 5, f"fresh-session AddNumbers(2,3) != 5: {ok}"
+
+        # Fresh instance stays hidden / non-intrusive (BG03/BG04).
+        _assert_owned_never_foreground(fresh_pid, "runtime-fresh")
+        _assert_no_visible_owned_windows(fresh_pid, "runtime-fresh")
+
+        # BG05: no user Excel PID was touched.
+        missing_user_pids = baseline_pids - _excel_pids()
+        assert not missing_user_pids, f"user Excel PIDs disappeared: {missing_user_pids}"
+
+        # Disposable copies intact.
+        assert _sha256(rig._original) == original_hash, "original must be unchanged"
+        assert _sha256(fixture) == committed_hash, "committed fixture must never change"
+
+        print(
+            f"[macro-runtime] status={result.status.value} error_code={result.error_code} "
+            f"dispatches={counts['execute']} old_pid={old_pid} fresh_pid={fresh_pid} "
+            f"owned_foreground_samples={len(owned_foreground)}"
+        )
+    finally:
+        # Defensive: ensure every automation-owned instance is gone before shutdown.
+        for pid in (old_pid, fresh_pid):
+            if pid is not None and _pid_alive(pid):
+                _terminate_owned_pid(pid)
+        await rig.stop()
+
+    assert old_pid is not None
+    assert _wait_pid_gone(old_pid), f"old owned PID {old_pid} still alive after shutdown"
+
+
+# ---------------------------------------------------------------------------
+# Test 8 (task_023): hung macro -> MACRO_TIMEOUT / needs-recovery, attempted once
+# ---------------------------------------------------------------------------
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_timeout_not_retried(tmp_path: Path) -> None:
+    """A hung macro -> ``MACRO_TIMEOUT`` / needs-recovery with exactly one attempt.
+
+    An injected ``modTest.HangForever`` busy loop exceeds the short soft deadline.
+    The service classifies ``MACRO_TIMEOUT`` / needs-recovery, records diagnostics,
+    and never auto-retries (exactly one ``execute`` dispatch). Only the owned PID is
+    terminated by the harness to unblock shutdown; no user Excel PID is touched.
+    """
+
+    fixture = _fixture_or_skip(_CLEAN_PROJECT)
+    rig = _make_rig(tmp_path, fixture)
+    # Capture the user-owned Excel baseline BEFORE the automation starts so an
+    # owned PID (which the modal path may terminate mid-test) is never counted as
+    # a disappeared user process (BG05).
+    baseline_pids = _excel_pids()
+    await rig.start()
+    owned_pid: int | None = None
+    try:
+        committed_hash = _sha256(fixture)
+        original_hash = _sha256(rig._original)  # type: ignore[arg-type]
+
+        info = await rig.open()
+        owned_pid = rig.worker.get_status().owned_pid
+        assert owned_pid is not None
+
+        # Inject a busy-loop macro into the in-memory working copy (file untouched).
+        await _inject_hang(rig, info.path)
+        rig.grant_macro_run("modTest.HangForever")
+        rig.classify_safe("modTest.HangForever")
+
+        with _count_execute_dispatches(rig) as counts:
+            result = await rig.service.run_macro(
+                info.workbook_id, "modTest.HangForever", timeout_s=_HANG_TIMEOUT_S
+            )
+
+        # Plain timeout (no modal) -> needs-recovery; never success.
+        assert result.status is MacroRunStatus.TIMEOUT, (
+            f"HangForever did not classify as TIMEOUT: {result}"
+        )
+        assert result.error_code == "MACRO_TIMEOUT"
+        assert "needs recovery" in (result.error_text or "").lower()
+        assert result.status is not MacroRunStatus.SUCCESS
+        # Exactly one attempt: no auto-retry of a hung macro.
+        assert counts["execute"] == 1, (
+            f"expected exactly 1 execute dispatch (no retry), got {counts['execute']}"
+        )
+        # Diagnostics: the run waited ~the soft deadline before giving up.
+        assert result.duration_ms >= int(_HANG_TIMEOUT_S * 1000 * 0.8), (
+            f"duration {result.duration_ms}ms does not reflect the soft deadline {_HANG_TIMEOUT_S}s"
+        )
+
+        # The worker is in NEEDS_RECOVERY (a new non-close submit must fail fast).
+        assert rig.worker.get_status().state is WorkbookSessionState.NEEDS_RECOVERY
+
+        # No user Excel PID was touched (BG05); disposable copies intact.
+        missing_user_pids = baseline_pids - _excel_pids()
+        assert not missing_user_pids, f"user Excel PIDs disappeared: {missing_user_pids}"
+        assert _sha256(rig._original) == original_hash, "original must be unchanged"
+        assert _sha256(fixture) == committed_hash, "committed fixture must never change"
+
+        print(
+            f"[macro-timeout] status={result.status.value} error_code={result.error_code} "
+            f"duration_ms={result.duration_ms} dispatches={counts['execute']} "
             f"owned_pid={owned_pid}"
         )
     finally:
