@@ -18,6 +18,19 @@ Coverage:
 * ``test_snapshot_closed_branch_and_diff`` — after closing the working copy, take
   a closed-branch (file-copy) snapshot of the same workbook id and diff it against
   the earlier SaveCopyAs snapshot.
+* ``test_each_case_starts_from_same_baseline`` — create one immutable baseline
+  snapshot, then run two independent cases that each open the baseline, mutate the
+  working copy differently and close without saving. Asserts the baseline snapshot
+  file SHA-256 is identical before/after both cases (one case cannot contaminate
+  another), each case's working copy starts byte-identical to the baseline, and the
+  original fixture is unchanged (task_015).
+* ``test_restore_after_mutation`` — mutate a working copy and ``restore_snapshot``;
+  assert the restored working copy matches the baseline, the snapshot file is
+  unchanged and ``external_side_effects_not_undone=true`` is recorded in the
+  manifest and audit trail. Then simulate an abnormal Excel end by terminating ONLY
+  the owned ``EXCEL.exe`` PID, prove a restore on the dead rig returns a structured
+  error (no false success), and recover from the same immutable snapshot into a
+  fresh session (task_015).
 
 Every test asserts the owned instance stays hidden / non-activating
 (BG03/BG04) and that the owned ``EXCEL.exe`` is reaped on shutdown (no orphan).
@@ -31,6 +44,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import shutil
 import subprocess
 import sys
@@ -46,6 +60,8 @@ from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
+from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.domain.models import WorkbookInfo
 from excel_vba_mcp.domain.statuses import OperationClass, SessionMode
 from excel_vba_mcp.security.approval import (
     ApprovalGrant,
@@ -198,6 +214,67 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _terminate_owned_pid(pid: int) -> None:
+    """Force-terminate ONLY the automation-owned ``EXCEL.exe`` (abnormal end).
+
+    Safety: this is only ever called with the owned PID returned by
+    ``worker.get_status().owned_pid`` (a ``DispatchEx`` instance owned by the
+    test). It never touches a non-owned / user-session Excel process.
+
+    Raises:
+        RuntimeError: If ``taskkill`` reports a non-zero exit code.
+    """
+
+    result = subprocess.run(
+        ["taskkill", "/F", "/PID", str(pid)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"taskkill /F /PID {pid} failed (rc={result.returncode}): "
+            f"{result.stdout.strip()} {result.stderr.strip()}"
+        )
+
+
+def _read_audit_events(path: Path) -> list[dict[str, Any]]:
+    """Parse an append-only JSONL audit file into a list of event dicts."""
+
+    events: list[dict[str, Any]] = []
+    if not path.is_file():
+        return events
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict):
+            events.append(parsed)
+    return events
+
+
+# ---------------------------------------------------------------------------
+# STA-thread cell helpers (must run on the worker that owns ``app_adapter``)
+# ---------------------------------------------------------------------------
+def _read_a1(app_adapter: ExcelAppAdapter, path: str) -> str:
+    """Read ``A1`` as a string on the owning STA thread."""
+
+    wb = _find_wb(app_adapter, path)
+    return str(wb.Worksheets(1).Range("A1").Value)
+
+
+def _mutate_a1(app_adapter: ExcelAppAdapter, path: str, value: str) -> str:
+    """Write ``A1`` on the owning STA thread and echo the written value."""
+
+    wb = _find_wb(app_adapter, path)
+    wb.Worksheets(1).Range("A1").Value = value
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Fixtures / service builder
 # ---------------------------------------------------------------------------
@@ -209,7 +286,14 @@ def anyio_backend() -> str:
 class _SnapshotRig:
     """Bundle of a live worker + session + snapshot service + temp dirs."""
 
-    def __init__(self, tmp_dir: Path, original: Path) -> None:
+    def __init__(
+        self,
+        tmp_dir: Path,
+        original: Path,
+        *,
+        store_root: Path | None = None,
+        audit_path: Path | None = None,
+    ) -> None:
         self.tmp_dir = tmp_dir
         self.original = original
         self.path_policy = PathPolicy({str(tmp_dir): str(tmp_dir)})
@@ -217,7 +301,7 @@ class _SnapshotRig:
         self.approval = ApprovalPolicy()
         self.app_adapter = ExcelAppAdapter()
         self.worker = ExcelComWorker(self.app_adapter, orphan_timeout_s=_ORPHAN_POLL_TIMEOUT_S)
-        self.audit = AuditLogger(tmp_dir / "audit.jsonl")
+        self.audit = AuditLogger(audit_path or (tmp_dir / "audit.jsonl"))
         self.session = SessionService(
             self.worker,
             self.app_adapter,
@@ -226,7 +310,7 @@ class _SnapshotRig:
             self.audit,
             work_dir=tmp_dir / "work",
         )
-        self.store = SnapshotStore(tmp_dir / "snapshots")
+        self.store = SnapshotStore(store_root or (tmp_dir / "snapshots"))
         self.snapshot = SnapshotService(
             self.store,
             self.session,
@@ -464,3 +548,265 @@ async def test_snapshot_closed_branch_and_diff(tmp_path: Path) -> None:
 
     assert owned_pid is not None
     assert _wait_pid_gone(owned_pid), f"owned PID {owned_pid} still alive after shutdown"
+
+
+# ---------------------------------------------------------------------------
+# Test 3 (task_015): every case starts from the same immutable baseline
+# ---------------------------------------------------------------------------
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_each_case_starts_from_same_baseline(tmp_path: Path) -> None:
+    rig = _make_rig(tmp_path)
+    rig.grant("excel_open")  # writable open of the original working copy
+    await rig.start()
+    owned_pid: int | None = None
+    try:
+        original_hash = _sha256(rig.original)
+        owned_pid = rig.worker.get_status().owned_pid
+        assert owned_pid is not None
+
+        # --- Create the single immutable baseline snapshot from a working copy ---
+        info0 = await rig.session.open_workbook(
+            str(rig.original), mode=SessionMode.EXECUTE, read_only=False
+        )
+        baseline_manifest = await rig.snapshot.create_snapshot(info0.workbook_id)
+        assert baseline_manifest.snapshot_method == "SaveCopyAs"
+        baseline_file = (
+            rig.store.path_for(baseline_manifest.snapshot_id) / baseline_manifest.file_name
+        )
+        baseline_sha = baseline_manifest.sha256
+        assert _sha256(baseline_file) == baseline_sha, "manifest SHA must match the baseline file"
+
+        # The baseline A1 value (empty cell -> "None").
+        baseline_a1 = await rig.worker.submit(
+            lambda: _read_a1(rig.app_adapter, info0.path),
+            timeout=_CALL_TIMEOUT_S,
+            op_class=OperationClass.READ_ONLY,
+        )
+        await rig.session.close_workbook(info0.workbook_id)
+
+        # Approval for opening the immutable baseline snapshot as a working copy.
+        rig.grant_open_for(baseline_file)
+
+        # --- Case A: open baseline, mutate A1, close WITHOUT save ---
+        info_a = await rig.session.open_workbook(
+            str(baseline_file), mode=SessionMode.INSPECT, read_only=False
+        )
+        assert info_a.workbook_id != info0.workbook_id
+        working_sha_a = _sha256(Path(info_a.path))
+        a1_start_a = await rig.worker.submit(
+            lambda: _read_a1(rig.app_adapter, info_a.path),
+            timeout=_CALL_TIMEOUT_S,
+            op_class=OperationClass.READ_ONLY,
+        )
+        assert working_sha_a == baseline_sha, (
+            "case A working copy must start byte-identical to the baseline snapshot"
+        )
+        assert a1_start_a == baseline_a1, "case A must start from the baseline A1"
+        await rig.worker.submit(
+            lambda: _mutate_a1(rig.app_adapter, info_a.path, "MUT-CASE-A"),
+            timeout=_CALL_TIMEOUT_S,
+            op_class=OperationClass.MUTATING,
+        )
+        await rig.session.close_workbook(info_a.workbook_id)  # default: no save
+        assert _sha256(baseline_file) == baseline_sha, (
+            "case A must not mutate the baseline snapshot"
+        )
+
+        # --- Case B: open the SAME baseline again, mutate differently, close ---
+        info_b = await rig.session.open_workbook(
+            str(baseline_file), mode=SessionMode.INSPECT, read_only=False
+        )
+        assert info_b.workbook_id not in {info0.workbook_id, info_a.workbook_id}
+        working_sha_b = _sha256(Path(info_b.path))
+        a1_start_b = await rig.worker.submit(
+            lambda: _read_a1(rig.app_adapter, info_b.path),
+            timeout=_CALL_TIMEOUT_S,
+            op_class=OperationClass.READ_ONLY,
+        )
+        assert working_sha_b == baseline_sha, (
+            "case B working copy must start byte-identical to the baseline snapshot"
+        )
+        assert a1_start_b == baseline_a1, "case B must start from the same baseline value as case A"
+        await rig.worker.submit(
+            lambda: _mutate_a1(rig.app_adapter, info_b.path, "MUT-CASE-B"),
+            timeout=_CALL_TIMEOUT_S,
+            op_class=OperationClass.MUTATING,
+        )
+        await rig.session.close_workbook(info_b.workbook_id)
+
+        # --- Isolation / integrity assertions ---
+        # The immutable baseline file is byte-identical before/after both cases.
+        assert _sha256(baseline_file) == baseline_sha, "baseline snapshot changed across cases"
+        assert rig.store.sha256(baseline_file) == baseline_manifest.sha256
+        # Both cases started from the exact same baseline hash (no cross-contamination).
+        assert working_sha_a == working_sha_b == baseline_sha
+        # The original fixture is untouched by every case.
+        assert _sha256(rig.original) == original_hash, "original fixture must be unchanged"
+
+        _assert_owned_never_foreground(owned_pid, "cases")
+        _assert_no_visible_owned_windows(owned_pid, "cases")
+
+        print(
+            f"[isolation] baseline_sha={baseline_sha[:12]}… "
+            f"caseA_start_sha={working_sha_a[:12]}… caseB_start_sha={working_sha_b[:12]}… "
+            f"baseline_a1={baseline_a1!r} original_unchanged=True"
+        )
+    finally:
+        await rig.stop()
+
+    assert owned_pid is not None
+    assert _wait_pid_gone(owned_pid), f"owned PID {owned_pid} still alive after shutdown"
+
+
+# ---------------------------------------------------------------------------
+# Test 4 (task_015): restore after mutation + crash recovery into a fresh session
+# ---------------------------------------------------------------------------
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_restore_after_mutation(tmp_path: Path) -> None:
+    rig = _make_rig(tmp_path)
+    rig.grant("excel_open")
+    await rig.start()
+    owned_pid: int | None = None
+    fresh: _SnapshotRig | None = None
+    fresh_pid: int | None = None
+    try:
+        original_hash = _sha256(rig.original)
+        owned_pid = rig.worker.get_status().owned_pid
+        assert owned_pid is not None
+
+        # --- Create the immutable baseline snapshot ---
+        info0 = await rig.session.open_workbook(
+            str(rig.original), mode=SessionMode.EXECUTE, read_only=False
+        )
+        manifest = await rig.snapshot.create_snapshot(info0.workbook_id)
+        snapshot_file = rig.store.path_for(manifest.snapshot_id) / manifest.file_name
+        baseline_sha = manifest.sha256
+        baseline_a1 = await rig.worker.submit(
+            lambda: _read_a1(rig.app_adapter, info0.path),
+            timeout=_CALL_TIMEOUT_S,
+            op_class=OperationClass.READ_ONLY,
+        )
+        await rig.session.close_workbook(info0.workbook_id)
+
+        # --- Part A: normal restore after an unsaved mutation ---
+        rig.grant_open_for(snapshot_file)
+        info = await rig.session.open_workbook(
+            str(snapshot_file), mode=SessionMode.INSPECT, read_only=False
+        )
+        await rig.worker.submit(
+            lambda: _mutate_a1(rig.app_adapter, info.path, "MUT-RESTORE"),
+            timeout=_CALL_TIMEOUT_S,
+            op_class=OperationClass.MUTATING,
+        )
+        restored = await rig.snapshot.restore_snapshot(
+            manifest.snapshot_id, workbook_id=info.workbook_id
+        )
+        assert isinstance(restored, WorkbookInfo)
+        assert restored.workbook_id != info.workbook_id, "restore opens a fresh working copy"
+        assert Path(restored.path) != snapshot_file.resolve(), (
+            "restore must open a working copy, not the snapshot file itself"
+        )
+        restored_a1 = await rig.worker.submit(
+            lambda: _read_a1(rig.app_adapter, restored.path),
+            timeout=_CALL_TIMEOUT_S,
+            op_class=OperationClass.READ_ONLY,
+        )
+        assert restored_a1 == baseline_a1, (
+            f"restore must restore the baseline A1 ({baseline_a1!r}), got {restored_a1!r}"
+        )
+        # The immutable snapshot file is byte-identical after restore.
+        assert rig.store.sha256(snapshot_file) == baseline_sha
+        # external_side_effects_not_undone is stated on the manifest.
+        assert rig.store.load(manifest.snapshot_id).external_side_effects_not_undone is True
+        # ... and recorded in the audit trail for the restore.
+        rig.audit.flush()
+        restore_events = [
+            event
+            for event in _read_audit_events(rig.audit.path)
+            if event.get("tool") == "snapshot_restore"
+        ]
+        assert restore_events, "restore must be recorded in the audit trail"
+        assert any(
+            (event.get("result") or {}).get("external_side_effects_not_undone") is True
+            for event in restore_events
+        ), "audit must record external_side_effects_not_undone=true"
+        # The original fixture is unchanged (BG05).
+        assert _sha256(rig.original) == original_hash
+
+        _assert_owned_never_foreground(owned_pid, "after-restore")
+        _assert_no_visible_owned_windows(owned_pid, "after-restore")
+        await rig.session.close_workbook(restored.workbook_id)
+
+        # --- Part B: crash recovery (abnormal end of ONLY the owned EXCEL.exe) ---
+        info2 = await rig.session.open_workbook(
+            str(snapshot_file), mode=SessionMode.INSPECT, read_only=False
+        )
+        await rig.worker.submit(
+            lambda: _mutate_a1(rig.app_adapter, info2.path, "MUT-BEFORE-CRASH"),
+            timeout=_CALL_TIMEOUT_S,
+            op_class=OperationClass.MUTATING,
+        )
+        crash_pid = rig.worker.get_status().owned_pid
+        assert crash_pid is not None and crash_pid == owned_pid, (
+            "must terminate ONLY the owned automation PID"
+        )
+        _terminate_owned_pid(crash_pid)
+        assert _wait_pid_gone(crash_pid), f"owned PID {crash_pid} did not terminate"
+
+        # A restore attempt on the crashed rig must NOT falsely succeed; it must
+        # return a structured error (stale session / dead instance -> ExcelVbaMcpError).
+        with pytest.raises(ExcelVbaMcpError) as excinfo:
+            await rig.snapshot.restore_snapshot(manifest.snapshot_id)
+        structured = excinfo.value.to_dict()
+        assert structured.get("code"), "structured error must carry a stable code"
+        assert _sha256(snapshot_file) == baseline_sha, "a crash must not alter the snapshot file"
+
+        # Recovery: a FRESH session restores from the same immutable snapshot.
+        fresh = _SnapshotRig(
+            tmp_path,
+            rig.original,
+            store_root=rig.store.root,  # share the immutable snapshot store
+            audit_path=tmp_path / "audit_fresh.jsonl",
+        )
+        await fresh.start()
+        fresh_pid = fresh.worker.get_status().owned_pid
+        assert fresh_pid is not None and fresh_pid != crash_pid, (
+            "recovery must run on a fresh, distinct Excel instance"
+        )
+        fresh.grant_open_for(snapshot_file)
+        recovered = await fresh.snapshot.restore_snapshot(manifest.snapshot_id)
+        assert isinstance(recovered, WorkbookInfo)
+        recovered_a1 = await fresh.worker.submit(
+            lambda: _read_a1(fresh.app_adapter, recovered.path),
+            timeout=_CALL_TIMEOUT_S,
+            op_class=OperationClass.READ_ONLY,
+        )
+        assert recovered_a1 == baseline_a1, (
+            f"fresh-session recovery must restore the baseline A1 ({baseline_a1!r})"
+        )
+        assert fresh.store.sha256(snapshot_file) == baseline_sha
+        assert _sha256(rig.original) == original_hash, "original fixture must be unchanged"
+
+        _assert_owned_never_foreground(fresh_pid, "fresh-recovery")
+        _assert_no_visible_owned_windows(fresh_pid, "fresh-recovery")
+        await fresh.session.close_workbook(recovered.workbook_id)
+
+        print(
+            f"[restore] baseline_sha={baseline_sha[:12]}… restored_a1={restored_a1!r} "
+            f"external_side_effects_not_undone=True crash_pid={crash_pid}(dead) "
+            f"fresh_pid={fresh_pid} recovered_a1={recovered_a1!r}"
+        )
+        print(f"[side-effects] {_EXTERNAL_SIDE_EFFECTS_NOTE}")
+    finally:
+        if fresh is not None:
+            await fresh.stop()
+        await rig.stop()
+
+    assert owned_pid is not None
+    assert _wait_pid_gone(owned_pid), f"owned PID {owned_pid} still alive after shutdown"
+    if fresh_pid is not None:
+        assert _wait_pid_gone(fresh_pid), f"fresh owned PID {fresh_pid} still alive after shutdown"
