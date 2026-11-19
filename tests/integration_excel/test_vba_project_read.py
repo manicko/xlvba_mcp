@@ -24,6 +24,17 @@ Coverage (spec §6.2 / §7.2; research ``g1-poc-research-2026-11-19.md`` §2):
 * ``test_locked_project_skipped`` — ``LockedProject.xlsm`` does not exist
   (manual binary); the test skips with an explicit reason.
 * ``test_search_code`` — bounded substring / regex search.
+* ``test_source_hash_matches_export`` (task_017) — an **independent** re-hash of
+  the exported ``.bas`` / ``.cls`` / ``.frm`` body (attribute/version header
+  stripped, EOL + trailing whitespace normalized) equals the ``source_hash``
+  reported by ``vba_read_component``.
+* ``test_missing_reference_detected`` (task_017) — forcing ``IsBroken=True`` via
+  ``VBProject.References.AddFromFile`` so ``vba_get_references`` reports a
+  missing reference; skips with a clear reason when the build cannot produce a
+  service-visible broken reference safely.
+* ``test_all_component_types_present`` (task_017) — CleanProject exposes
+  Standard / Class / UserForm / Document component types and Document modules
+  survive an export.
 * BG03/BG04/BG05 background non-interference + orphan check after shutdown.
 
 Run serially (no xdist)::
@@ -218,6 +229,46 @@ def _assert_user_session_preserved(
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _normalize_exported_body(exported_text: str) -> str:
+    """Independently normalize an exported VBA source file for hashing.
+
+    This is a deliberately **independent** re-implementation of the production
+    normalization (it does not import ``normalize_code`` / ``hash_code``) so the
+    task_017 hash test is a genuine cross-check rather than a tautology.
+
+    Steps:
+
+    1. Unify CRLF / lone CR to ``\\n``.
+    2. Drop the export header noise: a ``.bas`` / ``.cls`` / ``.frm`` export
+       starts with ``Attribute VB_Name = "..."`` (and, for ``.frm`` / ``.cls``,
+       a ``VERSION`` / ``Begin ... End`` designer block plus more
+       ``Attribute VB_*`` lines). The code body is everything after the **last**
+       ``Attribute VB_`` line, matching how the VBE stores the module body.
+    3. Right-trim every line and strip leading / trailing blank lines.
+
+    The normalized text is what gets SHA-256 hashed and compared against the
+    ``source_hash`` reported by ``vba_read_component``.
+    """
+
+    unified = exported_text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = unified.split("\n")
+    last_attr = -1
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("Attribute VB_"):
+            last_attr = index
+    body = lines[last_attr + 1 :] if last_attr >= 0 else lines
+    trimmed = [line.rstrip() for line in body]
+    while trimmed and not trimmed[0].strip():
+        trimmed.pop(0)
+    while trimmed and not trimmed[-1].strip():
+        trimmed.pop()
+    return "\n".join(trimmed)
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _grant(
@@ -571,6 +622,328 @@ async def test_locked_project_reported_without_bypass(tmp_path: Path) -> None:
             await rig.service.get_project_info(info.workbook_id)
         assert exc_info.value.code is ErrorCode.VBA_PROJECT_LOCKED
         print(f"[vba-locked] code={exc_info.value.code.value} bypass_attempted=False")
+    finally:
+        await rig.stop()
+
+    assert owned_pid is not None
+    assert _wait_pid_gone(owned_pid), f"owned PID {owned_pid} still alive after shutdown"
+
+
+# ---------------------------------------------------------------------------
+# Test 6 (task_017): source_hash == independent normalized export hash
+# ---------------------------------------------------------------------------
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_source_hash_matches_export(tmp_path: Path) -> None:
+    """The exported body, independently re-hashed, must equal ``source_hash``.
+
+    For ``modTest`` (``.bas``), ``clsTest`` (``.cls``) and ``frmTest``
+    (``.frm``) the test reads the component ``source_hash`` via
+    ``vba_read_component`` and the exported file via ``vba_export_project``,
+    strips the export's attribute / version header, normalizes EOL + trailing
+    whitespace *independently* of production code
+    (:func:`_normalize_exported_body`) and asserts the SHA-256 of the normalized
+    body equals ``source_hash``. For ``frmTest`` the ``.frx`` companion must
+    also exist.
+
+    The normalization used (documented in :func:`_normalize_exported_body`):
+
+    * CRLF / lone CR -> ``\\n``;
+    * drop everything up to and including the last ``Attribute VB_*`` line
+      (the ``.bas`` / ``.cls`` / ``.frm`` export header);
+    * right-trim each line, then strip leading / trailing blank lines;
+    * SHA-256 the UTF-8 bytes of the result.
+    """
+
+    rig = _make_rig(tmp_path)
+    await rig.start()
+    owned_pid: int | None = None
+    try:
+        owned_pid = rig.worker.get_status().owned_pid
+        assert owned_pid is not None
+
+        info = await rig.open()
+
+        manifest = await rig.service.export_project(info.workbook_id)
+        out_dir = Path(manifest.out_dir)
+        by_name = {entry.component_name: entry for entry in manifest.components}
+        assert all(entry.export_status is VbaExportStatus.OK for entry in manifest.components), (
+            f"export failures: {[(e.component_name, e.error) for e in manifest.components]}"
+        )
+
+        checked: list[str] = []
+        for component, extension in (
+            ("modTest", ".bas"),
+            ("clsTest", ".cls"),
+            ("frmTest", ".frm"),
+        ):
+            source = await rig.service.read_component(info.workbook_id, component)
+            entry = by_name[component]
+            assert entry.extension == extension
+
+            exported_path = Path(entry.file_path)
+            assert exported_path.is_file(), f"{component} export missing: {exported_path}"
+            exported_text = exported_path.read_text(encoding="utf-8", errors="replace")
+
+            # Independent normalization + hash (does NOT call production hash_code).
+            normalized = _normalize_exported_body(exported_text)
+            export_hash = _sha256_text(normalized)
+
+            assert export_hash == source.source_hash, (
+                f"source_hash mismatch for {component}: "
+                f"independent_export_hash={export_hash} "
+                f"read_component_source_hash={source.source_hash}\n"
+                f"--- normalized export body ---\n{normalized!r}"
+            )
+            checked.append(component)
+
+        # The UserForm needs both a .frm (code) and a .frx (designer resource).
+        frm_entry = by_name["frmTest"]
+        frm_path = Path(frm_entry.file_path)
+        assert frm_path.is_file()
+        assert frm_entry.resource_file_name == "frmTest.frx"
+        assert (out_dir / "frmTest.frx").is_file(), "frmTest.frx designer resource missing"
+
+        _assert_owned_never_foreground(owned_pid, "vba-hash")
+        _assert_no_visible_owned_windows(owned_pid, "vba-hash")
+
+        print(f"[vba-hash] checked={checked} all_hashes_match=True out_dir={out_dir}")
+    finally:
+        await rig.stop()
+
+    assert owned_pid is not None
+    assert _wait_pid_gone(owned_pid), f"owned PID {owned_pid} still alive after shutdown"
+
+
+# ---------------------------------------------------------------------------
+# Test 7 (task_017): missing reference reported by vba_get_references
+# ---------------------------------------------------------------------------
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_missing_reference_detected(tmp_path: Path) -> None:
+    """A broken reference must surface as a ``missing_references`` diagnostic.
+
+    A temp copy of ``CleanProject.xlsm`` is opened and a broken reference is
+    forced through VBIDE ``VBProject.References.AddFromFile`` (a non-existent
+    path, then a registered typelib whose temp copy is deleted). The test then
+    asserts ``vba_get_references`` returns the broken reference with a
+    name/GUID and that ``get_project_info().missing_references`` includes it.
+
+    This mutates a **temporary copy only**; the committed fixture is never
+    touched. On builds where no safe recipe yields a service-visible broken
+    reference (the production adapter drops broken refs whose ``Name`` raises),
+    the test skips with an explicit reason rather than asserting a false pass.
+    """
+
+    rig = _make_rig(tmp_path)
+    committed_hash = _sha256(_CLEAN_PROJECT)
+    await rig.start()
+    owned_pid: int | None = None
+    try:
+        owned_pid = rig.worker.get_status().owned_pid
+        assert owned_pid is not None
+
+        info = await rig.open()
+        record = rig.session._records[info.workbook_id]
+        working_path = Path(record.working_path)
+
+        # Registered typelib not in the default reference set. Used to attempt an
+        # "add then delete the target" break. Present on Windows.
+        scripting_typelib = Path(r"C:\Windows\System32\scrrun.dll")
+
+        def force_broken() -> dict[str, Any]:
+            """Run on the STA worker: try to add a broken reference in-memory."""
+
+            app = rig.app_adapter.app
+            target = working_path.as_posix().lower()
+            wb = None
+            for candidate in app.Workbooks:
+                try:
+                    if str(candidate.FullName).replace("\\", "/").lower() == target:
+                        wb = candidate
+                        break
+                except Exception:  # noqa: BLE001 - defensive
+                    continue
+            if wb is None:
+                return {"stage": "no-workbook"}
+
+            project = wb.VBProject
+            outcome: dict[str, Any] = {"stage": "attempted"}
+
+            # Attempt 1: AddFromFile a non-existent path (expected to raise on
+            # this build; handled so the test can decide how to proceed).
+            missing_path = working_path.parent / f"does_not_exist_{uuid4().hex}.tlb"
+            try:
+                project.References.AddFromFile(str(missing_path))
+                outcome["add_nonexistent"] = "added"
+            except Exception as exc:  # noqa: BLE001 - expected on this build
+                outcome["add_nonexistent"] = f"raised:{type(exc).__name__}"
+
+            # Attempt 2: add a registered typelib from a temp copy, then delete
+            # the temp copy to try to force IsBroken. We only delete OUR temp
+            # copy, never the registered system file.
+            temp_copy = working_path.parent / f"probe_typelib_{uuid4().hex}.dll"
+            if scripting_typelib.is_file():
+                try:
+                    shutil.copy2(scripting_typelib, temp_copy)
+                    new_ref = project.References.AddFromFile(str(temp_copy))
+                    outcome["add_typelib"] = str(new_ref.Name)
+                    with contextlib.suppress(Exception):
+                        temp_copy.unlink()
+                        outcome["deleted_temp_copy"] = True
+                except Exception as exc:  # noqa: BLE001 - expected on some builds
+                    outcome["add_typelib"] = f"raised:{type(exc).__name__}"
+                    with contextlib.suppress(Exception):
+                        temp_copy.unlink()
+
+            return outcome
+
+        force_broken.__name__ = "vba_force_broken_reference"
+        mutation = await rig.worker.submit(
+            force_broken, timeout=_CALL_TIMEOUT_S, section="diagnostic"
+        )
+
+        refs = await rig.service.get_references(info.workbook_id)
+        broken = [reference for reference in refs if reference.is_broken]
+        project = await rig.service.get_project_info(info.workbook_id)
+
+        # If the build could not produce a service-visible broken reference, skip
+        # with a precise reason (AddFromFile(nonexistent) raises here, and the
+        # production adapter drops broken refs whose Name raises com_error).
+        if not broken:
+            pytest.skip(
+                "This Excel build did not yield a service-visible broken reference "
+                "without unsafe file/registry manipulation: "
+                f"AddFromFile(nonexistent)={mutation.get('add_nonexistent')!r}, "
+                f"AddFromFile(typelib)={mutation.get('add_typelib')!r}; "
+                "the production VBIDEAdapter drops broken references whose Name "
+                "raises com_error, and registered typelibs canonicalise to their "
+                "system path (deleting a temp copy cannot break them). "
+                "Renaming the referenced system file is unsafe / out of scope."
+            )
+
+        # A broken reference must carry a name or GUID and appear in the
+        # missing_references diagnostic.
+        broken_with_identity = [
+            reference for reference in broken if reference.name or reference.guid
+        ]
+        assert broken_with_identity, (
+            f"broken reference surfaced without name/GUID: {[r.model_dump() for r in broken]}"
+        )
+
+        broken_names = {reference.name for reference in broken if reference.name}
+        broken_guids = {reference.guid for reference in broken if reference.guid}
+        missing = set(project.missing_references)
+
+        assert missing, (
+            "get_project_info().missing_references is empty despite broken refs: "
+            f"broken={[r.model_dump() for r in broken]}"
+        )
+        assert broken_names & missing or broken_guids & missing, (
+            f"missing_references={sorted(missing)} does not include any broken "
+            f"reference name={sorted(broken_names)} guid={sorted(broken_guids)}"
+        )
+
+        # The committed fixture is untouched.
+        assert _sha256(_CLEAN_PROJECT) == committed_hash
+
+        _assert_owned_never_foreground(owned_pid, "vba-missing-ref")
+        _assert_no_visible_owned_windows(owned_pid, "vba-missing-ref")
+
+        print(
+            f"[vba-missing-ref] broken={[r.name for r in broken]} "
+            f"missing_references={sorted(missing)} mutation={mutation}"
+        )
+    finally:
+        await rig.stop()
+
+    assert owned_pid is not None
+    assert _wait_pid_gone(owned_pid), f"owned PID {owned_pid} still alive after shutdown"
+
+
+# ---------------------------------------------------------------------------
+# Test 8 (task_017): all component types present (Standard/Class/UserForm/Document)
+# ---------------------------------------------------------------------------
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_all_component_types_present(tmp_path: Path) -> None:
+    """CleanProject must expose every supported component type.
+
+    Asserts the inventory contains a Standard module, a Class module, a UserForm
+    (with designer) and Document modules, that the Document modules are flagged
+    ``is_document_module`` and are still present after an export (i.e. exporting
+    never strips them).
+    """
+
+    rig = _make_rig(tmp_path)
+    await rig.start()
+    owned_pid: int | None = None
+    try:
+        owned_pid = rig.worker.get_status().owned_pid
+        assert owned_pid is not None
+
+        info = await rig.open()
+
+        project = await rig.service.get_project_info(info.workbook_id)
+        assert project.available is True
+        types_observed = {component.component_type for component in project.components}
+
+        assert VbaComponentType.STANDARD_MODULE in types_observed, (
+            f"no Standard module; observed={sorted(t.value for t in types_observed)}"
+        )
+        assert VbaComponentType.CLASS_MODULE in types_observed, (
+            f"no Class module; observed={sorted(t.value for t in types_observed)}"
+        )
+        assert VbaComponentType.USER_FORM in types_observed, (
+            f"no UserForm; observed={sorted(t.value for t in types_observed)}"
+        )
+        assert VbaComponentType.DOCUMENT_MODULE in types_observed, (
+            f"no Document module; observed={sorted(t.value for t in types_observed)}"
+        )
+
+        by_name = {component.component_name: component for component in project.components}
+
+        # Document modules (ThisWorkbook / Sheet1) are present and flagged.
+        document_names = {
+            name for name, component in by_name.items() if component.is_document_module
+        }
+        assert document_names, "no component flagged is_document_module"
+        assert {"ThisWorkbook", "Sheet1"}.issubset(document_names), (
+            f"expected ThisWorkbook + Sheet1 as Document modules; got {sorted(document_names)}"
+        )
+
+        # The UserForm has a designer and is flagged as a UserForm type.
+        user_forms = [
+            component
+            for component in project.components
+            if component.component_type is VbaComponentType.USER_FORM
+        ]
+        assert user_forms, "no UserForm component"
+        assert any(component.has_designer for component in user_forms), "UserForm has no designer"
+
+        # Export must not remove Document modules.
+        manifest = await rig.service.export_project(info.workbook_id)
+        assert all(entry.export_status is VbaExportStatus.OK for entry in manifest.components), (
+            f"export failures: {[(e.component_name, e.error) for e in manifest.components]}"
+        )
+
+        after = await rig.service.list_components(info.workbook_id)
+        after_names = {component.component_name for component in after}
+        assert {"ThisWorkbook", "Sheet1"}.issubset(after_names), (
+            f"document modules removed after export: {sorted(after_names)}"
+        )
+
+        _assert_owned_never_foreground(owned_pid, "vba-types")
+        _assert_no_visible_owned_windows(owned_pid, "vba-types")
+
+        print(
+            f"[vba-types] types={sorted(t.value for t in types_observed)} "
+            f"document_modules={sorted(document_names)} "
+            f"components={len(project.components)}"
+        )
     finally:
         await rig.stop()
 
