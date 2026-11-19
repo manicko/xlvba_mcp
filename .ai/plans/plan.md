@@ -525,6 +525,9 @@ extra_context: |
   Не включать все макросы; не устанавливать AutomationSecurity=Low как общее правило; не менять
   registry, AccessVBOM, MacroSettings или Trusted Locations автоматически; не снимать MOTW.
   Не обходить пароль VBA проекта. Не сохранять credentials в логах.
+  **Addendum (BG06):** approval record расширяется classification `background_safe`, привязанной к
+  workbook hash + exact procedure; strict background macro execution требует этой классификации;
+  изменение source/hash инвалидирует её.
 files:
   - path: src/excel_vba_mcp/security/macro_policy.py
     targets: [{type: class, name: MacroPolicy}]
@@ -581,9 +584,10 @@ extra_context: |
   трогают COM, а только валидируют DTO и await ExcelComWorker.submit(). submit() должен быть
   awaitable с bounded timeout, без блокирующего join() в event loop; зависший worker → running/needs_recovery,
   а не stall всего сервера. ARCH-005: worker owned by MCPServer(lifespan=...) / main(); shutdown
-  закрывает только owned workbooks → Quit → release → CoUninitialize в finally. ARCH-013: policy
-  видимости — Visible=True для execute/compile/macro сессий, Visible=False только для inventory без UIA;
-  DisplayAlerts менять только через context manager с восстановлением.
+  закрывает только owned workbooks → Quit → release → CoUninitialize в finally. ARCH-013 (amended by
+  addendum): automation-owned Excel ВСЕГДА Visible=False и non-activating; Visible=True НЕ допускается.
+  DisplayAlerts/ScreenUpdating менять только узко вокруг операции через context manager с восстановлением
+  в finally (BG08).
 files:
   - path: src/excel_vba_mcp/adapters/excel/com_worker.py
     targets:

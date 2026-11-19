@@ -35,6 +35,10 @@ uv run python -m excel_vba_mcp
 
 The server writes diagnostics to stderr only; stdout is reserved for MCP protocol messages.
 
+## Execution model (non-intrusive background)
+
+The MCP server runs as the **currently logged-in user in the current interactive Windows session**. The automation-owned Excel instance (created via `DispatchEx`) is kept **hidden and non-activating** for its entire lifetime. This project does **not** use a VM, container, separate Windows user/session/desktop, RDP, or Windows Service, and never shows/activates Excel/VBE or sends input to dialogs. See `.ai/plans/plan_addendum_background_execution.md`.
+
 ## Use as an MCP Server
 
 The server speaks the Model Context Protocol over **STDIO**: protocol messages go to
