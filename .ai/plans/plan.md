@@ -336,6 +336,11 @@ extra_context: |
   Application.Run использует позиционные аргументы, максимум 30; принимать string, number,
   boolean, null, ISO date и поддерживаемые одномерные/двумерные массивы. Не принимать Python
   objects или COM references. Application.Run не является компилятором.
+  **Addendum (BG06/BG09/R13):** Excel остаётся hidden (Visible=False). Known interactive UI calls
+  (MsgBox/InputBox/UserForm.Show/FileDialog) в процедуре → preflight (эвристика по исходнику) →
+  блокировать ДО запуска со статусом INTERACTIVE_UI_NOT_SUPPORTED / BACKGROUND_SAFETY_NOT_VERIFIED;
+  не dismiss диалоги, не сообщать success. Runtime: если automation-owned окно стало visible/foreground
+  → stop COM, вернуть blocked/indeterminate, без focus steal.
 files:
   - path: tests/fixtures/CleanProject.xlsm
     targets: [{type: fixture, name: CleanProject test macros}]
@@ -1072,6 +1077,13 @@ extra_context: |
   expansion (`Debug` MenuItem → `Compile VBAProject` Invoke); CommandBars/ID-578 не работают.
   Реализацию command lookup вынести в `adapters/windows_ui/vbe_compile_ui.py`; при недоступности
   UIA возвращать COMPILE_INDETERMINATE.
+  **Hidden-compile research (2026-11-19, `.ai/audit/hidden-compile-research-2026-11-19.md`):** на
+  Excel 16.0.14332 единственный рабочий путь — UIA Debug→Compile, но он создаёт 4 видимых popup-окна
+  и делает VBE foreground (BG03/BG04 fail). CommandBars не содержит Compile; FindControl(578)
+  E_INVALIDARG; Application.Run не является compile-diagnostic (VBA compiles on demand). Вывод:
+  production `compile_project` возвращает COMPILE_INDETERMINATE(reason=NON_ACTIVATING_COMPILE_UNAVAILABLE);
+  UIA-маршрут в production НЕ использовать. Partial diagnostics — только References.IsBroken/Protection/
+  inventory/ACCESS_VBOM_DISABLED, с явной пометкой "NOT a compile".
 files:
   - path: src/excel_vba_mcp/application/compile_service.py
     targets:
@@ -1092,11 +1104,11 @@ changes:
   - action: add_compile_diagnostics
     description: Возвращать structured statuses и evidence; при неуверенности сохранять indeterminate.
 acceptance_criteria:
-  - Compile invokes the VBE project compile command, not a macro
-  - compile-error fixture produces COMPILE_ERROR with evidence
-  - unverified command/UIA state produces COMPILE_INDETERMINATE
-  - already_compiled is not described as a new compile run
-  - next COM action is blocked while compile dialog remains unresolved
+  - На target build (16.0.14332) non-activating compile недоступен: возвращать COMPILE_INDETERMINATE с reason NON_ACTIVATING_COMPILE_UNAVAILABLE; никогда не false compiled/compile_error
+  - compile-error fixture не должен приводить к видимому/foreground UI; если UI unavoidable — COMPILE_INDETERMINATE (не кликать)
+  - partial non-intrusive diagnostics (References.IsBroken, VBProject.Protection, component inventory, ACCESS_VBOM_DISABLED) возвращаются, явно помечены "NOT a compile"
+  - already_compiled не описывается как новый compile run
+  - next COM action blocked while compile dialog remains unresolved
 tests_to_run: ["unit tests for status/diagnostic DTOs", "integration success/error fixtures on target Office build"]
 agents:
   - researcher: required; compare command/UIA routes validated by PoC
