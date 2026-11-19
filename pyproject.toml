@@ -49,3 +49,6 @@ packages = ["excel_vba_mcp"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "integration_excel: tests that drive a live Excel COM instance on Windows (skipped when unavailable)",
+]
