@@ -35,6 +35,87 @@ uv run python -m excel_vba_mcp
 
 The server writes diagnostics to stderr only; stdout is reserved for MCP protocol messages.
 
+## Use as an MCP Server
+
+The server speaks the Model Context Protocol over **STDIO**: protocol messages go to
+stdout, diagnostics go to stderr. Any MCP-capable client (Kilo, Claude Desktop,
+Cline, etc.) can launch it as a local (stdio) server.
+
+### Install / prepare
+
+```powershell
+uv sync --locked
+```
+
+That creates `.venv/` and the `excel-vba-mcp` console script. No global install or
+Node.js/`npx` is involved — this is a Python project managed by `uv`.
+
+### Connect to an MCP client (Kilo example)
+
+Kilo's `mcp` block is runner-agnostic: `type: local` spawns the `command` array as a
+child process. The Python analogue of an `npx` command is `uv run` with
+`--directory` pointing at the repository root (this works regardless of the client's
+working directory):
+
+```json
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "mcp": {
+    "xlvba": {
+      "type": "local",
+      "command": [
+        "uv",
+        "run",
+        "--directory",
+        "<absolute-path-to-repo>",
+        "excel-vba-mcp"
+      ],
+      "environment": {
+        "EXCEL_VBA_MCP_LOG_LEVEL": "INFO"
+      },
+      "enabled": true,
+      "timeout": 60000
+    }
+  },
+  "permission": {
+    "xlvba_*": "ask"
+  }
+}
+```
+
+Notes:
+
+- Replace `<absolute-path-to-repo>` with the absolute path to this repository's root.
+- `environment`: only `EXCEL_VBA_MCP_LOG_LEVEL` is supported today (`DEBUG`, `INFO`,
+  `WARNING`, `ERROR`, `CRITICAL`; default `INFO`). It controls stderr logging only.
+- `timeout`: allow extra time on first launch (dependency sync / venv warm-up) and for
+  slow Excel COM calls; raise it further if you hit startup timeouts.
+- `permission`: tools drive real Excel COM automation and can modify workbooks, so
+  default them to `"ask"`. Whitelist safe tools later, e.g. `"xlvba_server_health":
+  "allow"`.
+- In the Kilo TUI, `/mcps` toggles loaded servers; their tools are exposed as
+  `xlvba_<tool>`.
+
+### Alternate launch commands
+
+All of the following are valid `type: local` commands:
+
+- Direct console script (requires a prior `uv sync`):
+  ```json
+  "command": ["<repo-root>\\.venv\\Scripts\\excel-vba-mcp.exe"]
+  ```
+- Module form:
+  ```json
+  "command": ["uv", "run", "--directory", "<absolute-path-to-repo>", "python", "-m", "excel_vba_mcp"]
+  ```
+- Global install (optional), then a clean command:
+  ```powershell
+  uv tool install --editable <absolute-path-to-repo>
+  ```
+  ```json
+  "command": ["excel-vba-mcp"]
+  ```
+
 ## Development
 
 ```powershell
