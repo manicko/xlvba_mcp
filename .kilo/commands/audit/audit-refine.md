@@ -1,0 +1,114 @@
+---
+name: audit-refine
+description: Execute full multi-agent audit pipeline using orchestrator coordination, executor subagents, and validator subagents with retry logic
+alwaysApply: false
+---
+
+# Audit Improvement Agent
+
+Process audit files from .ai/audit/99-validation one by one.
+Max allowed parallel subagents = 2
+Do not launch agents in background.
+If stop or break prefer resume old session not launching new agent.
+
+## Workflow
+
+
+## Gather Base Layer Context (once)
+Read `.ai/context/commands.md` for verification commands.
+Read `.ai/context/python-code-standards.md` for project code standards.
+List documentation structure from `docs/` folder.
+Run `git rev-parse HEAD` and capture its output as `{COMMIT_SHA}`.
+Run `git status --porcelain` and capture its output as `{WORKTREE_STATUS}`.
+
+Set variables:
+- `{BASE_CONTEXT}` = summary of the above files, **including** `{COMMIT_SHA}` and the
+  working-tree state (clean if `{WORKTREE_STATUS}` is empty, dirty otherwise)
+- `{AUDIT_FILES}` = list of files in `.ai/audit/99-validation`
+
+Every file named in this step must exist. If one does not, name the missing file in the
+run's summary and continue with what is present — a read that silently yields nothing is the
+defect this step exists to prevent.
+
+## Refuse Dirty Tree (hard stop)
+
+Run `git status --porcelain -- src tests docs pyproject.toml`.
+
+If the output is non-empty, **STOP** — refuse to start:
+
+> **AUDIT REFUSED: working tree is dirty.** The audit pipeline measures a
+> resolved commit, not uncommitted changes. Commit or stash before starting.
+>
+> Dirty paths:
+> {lines from `git status --porcelain -- src tests docs pyproject.toml`}
+
+No phase may start against a dirty tree.
+
+<refine_loop>
+
+## For each {file_path} in {AUDIT_FILES}
+
+### 1. Read the audit file  
+
+### 2. For all findings, recommendations Detect Non-Actionable Recommendations
+Select findings where at least one of the following is true:
+
+- The recommendation is vague.
+- The recommendation does not specify exactly what should be changed.
+- Multiple alternative solutions are proposed without a clear recommendation.
+- No implementation approach is provided.
+- The proposed fix is incomplete or ambiguous.
+
+{REQUIRE_RESEARCH}
+
+### 3. Launch a sub-agent to resolve Each Non-Actionable Recommendation
+ 
+```
+Task(
+  prompt="{subagent_prompt}\n"
+       + "Append your findings to related issues in: {file_path}\n"
+       + "Base context: {BASE_CONTEXT}\n",
+  agent="researcher",
+  mode = "subagent",
+  description="Research phase {file_name}"
+)
+```
+
+Using prompt bellow:
+
+<subagent_prompt>
+The issues require deeper research:
+{REQUIRE_RESEARCH}
+
+1. Analyze the current project architecture.
+2. Review relevant project documentation.
+3. Research current best practices for the project's technology stack.
+4. Evaluate available implementation options for each issue.
+5. Select a single recommended solution that best fits the existing architecture for each issue.
+6. Write a concise implementation recommendation extending the {file_path}.
+7. Update the corresponding audit finding with the finalized recommendation {file_path}
+
+
+## Output Rules
+
+- Modify the audit file {file_path} directly .
+- Preserve existing structure and formatting.
+- Replace ambiguous recommendations with a single actionable recommendation.
+- Do not leave multiple alternatives unless absolutely required.
+- Keep recommendations concise, technical, and implementation-oriented.
+- Ensure every finding has a clear next action for developers.
+
+<subagent_prompt>
+
+</refine_loop>
+
+
+## Completion
+
+Process all audit files in the folder until none remain.
+Generate a final summary containing:
+
+- Files processed
+- Findings updated
+- Recommendations clarified
+- Any findings that could not be resolved
