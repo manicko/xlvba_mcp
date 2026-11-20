@@ -287,3 +287,37 @@ class BaselinePolicy(StrEnum):
 
     CREATE = "create"
     USE_EXISTING = "use_existing"
+
+
+class ModelSectionStatus(StrEnum):
+    """Availability of one aggregated workbook-model section (spec §7.1, A03).
+
+    ``AVAILABLE`` means the section was read successfully (an empty inventory is
+    still ``AVAILABLE``); ``UNAVAILABLE`` means the underlying service failed and
+    the section is empty; ``PARTIAL`` means the section was read but at least one
+    sub-part (e.g. a single VBA component's procedures) could not be read.
+    """
+
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    PARTIAL = "partial"
+
+
+class VbaAccessStatus(StrEnum):
+    """VBA project access state reported by the workbook model (spec §7.1, §7.2).
+
+    The workbook model never aborts because VBA is inaccessible: it keeps the
+    non-VBA sections and reports one of these values in ``WorkbookModel.vba_access``.
+
+    * ``AVAILABLE`` — the VBProject was read (components/procedures available).
+    * ``UNAVAILABLE`` — the VBProject could not be read for a generic reason.
+    * ``LOCKED`` — the VBProject is password-protected; protection is never bypassed.
+    * ``VBOM_DISABLED`` — "Trust access to the VBA project object model" is off.
+    * ``SKIPPED`` — VBA aggregation was not requested (``include_vba=False``).
+    """
+
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    LOCKED = "locked"
+    VBOM_DISABLED = "vbom_disabled"
+    SKIPPED = "skipped"

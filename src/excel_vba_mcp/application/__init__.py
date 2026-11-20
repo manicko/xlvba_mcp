@@ -16,6 +16,7 @@ from excel_vba_mcp.application.macro_service import (
     MacroService,
 )
 from excel_vba_mcp.application.session_service import SessionService
+from excel_vba_mcp.application.workbook_model_service import WorkbookModelService
 
 __all__ = [
     "BackgroundSafetyRegistry",
@@ -25,4 +26,5 @@ __all__ = [
     "MacroInfo",
     "MacroService",
     "SessionService",
+    "WorkbookModelService",
 ]

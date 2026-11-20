@@ -18,6 +18,7 @@ settings is deferred to the configuration task. See ``_build_runtime``.
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import os
 import sys
@@ -27,6 +28,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ResourceError
 
 from excel_vba_mcp import __version__
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
@@ -107,6 +109,7 @@ from excel_vba_mcp.api.workbook_tools import (
     excel_list_workbooks,
     excel_open,
     excel_save,
+    workbook_get_model,
 )
 from excel_vba_mcp.application.compile_service import CompileService
 from excel_vba_mcp.application.controls_service import ControlsService
@@ -118,6 +121,13 @@ from excel_vba_mcp.application.sheets_service import SheetsService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
 from excel_vba_mcp.application.tables_service import TablesService
 from excel_vba_mcp.application.vba_project_service import VBAProjectService
+from excel_vba_mcp.application.workbook_model_service import WorkbookModelService
+from excel_vba_mcp.domain.errors import (
+    AccessVbomDisabledError,
+    ExcelVbaMcpError,
+    VbaProjectLockedError,
+)
+from excel_vba_mcp.domain.statuses import VbaAccessStatus
 from excel_vba_mcp.security.approval import ApprovalPolicy
 from excel_vba_mcp.security.audit import AuditLogger
 from excel_vba_mcp.security.path_policy import PathPolicy
@@ -341,6 +351,31 @@ _DESC_CONTROL_SET_ON_ACTION = (
     "controls are rejected). Guarded mutation: requires a writable session, a "
     "snapshot and an approval grant."
 )
+_DESC_WORKBOOK_GET_MODEL = (
+    "Return the aggregated Stage 1 workbook model: sheets, tables, names, shapes, "
+    "controls and (optionally) VBA components/procedures, each with a section "
+    "status. Read-only: no all-cells/Range data and no VBA execution. When VBA is "
+    "unavailable, locked or VBOM trust is disabled the other sections are still "
+    "returned and vba_access reports the state."
+)
+
+# Read-only MCP resource descriptions (spec §6.6). The URIs are per-workbook
+# templates so a client can read the model / VBA inventory / one component's
+# source without mutating the workbook and without running VBA.
+_DESC_RES_MODEL = (
+    "Read-only Stage 1 workbook model (JSON) for an open workbook. Aggregates "
+    "sheets, tables, names, shapes, controls and (optionally) VBA, with section "
+    "statuses and a content hash. Never reads all-cells/Range data."
+)
+_DESC_RES_VBA_COMPONENTS = (
+    "Read-only VBA component inventory (JSON) for an open workbook: name, type, "
+    "line count, normalized source hash and designer/export flags. Reports "
+    "vba_access instead of failing when VBA is unavailable or locked."
+)
+_DESC_RES_VBA_SOURCE = (
+    "Read-only VBA source code (text) of one component of an open workbook. The "
+    "workbook is never modified and no VBA is executed."
+)
 
 
 @dataclasses.dataclass
@@ -359,6 +394,7 @@ class _Runtime:
     controls: ControlsService
     compile: CompileService
     macro: MacroService
+    model: WorkbookModelService
     path_policy: PathPolicy
     approval: ApprovalPolicy
     audit: AuditLogger
@@ -427,6 +463,18 @@ def _build_runtime() -> _Runtime:
     # eligible for background execution until it is explicitly classified for the
     # current workbook hash and verified on a disposable copy.
     macro_service = MacroService(worker, session, approval, BackgroundSafetyRegistry(), audit)
+    model_service = WorkbookModelService(
+        worker,
+        session,
+        sheets,
+        tables,
+        names,
+        shapes,
+        controls,
+        vba,
+        path_policy,
+        audit,
+    )
     return _Runtime(
         worker=worker,
         app_adapter=app_adapter,
@@ -440,6 +488,7 @@ def _build_runtime() -> _Runtime:
         controls=controls,
         compile=compile_service,
         macro=macro_service,
+        model=model_service,
         path_policy=path_policy,
         approval=approval,
         audit=audit,
@@ -487,10 +536,12 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         control_tools.set_controls_service(runtime.controls)
         compile_tools.set_compile_service(runtime.compile)
         macro_tools.set_macro_service(runtime.macro)
+        workbook_tools.set_workbook_model_service(runtime.model)
     try:
         yield runtime
     finally:
         workbook_tools.set_session_service(None)
+        workbook_tools.set_workbook_model_service(None)
         test_tools.set_snapshot_service(None)
         vba_tools.set_vba_project_service(None)
         sheet_tools.set_sheets_service(None)
@@ -640,6 +691,11 @@ def _register_tools(server: MCPServer) -> None:
         name="control_set_on_action",
         description=_DESC_CONTROL_SET_ON_ACTION,
     )
+    server.add_tool(
+        workbook_get_model,
+        name="workbook_get_model",
+        description=_DESC_WORKBOOK_GET_MODEL,
+    )
 
 
 _configure_logging()
@@ -658,6 +714,89 @@ def server_health() -> dict[str, str]:
 # regardless of whether the server is started via ``main()`` here or directly via
 # ``excel_vba_mcp.__main__`` (which calls ``mcp.run`` on this module's ``mcp``).
 _register_tools(mcp)
+
+
+# ---------------------------------------------------------------------------
+# Read-only MCP resources (spec §6.6; plan task_032)
+# ---------------------------------------------------------------------------
+# These resources expose the Stage 1 model and VBA inventory/source as
+# read-only MCP resources. They are per-workbook URI templates so a client can
+# read one workbook's model without mutating it and without running VBA:
+#
+#   excel://workbooks/{workbook_id}/model
+#   excel://workbooks/{workbook_id}/vba/components
+#   excel://workbooks/{workbook_id}/vba/components/{component_name}
+#
+# The first two return JSON; the third returns the component's VBA source text.
+def _vba_access_from_error(exc: ExcelVbaMcpError) -> VbaAccessStatus:
+    """Map a VBA service error to the model's ``vba_access`` vocabulary."""
+
+    if isinstance(exc, AccessVbomDisabledError):
+        return VbaAccessStatus.VBOM_DISABLED
+    if isinstance(exc, VbaProjectLockedError):
+        return VbaAccessStatus.LOCKED
+    return VbaAccessStatus.UNAVAILABLE
+
+
+@mcp.resource(
+    "excel://workbooks/{workbook_id}/model",
+    name="workbook_model",
+    description=_DESC_RES_MODEL,
+    mime_type="application/json",
+)
+async def workbook_model_resource(workbook_id: str) -> str:
+    """Read-only Stage 1 workbook model as JSON (never mutates / runs VBA)."""
+
+    service = workbook_tools.get_workbook_model_service()
+    model = await service.get_workbook_model(workbook_id)
+    return model.model_dump_json(indent=2)
+
+
+@mcp.resource(
+    "excel://workbooks/{workbook_id}/vba/components",
+    name="workbook_vba_components",
+    description=_DESC_RES_VBA_COMPONENTS,
+    mime_type="application/json",
+)
+async def workbook_vba_components_resource(workbook_id: str) -> str:
+    """Read-only VBA component inventory as JSON (reports vba_access on failure)."""
+
+    vba_service = vba_tools.get_vba_project_service()
+    try:
+        components = await vba_service.list_components(workbook_id)
+    except ExcelVbaMcpError as exc:
+        payload: dict[str, object] = {
+            "workbook_id": workbook_id,
+            "vba_access": _vba_access_from_error(exc).value,
+            "components": [],
+            "diagnostics": [str(exc)],
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    payload = {
+        "workbook_id": workbook_id,
+        "vba_access": VbaAccessStatus.AVAILABLE.value,
+        "components": [component.model_dump(mode="json") for component in components],
+        "diagnostics": [],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+@mcp.resource(
+    "excel://workbooks/{workbook_id}/vba/components/{component_name}",
+    name="workbook_vba_component_source",
+    description=_DESC_RES_VBA_SOURCE,
+    mime_type="text/plain",
+)
+async def workbook_vba_component_source_resource(workbook_id: str, component_name: str) -> str:
+    """Read-only VBA source text of one component (never mutates / runs VBA)."""
+
+    vba_service = vba_tools.get_vba_project_service()
+    try:
+        source = await vba_service.read_component(workbook_id, component_name)
+    except ExcelVbaMcpError as exc:
+        raise ResourceError(str(exc)) from exc
+    return source.source
 
 
 def main() -> None:

@@ -27,6 +27,7 @@ from excel_vba_mcp.domain.statuses import (
     DiagnosticConfidence,
     MacroMappingStatus,
     MacroRunStatus,
+    ModelSectionStatus,
     NameScope,
     NameTargetKind,
     ProcedureType,
@@ -39,6 +40,7 @@ from excel_vba_mcp.domain.statuses import (
     SnapshotStatus,
     StepStatus,
     TestRunStatus,
+    VbaAccessStatus,
     VbaComponentType,
     VbaExportStatus,
     WorkbookSessionState,
@@ -495,15 +497,66 @@ class ControlEntry(DomainModel):
     )
 
 
+class ModelSection(DomainModel):
+    """Availability + diagnostics for one workbook-model section (spec §7.1, A03).
+
+    The Stage 1 model is an aggregation of the existing inventory services. Each
+    section records whether it was read (``status``), how many items it contains
+    (``count``) and any per-section diagnostics (never a COM object).
+    """
+
+    name: str
+    status: ModelSectionStatus
+    count: int = 0
+    diagnostics: list[str] = Field(default_factory=list)
+
+
 class WorkbookModel(TimestampedModel):
-    """Compact, paginated Phase 1 workbook model (spec §6.1, Appendix A)."""
+    """Compact, paginated Phase 1 workbook model (spec §6.1, §7.1, Appendix A).
+
+    This is an **aggregating** view over the Stage 1 inventory services (sheets,
+    tables, names, shapes, controls and the VBA project); it is not a second
+    source of object data and it never carries all-cells / Range data.
+
+    ``vba_access`` reports the VBA project state without aborting the rest of the
+    model: when VBProject is unavailable, locked or VBOM-trust is disabled the
+    non-VBA sections are still returned. ``model_hash`` is a SHA-256 over the
+    model content (excluding the timestamps and the hash itself) so two reads of
+    an unchanged workbook produce the same hash.
+    """
 
     schema_version: int = SCHEMA_VERSION
     workbook: WorkbookInfo
     sheets: list[SheetInfo] = Field(default_factory=list)
+    tables: list[TableInfo] = Field(default_factory=list)
     vba_project: VbaProjectInfo | None = None
+    vba_access: VbaAccessStatus = VbaAccessStatus.AVAILABLE
+    vba_procedures: list[VbaProcedureInfo] = Field(default_factory=list)
     names: list[DefinedNameInfo] = Field(default_factory=list)
-    controls: list[ControlInfo] = Field(default_factory=list)
+    shapes: list[ShapeInfo] = Field(default_factory=list)
+    controls: list[ControlEntry] = Field(default_factory=list)
+    sections: dict[str, ModelSection] = Field(default_factory=dict)
+    model_version: int = Field(default=1)
+    model_hash: str | None = None
+
+
+class SheetModel(TimestampedModel):
+    """Sheet-scoped Stage 1 model (spec §7.1, §7.5, A03).
+
+    Sheet metadata plus the tables, names, shapes and controls scoped to that
+    sheet, aggregated from the same inventory services as :class:`WorkbookModel`.
+    Each scoped section carries its own status/diagnostics. The sheet model never
+    carries all-cells / Range data.
+    """
+
+    schema_version: int = SCHEMA_VERSION
+    workbook_id: str
+    sheet: SheetInfo
+    tables: list[TableInfo] = Field(default_factory=list)
+    names: list[DefinedNameInfo] = Field(default_factory=list)
+    shapes: list[ShapeInfo] = Field(default_factory=list)
+    controls: list[ControlEntry] = Field(default_factory=list)
+    sections: dict[str, ModelSection] = Field(default_factory=dict)
     model_version: int = Field(default=1)
     model_hash: str | None = None
 

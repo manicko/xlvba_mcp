@@ -32,6 +32,9 @@ from excel_vba_mcp.api.workbook_tools import (
     excel_list_workbooks,
     excel_open,
     excel_save,
+    get_workbook_model_service,
+    set_workbook_model_service,
+    workbook_get_model,
 )
 
 __all__ = [
@@ -40,12 +43,14 @@ __all__ = [
     "excel_list_workbooks",
     "excel_open",
     "excel_save",
+    "get_workbook_model_service",
     "macro_get_last_result",
     "macro_list",
     "macro_run",
     "set_compile_service",
     "set_macro_service",
     "set_vba_project_service",
+    "set_workbook_model_service",
     "vba_compile",
     "vba_export_project",
     "vba_get_compile_diagnostics",
@@ -55,4 +60,5 @@ __all__ = [
     "vba_project_info",
     "vba_read_component",
     "vba_search_code",
+    "workbook_get_model",
 ]

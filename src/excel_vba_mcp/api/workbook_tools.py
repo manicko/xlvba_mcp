@@ -1,32 +1,37 @@
-"""Base workbook / session MCP tools (task_012).
+"""Base workbook / session MCP tools (task_012, task_032).
 
 These are the thin, async MCP tool handlers for the workbook lifecycle:
-``excel_open``, ``excel_close``, ``excel_save``, ``excel_get_status`` and
-``excel_list_workbooks``. They are deliberately **thin**: each one validates its
-arguments, delegates to :class:`~excel_vba_mcp.application.session_service.SessionService`,
+``excel_open``, ``excel_close``, ``excel_save``, ``excel_get_status``,
+``excel_list_workbooks`` and ``workbook_get_model``. They are deliberately
+**thin**: each one validates its arguments, delegates to an application service,
 and returns a domain DTO. They **never touch COM** (ARCH-009): no
 ``pythoncom`` / ``win32com`` import lives in this module, and all Excel access
-happens inside the session service on the dedicated STA worker.
+happens inside the services on the dedicated STA worker.
 
-The handlers need a configured :class:`SessionService`. Because a STDIO MCP
-server has a single runtime owned by the server lifespan, the active service is
-published here via :func:`set_session_service` (called from the lifespan) and
-read via :func:`get_session_service`. This keeps the public tool signatures
-exactly as specified while remaining straightforward to unit-test with a fake
-service.
+The handlers need configured services. Because a STDIO MCP server has a single
+runtime owned by the server lifespan, the active services are published here via
+``set_session_service`` / ``set_workbook_model_service`` (called from the
+lifespan) and read via ``get_session_service`` / ``get_workbook_model_service``.
+This keeps the public tool signatures exactly as specified while remaining
+straightforward to unit-test with fake services.
 """
 
 from __future__ import annotations
 
 from excel_vba_mcp.application.session_service import SessionService
+from excel_vba_mcp.application.workbook_model_service import WorkbookModelService
 from excel_vba_mcp.domain.errors import ExcelVbaMcpError
-from excel_vba_mcp.domain.models import SessionStatus, WorkbookInfo
+from excel_vba_mcp.domain.models import SessionStatus, WorkbookInfo, WorkbookModel
 from excel_vba_mcp.domain.statuses import SessionMode
 
 # The active session service, published by the server lifespan. ``None`` before
 # startup and after shutdown; the tools raise a clear error if used out of band
 # (e.g. in a unit test that has not installed a fake).
 _session_service: SessionService | None = None
+
+# The active workbook model service, published by the server lifespan. ``None``
+# before startup and after shutdown; ``workbook_get_model`` raises if unset.
+_workbook_model_service: WorkbookModelService | None = None
 
 
 def set_session_service(service: SessionService | None) -> None:
@@ -45,6 +50,24 @@ def get_session_service() -> SessionService:
             context={"tool": "workbook_tools"},
         )
     return _session_service
+
+
+def set_workbook_model_service(service: WorkbookModelService | None) -> None:
+    """Publish (or clear) the active workbook model service used by the tools."""
+
+    global _workbook_model_service
+    _workbook_model_service = service
+
+
+def get_workbook_model_service() -> WorkbookModelService:
+    """Return the active workbook model service or raise if it is not configured."""
+
+    if _workbook_model_service is None:
+        raise ExcelVbaMcpError(
+            "The workbook model service is not initialized.",
+            context={"tool": "workbook_tools"},
+        )
+    return _workbook_model_service
 
 
 def _require_non_empty(value: str, field: str) -> str:
@@ -136,6 +159,27 @@ async def excel_list_workbooks() -> list[WorkbookInfo]:
     return await service.list_workbooks()
 
 
+async def workbook_get_model(workbook_id: str, include_vba: bool = True) -> WorkbookModel:
+    """Return the aggregated Stage 1 workbook model for an open workbook.
+
+    The model aggregates sheets, tables, names, shapes, controls and — when
+    ``include_vba`` is true — the VBA project, each with a section status. It
+    never reads all-cells / Range data and never aborts because VBA is
+    unavailable (``vba_access`` reports the VBA state instead).
+
+    Args:
+        workbook_id: The id returned by :func:`excel_open`.
+        include_vba: When ``True`` (default) the VBA project is aggregated.
+
+    Returns:
+        A :class:`WorkbookModel` with a content ``model_hash``.
+    """
+
+    _require_non_empty(workbook_id, "workbook_id")
+    service = get_workbook_model_service()
+    return await service.get_workbook_model(workbook_id, include_vba=include_vba)
+
+
 __all__ = [
     "excel_close",
     "excel_get_status",
@@ -143,5 +187,8 @@ __all__ = [
     "excel_open",
     "excel_save",
     "get_session_service",
+    "get_workbook_model_service",
     "set_session_service",
+    "set_workbook_model_service",
+    "workbook_get_model",
 ]
