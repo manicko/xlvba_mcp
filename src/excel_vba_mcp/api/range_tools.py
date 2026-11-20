@@ -269,7 +269,11 @@ async def range_write_values(
         payload: The bounded 2-D value grid (:class:`RangeWriteRequest`).
     """
 
-    raise _not_implemented("range_write_values")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(sheet, "sheet")
+    _require_non_empty(address, "address")
+    service = get_ranges_service()
+    return await service.write_values(workbook_id, sheet, address, payload)
 
 
 async def range_write_formulas(
@@ -291,7 +295,11 @@ async def range_write_formulas(
         payload: The bounded 2-D formula grid (:class:`FormulaWriteRequest`).
     """
 
-    raise _not_implemented("range_write_formulas")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(sheet, "sheet")
+    _require_non_empty(address, "address")
+    service = get_ranges_service()
+    return await service.write_formulas(workbook_id, sheet, address, payload)
 
 
 async def range_set_format(

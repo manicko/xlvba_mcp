@@ -1,8 +1,11 @@
-"""STA-local Excel Range/Cells adapter (task_042, spec §14 Phase 2 — Range/Cells).
+"""STA-local Excel Range/Cells adapter (task_042 read, task_043 write, spec §14).
+
+Phase 2 — Range/Cells.
 
 :class:`RangesAdapter` is the single place where the Excel ``Worksheet.Range`` /
-``Range.Value2`` / ``Range.Formula2`` object model is touched for the read-only
-Phase-2 surface (``range_get``, ``range_read_values``, ``range_read_formulas``).
+``Range.Value2`` / ``Range.Formula2`` object model is touched for the Phase-2
+surface (``range_get``, ``range_read_values``, ``range_read_formulas``,
+``range_write_values``, ``range_write_formulas``).
 It is a **pure STA-local helper**: every method is synchronous, receives the live
 ``Workbook`` COM proxy (``Any``) and returns only Pydantic DTOs / primitives, so
 results cross the single-STA worker boundary safely
@@ -24,6 +27,18 @@ Read semantics (task_038 decision record, ``docs/research/ranges_cells_api.md``)
   ``Range.Formula`` is the fallback. ``_xlfn`` / ``_xlws`` / ``_xlpm`` prefixes
   are passed through verbatim and flagged in ``notes``.
 
+Write semantics (task_043):
+
+* ``write_values`` accepts a scalar or a 2-D block; the payload shape is
+  validated against the resolved target **before** any COM mutation.
+* ``write_formulas`` writes through ``Formula2`` (primary) with a ``Formula``
+  fallback on a build without dynamic arrays.
+* ListObject targets are allowed only for cell-level writes that do **not** change
+  the table's row/column structure; the adapter captures before/after
+  ``ListObject`` geometry and rejects a structural change with
+  :class:`~excel_vba_mcp.domain.errors.ListObjectIntersectionError`.
+* The adapter never evaluates a formula; strings are passed verbatim to Excel.
+
 Bounds (task_038 §3.2/§3.3): ``MAX_RANGE_CELLS`` / ``MAX_RESPONSE_CELLS`` are
 enforced **before** materializing a response; an oversized request is rejected
 and an oversized response is truncated (``truncated=True``). The whole
@@ -35,8 +50,11 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
-from excel_vba_mcp.adapters.excel.cell_values import classify_cell_value
-from excel_vba_mcp.domain.errors import InvalidRangeError
+from excel_vba_mcp.adapters.excel.cell_values import (
+    EXCEL_ERROR_CODE_TO_LITERAL,
+    classify_cell_value,
+)
+from excel_vba_mcp.domain.errors import InvalidRangeError, ListObjectIntersectionError
 from excel_vba_mcp.domain.models import (
     MAX_RANGE_CELLS,
     MAX_RESPONSE_CELLS,
@@ -44,6 +62,7 @@ from excel_vba_mcp.domain.models import (
     FormulaCell,
     RangeAddress,
     RangeFormulas,
+    RangeMutationResult,
     RangeValues,
 )
 from excel_vba_mcp.domain.statuses import CellValueKind, RangeShape
@@ -530,10 +549,397 @@ class RangesAdapter:
         range_obj = _resolve_range(worksheet, address, sheet_name=_safe_str(worksheet.Name))
         return worksheet, range_obj, _describe_range(range_obj, sheet=_safe_str(worksheet.Name))
 
+    # ------------------------------------------------------------------
+    # Values (write, typed, bounded)
+    # ------------------------------------------------------------------
+    def write_values(
+        self,
+        wb: Any,
+        sheet: str,
+        address: str,
+        rows: int,
+        cols: int,
+        values: list[list[CellValue]],
+    ) -> RangeMutationResult:
+        """Write typed cell values to a bounded Range and verify the result.
+
+        The payload shape (``rows`` x ``cols``) is validated against the resolved
+        target **before** any COM mutation; a wrong-sized payload raises a typed
+        :class:`~excel_vba_mcp.domain.errors.InvalidRangeError` and leaves the
+        workbook untouched. ``None`` clears a cell; ``datetime`` values are
+        converted to an Excel serial; Excel error literals are written as error
+        values; a string beginning with ``=`` is stored as text (never a formula).
+
+        When the target intersects a ListObject, the adapter captures the table
+        geometry before and after the write and rejects a structural change with
+        :class:`~excel_vba_mcp.domain.errors.ListObjectIntersectionError`.
+        """
+
+        worksheet, range_obj, resolved = self._open(wb, sheet, address)
+        _validate_payload_shape(resolved.rows, resolved.cols, rows, cols, len(values))
+        _validate_target_cells(resolved.rows * resolved.cols)
+
+        table_before = _capture_tables(worksheet, range_obj)
+        raw_grid = _values_to_raw_grid(values, rows, cols)
+        _assign_value2(range_obj, raw_grid, rows, cols)
+        _guard_table_structure(worksheet, range_obj, table_before)
+
+        post = self.read_values(wb, sheet, address)
+        verified = _values_match(values, post)
+        notes: list[str] = []
+        if not verified:
+            notes.append("Postcondition mismatch: the re-read values differ from the payload.")
+        return RangeMutationResult(
+            action="write_values",
+            range_before=resolved,
+            range_after=post.range,
+            verified=verified,
+            postcondition_values=post,
+            notes=notes,
+        )
+
+    # ------------------------------------------------------------------
+    # Formulas (write, 2-D normalized)
+    # ------------------------------------------------------------------
+    def write_formulas(
+        self,
+        wb: Any,
+        sheet: str,
+        address: str,
+        rows: int,
+        cols: int,
+        formulas: list[list[str]],
+    ) -> RangeMutationResult:
+        """Write formulas (``Formula2``) to a bounded Range and verify the result.
+
+        The payload shape (``rows`` x ``cols``) is validated against the resolved
+        target **before** any COM mutation; a wrong-sized payload raises a typed
+        :class:`~excel_vba_mcp.domain.errors.InvalidRangeError` and leaves the
+        workbook untouched. Every entry must be an actual formula string beginning
+        with ``=`` (a bare constant belongs in :meth:`write_values`). Formula
+        strings are passed verbatim to Excel (``_xlfn`` / ``_xlws`` / ``_xlpm``
+        prefixes are never stripped or rewritten); no formula is evaluated in
+        Python.
+
+        When the target intersects a ListObject, the adapter captures the table
+        geometry before and after the write and rejects a structural change with
+        :class:`~excel_vba_mcp.domain.errors.ListObjectIntersectionError`.
+        """
+
+        worksheet, range_obj, resolved = self._open(wb, sheet, address)
+        _validate_payload_shape(resolved.rows, resolved.cols, rows, cols, len(formulas))
+        _validate_target_cells(resolved.rows * resolved.cols)
+        _require_formula_strings(formulas)
+
+        table_before = _capture_tables(worksheet, range_obj)
+        raw_grid = _formulas_to_raw_grid(formulas, rows, cols)
+        _assign_formula2(range_obj, raw_grid, rows, cols)
+        _guard_table_structure(worksheet, range_obj, table_before)
+
+        post_formulas = self.read_formulas(wb, sheet, address)
+        post_values = self.read_values(wb, sheet, address)
+        verified = _formulas_match(formulas, post_formulas)
+        notes: list[str] = []
+        if not verified:
+            notes.append("Postcondition mismatch: the re-read formulas differ from the payload.")
+        return RangeMutationResult(
+            action="write_formulas",
+            range_before=resolved,
+            range_after=post_values.range,
+            verified=verified,
+            postcondition_values=post_values,
+            notes=notes,
+        )
+
 
 # ---------------------------------------------------------------------------
-# Window / bound helpers (no COM)
+# Write helpers (task_043)
 # ---------------------------------------------------------------------------
+def _validate_payload_shape(
+    target_rows: int, target_cols: int, rows: int, cols: int, width: int
+) -> None:
+    """Validate the write payload shape against the resolved target (no COM).
+
+    Rejects a wrong-sized payload, an empty grid or a ragged row **before** any
+    workbook mutation.
+    """
+
+    if width != rows:
+        raise InvalidRangeError(
+            f"Payload row count {width} does not match rows={rows}.",
+            context={"rows": rows, "payload_rows": width},
+        )
+    if rows != target_rows or cols != target_cols:
+        raise InvalidRangeError(
+            f"Payload shape {rows}x{cols} does not match the target {target_rows}x{target_cols}.",
+            context={
+                "target_rows": target_rows,
+                "target_cols": target_cols,
+                "payload_rows": rows,
+                "payload_cols": cols,
+            },
+        )
+
+
+def _validate_target_cells(cells: int) -> None:
+    """Reject a target larger than ``MAX_RANGE_CELLS`` before any mutation."""
+
+    if cells > MAX_RANGE_CELLS:
+        raise InvalidRangeError(
+            f"Target {cells} cells exceeds MAX_RANGE_CELLS ({MAX_RANGE_CELLS}).",
+            context={"cells": cells, "limit": MAX_RANGE_CELLS},
+        )
+
+
+def _values_to_raw_grid(
+    values: list[list[CellValue]], rows: int, cols: int
+) -> tuple[tuple[Any, ...], ...]:
+    """Convert a typed :class:`CellValue` grid into a raw Excel value grid."""
+
+    grid: list[tuple[Any, ...]] = []
+    for r in range(rows):
+        row_values: list[Any] = []
+        for c in range(cols):
+            row_values.append(_cell_to_raw(values[r][c]))
+        grid.append(tuple(row_values))
+    return tuple(grid)
+
+
+def _cell_to_raw(cell: CellValue) -> Any:
+    """Convert one typed :class:`CellValue` into the raw value Excel should store."""
+
+    if cell.kind is CellValueKind.EMPTY or cell.value is None:
+        return None
+    if cell.kind is CellValueKind.DATE:
+        text = str(cell.value)
+        try:
+            moment = datetime.fromisoformat(text)
+        except ValueError:
+            return text
+        return (moment - _EXCEL_EPOCH).total_seconds() / 86400.0
+    if cell.kind is CellValueKind.ERROR:
+        text = str(cell.value)
+        code = _ERROR_LITERAL_TO_CODE.get(text)
+        return code if code is not None else text
+    if cell.kind is CellValueKind.BOOLEAN:
+        return bool(cell.value)
+    if cell.kind is CellValueKind.NUMBER:
+        return cell.value
+    return cell.value
+
+
+#: Inverse of :data:`excel_vba_mcp.adapters.excel.cell_values.EXCEL_ERROR_CODE_TO_LITERAL`
+#: for writing an Excel error value back through ``Range.Value2`` (task_038 §7).
+_ERROR_LITERAL_TO_CODE: dict[str, int] = {
+    literal: code for code, literal in EXCEL_ERROR_CODE_TO_LITERAL.items()
+}
+
+
+def _formulas_to_raw_grid(
+    formulas: list[list[str]], rows: int, cols: int
+) -> tuple[tuple[Any, ...], ...]:
+    """Convert a formula-string grid into a raw Excel value grid (verbatim)."""
+
+    grid: list[tuple[Any, ...]] = []
+    for r in range(rows):
+        grid.append(tuple(formulas[r][c] for c in range(cols)))
+    return tuple(grid)
+
+
+def _require_formula_strings(formulas: list[list[str]]) -> None:
+    """Reject a formula payload that carries a non-formula / non-string entry."""
+
+    for r, row in enumerate(formulas):
+        for c, value in enumerate(row):
+            if not isinstance(value, str) or not value.startswith("="):
+                raise InvalidRangeError(
+                    "A formula write requires every entry to be a formula string "
+                    "beginning with '='; use write_values for constants.",
+                    context={"row": r, "col": c, "value": value},
+                )
+
+
+def _assign_value2(
+    range_obj: Any, raw_grid: tuple[tuple[Any, ...], ...], rows: int, cols: int
+) -> None:
+    """Assign a raw value grid to ``range_obj.Value2`` (single COM mutation)."""
+
+    payload: Any = raw_grid
+    if rows == 1 and cols == 1:
+        payload = raw_grid[0][0]
+    try:
+        range_obj.Value2 = payload
+    except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
+        raise InvalidRangeError(
+            "Excel rejected the value write.",
+            context={"rows": rows, "cols": cols, "error": str(exc)},
+        ) from exc
+
+
+def _assign_formula2(
+    range_obj: Any, raw_grid: tuple[tuple[Any, ...], ...], rows: int, cols: int
+) -> None:
+    """Assign a raw formula grid through ``Formula2`` (fallback ``Formula``)."""
+
+    payload: Any = raw_grid
+    if rows == 1 and cols == 1:
+        payload = raw_grid[0][0]
+    try:
+        range_obj.Formula2 = payload
+    except Exception:  # noqa: BLE001 - Formula2 unavailable -> fallback to Formula
+        try:
+            range_obj.Formula = payload
+        except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
+            raise InvalidRangeError(
+                "Excel rejected the formula write.",
+                context={"rows": rows, "cols": cols, "error": str(exc)},
+            ) from exc
+
+
+# ---------------------------------------------------------------------------
+# ListObject structure guard (task_043)
+# ---------------------------------------------------------------------------
+def _capture_tables(worksheet: Any, range_obj: Any) -> dict[str, str]:
+    """Capture the geometry of every ListObject intersecting ``range_obj``.
+
+    Returns a mapping ``table name -> range address`` for the tables whose
+    ``Range`` intersects the target; an empty mapping means the target is outside
+    every table.
+    """
+
+    captured: dict[str, str] = {}
+    try:
+        list_objects = worksheet.ListObjects
+        count = _safe_int(list_objects.Count)
+    except Exception:  # noqa: BLE001 - sheet without ListObjects
+        return captured
+    for index in range(1, count + 1):
+        try:
+            list_object = list_objects.Item(index)
+            table_range = list_object.Range
+        except Exception:  # noqa: BLE001 - defensive per-item COM read
+            continue
+        if not _ranges_intersect(range_obj, table_range):
+            continue
+        name = _safe_str(list_object.Name) or f"ListObject{index}"
+        captured[name] = _safe_str(table_range.Address)
+    return captured
+
+
+def _ranges_intersect(a: Any, b: Any) -> bool:
+    """Return whether two resolved single-area ranges intersect (best-effort)."""
+
+    try:
+        a_top = _safe_int(a.Top)
+        a_left = _safe_int(a.Left)
+        a_height = _safe_int(a.Height, default=1)
+        a_width = _safe_int(a.Width, default=1)
+        b_top = _safe_int(b.Top)
+        b_left = _safe_int(b.Left)
+        b_height = _safe_int(b.Height, default=1)
+        b_width = _safe_int(b.Width, default=1)
+    except Exception:  # noqa: BLE001 - defensive COM read
+        return False
+    a_bottom = a_top + a_height - 1
+    a_right = a_left + a_width - 1
+    b_bottom = b_top + b_height - 1
+    b_right = b_left + b_width - 1
+    return a_top <= b_bottom and b_top <= a_bottom and a_left <= b_right and b_left <= a_right
+
+
+def _guard_table_structure(worksheet: Any, range_obj: Any, table_before: dict[str, str]) -> None:
+    """Reject a write that changed an intersecting ListObject's row/column structure.
+
+    Cell-level writes inside a table are allowed; a change to the table geometry
+    (row count / column count / address) is a structural change owned by the
+    Tables service and is rejected with
+    :class:`~excel_vba_mcp.domain.errors.ListObjectIntersectionError`.
+    """
+
+    if not table_before:
+        return
+    table_after = _capture_tables(worksheet, range_obj)
+    for name, address_before in table_before.items():
+        address_after = table_after.get(name)
+        if address_after != address_before:
+            raise ListObjectIntersectionError(
+                "The write changed the structure of an Excel Table; "
+                "structural changes are owned by the table tools.",
+                context={
+                    "table": name,
+                    "table_range": address_before,
+                    "table_range_after": address_after,
+                },
+            )
+
+
+# ---------------------------------------------------------------------------
+# Postcondition verification (task_043)
+# ---------------------------------------------------------------------------
+def _values_match(expected: list[list[CellValue]], post: RangeValues) -> bool:
+    """Compare the written value payload against the re-read typed values."""
+
+    if post.rows != len(expected):
+        return False
+    for r, row in enumerate(expected):
+        if len(post.values[r]) != len(row):
+            return False
+        for c, cell in enumerate(row):
+            if not _cell_matches(cell, post.values[r][c]):
+                return False
+    return True
+
+
+def _cell_matches(expected: CellValue, actual: CellValue) -> bool:
+    """Return whether a re-read cell value matches the written payload cell."""
+
+    # A declared EMPTY and a re-read None both mean "no value"; a declared None
+    # value with any kind is likewise treated as an empty write.
+    if expected.kind is CellValueKind.EMPTY or expected.value is None:
+        return actual.kind is CellValueKind.EMPTY or actual.value is None
+    if actual.value is None:
+        return False
+    if expected.kind is CellValueKind.ERROR:
+        return actual.kind is CellValueKind.ERROR and actual.value == expected.value
+    if expected.kind is CellValueKind.DATE:
+        if actual.kind is not CellValueKind.DATE:
+            return False
+        return _dates_equal(str(expected.value), str(actual.value))
+    if expected.kind is CellValueKind.BOOLEAN:
+        return actual.kind is CellValueKind.BOOLEAN and bool(actual.value) == bool(expected.value)
+    if expected.kind is CellValueKind.NUMBER:
+        if actual.kind is not CellValueKind.NUMBER:
+            return False
+        try:
+            return float(actual.value) == float(expected.value)  # type: ignore[arg-type,unused-ignore]
+        except (TypeError, ValueError):
+            return False
+    return actual.kind is CellValueKind.STRING and actual.value == expected.value
+
+
+def _dates_equal(expected: str, actual: str) -> bool:
+    """Compare two ISO-8601 date strings by their date/time prefix (second precision)."""
+
+    return expected[:19] == actual[:19]
+
+
+def _formulas_match(expected: list[list[str]], post: RangeFormulas) -> bool:
+    """Compare the written formula payload against the re-read ``Formula2`` grid."""
+
+    if post.rows != len(expected):
+        return False
+    for r, row in enumerate(expected):
+        if len(post.formulas[r]) != len(row):
+            return False
+        for c, value in enumerate(row):
+            if post.formulas[r][c].formula2 != value:
+                return False
+    return True
+
+
+__all__ = ["RangesAdapter"]
+
+
 def _validate_window(offset: int, limit: int | None) -> None:
     """Reject an invalid ``offset`` / ``limit`` before any COM access."""
 

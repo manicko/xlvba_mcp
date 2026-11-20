@@ -65,6 +65,8 @@ from excel_vba_mcp.api.range_tools import (
     range_get,
     range_read_formulas,
     range_read_values,
+    range_write_formulas,
+    range_write_values,
 )
 from excel_vba_mcp.api.shape_tools import (
     shape_get,
@@ -354,6 +356,22 @@ _DESC_RANGE_READ_FORMULAS = (
     "fallback). _xlfn/_xlws/_xlpm prefixes are returned verbatim and flagged. "
     "offset is a 0-based row index and limit caps the rows; oversized requests "
     "are rejected."
+)
+_DESC_RANGE_WRITE_VALUES = (
+    "Write typed cell values to a bounded Range. The payload shape is validated "
+    "against the target before any mutation (a wrong-sized payload is rejected "
+    "with no change). A string beginning with '=' is stored as text, not a "
+    "formula. Guarded mutation: requires a writable working copy, a successful "
+    "snapshot, an approval grant and a postcondition re-read. Cell writes inside "
+    "an Excel Table are allowed only when the table row/column structure is "
+    "unchanged."
+)
+_DESC_RANGE_WRITE_FORMULAS = (
+    "Write formulas (Formula2 primary, Formula fallback) to a bounded Range. "
+    "Every entry must be a formula string beginning with '='; a bare constant "
+    "belongs in range_write_values. Guarded mutation: writable session + "
+    "snapshot + approval + postcondition re-read. Cell writes inside an Excel "
+    "Table are allowed only when the table row/column structure is unchanged."
 )
 _DESC_NAMES_LIST = (
     "List every defined name (Named Range) of an open workbook across workbook "
@@ -788,6 +806,14 @@ def _register_tools(server: MCPServer) -> None:
     )
     server.add_tool(
         range_read_formulas, name="range_read_formulas", description=_DESC_RANGE_READ_FORMULAS
+    )
+    server.add_tool(
+        range_write_values, name="range_write_values", description=_DESC_RANGE_WRITE_VALUES
+    )
+    server.add_tool(
+        range_write_formulas,
+        name="range_write_formulas",
+        description=_DESC_RANGE_WRITE_FORMULAS,
     )
     server.add_tool(names_list, name="names_list", description=_DESC_NAMES_LIST)
     server.add_tool(name_get, name="name_get", description=_DESC_NAME_GET)
