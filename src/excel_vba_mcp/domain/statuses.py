@@ -220,6 +220,48 @@ class ControlKind(StrEnum):
     SHAPE = "shape"
 
 
+class ShapeKind(StrEnum):
+    """Drawing-layer object kind derived from ``Shape.Type`` (spec §7.6).
+
+    The Excel ``MsoShapeType`` enumeration is mapped to this closed vocabulary.
+    ``FormControl`` and ``OLEControlObject`` classify as their dedicated kinds so
+    callers can tell a Form Control / ActiveX object from a plain drawing shape;
+    every other drawing type (AutoShape, TextBox, Group, Picture, …) is ``SHAPE``.
+    """
+
+    AUTOSHAPE = "autoshape"
+    TEXT_BOX = "text_box"
+    GROUP = "group"
+    PICTURE = "picture"
+    LINE = "line"
+    FREEFORM = "freeform"
+    PLACEHOLDER = "placeholder"
+    CHART = "chart"
+    FORM_CONTROL = "form_control"
+    ACTIVEX = "activex"
+    SHAPE = "shape"
+    UNKNOWN = "unknown"
+
+
+class ControlFormType(StrEnum):
+    """Form Control subtype derived from ``FormControl.Type`` (spec §7.6).
+
+    Values mirror the Excel ``xlFormControl`` range used by this server
+    (``0..8``); anything else is ``UNKNOWN``.
+    """
+
+    BUTTON = "button"
+    CHECKBOX = "checkbox"
+    OPTION_BUTTON = "option_button"
+    SPIN_BUTTON = "spin_button"
+    LIST_BOX = "list_box"
+    GROUP_BOX = "group_box"
+    SCROLL_BAR = "scroll_bar"
+    EDIT_BOX = "edit_box"
+    COMBO_BOX = "combo_box"
+    UNKNOWN = "unknown"
+
+
 class MacroMappingStatus(StrEnum):
     """Whether a control OnAction maps to a resolved VBA procedure (spec §7.4)."""
 

@@ -22,6 +22,7 @@ from excel_vba_mcp.domain.statuses import (
     CellValueKind,
     CompileMethod,
     CompileStatus,
+    ControlFormType,
     ControlKind,
     DiagnosticConfidence,
     MacroMappingStatus,
@@ -32,6 +33,7 @@ from excel_vba_mcp.domain.statuses import (
     ProcedureVisibility,
     ReferenceStatus,
     SessionMode,
+    ShapeKind,
     SheetObjectType,
     SheetVisibility,
     SnapshotStatus,
@@ -409,6 +411,88 @@ class ControlInfo(DomainModel):
     on_action: str | None = None
     macro_mapping: MacroMappingStatus = MacroMappingStatus.UNKNOWN
     sheet_name: str | None = None
+
+
+class ShapeInfo(DomainModel):
+    """A drawing-layer shape entry (spec §7.6 Shapes inventory).
+
+    One entry per ``Worksheet.Shapes`` item. ``kind`` is derived from
+    ``Shape.Type`` (``msoShapeType``); ``on_action`` is the shape's ``OnAction``
+    text read verbatim — **the assigned macro is never executed**. Coordinates
+    and size are Excel points; ``top``/``left``/``width``/``height`` are ``None``
+    when the property is unavailable. ``text`` is a best-effort rendering of the
+    shape's text frame (never ``None`` when a text frame exists but is empty:
+    an empty string is meaningful). ``control_format`` is ``True`` only when the
+    shape exposes an Excel ``ControlFormat`` object (Form Controls); ActiveX /
+    plain shapes report ``None``.
+    """
+
+    name: str
+    kind: ShapeKind
+    shape_id: str | int | None = None
+    sheet_name: str | None = None
+    on_action: str | None = None
+    visible: bool | None = None
+    top: float | None = None
+    left: float | None = None
+    width: float | None = None
+    height: float | None = None
+    text: str | None = None
+    alternative_text: str | None = None
+    control_format: bool | None = Field(
+        default=None,
+        description="True when the shape exposes an Excel ControlFormat (Form Control).",
+    )
+    notes: list[str] = Field(
+        default_factory=list,
+        description="Diagnostics for properties that could not be read.",
+    )
+
+
+class ControlEntry(DomainModel):
+    """A Form Control or ActiveX control entry (spec §7.6 Controls inventory).
+
+    Form Controls and ActiveX controls live in different Excel collections and
+    expose different metadata, so this DTO carries both shapes of information:
+
+    * Form Controls (``ws.Shapes`` of type ``msoFormControl``) report
+      ``control_type`` (button / checkbox / …), ``caption``, ``linked_cell`` and
+      their ``on_action`` (the assigned macro, read verbatim, never executed).
+    * ActiveX controls (``ws.OLEObjects``) report ``prog_id`` plus an **inferred,
+      probable** event-procedure association. ``probable_procedure`` is a
+      best-effort ``<sheet_code_name>_<control_name>_<event>`` guess (Excel's
+      default document-module event handler naming); it is **not** a confirmed
+      mapping and must never be reported as one. ``macro_mapping`` is
+      ``PROBABLE`` for such an inferred association and ``UNKNOWN`` when no
+      candidate can be formed.
+    """
+
+    name: str
+    kind: ControlKind
+    sheet_name: str | None = None
+    shape_id: str | int | None = None
+    prog_id: str | None = None
+    control_type: ControlFormType | None = Field(
+        default=None, description="Form Control subtype (button/checkbox/...)."
+    )
+    caption: str | None = None
+    text: str | None = None
+    linked_cell: str | None = None
+    on_action: str | None = None
+    visible: bool | None = None
+    top: float | None = None
+    left: float | None = None
+    width: float | None = None
+    height: float | None = None
+    macro_mapping: MacroMappingStatus = MacroMappingStatus.UNKNOWN
+    probable_procedure: str | None = Field(
+        default=None,
+        description="Inferred ActiveX event procedure (probable, not confirmed).",
+    )
+    notes: list[str] = Field(
+        default_factory=list,
+        description="Diagnostics for properties that could not be read.",
+    )
 
 
 class WorkbookModel(TimestampedModel):
