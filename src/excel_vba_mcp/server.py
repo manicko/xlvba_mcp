@@ -35,6 +35,7 @@ from excel_vba_mcp.api import (
     compile_tools,
     macro_tools,
     sheet_tools,
+    table_tools,
     test_tools,
     vba_tools,
     workbook_tools,
@@ -49,6 +50,19 @@ from excel_vba_mcp.api.sheet_tools import (
     sheet_rename,
     sheet_set_visibility,
     sheets_list,
+)
+from excel_vba_mcp.api.table_tools import (
+    table_add_column,
+    table_append_rows,
+    table_create,
+    table_delete_column,
+    table_delete_rows,
+    table_get,
+    table_insert_row,
+    table_read_rows,
+    table_resize,
+    table_update_rows,
+    tables_list,
 )
 from excel_vba_mcp.api.test_tools import (
     snapshot_create,
@@ -79,6 +93,7 @@ from excel_vba_mcp.application.macro_service import BackgroundSafetyRegistry, Ma
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.sheets_service import SheetsService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
+from excel_vba_mcp.application.tables_service import TablesService
 from excel_vba_mcp.application.vba_project_service import VBAProjectService
 from excel_vba_mcp.security.approval import ApprovalPolicy
 from excel_vba_mcp.security.audit import AuditLogger
@@ -208,6 +223,54 @@ _DESC_SHEET_SET_VISIBILITY = (
     "requires a writable session, a snapshot and an approval grant; hiding the "
     "last visible worksheet is rejected."
 )
+_DESC_TABLES_LIST = (
+    "List every Excel Table (ListObject) of an open workbook with name, sheet, "
+    "range address, HeaderRowRange, DataBodyRange, TotalRowRange, ShowTotals, "
+    "TableStyle, row count and columns."
+)
+_DESC_TABLE_GET = (
+    "Return one Excel Table's TableInfo by name/display name (range, header/body/"
+    "total ranges, totals, style, rows, columns)."
+)
+_DESC_TABLE_READ_ROWS = (
+    "Read a typed, bounded slice of a table's data rows. offset is a 0-based row "
+    "index; limit caps the rows. Values are typed (str/int/float/bool/null/ISO "
+    "date/Excel error) and the response is size-limited (truncated flag)."
+)
+_DESC_TABLE_APPEND_ROWS = (
+    "Append rows through ListRows.Add (table structure preserved). Guarded "
+    "mutation: requires a writable session, a snapshot and an approval grant."
+)
+_DESC_TABLE_INSERT_ROW = (
+    "Insert one data row at a 1-based position via ListRows.Add. Guarded mutation: "
+    "requires a writable session, a snapshot and an approval grant."
+)
+_DESC_TABLE_UPDATE_ROWS = (
+    "Update rows by explicit index or an unambiguous where filter. Ambiguous "
+    "filters are rejected with a preview (no auto-guess). Guarded mutation: "
+    "writable session + snapshot + approval."
+)
+_DESC_TABLE_DELETE_ROWS = (
+    "Delete rows by explicit indices or an unambiguous where filter. Ambiguous "
+    "filters are rejected with a preview. Guarded mutation: writable session + "
+    "snapshot + approval."
+)
+_DESC_TABLE_ADD_COLUMN = (
+    "Add a column via ListColumns.Add(Position) with a unique header. Guarded "
+    "mutation: writable session + snapshot + approval."
+)
+_DESC_TABLE_DELETE_COLUMN = (
+    "Delete the column identified by a unique header. Guarded mutation: writable "
+    "session + snapshot + approval."
+)
+_DESC_TABLE_CREATE = (
+    "Create a ListObject on a sheet over an A1 range or defined name. Guarded "
+    "mutation: writable session + snapshot + approval."
+)
+_DESC_TABLE_RESIZE = (
+    "Resize a table to a new A1 range via ListObject.Resize. Guarded mutation: "
+    "writable session + snapshot + approval."
+)
 
 
 @dataclasses.dataclass
@@ -220,6 +283,7 @@ class _Runtime:
     snapshot: SnapshotService
     vba: VBAProjectService
     sheets: SheetsService
+    tables: TablesService
     compile: CompileService
     macro: MacroService
     path_policy: PathPolicy
@@ -281,6 +345,7 @@ def _build_runtime() -> _Runtime:
         approval=approval,
     )
     sheets = SheetsService(worker, session, snapshot, approval, path_policy, audit)
+    tables = TablesService(worker, session, snapshot, approval, path_policy, audit)
     compile_service = CompileService(worker, session, vba, path_policy, audit)
     # background_safe starts empty (deny-by-default, BG06): no procedure is
     # eligible for background execution until it is explicitly classified for the
@@ -293,6 +358,7 @@ def _build_runtime() -> _Runtime:
         snapshot=snapshot,
         vba=vba,
         sheets=sheets,
+        tables=tables,
         compile=compile_service,
         macro=macro_service,
         path_policy=path_policy,
@@ -336,6 +402,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         test_tools.set_snapshot_service(runtime.snapshot)
         vba_tools.set_vba_project_service(runtime.vba)
         sheet_tools.set_sheets_service(runtime.sheets)
+        table_tools.set_tables_service(runtime.tables)
         compile_tools.set_compile_service(runtime.compile)
         macro_tools.set_macro_service(runtime.macro)
     try:
@@ -345,6 +412,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         test_tools.set_snapshot_service(None)
         vba_tools.set_vba_project_service(None)
         sheet_tools.set_sheets_service(None)
+        table_tools.set_tables_service(None)
         compile_tools.set_compile_service(None)
         macro_tools.set_macro_service(None)
         await _safe_shutdown(runtime.worker)
@@ -433,6 +501,41 @@ def _register_tools(server: MCPServer) -> None:
         name="sheet_set_visibility",
         description=_DESC_SHEET_SET_VISIBILITY,
     )
+    server.add_tool(tables_list, name="tables_list", description=_DESC_TABLES_LIST)
+    server.add_tool(table_get, name="table_get", description=_DESC_TABLE_GET)
+    server.add_tool(table_read_rows, name="table_read_rows", description=_DESC_TABLE_READ_ROWS)
+    server.add_tool(
+        table_append_rows,
+        name="table_append_rows",
+        description=_DESC_TABLE_APPEND_ROWS,
+    )
+    server.add_tool(
+        table_insert_row,
+        name="table_insert_row",
+        description=_DESC_TABLE_INSERT_ROW,
+    )
+    server.add_tool(
+        table_update_rows,
+        name="table_update_rows",
+        description=_DESC_TABLE_UPDATE_ROWS,
+    )
+    server.add_tool(
+        table_delete_rows,
+        name="table_delete_rows",
+        description=_DESC_TABLE_DELETE_ROWS,
+    )
+    server.add_tool(
+        table_add_column,
+        name="table_add_column",
+        description=_DESC_TABLE_ADD_COLUMN,
+    )
+    server.add_tool(
+        table_delete_column,
+        name="table_delete_column",
+        description=_DESC_TABLE_DELETE_COLUMN,
+    )
+    server.add_tool(table_create, name="table_create", description=_DESC_TABLE_CREATE)
+    server.add_tool(table_resize, name="table_resize", description=_DESC_TABLE_RESIZE)
 
 
 _configure_logging()
