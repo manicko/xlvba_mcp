@@ -65,12 +65,16 @@ from excel_vba_mcp.api.range_tools import (
     range_copy,
     range_delete,
     range_get,
+    range_get_conditional_formatting,
     range_get_format,
+    range_get_validation,
     range_insert,
     range_merge,
     range_read_formulas,
     range_read_values,
+    range_set_conditional_formatting,
     range_set_format,
+    range_set_validation,
     range_unmerge,
     range_write_formulas,
     range_write_values,
@@ -429,6 +433,36 @@ _DESC_RANGE_UNMERGE = (
     "merged area intersects the target, for a protected sheet, or for an Excel "
     "Table (ListObject) intersection. Guarded mutation: writable session + "
     "snapshot + approval + postcondition re-read."
+)
+_DESC_RANGE_GET_VALIDATION = (
+    "Read the data-validation rule of a Range (type, Formula1/Formula2, operator, "
+    "ignore_blank, in_cell_dropdown, alert_style and the message/title strings). "
+    "A target without a rule returns present=false; a non-uniform target is "
+    "reported with non_uniform_validation / mixed_validation in unsupported "
+    "instead of being flattened. Read-only."
+)
+_DESC_RANGE_SET_VALIDATION = (
+    "Add or modify the data-validation rule of a Range (list, whole number, "
+    "decimal, date, time, text length, custom). Formula1/Formula2 are opaque "
+    "strings bounded at 255 characters and are never evaluated; a missing operand, "
+    "an over-long formula or an unsupported type is rejected before any mutation. "
+    "An existing rule is modified so unspecified properties are preserved. Guarded "
+    "mutation: writable session + snapshot + approval + postcondition re-read."
+)
+_DESC_RANGE_GET_CONDITIONAL_FORMATTING = (
+    "Read the conditional-formatting rules applying to a Range in ascending "
+    "priority order (type, operator, Formula1/Formula2, stop_if_true, applies_to "
+    "plus a bounded fill/font subset). ColorScale / DataBar / IconSet rules are "
+    "reported with supported=false and an explicit unsupported_reason rather than "
+    "omitted. Read-only."
+)
+_DESC_RANGE_SET_CONDITIONAL_FORMATTING = (
+    "Add, modify or delete one supported conditional-format rule (mode: add, "
+    "modify, delete). spec.priority is the only stable rule identity and is "
+    "required for modify/delete; a rule type is never silently converted. "
+    "Priorities are sheet-wide: assigning one renumbers the other rules. "
+    "ColorScale / DataBar / IconSet are rejected explicitly. Guarded mutation: "
+    "writable session + snapshot + approval + postcondition re-read."
 )
 _DESC_NAMES_LIST = (
     "List every defined name (Named Range) of an open workbook across workbook "
@@ -879,6 +913,26 @@ def _register_tools(server: MCPServer) -> None:
     server.add_tool(range_delete, name="range_delete", description=_DESC_RANGE_DELETE)
     server.add_tool(range_merge, name="range_merge", description=_DESC_RANGE_MERGE)
     server.add_tool(range_unmerge, name="range_unmerge", description=_DESC_RANGE_UNMERGE)
+    server.add_tool(
+        range_get_validation,
+        name="range_get_validation",
+        description=_DESC_RANGE_GET_VALIDATION,
+    )
+    server.add_tool(
+        range_set_validation,
+        name="range_set_validation",
+        description=_DESC_RANGE_SET_VALIDATION,
+    )
+    server.add_tool(
+        range_get_conditional_formatting,
+        name="range_get_conditional_formatting",
+        description=_DESC_RANGE_GET_CONDITIONAL_FORMATTING,
+    )
+    server.add_tool(
+        range_set_conditional_formatting,
+        name="range_set_conditional_formatting",
+        description=_DESC_RANGE_SET_CONDITIONAL_FORMATTING,
+    )
     server.add_tool(names_list, name="names_list", description=_DESC_NAMES_LIST)
     server.add_tool(name_get, name="name_get", description=_DESC_NAME_GET)
     server.add_tool(name_create, name="name_create", description=_DESC_NAME_CREATE)

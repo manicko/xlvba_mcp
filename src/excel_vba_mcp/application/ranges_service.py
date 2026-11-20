@@ -1,11 +1,13 @@
 """Excel Range/Cells service (task_042 read, task_043 write, task_044 format,
-task_045 structural).
+task_045 structural, task_046 validation + conditional formatting).
 
 :class:`RangesService` is the async application-layer orchestration for the
 Range/Cells surface (``range_get``, ``range_read_values``,
 ``range_read_formulas``, ``range_write_values``, ``range_write_formulas``,
 ``range_get_format``, ``range_set_format``, ``range_copy``, ``range_insert``,
-``range_delete``, ``range_merge``, ``range_unmerge``). It is
+``range_delete``, ``range_merge``, ``range_unmerge``, ``range_get_validation``,
+``range_set_validation``, ``range_get_conditional_formatting``,
+``range_set_conditional_formatting``). It is
 deliberately **COM-free**: every method resolves the ``workbook_id`` through the
 session bookkeeping, enforces the non-COM guard chain and then submits a single
 STA-local callable to the dedicated single-STA
@@ -39,11 +41,19 @@ from typing import Any, TypeVar, cast
 
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
-from excel_vba_mcp.adapters.excel.ranges_adapter import RangesAdapter, validate_format_patch
+from excel_vba_mcp.adapters.excel.ranges_adapter import (
+    RangesAdapter,
+    validate_conditional_format_spec,
+    validate_format_patch,
+    validate_validation_spec,
+)
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
 from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
+    ConditionalFormatMutationResult,
+    ConditionalFormatRule,
+    ConditionalFormatSpec,
     FormatInfo,
     FormatMutationResult,
     FormulaWriteRequest,
@@ -54,6 +64,8 @@ from excel_vba_mcp.domain.models import (
     RangeValues,
     RangeWriteRequest,
     StructuralMutationResult,
+    ValidationRule,
+    ValidationSpec,
     WorkbookInfo,
 )
 from excel_vba_mcp.domain.statuses import OperationClass
@@ -68,6 +80,8 @@ _DEFAULT_TIMEOUT_S = 60.0
 _ACTION_WRITE_VALUES = "range_write_values"
 _ACTION_WRITE_FORMULAS = "range_write_formulas"
 _ACTION_SET_FORMAT = "range_set_format"
+_ACTION_SET_VALIDATION = "range_set_validation"
+_ACTION_SET_CONDITIONAL_FORMATTING = "range_set_conditional_formatting"
 _ACTION_COPY = "range_copy"
 _ACTION_INSERT = "range_insert"
 _ACTION_DELETE = "range_delete"
@@ -374,6 +388,177 @@ class RangesService:
                 "sheet": result.range.sheet,
                 "address": result.range.address,
                 "applied": result.applied,
+                "verified": result.verified,
+            },
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Public API — validation + conditional formatting (task_046)
+    # ------------------------------------------------------------------
+    async def get_validation(self, workbook_id: str, sheet: str, address: str) -> ValidationRule:
+        """Read the data-validation rule of a Range (read-only; audited).
+
+        A target without a rule returns ``present=false``. A non-uniform target is
+        reported with the representative rule plus ``non_uniform_validation`` /
+        ``mixed_validation`` in ``unsupported`` instead of being flattened.
+        """
+
+        record = self._resolve_record(workbook_id)
+        result = await self._submit_read(
+            workbook_id,
+            "range_get_validation",
+            lambda wb: self._adapter.get_validation(wb, sheet, address),
+            record,
+        )
+        self._record_audit(
+            "range_get_validation",
+            "read_only",
+            record,
+            {"workbook_id": workbook_id, "sheet": sheet, "address": address},
+            {
+                "present": result.present,
+                "type": result.type.value,
+                "apply_to": result.apply_to,
+                "unsupported": result.unsupported,
+            },
+        )
+        return result
+
+    async def set_validation(
+        self, workbook_id: str, sheet: str, address: str, spec: ValidationSpec
+    ) -> ValidationRule:
+        """Add or modify a Range's data-validation rule (guarded; audited).
+
+        The rule is validated **before** the guard chain so malformed input fails
+        with ``INVALID_RANGE`` regardless of the session state. The adapter then
+        runs the writable -> snapshot -> approval chain, applies the rule and
+        re-reads the target as a postcondition.
+        """
+
+        # Validate the rule first (pure, pre-COM) so malformed input is rejected
+        # before the guard chain and before the STA worker touches Excel.
+        validate_validation_spec(spec)
+
+        record = self._require_writable(workbook_id)
+        self._require_snapshot(workbook_id)
+        self._require_approval(record, _ACTION_SET_VALIDATION)
+
+        def apply_fn(wb: Any) -> ValidationRule:
+            return self._adapter.set_validation(wb, sheet, address, spec)
+
+        result = await self._submit_mutation(workbook_id, "range_set_validation", apply_fn, record)
+        self._record_audit(
+            "range_set_validation",
+            "mutating",
+            record,
+            {
+                "workbook_id": workbook_id,
+                "sheet": sheet,
+                "address": address,
+                "type": spec.type.value,
+                "operator": spec.operator.value if spec.operator is not None else None,
+                "formula1": spec.formula1,
+                "formula2": spec.formula2,
+            },
+            {
+                "present": result.present,
+                "type": result.type.value,
+                "operator": result.operator.value if result.operator is not None else None,
+                "formula1": result.formula1,
+                "formula2": result.formula2,
+                "verified": result.present and "postcondition_mismatch" not in result.unsupported,
+            },
+        )
+        return result
+
+    async def get_conditional_formatting(
+        self, workbook_id: str, sheet: str, address: str
+    ) -> list[ConditionalFormatRule]:
+        """Read the conditional-formatting rules of a Range (read-only; audited).
+
+        Rules are returned in ascending priority order; ``xlColorScale`` /
+        ``xlDataBar`` / ``xlIconSet`` are reported with ``supported=false`` and an
+        explicit ``unsupported_reason`` instead of being dropped.
+        """
+
+        record = self._resolve_record(workbook_id)
+        result = await self._submit_read(
+            workbook_id,
+            "range_get_conditional_formatting",
+            lambda wb: self._adapter.get_conditional_formatting(wb, sheet, address),
+            record,
+        )
+        self._record_audit(
+            "range_get_conditional_formatting",
+            "read_only",
+            record,
+            {"workbook_id": workbook_id, "sheet": sheet, "address": address},
+            {
+                "rules": [
+                    {
+                        "priority": rule.priority,
+                        "type": rule.type.value,
+                        "supported": rule.supported,
+                    }
+                    for rule in result
+                ],
+            },
+        )
+        return result
+
+    async def set_conditional_formatting(
+        self,
+        workbook_id: str,
+        sheet: str,
+        address: str,
+        spec: ConditionalFormatSpec,
+        mode: str = "add",
+    ) -> ConditionalFormatMutationResult:
+        """Add, modify or delete one conditional-format rule (guarded; audited).
+
+        The specification and ``mode`` are validated before the guard chain; the
+        adapter applies the operation and re-reads the collection. The result
+        carries the post-mutation rules, the applied priority (sheet-wide), the
+        unsupported rule types still present in the target and the ``verified``
+        postcondition flag.
+        """
+
+        # Validate the spec and mode first (pure, pre-COM).
+        validate_conditional_format_spec(spec, mode)
+
+        record = self._require_writable(workbook_id)
+        self._require_snapshot(workbook_id)
+        self._require_approval(record, _ACTION_SET_CONDITIONAL_FORMATTING)
+
+        def apply_fn(wb: Any) -> ConditionalFormatMutationResult:
+            return self._adapter.set_conditional_formatting(wb, sheet, address, spec, mode)
+
+        result = await self._submit_mutation(
+            workbook_id, "range_set_conditional_formatting", apply_fn, record
+        )
+        self._record_audit(
+            "range_set_conditional_formatting",
+            "mutating",
+            record,
+            {
+                "workbook_id": workbook_id,
+                "sheet": sheet,
+                "address": address,
+                "mode": mode,
+                "type": spec.type.value,
+                "priority": spec.priority,
+                "operator": spec.operator.value if spec.operator is not None else None,
+                "formula1": spec.formula1,
+            },
+            {
+                "action": result.action,
+                "address": result.range.address,
+                "rules": [
+                    {"priority": rule.priority, "type": rule.type.value} for rule in result.rules
+                ],
+                "applied_priorities": result.applied_priorities,
+                "unsupported": result.unsupported,
                 "verified": result.verified,
             },
         )

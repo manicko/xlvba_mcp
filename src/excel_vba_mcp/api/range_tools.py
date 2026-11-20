@@ -1,11 +1,12 @@
-"""Range & Cells MCP tool contracts (task_040 schema group).
+"""Range & Cells MCP tool contracts (task_040 schema group) and handlers.
 
 This module defines the **signatures, Pydantic DTOs and docstrings** for the
-Phase 2 Range/Cells surface. It is a frozen contract only (task_040): the bodies
-raise :class:`NotImplementedError` and are implemented by later tasks
-(``task_042``–``task_046``). This module deliberately imports **no Excel/COM**
-(``pythoncom`` / ``win32com``) — it only imports domain DTOs. All Excel access
-happens on the single-STA worker inside the ranges service/adapter.
+Phase 2 Range/Cells surface and implements every tool as a thin async handler
+(``task_042``–``task_046``): validate the arguments, delegate to
+:class:`~excel_vba_mcp.application.ranges_service.RangesService` and return a
+domain DTO. This module deliberately imports **no Excel/COM** (``pythoncom`` /
+``win32com``) — it only imports domain DTOs. All Excel access happens on the
+single-STA worker inside the ranges service/adapter.
 
 Tool groups:
 
@@ -20,15 +21,6 @@ Tool groups:
 Structural operations that intersect an Excel Table (ListObject) are rejected
 with :class:`~excel_vba_mcp.domain.errors.ListObjectIntersectionError` and routed
 to the table tools; the Range API never changes table row/column structure.
-
-The read-only tools (``range_get``, ``range_read_values``,
-``range_read_formulas``, task_042), the write/format tools (``range_write_values``,
-``range_write_formulas``, ``range_set_format``; task_043/task_044) and the
-structural tools (``range_copy``, ``range_insert``, ``range_delete``,
-``range_merge``, ``range_unmerge``; task_045) are implemented here as thin async
-handlers that validate their arguments, delegate to
-:class:`~excel_vba_mcp.application.ranges_service.RangesService` and return a
-domain DTO. The remaining stubs are implemented by ``task_046``.
 """
 
 from __future__ import annotations
@@ -53,20 +45,8 @@ from excel_vba_mcp.domain.models import (
     ValidationSpec,
 )
 
-_NOT_IMPLEMENTED = (
-    "Range/Cells tool {name} is a frozen contract (task_040) and is implemented "
-    "in a later task; it performs no Excel/COM access here."
-)
-
-
-def _not_implemented(name: str) -> NotImplementedError:
-    """Return the canonical not-yet-implemented error for a contract stub."""
-
-    return NotImplementedError(_NOT_IMPLEMENTED.format(name=name))
-
-
 # ---------------------------------------------------------------------------
-# Active service wiring (read tools; published by the server lifespan)
+# Active service wiring (published by the server lifespan)
 # ---------------------------------------------------------------------------
 _ranges_service: RangesService | None = None
 
@@ -273,13 +253,23 @@ async def range_get_format(workbook_id: str, sheet: str, address: str) -> Format
 async def range_get_validation(workbook_id: str, sheet: str, address: str) -> ValidationRule:
     """Read the data-validation rule of a Range (``present=false`` when none).
 
+    A non-uniform target is not flattened to one cell's rule: the representative
+    rule is returned with ``non_uniform_validation`` / ``mixed_validation`` in
+    ``unsupported``.
+
     Args:
         workbook_id: The id returned by ``excel_open``.
         sheet: The worksheet name.
         address: An A1-style address for the target block.
+
+    Read-only; no snapshot/approval.
     """
 
-    raise _not_implemented("range_get_validation")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(sheet, "sheet")
+    _require_non_empty(address, "address")
+    service = get_ranges_service()
+    return await service.get_validation(workbook_id, sheet, address)
 
 
 async def range_get_conditional_formatting(
@@ -289,15 +279,21 @@ async def range_get_conditional_formatting(
 
     Supported plain ``FormatCondition`` rules are returned with priority and
     ``stop_if_true``; ``ColorScale`` / ``DataBar`` / ``IconSet`` are flagged
-    ``supported=false`` rather than omitted.
+    ``supported=false`` with an explicit ``unsupported_reason`` rather than omitted.
 
     Args:
         workbook_id: The id returned by ``excel_open``.
         sheet: The worksheet name.
         address: An A1-style address for the target block.
+
+    Read-only; no snapshot/approval.
     """
 
-    raise _not_implemented("range_get_conditional_formatting")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(sheet, "sheet")
+    _require_non_empty(address, "address")
+    service = get_ranges_service()
+    return await service.get_conditional_formatting(workbook_id, sheet, address)
 
 
 # ---------------------------------------------------------------------------
@@ -547,9 +543,15 @@ async def range_set_validation(
         sheet: The worksheet name.
         address: The A1-style target address.
         spec: The validation rule payload (:class:`ValidationSpec`).
+
+    Guarded mutation: writable session + snapshot + approval + postcondition re-read.
     """
 
-    raise _not_implemented("range_set_validation")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(sheet, "sheet")
+    _require_non_empty(address, "address")
+    service = get_ranges_service()
+    return await service.set_validation(workbook_id, sheet, address, spec)
 
 
 async def range_set_conditional_formatting(
@@ -562,9 +564,12 @@ async def range_set_conditional_formatting(
 ) -> ConditionalFormatMutationResult:
     """Add / modify / delete a supported conditional-formatting rule.
 
-    ``mode`` is ``"add"``, ``"modify"`` or ``"delete"``; priority ordering is
-    preserved. Unsupported rule types are rejected explicitly. Guarded mutation:
-    writable session + snapshot + approval + postcondition re-read.
+    ``mode`` is ``"add"``, ``"modify"`` or ``"delete"``; ``spec.priority`` is the
+    only stable rule identity and is required for ``modify`` / ``delete``. Rule
+    order is preserved and priorities are sheet-wide: assigning a priority
+    renumbers the other rules (reported through ``applied_priorities`` / ``notes``).
+    Unsupported rule types (``xlColorScale`` / ``xlDataBar`` / ``xlIconSet``) are
+    rejected explicitly; a rule type is never silently converted.
 
     Args:
         workbook_id: The id returned by ``excel_open``.
@@ -572,9 +577,15 @@ async def range_set_conditional_formatting(
         address: The A1-style target address.
         spec: The conditional-formatting rule payload.
         mode: One of ``"add"``, ``"modify"``, ``"delete"``.
+
+    Guarded mutation: writable session + snapshot + approval + postcondition re-read.
     """
 
-    raise _not_implemented("range_set_conditional_formatting")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(sheet, "sheet")
+    _require_non_empty(address, "address")
+    service = get_ranges_service()
+    return await service.set_conditional_formatting(workbook_id, sheet, address, spec, mode)
 
 
 __all__ = [

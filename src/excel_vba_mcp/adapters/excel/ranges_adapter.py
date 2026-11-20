@@ -1,5 +1,5 @@
 """STA-local Excel Range/Cells adapter (task_042 read, task_043 write, task_044
-format, task_045 structural).
+format, task_045 structural, task_046 validation + conditional formatting).
 
 Phase 2 — Range/Cells.
 
@@ -8,7 +8,9 @@ Phase 2 — Range/Cells.
 surface (``range_get``, ``range_read_values``, ``range_read_formulas``,
 ``range_write_values``, ``range_write_formulas``, ``range_get_format``,
 ``range_set_format``, ``range_copy``, ``range_insert``, ``range_delete``,
-``range_merge``, ``range_unmerge``).
+``range_merge``, ``range_unmerge``, ``range_get_validation``,
+``range_set_validation``, ``range_get_conditional_formatting``,
+``range_set_conditional_formatting``).
 It is a **pure STA-local helper**: every method is synchronous, receives the live
 ``Workbook`` COM proxy (``Any``) and returns only Pydantic DTOs / primitives, so
 results cross the single-STA worker boundary safely
@@ -81,11 +83,28 @@ Structural semantics (task_045, ``docs/research/ranges_cells_api.md`` §5):
   the table tools; a table's structure is never changed here.
 * Merged-cell targets, protected sheets and dynamic-array spill ranges are
   guarded per task_038 §7 (reject, or preview + ``allow_merged``).
+
+Validation / conditional-format semantics (task_046, ``docs/research/ranges_cells_api.md`` §6):
+
+* ``get_validation`` reads ``Range.Validation`` (type, ``Formula1``/``Formula2``,
+  ``IgnoreBlank``, ``InCellDropdown``, ``Operator``, ``AlertStyle`` and the
+  message/title strings). Excel answers the range-level read only when the rule
+  is uniform, so a non-uniform target is probed in a bounded way and reported
+  with ``non_uniform_validation`` / ``mixed_validation`` in ``unsupported``.
+* ``set_validation`` adds (``Validation.Add``) or modifies
+  (``Validation.Modify``) the rule; ``Formula1``/``Formula2`` are opaque strings
+  bounded at 255 characters and never evaluated.
+* ``get_conditional_formatting`` / ``set_conditional_formatting`` handle the
+  plain ``FormatCondition`` types only; ``xlColorScale`` / ``xlDataBar`` /
+  ``xlIconSet`` are detected and reported as unsupported instead of being
+  dropped. Rule priorities are sheet-wide and unique; ``modify`` / ``delete``
+  require the priority as the rule identity and a rule type is never silently
+  converted.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta
 from typing import Any
@@ -102,8 +121,12 @@ from excel_vba_mcp.domain.errors import (
 from excel_vba_mcp.domain.models import (
     MAX_RANGE_CELLS,
     MAX_RESPONSE_CELLS,
+    MAX_VALIDATION_FORMULA_LENGTH,
     AlignmentFormat,
     CellValue,
+    ConditionalFormatMutationResult,
+    ConditionalFormatRule,
+    ConditionalFormatSpec,
     FillFormat,
     FontFormat,
     FormatInfo,
@@ -115,8 +138,16 @@ from excel_vba_mcp.domain.models import (
     RangeMutationResult,
     RangeValues,
     StructuralMutationResult,
+    ValidationRule,
+    ValidationSpec,
 )
-from excel_vba_mcp.domain.statuses import CellValueKind, RangeShape
+from excel_vba_mcp.domain.statuses import (
+    CellValueKind,
+    ConditionalFormatType,
+    DataValidationType,
+    RangeShape,
+    ValidationOperator,
+)
 
 #: Formula prefixes that mark a function newer than the reading build
 #: (task_038 §2.1). Presence is surfaced in ``notes``; the string itself is
@@ -271,6 +302,190 @@ _MAX_MERGE_SCAN_CELLS = 4096
 #: Upper bound on the number of referencing cells reported by the best-effort
 #: same-sheet formula scan (task_038 §5.2 item 5).
 _MAX_REFERENCE_HITS = 50
+
+
+# ---------------------------------------------------------------------------
+# Data validation (task_046, task_038 §6.1)
+# ---------------------------------------------------------------------------
+# Documented ``XlDVType`` / ``XlFormatConditionOperator`` / ``XlAlertStyle``
+# values (Microsoft Learn). They are resolved here — the only layer that touches
+# Excel constants — so the service/API can validate a rule name without COM.
+
+XL_VALIDATE_INPUT_ONLY = 0  # xlValidateInputOnly
+XL_VALIDATE_WHOLE_NUMBER = 1  # xlValidateWholeNumber
+XL_VALIDATE_DECIMAL = 2  # xlValidateDecimal
+XL_VALIDATE_LIST = 3  # xlValidateList
+XL_VALIDATE_DATE = 4  # xlValidateDate
+XL_VALIDATE_TIME = 5  # xlValidateTime
+XL_VALIDATE_TEXT_LENGTH = 6  # xlValidateTextLength
+XL_VALIDATE_CUSTOM = 7  # xlValidateCustom
+
+XL_COND_BETWEEN = 1  # xlBetween
+XL_COND_EQUAL = 2  # xlEqual
+XL_COND_GREATER = 3  # xlGreater
+XL_COND_GREATER_EQUAL = 4  # xlGreaterEqual
+XL_COND_LESS = 5  # xlLess
+XL_COND_LESS_EQUAL = 6  # xlLessEqual
+XL_COND_NOT_BETWEEN = 7  # xlNotBetween
+XL_COND_NOT_EQUAL = 8  # xlNotEqual
+
+XL_ALERT_INFORMATION = 1  # xlValidAlertInformation
+XL_ALERT_STOP = 2  # xlValidAlertStop
+XL_ALERT_WARNING = 3  # xlValidAlertWarning
+
+#: ``Range.Validation.Type`` -> :class:`DataValidationType` (``NONE`` has no int).
+_VALIDATION_TYPE_BY_INT: dict[int, DataValidationType] = {
+    XL_VALIDATE_INPUT_ONLY: DataValidationType.INPUT_ONLY,
+    XL_VALIDATE_WHOLE_NUMBER: DataValidationType.WHOLE_NUMBER,
+    XL_VALIDATE_DECIMAL: DataValidationType.DECIMAL,
+    XL_VALIDATE_LIST: DataValidationType.LIST,
+    XL_VALIDATE_DATE: DataValidationType.DATE,
+    XL_VALIDATE_TIME: DataValidationType.TIME,
+    XL_VALIDATE_TEXT_LENGTH: DataValidationType.TEXT_LENGTH,
+    XL_VALIDATE_CUSTOM: DataValidationType.CUSTOM,
+}
+_VALIDATION_TYPE_VALUES: dict[DataValidationType, int] = {
+    value: key for key, value in _VALIDATION_TYPE_BY_INT.items()
+}
+
+_OPERATOR_BY_INT: dict[int, ValidationOperator] = {
+    XL_COND_BETWEEN: ValidationOperator.BETWEEN,
+    XL_COND_EQUAL: ValidationOperator.EQUAL,
+    XL_COND_GREATER: ValidationOperator.GREATER,
+    XL_COND_GREATER_EQUAL: ValidationOperator.GREATER_EQUAL,
+    XL_COND_LESS: ValidationOperator.LESS,
+    XL_COND_LESS_EQUAL: ValidationOperator.LESS_EQUAL,
+    XL_COND_NOT_BETWEEN: ValidationOperator.NOT_BETWEEN,
+    XL_COND_NOT_EQUAL: ValidationOperator.NOT_EQUAL,
+}
+_OPERATOR_VALUES: dict[ValidationOperator, int] = {
+    value: key for key, value in _OPERATOR_BY_INT.items()
+}
+
+_ALERT_STYLE_BY_INT: dict[int, str] = {
+    XL_ALERT_INFORMATION: "xlValidAlertInformation",
+    XL_ALERT_STOP: "xlValidAlertStop",
+    XL_ALERT_WARNING: "xlValidAlertWarning",
+}
+_ALERT_STYLE_VALUES: dict[str, int] = {value: key for key, value in _ALERT_STYLE_BY_INT.items()}
+
+#: Validation types that use only ``Formula1``; Excel ignores ``Formula2``.
+_VALIDATION_SINGLE_FORMULA_TYPES: frozenset[DataValidationType] = frozenset(
+    {DataValidationType.LIST, DataValidationType.CUSTOM}
+)
+
+#: Operators that require **both** operands (task_038 §6.1).
+_DUAL_FORMULA_OPERATORS: frozenset[ValidationOperator] = frozenset(
+    {ValidationOperator.BETWEEN, ValidationOperator.NOT_BETWEEN}
+)
+
+#: Excel UI limit for a validation message / title string (task_038 §6.3).
+MAX_VALIDATION_TEXT_LENGTH = 255
+
+#: Upper bound on the cells probed when Excel refuses to read a range-level
+#: validation rule (a mixed or partially covered target). The probe is
+#: deterministic (first, last and evenly spaced cells) and bounded.
+_MAX_VALIDATION_PROBE_CELLS = 32
+
+
+# ---------------------------------------------------------------------------
+# Conditional formatting (task_046, task_038 §6.3)
+# ---------------------------------------------------------------------------
+# Documented ``XlFormatConditionType`` values (Microsoft Learn). Only the plain
+# ``FormatCondition`` types are supported; ``xlColorScale`` / ``xlDataBar`` /
+# ``xlIconSet`` are distinct COM objects and are reported as unsupported rather
+# than silently dropped.
+
+XL_CF_CELL_VALUE = 1  # xlCellValue
+XL_CF_EXPRESSION = 2  # xlExpression
+XL_CF_COLOR_SCALE = 3  # xlColorScale (distinct COM object)
+XL_CF_DATA_BAR = 4  # xlDataBar (distinct COM object)
+XL_CF_TOP10 = 5  # xlTop10
+XL_CF_ICON_SET = 6  # xlIconSet (distinct COM object)
+XL_CF_DUPLICATE_VALUES = 7  # xlDuplicateValues (not modelled)
+XL_CF_UNIQUE_VALUES = 8  # xlUniqueValues
+XL_CF_TEXT_STRING = 9  # xlTextString
+XL_CF_BLANKS = 10  # xlBlanksCondition
+XL_CF_TIME_PERIOD = 11  # xlTimePeriod
+XL_CF_ABOVE_AVERAGE = 12  # xlAboveAverageCondition
+XL_CF_NO_BLANKS = 13  # xlNoBlanksCondition
+XL_CF_ERRORS = 16  # xlErrorsCondition
+XL_CF_NO_ERRORS = 17  # xlNoErrorsCondition
+
+_CF_TYPE_BY_INT: dict[int, ConditionalFormatType] = {
+    XL_CF_CELL_VALUE: ConditionalFormatType.CELL_VALUE,
+    XL_CF_EXPRESSION: ConditionalFormatType.EXPRESSION,
+    XL_CF_COLOR_SCALE: ConditionalFormatType.COLOR_SCALE,
+    XL_CF_DATA_BAR: ConditionalFormatType.DATA_BAR,
+    XL_CF_TOP10: ConditionalFormatType.TOP10,
+    XL_CF_ICON_SET: ConditionalFormatType.ICON_SET,
+    XL_CF_DUPLICATE_VALUES: ConditionalFormatType.UNSUPPORTED,
+    XL_CF_UNIQUE_VALUES: ConditionalFormatType.UNIQUE_VALUES,
+    XL_CF_TEXT_STRING: ConditionalFormatType.TEXT_STRING,
+    XL_CF_BLANKS: ConditionalFormatType.BLANKS,
+    XL_CF_TIME_PERIOD: ConditionalFormatType.TIME_PERIOD,
+    XL_CF_ABOVE_AVERAGE: ConditionalFormatType.ABOVE_AVERAGE,
+    XL_CF_NO_BLANKS: ConditionalFormatType.NO_BLANKS,
+    XL_CF_ERRORS: ConditionalFormatType.ERRORS,
+    XL_CF_NO_ERRORS: ConditionalFormatType.NO_ERRORS,
+}
+_CF_TYPE_VALUES: dict[ConditionalFormatType, int] = {
+    value: key
+    for key, value in _CF_TYPE_BY_INT.items()
+    if value is not ConditionalFormatType.UNSUPPORTED
+}
+
+#: Plain ``FormatCondition`` types supported by ``range_set_conditional_formatting``.
+_SUPPORTED_CF_TYPES: frozenset[ConditionalFormatType] = frozenset(
+    {
+        ConditionalFormatType.CELL_VALUE,
+        ConditionalFormatType.EXPRESSION,
+        ConditionalFormatType.TEXT_STRING,
+        ConditionalFormatType.BLANKS,
+        ConditionalFormatType.NO_BLANKS,
+        ConditionalFormatType.ERRORS,
+        ConditionalFormatType.NO_ERRORS,
+        ConditionalFormatType.TIME_PERIOD,
+        ConditionalFormatType.TOP10,
+        ConditionalFormatType.ABOVE_AVERAGE,
+        ConditionalFormatType.UNIQUE_VALUES,
+    }
+)
+
+#: Rule types that require an ``Operator`` argument to ``FormatConditions.Add``.
+_CF_OPERATOR_REQUIRED_TYPES: frozenset[ConditionalFormatType] = frozenset(
+    {ConditionalFormatType.CELL_VALUE, ConditionalFormatType.TEXT_STRING}
+)
+
+#: Rule types that require a ``Formula1`` operand.
+_CF_FORMULA_REQUIRED_TYPES: frozenset[ConditionalFormatType] = frozenset(
+    {
+        ConditionalFormatType.CELL_VALUE,
+        ConditionalFormatType.EXPRESSION,
+        ConditionalFormatType.TEXT_STRING,
+        ConditionalFormatType.TOP10,
+        ConditionalFormatType.TIME_PERIOD,
+    }
+)
+
+#: Explicit reasons for the rule types that are detected but not supported.
+_CF_UNSUPPORTED_REASONS: dict[int, str] = {
+    XL_CF_COLOR_SCALE: (
+        "xlColorScale is a distinct COM object (ColorScale); outside the bounded Phase 2 scope."
+    ),
+    XL_CF_DATA_BAR: (
+        "xlDataBar is a distinct COM object (Databar); outside the bounded Phase 2 scope."
+    ),
+    XL_CF_ICON_SET: (
+        "xlIconSet is a distinct COM object (IconSetCondition); outside the bounded Phase 2 scope."
+    ),
+    XL_CF_DUPLICATE_VALUES: (
+        "duplicate-values rules (type 7) are not modelled by the bounded Phase 2 scope."
+    ),
+}
+
+#: Conditional-formatting mutation modes accepted by ``range_set_conditional_formatting``.
+CF_MODES: frozenset[str] = frozenset({"add", "modify", "delete"})
 
 
 # ---------------------------------------------------------------------------
@@ -912,6 +1127,148 @@ class RangesAdapter:
         )
 
     # ------------------------------------------------------------------
+    # Data validation (read-only; guarded write; task_046)
+    # ------------------------------------------------------------------
+    def get_validation(self, wb: Any, sheet: str, address: str) -> ValidationRule:
+        """Read the data-validation rule of a Range (``present=false`` when none).
+
+        ``Range.Validation`` is read at the range level first: Excel answers that
+        read only when every cell of the target shares the same rule. When it
+        refuses (a mixed or only partially covered target) the adapter falls back
+        to a bounded, deterministic cell probe (first, last and evenly spaced
+        cells, at most ``_MAX_VALIDATION_PROBE_CELLS``) and reports the
+        representative rule together with ``non_uniform_validation`` /
+        ``mixed_validation`` in ``unsupported`` — a mixed target is never
+        silently flattened to one cell's rule (task_038 §6.4).
+        """
+
+        worksheet = _require_sheet(wb, sheet)
+        sheet_name = _safe_str(worksheet.Name)
+        range_obj = _resolve_range(worksheet, address, sheet_name=sheet_name)
+        resolved = _describe_range(range_obj, sheet=sheet_name)
+        return _read_validation_rule(range_obj, apply_to=resolved.address)
+
+    def set_validation(
+        self, wb: Any, sheet: str, address: str, spec: ValidationSpec
+    ) -> ValidationRule:
+        """Add or modify the data-validation rule of a Range and verify the result.
+
+        The rule is validated before any COM mutation (a bad type, an over-long
+        ``Formula1``, a missing operand or an explicit ``None`` on a rule-bearing
+        type leaves the workbook untouched). An existing rule is **modified**
+        (``Validation.Modify``) so the properties the caller did not set keep
+        their current values; a target without a rule is **added**
+        (``Validation.Add``). Formulas are opaque strings passed to Excel and are
+        never evaluated here. The postcondition is a re-read of the same target;
+        a mismatch is reported through ``unsupported`` (``postcondition_mismatch``)
+        rather than claimed as success.
+        """
+
+        worksheet = _require_sheet(wb, sheet)
+        sheet_name = _safe_str(worksheet.Name)
+        range_obj = _resolve_range(worksheet, address, sheet_name=sheet_name)
+        resolved = _describe_range(range_obj, sheet=sheet_name)
+
+        # Validate the whole rule before touching Excel (defense in depth; the
+        # service already validated before submitting to the STA worker).
+        validate_validation_spec(spec)
+        _require_unprotected(worksheet)
+        _apply_validation(range_obj, spec)
+
+        post = _read_validation_rule(range_obj, apply_to=resolved.address)
+        if not _validation_matches_spec(post, spec):
+            post.unsupported.append("postcondition_mismatch")
+        return post
+
+    # ------------------------------------------------------------------
+    # Conditional formatting (read-only; guarded write; task_046)
+    # ------------------------------------------------------------------
+    def get_conditional_formatting(
+        self, wb: Any, sheet: str, address: str
+    ) -> list[ConditionalFormatRule]:
+        """Read the conditional-formatting rules that apply to a Range.
+
+        Every rule is returned in ascending ``priority`` order. Plain
+        ``FormatCondition`` rules carry ``type`` / ``operator`` / ``formula1`` /
+        ``formula2`` / ``stop_if_true`` / ``applies_to`` plus the bounded
+        ``interior_color`` and ``font`` subset. ``xlColorScale`` / ``xlDataBar`` /
+        ``xlIconSet`` (distinct COM objects) are reported with ``supported=false``
+        and an explicit ``unsupported_reason`` instead of being dropped.
+        """
+
+        worksheet = _require_sheet(wb, sheet)
+        range_obj = _resolve_range(worksheet, address, sheet_name=_safe_str(worksheet.Name))
+        return _read_format_conditions(range_obj.FormatConditions)
+
+    def set_conditional_formatting(
+        self,
+        wb: Any,
+        sheet: str,
+        address: str,
+        spec: ConditionalFormatSpec,
+        mode: str = "add",
+    ) -> ConditionalFormatMutationResult:
+        """Add, modify or delete one supported conditional-format rule.
+
+        ``add`` appends a rule (``FormatConditions.Add``), ``modify`` replaces the
+        rule identified by ``spec.priority`` (the rule type is never silently
+        converted: a type mismatch is rejected) and ``delete`` removes that rule.
+        ``spec.priority`` is the only stable rule identity and is mandatory for
+        ``modify`` / ``delete``. Priorities are sheet-wide and unique: assigning a
+        ``Priority`` renumbers the other rules (reported through
+        ``applied_priorities`` / ``notes``), and deleting a rule leaves a gap
+        rather than renumbering. The postcondition re-reads the whole collection;
+        a rule formula is compared after normalizing Excel's leading ``=`` so an
+        operand written as ``10`` is not reported as a mismatch for Excel's ``=10``.
+        """
+
+        worksheet = _require_sheet(wb, sheet)
+        sheet_name = _safe_str(worksheet.Name)
+        range_obj = _resolve_range(worksheet, address, sheet_name=sheet_name)
+        resolved = _describe_range(range_obj, sheet=sheet_name)
+
+        validate_conditional_format_spec(spec, mode)
+        _require_unprotected(worksheet)
+
+        conditions = range_obj.FormatConditions
+        before = _read_format_conditions(conditions)
+
+        applied: list[int] = []
+        if mode == "delete":
+            _delete_cf_rule(conditions, before, spec)
+        else:
+            applied = _apply_cf_rule(conditions, spec, mode, before)
+
+        after = _read_format_conditions(conditions)
+        verified = _cf_postcondition(before, after, spec, mode, applied)
+        unsupported = _unsupported_cf_types(after)
+        notes: list[str] = []
+        if mode in ("add", "modify") and spec.priority is not None:
+            notes.append(
+                "Conditional-format priorities are sheet-wide: assigning a priority "
+                "renumbers the other rules on the sheet."
+            )
+        if mode == "delete":
+            notes.append(
+                "Deleting a conditional-format rule does not renumber the remaining "
+                "rules; priorities may contain gaps."
+            )
+        if not verified:
+            notes.append(
+                "Postcondition mismatch: the re-read rule collection does not match "
+                "the requested operation."
+            )
+        return ConditionalFormatMutationResult(
+            action=mode,
+            range=resolved,
+            rules=after,
+            applied_priorities=applied,
+            unsupported=unsupported,
+            verified=verified,
+            notes=notes,
+        )
+
+    # ------------------------------------------------------------------
     # Structural operations (copy / insert / delete / merge / unmerge)
     # ------------------------------------------------------------------
     # Every structural operation is **explicit** (destination / shift / target),
@@ -1493,7 +1850,7 @@ def _require_color(value: object, field: str) -> None:
         )
 
 
-def _require_enum(value: object, allowed: dict[str, int], field: str) -> None:
+def _require_enum(value: object, allowed: Collection[str], field: str) -> None:
     """Reject an enum name outside the supported set."""
 
     if not isinstance(value, str) or value not in allowed:
@@ -1777,6 +2134,772 @@ def _read_enum_prop(
         mixed.append(path)
         return None
     return name_map.get(int_value, str(int_value))
+
+
+# ---------------------------------------------------------------------------
+# Data validation helpers (task_046, task_038 §6.1)
+# ---------------------------------------------------------------------------
+def validate_validation_spec(spec: ValidationSpec) -> None:
+    """Validate a ``range_set_validation`` payload before any COM mutation (pure).
+
+    Rejects a rule type without rule semantics (``none`` / ``input_only``), a
+    missing or over-long ``Formula1`` / ``Formula2``, a ``Formula2`` on a
+    single-formula type, a missing second operand for ``between`` /
+    ``not_between``, an unknown operator / alert style and an over-long message.
+    Formulas are never evaluated — only their length and presence are checked.
+    """
+
+    if spec.type in (DataValidationType.NONE, DataValidationType.INPUT_ONLY):
+        raise InvalidRangeError(
+            "A data-validation rule requires a rule-bearing type; "
+            f"{spec.type.value!r} carries no rule semantics.",
+            context={"type": spec.type.value},
+        )
+
+    _require_rule_formula(spec.formula1, "formula1", required=True)
+    if spec.formula2 is not None:
+        _require_rule_formula(spec.formula2, "formula2", required=False)
+
+    if spec.type in _VALIDATION_SINGLE_FORMULA_TYPES:
+        if spec.formula2:
+            raise InvalidRangeError(
+                f"Validation type {spec.type.value!r} uses only Formula1; Formula2 is ignored.",
+                context={"type": spec.type.value, "formula2": spec.formula2},
+            )
+    elif spec.operator in _DUAL_FORMULA_OPERATORS and not spec.formula2:
+        raise InvalidRangeError(
+            f"Operator {spec.operator.value!r} requires both Formula1 and Formula2.",
+            context={"operator": spec.operator.value},
+        )
+
+    if spec.operator is not None:
+        _require_enum(spec.operator, _OPERATOR_VALUES, "operator")
+    if spec.alert_style is not None:
+        _require_enum(spec.alert_style, _ALERT_STYLE_VALUES, "alert_style")
+
+    for name in ("error_title", "error_message", "input_title", "input_message"):
+        value = getattr(spec, name)
+        if value is not None:
+            _require_validation_text(value, name)
+
+    for name in ("ignore_blank", "in_cell_dropdown", "show_error", "show_input"):
+        value = getattr(spec, name)
+        if value is not None and not isinstance(value, bool):
+            raise InvalidRangeError(f"Argument {name!r} must be a boolean.", context={name: value})
+
+
+def validate_conditional_format_spec(spec: ConditionalFormatSpec, mode: str) -> None:
+    """Validate a ``range_set_conditional_formatting`` payload (pure, pre-COM).
+
+    Rejects an unknown ``mode``, an unsupported rule type (``xlColorScale`` /
+    ``xlDataBar`` / ``xlIconSet`` and unknown types), a missing rule identity for
+    ``modify`` / ``delete``, a missing operator/formula for a type that requires
+    it, an over-long formula and an out-of-range colour/font value.
+    """
+
+    if mode not in CF_MODES:
+        raise InvalidRangeError(
+            f"Argument 'mode' must be one of {sorted(CF_MODES)}.", context={"mode": mode}
+        )
+
+    if spec.type not in _SUPPORTED_CF_TYPES:
+        reason = _cf_unsupported_reason(spec.type)
+        raise InvalidRangeError(
+            f"Conditional-format type {spec.type.value!r} is not supported: {reason}",
+            context={"type": spec.type.value, "reason": reason},
+        )
+
+    if mode in ("modify", "delete") and spec.priority is None:
+        raise InvalidRangeError(
+            f"Argument 'priority' is required to {mode} a conditional-format rule; "
+            "it is the only stable rule identity.",
+            context={"mode": mode},
+        )
+
+    if spec.operator is not None:
+        _require_enum(spec.operator, _OPERATOR_VALUES, "operator")
+    elif spec.type in _CF_OPERATOR_REQUIRED_TYPES:
+        raise InvalidRangeError(
+            f"Argument 'operator' is required for conditional-format type {spec.type.value!r}.",
+            context={"type": spec.type.value},
+        )
+
+    if spec.formula1 is not None:
+        _require_rule_formula(
+            spec.formula1, "formula1", required=spec.type in _CF_FORMULA_REQUIRED_TYPES
+        )
+    elif spec.type in _CF_FORMULA_REQUIRED_TYPES:
+        raise InvalidRangeError(
+            f"Argument 'formula1' is required for conditional-format type {spec.type.value!r}.",
+            context={"type": spec.type.value},
+        )
+    if spec.formula2 is not None:
+        _require_rule_formula(spec.formula2, "formula2", required=False)
+
+    if spec.interior_color is not None:
+        _require_color(spec.interior_color, "interior_color")
+    if spec.font is not None:
+        _validate_cf_font(spec.font)
+
+
+def _validate_cf_font(font: FontFormat) -> None:
+    """Validate the bounded ``FormatCondition.Font`` subset before any COM write."""
+
+    if font.name is not None:
+        _require_format_string(font.name, "font.name")
+    if font.bold is not None and not isinstance(font.bold, bool):
+        raise InvalidRangeError(
+            "Argument 'font.bold' must be a boolean.", context={"font.bold": font.bold}
+        )
+    if font.italic is not None and not isinstance(font.italic, bool):
+        raise InvalidRangeError(
+            "Argument 'font.italic' must be a boolean.", context={"font.italic": font.italic}
+        )
+    if font.size is not None:
+        if isinstance(font.size, bool) or not isinstance(font.size, (int, float)):
+            raise InvalidRangeError(
+                "Argument 'font.size' must be a number.", context={"font.size": font.size}
+            )
+        if font.size < _MIN_FONT_SIZE or font.size > _MAX_FONT_SIZE:
+            raise InvalidRangeError(
+                f"Argument 'font.size' must be within {_MIN_FONT_SIZE}..{_MAX_FONT_SIZE}.",
+                context={"font.size": font.size},
+            )
+    if font.color is not None:
+        _require_color(font.color, "font.color")
+
+
+def _require_rule_formula(value: object, field: str, *, required: bool) -> None:
+    """Validate one rule operand: presence (optionally) and the 255-char limit."""
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        if required:
+            raise InvalidRangeError(
+                f"Argument {field!r} is required for this rule.",
+                context={field: value},
+            )
+        return
+    if not isinstance(value, str):
+        raise InvalidRangeError(f"Argument {field!r} must be a string.", context={field: value})
+    if len(value) > MAX_VALIDATION_FORMULA_LENGTH:
+        raise InvalidRangeError(
+            f"Argument {field!r} exceeds the {MAX_VALIDATION_FORMULA_LENGTH}-character limit.",
+            context={field: value, "length": len(value)},
+        )
+
+
+def _require_validation_text(value: str, field: str) -> None:
+    """Validate a validation message/title string against Excel's UI limit."""
+
+    if not isinstance(value, str):
+        raise InvalidRangeError(f"Argument {field!r} must be a string.", context={field: value})
+    if len(value) > MAX_VALIDATION_TEXT_LENGTH:
+        raise InvalidRangeError(
+            f"Argument {field!r} exceeds the {MAX_VALIDATION_TEXT_LENGTH}-character limit.",
+            context={field: value, "length": len(value)},
+        )
+
+
+def _read_validation_rule(range_obj: Any, *, apply_to: str) -> ValidationRule:
+    """Read the validation rule of a resolved Range (never raises, never guesses).
+
+    The range-level read is authoritative when Excel answers it (every cell of
+    the target shares one rule). Otherwise a bounded cell probe produces the
+    representative rule and marks the result ``non_uniform_validation`` (one
+    distinct rule, coverage differs) or ``mixed_validation`` (several distinct
+    rules); an exhausted probe on a large target is flagged
+    ``validation_probe_limited``.
+    """
+
+    direct = _read_validation(_read_attr(range_obj, "Validation"))
+    if direct is not None:
+        return direct.model_copy(update={"apply_to": apply_to})
+
+    rows, cols = _declare(range_obj)
+    if rows <= 0 or cols <= 0:
+        return ValidationRule(present=False, apply_to=apply_to)
+
+    probed, limited = _probe_validation(range_obj, rows, cols)
+    if not probed:
+        rule = ValidationRule(present=False, apply_to=apply_to)
+        if limited:
+            rule.unsupported.append("validation_probe_limited")
+        return rule
+
+    signatures = {_validation_signature(item) for item in probed}
+    rule = probed[0].model_copy(update={"apply_to": apply_to})
+    if len(signatures) > 1:
+        rule.unsupported.extend(["mixed_validation", f"distinct_rules={len(signatures)}"])
+    else:
+        rule.unsupported.append("non_uniform_validation")
+    if limited:
+        rule.unsupported.append("validation_probe_limited")
+    return rule
+
+
+def _read_validation(validation: Any) -> ValidationRule | None:
+    """Read a ``Validation`` object; ``None`` when Excel has no rule to read.
+
+    Excel raises ``1004`` when the range carries no validation (or when the cells
+    of the range disagree), so an unreadable ``Type`` is the "no rule" signal and
+    is never reported as a fabricated ``none`` rule.
+    """
+
+    if validation is None:
+        return None
+    type_value = _read_int_or_none(validation, "Type")
+    if type_value is None:
+        return None
+
+    unsupported: list[str] = []
+    validation_type = _VALIDATION_TYPE_BY_INT.get(type_value)
+    if validation_type is None:
+        unsupported.append(f"validation_type={type_value}")
+        validation_type = DataValidationType.NONE
+
+    operator_value = _read_int_or_none(validation, "Operator")
+    operator = _OPERATOR_BY_INT.get(operator_value) if operator_value is not None else None
+    if operator_value is not None and operator is None:
+        unsupported.append(f"operator={operator_value}")
+
+    alert_value = _read_int_or_none(validation, "AlertStyle")
+    alert_style = _ALERT_STYLE_BY_INT.get(alert_value) if alert_value is not None else None
+    if alert_value is not None and alert_style is None:
+        unsupported.append(f"alert_style={alert_value}")
+
+    return ValidationRule(
+        present=True,
+        type=validation_type,
+        operator=operator,
+        formula1=_read_optional_str(validation, "Formula1"),
+        formula2=_read_optional_str(validation, "Formula2"),
+        ignore_blank=_read_optional_bool(validation, "IgnoreBlank"),
+        in_cell_dropdown=_read_optional_bool(validation, "InCellDropdown"),
+        alert_style=alert_style,
+        error_message=_read_optional_str(validation, "ErrorMessage"),
+        error_title=_read_optional_str(validation, "ErrorTitle"),
+        input_message=_read_optional_str(validation, "InputMessage"),
+        input_title=_read_optional_str(validation, "InputTitle"),
+        show_error=_read_optional_bool(validation, "ShowError"),
+        show_input=_read_optional_bool(validation, "ShowInput"),
+        unsupported=unsupported,
+    )
+
+
+def _validation_signature(rule: ValidationRule) -> tuple[Any, ...]:
+    """Return the comparable identity of a validation rule."""
+
+    return (
+        rule.type,
+        rule.operator,
+        rule.formula1,
+        rule.formula2,
+        rule.ignore_blank,
+        rule.in_cell_dropdown,
+        rule.alert_style,
+    )
+
+
+def _validation_probe_coordinates(rows: int, cols: int) -> list[tuple[int, int]]:
+    """Return the 1-based ``(row, col)`` coordinates of the bounded probe."""
+
+    total = rows * cols
+    if total <= _MAX_VALIDATION_PROBE_CELLS:
+        indices = list(range(total))
+    else:
+        last = total - 1
+        count = _MAX_VALIDATION_PROBE_CELLS
+        sampled = {0, last}
+        sampled.update(round(index * last / (count - 1)) for index in range(count))
+        indices = sorted(sampled)
+    return [(index // cols + 1, index % cols + 1) for index in indices]
+
+
+def _probe_validation(range_obj: Any, rows: int, cols: int) -> tuple[list[ValidationRule], bool]:
+    """Probe up to ``_MAX_VALIDATION_PROBE_CELLS`` cells for a validation rule."""
+
+    rules: list[ValidationRule] = []
+    for row, col in _validation_probe_coordinates(rows, cols):
+        cell = range_obj.Cells(row, col)
+        rule = _read_validation(_read_attr(cell, "Validation"))
+        if rule is not None:
+            rules.append(rule)
+    return rules, rows * cols > _MAX_VALIDATION_PROBE_CELLS
+
+
+def _apply_validation(range_obj: Any, spec: ValidationSpec) -> None:
+    """Add or modify the range's validation rule (STA-local, one COM path)."""
+
+    validation = range_obj.Validation
+    top_left = range_obj.Cells(1, 1)
+    exists = (
+        _read_validation(validation) is not None
+        or _read_validation(_read_attr(top_left, "Validation")) is not None
+    )
+
+    type_value = _VALIDATION_TYPE_VALUES[spec.type]
+    operator_value = (
+        _OPERATOR_VALUES[spec.operator] if spec.operator is not None else XL_COND_BETWEEN
+    )
+    alert_value = (
+        _ALERT_STYLE_VALUES[str(spec.alert_style)]
+        if spec.alert_style is not None
+        else XL_ALERT_STOP
+    )
+    arguments = (
+        type_value,
+        alert_value,
+        operator_value,
+        spec.formula1 or "",
+        spec.formula2 or "",
+    )
+    try:
+        if exists:
+            validation.Modify(*arguments)
+        else:
+            validation.Add(*arguments)
+    except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
+        raise InvalidRangeError(
+            "Excel rejected the data-validation rule.",
+            context={
+                "type": spec.type.value,
+                "operator": spec.operator.value if spec.operator is not None else None,
+                "formula1": spec.formula1,
+                "formula2": spec.formula2,
+                "existing": exists,
+                "error": str(exc),
+            },
+        ) from exc
+
+    fields = spec.model_fields_set
+    if "ignore_blank" in fields and spec.ignore_blank is not None:
+        _set_com(validation, "IgnoreBlank", bool(spec.ignore_blank))
+    if "in_cell_dropdown" in fields and spec.in_cell_dropdown is not None:
+        _set_com(validation, "InCellDropdown", bool(spec.in_cell_dropdown))
+    if "show_error" in fields and spec.show_error is not None:
+        _set_com(validation, "ShowError", bool(spec.show_error))
+    if "show_input" in fields and spec.show_input is not None:
+        _set_com(validation, "ShowInput", bool(spec.show_input))
+    if "error_title" in fields and spec.error_title is not None:
+        _set_com(validation, "ErrorTitle", spec.error_title)
+    if "error_message" in fields and spec.error_message is not None:
+        _set_com(validation, "ErrorMessage", spec.error_message)
+    if "input_title" in fields and spec.input_title is not None:
+        _set_com(validation, "InputTitle", spec.input_title)
+    if "input_message" in fields and spec.input_message is not None:
+        _set_com(validation, "InputMessage", spec.input_message)
+
+
+def _validation_matches_spec(rule: ValidationRule, spec: ValidationSpec) -> bool:
+    """Return whether a re-read validation rule matches the requested spec."""
+
+    if not rule.present or rule.type is not spec.type:
+        return False
+    if spec.formula1 is not None and rule.formula1 != spec.formula1:
+        return False
+    if spec.formula2 is not None and (rule.formula2 or "") != spec.formula2:
+        return False
+    if (
+        spec.operator is not None
+        and spec.type not in _VALIDATION_SINGLE_FORMULA_TYPES
+        and rule.operator is not spec.operator
+    ):
+        return False
+
+    fields = spec.model_fields_set
+    expectations: tuple[tuple[str, Any, Any], ...] = (
+        ("ignore_blank", "ignore_blank", spec.ignore_blank),
+        ("in_cell_dropdown", "in_cell_dropdown", spec.in_cell_dropdown),
+        ("alert_style", "alert_style", spec.alert_style),
+        ("error_message", "error_message", spec.error_message),
+        ("error_title", "error_title", spec.error_title),
+        ("input_message", "input_message", spec.input_message),
+        ("input_title", "input_title", spec.input_title),
+        ("show_error", "show_error", spec.show_error),
+        ("show_input", "show_input", spec.show_input),
+    )
+    for field, attribute, expected in expectations:
+        if field in fields and expected is not None and getattr(rule, attribute) != expected:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Conditional-formatting helpers (task_046, task_038 §6.3)
+# ---------------------------------------------------------------------------
+def _classify_cf_type(type_value: int | None) -> tuple[ConditionalFormatType, bool, str | None]:
+    """Return ``(type, supported, unsupported_reason)`` for a raw rule type."""
+
+    if type_value is None:
+        return ConditionalFormatType.UNSUPPORTED, False, "the rule type could not be read."
+    cf_type = _CF_TYPE_BY_INT.get(type_value)
+    if cf_type is None:
+        return (
+            ConditionalFormatType.UNSUPPORTED,
+            False,
+            f"unknown conditional-format type {type_value}.",
+        )
+    if cf_type in _SUPPORTED_CF_TYPES:
+        return cf_type, True, None
+    reason = _CF_UNSUPPORTED_REASONS.get(type_value)
+    if reason is None:
+        reason = f"{cf_type.value!r} is not a supported plain FormatCondition type."
+    return cf_type, False, reason
+
+
+def _cf_unsupported_reason(cf_type: ConditionalFormatType) -> str:
+    """Return the explicit unsupported reason for a rule type."""
+
+    for type_value, reason in _CF_UNSUPPORTED_REASONS.items():
+        if _CF_TYPE_BY_INT.get(type_value) is cf_type:
+            return reason
+    return f"{cf_type.value!r} is not a supported plain FormatCondition type."
+
+
+def _read_format_conditions(conditions: Any) -> list[ConditionalFormatRule]:
+    """Read every rule of a ``FormatConditions`` collection in priority order."""
+
+    rules: list[ConditionalFormatRule] = []
+    count = _read_int_or_none(conditions, "Count") or 0
+    for index in range(1, count + 1):
+        try:
+            rule_obj = conditions.Item(index)
+        except Exception:  # noqa: BLE001 - defensive per-item COM read
+            continue
+        rules.append(_read_format_condition(rule_obj))
+    rules.sort(key=lambda item: item.priority)
+    return rules
+
+
+def _read_format_condition(rule_obj: Any) -> ConditionalFormatRule:
+    """Assemble one :class:`ConditionalFormatRule` from a COM rule object."""
+
+    type_value = _read_int_or_none(rule_obj, "Type")
+    cf_type, supported, reason = _classify_cf_type(type_value)
+    priority = _read_int_or_none(rule_obj, "Priority")
+    operator_value = _read_int_or_none(rule_obj, "Operator")
+    return ConditionalFormatRule(
+        priority=priority if priority is not None and priority >= 1 else 1,
+        type=cf_type,
+        operator=_OPERATOR_BY_INT.get(operator_value) if operator_value is not None else None,
+        formula1=_read_optional_str(rule_obj, "Formula1"),
+        formula2=_read_optional_str(rule_obj, "Formula2"),
+        stop_if_true=_read_optional_bool(rule_obj, "StopIfTrue"),
+        applies_to=_read_applies_to(rule_obj),
+        interior_color=_read_cf_interior_color(rule_obj) if supported else None,
+        font=_read_cf_font(rule_obj) if supported else None,
+        supported=supported,
+        unsupported_reason=reason,
+    )
+
+
+def _read_applies_to(rule_obj: Any) -> str | None:
+    """Read ``FormatCondition.AppliesTo.Address`` (``None`` when unavailable)."""
+
+    applies_to = _read_attr(rule_obj, "AppliesTo")
+    if applies_to is None:
+        return None
+    return _safe_str(_read_attr(applies_to, "Address")) or None
+
+
+def _read_cf_interior_color(rule_obj: Any) -> int | None:
+    """Read the bounded ``FormatCondition.Interior`` colour.
+
+    ``Interior.ColorIndex`` is ``Null`` for a rule without an explicit fill, so
+    the colour is reported as ``None`` instead of Excel's default black.
+    """
+
+    interior = _read_attr(rule_obj, "Interior")
+    if interior is None:
+        return None
+    color_index = _read_int_or_none(interior, "ColorIndex")
+    if color_index is None:
+        return None
+    return _read_int_or_none(interior, "Color")
+
+
+def _read_cf_font(rule_obj: Any) -> FontFormat | None:
+    """Read the bounded ``FormatCondition.Font`` subset (``None`` when unset).
+
+    Excel reports ``Name = "None"``, ``Size = Null`` and ``Color = Null`` for a
+    rule without a font override. A bold/italic-only rule has no name/size/colour
+    but is still reported (the non-default flags are the evidence of a font
+    override), so no rule detail is silently dropped.
+    """
+
+    font_obj = _read_attr(rule_obj, "Font")
+    if font_obj is None:
+        return None
+    name = _read_optional_str(font_obj, "Name")
+    if name == "None":  # Excel reports the string "None" for an unset font name
+        name = None
+    size = _read_optional_float(font_obj, "Size")
+    color = _read_optional_int(font_obj, "Color")
+    bold = _read_optional_bool(font_obj, "Bold")
+    italic = _read_optional_bool(font_obj, "Italic")
+    if name is None and size is None and color is None and not bold and not italic:
+        return None
+    return FontFormat(name=name, bold=bold, italic=italic, size=size, color=color)
+
+
+def _read_optional_str(obj: Any, attribute: str) -> str | None:
+    """Read a string property; ``None`` when Excel raises (property not applicable)."""
+
+    value = _read_attr(obj, attribute)
+    if value is None:
+        return None
+    return str(value)
+
+
+def _read_optional_bool(obj: Any, attribute: str) -> bool | None:
+    """Read a boolean property; ``None`` when Excel raises."""
+
+    value = _read_attr(obj, attribute)
+    if value is None:
+        return None
+    return bool(value)
+
+
+def _read_optional_float(obj: Any, attribute: str) -> float | None:
+    """Read a float property; ``None`` when Excel raises or returns ``Null``."""
+
+    value = _read_attr(obj, attribute)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_optional_int(obj: Any, attribute: str) -> int | None:
+    """Read an integer property; ``None`` when Excel raises or returns ``Null``."""
+
+    value = _read_attr(obj, attribute)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _find_cf_rule(
+    conditions: Any, before: list[ConditionalFormatRule], spec: ConditionalFormatSpec
+) -> Any:
+    """Return the COM rule object identified by ``spec.priority``."""
+
+    priority = spec.priority
+    if priority is None:  # pragma: no cover - validated before the call
+        raise InvalidRangeError("A rule priority is required.", context={"priority": None})
+    match = next((rule for rule in before if rule.priority == priority), None)
+    if match is None:
+        raise InvalidRangeError(
+            f"No conditional-format rule has priority {priority}.",
+            context={"priority": priority, "priorities": [rule.priority for rule in before]},
+        )
+    if match.type is not spec.type:
+        raise InvalidRangeError(
+            "The rule at the requested priority has a different type; a conditional-format "
+            "rule type is never silently converted.",
+            context={
+                "priority": priority,
+                "existing_type": match.type.value,
+                "requested_type": spec.type.value,
+            },
+        )
+
+    count = _read_int_or_none(conditions, "Count") or 0
+    for index in range(1, count + 1):
+        rule_obj = conditions.Item(index)
+        if _read_int_or_none(rule_obj, "Priority") == priority:
+            return rule_obj
+    raise InvalidRangeError(  # pragma: no cover - the collection changed under us
+        f"The rule with priority {priority} disappeared before it could be updated.",
+        context={"priority": priority},
+    )
+
+
+def _delete_cf_rule(
+    conditions: Any, before: list[ConditionalFormatRule], spec: ConditionalFormatSpec
+) -> None:
+    """Delete the rule identified by ``spec.priority`` (no renumbering)."""
+
+    rule_obj = _find_cf_rule(conditions, before, spec)
+    try:
+        rule_obj.Delete()
+    except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
+        raise InvalidRangeError(
+            "Excel rejected the conditional-format delete.",
+            context={"priority": spec.priority, "error": str(exc)},
+        ) from exc
+
+
+def _apply_cf_rule(
+    conditions: Any,
+    spec: ConditionalFormatSpec,
+    mode: str,
+    before: list[ConditionalFormatRule],
+) -> list[int]:
+    """Add (or replace) one rule and return the resulting priorities."""
+
+    if mode == "modify":
+        # ``FormatCondition`` has no in-place Modify and ``Formula1`` is
+        # read-only, so a modify is a delete + add with the priority restored.
+        _find_cf_rule(conditions, before, spec).Delete()
+
+    arguments: list[Any] = [
+        _CF_TYPE_VALUES[spec.type],
+        _OPERATOR_VALUES[spec.operator] if spec.operator is not None else None,
+        spec.formula1,
+    ]
+    if spec.formula2 is not None:
+        arguments.append(spec.formula2)
+
+    try:
+        rule_obj = conditions.Add(*arguments)
+    except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
+        raise InvalidRangeError(
+            "Excel rejected the conditional-format rule.",
+            context={
+                "type": spec.type.value,
+                "operator": spec.operator.value if spec.operator is not None else None,
+                "formula1": spec.formula1,
+                "formula2": spec.formula2,
+                "mode": mode,
+                "error": str(exc),
+            },
+        ) from exc
+
+    _apply_cf_rule_format(rule_obj, spec)
+
+    applied: list[int] = []
+    if spec.priority is not None:
+        try:
+            rule_obj.Priority = spec.priority
+        except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
+            raise InvalidRangeError(
+                "Excel rejected the requested conditional-format priority.",
+                context={"priority": spec.priority, "error": str(exc)},
+            ) from exc
+        applied.append(spec.priority)
+    else:
+        priority = _read_int_or_none(rule_obj, "Priority")
+        if priority is not None:
+            applied.append(priority)
+    return applied
+
+
+def _apply_cf_rule_format(rule_obj: Any, spec: ConditionalFormatSpec) -> None:
+    """Apply the bounded ``StopIfTrue`` / ``Interior`` / ``Font`` subset."""
+
+    if spec.stop_if_true is not None:
+        _set_com(rule_obj, "StopIfTrue", bool(spec.stop_if_true))
+
+    if spec.interior_color is not None:
+        interior = _read_attr(rule_obj, "Interior")
+        if interior is None:  # pragma: no cover - defensive COM read
+            raise InvalidRangeError(
+                "The conditional-format rule does not expose an Interior format.",
+                context={"type": spec.type.value},
+            )
+        _set_com(interior, "Color", int(spec.interior_color))
+
+    if spec.font is not None:
+        font_obj = _read_attr(rule_obj, "Font")
+        if font_obj is None:  # pragma: no cover - defensive COM read
+            raise InvalidRangeError(
+                "The conditional-format rule does not expose a Font format.",
+                context={"type": spec.type.value},
+            )
+        if spec.font.name is not None:
+            _set_com(font_obj, "Name", spec.font.name)
+        if spec.font.bold is not None:
+            _set_com(font_obj, "Bold", bool(spec.font.bold))
+        if spec.font.italic is not None:
+            _set_com(font_obj, "Italic", bool(spec.font.italic))
+        if spec.font.size is not None:
+            _set_com(font_obj, "Size", spec.font.size)
+        if spec.font.color is not None:
+            _set_com(font_obj, "Color", int(spec.font.color))
+
+
+def _normalize_cf_formula(value: str | None) -> str | None:
+    """Normalize a rule formula for comparison (Excel stores it with a leading ``=``).
+
+    Excel accepts ``FormatConditions.Add`` operands with or without the leading
+    ``=`` and always stores them with it, so the postcondition comparison must not
+    report a mismatch for the two equivalent spellings. The returned rule keeps
+    Excel's stored form; only the comparison is normalized.
+    """
+
+    if value is None:
+        return None
+    return value[1:] if value.startswith("=") else value
+
+
+def _cf_rule_matches(rule: ConditionalFormatRule, spec: ConditionalFormatSpec) -> bool:
+    """Return whether a re-read rule matches the requested specification."""
+
+    if rule.type is not spec.type:
+        return False
+    if spec.formula1 is not None and _normalize_cf_formula(rule.formula1) != (
+        _normalize_cf_formula(spec.formula1)
+    ):
+        return False
+    if spec.formula2 is not None and _normalize_cf_formula(rule.formula2) != (
+        _normalize_cf_formula(spec.formula2)
+    ):
+        return False
+    if spec.operator is not None and rule.operator is not spec.operator:
+        return False
+    if spec.stop_if_true is not None and rule.stop_if_true is not spec.stop_if_true:
+        return False
+    if spec.interior_color is not None and rule.interior_color != spec.interior_color:
+        return False
+    if spec.font is not None and rule.font is not None:
+        for field in ("name", "bold", "italic", "size", "color"):
+            expected = getattr(spec.font, field)
+            if expected is not None and getattr(rule.font, field) != expected:
+                return False
+    return True
+
+
+def _cf_postcondition(
+    before: list[ConditionalFormatRule],
+    after: list[ConditionalFormatRule],
+    spec: ConditionalFormatSpec,
+    mode: str,
+    applied: list[int],
+) -> bool:
+    """Verify the re-read rule collection against the requested operation."""
+
+    if mode == "delete":
+        return len(after) == len(before) - 1 and not any(
+            rule.priority == spec.priority for rule in after
+        )
+
+    expected_count = len(before) + 1 if mode == "add" else len(before)
+    if len(after) != expected_count:
+        return False
+    if not any(_cf_rule_matches(rule, spec) for rule in after):
+        return False
+    if spec.priority is not None:
+        return any(
+            rule.priority == spec.priority and _cf_rule_matches(rule, spec) for rule in after
+        )
+    return not applied or any(rule.priority in applied for rule in after)
+
+
+def _unsupported_cf_types(rules: list[ConditionalFormatRule]) -> list[str]:
+    """Return the sorted, de-duplicated unsupported rule types of a collection."""
+
+    found: set[str] = set()
+    for rule in rules:
+        if rule.supported:
+            continue
+        found.add(rule.type.value)
+    return sorted(found)
 
 
 # ---------------------------------------------------------------------------
@@ -2520,6 +3643,8 @@ def _same_geometry(before: RangeAddress, post: RangeAddress) -> bool:
 __all__ = [
     "RangesAdapter",
     "validate_format_patch",
+    "validate_validation_spec",
+    "validate_conditional_format_spec",
 ]
 
 
@@ -2567,9 +3692,3 @@ def _window(
         max_rows = max(0, MAX_RESPONSE_CELLS // max(1, total_cols))
         end = start + min(requested, max_rows)
     return start, end, truncated
-
-
-__all__ = [
-    "RangesAdapter",
-    "validate_format_patch",
-]
