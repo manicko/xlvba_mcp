@@ -390,6 +390,11 @@ class SheetInfo(DomainModel):
     tables: list[TableInfo] = Field(default_factory=list)
     names: list[str] = Field(default_factory=list)
     controls: list[ControlInfo] = Field(default_factory=list)
+    pivot_tables: list[PivotTableInfo] = Field(
+        default_factory=list,
+        description="PivotTable inventory metadata scoped to this sheet (task_048); "
+        "metadata only, never the PivotTable cell output.",
+    )
 
 
 class DefinedNameInfo(DomainModel):
@@ -566,6 +571,11 @@ class SheetModel(TimestampedModel):
     names: list[DefinedNameInfo] = Field(default_factory=list)
     shapes: list[ShapeInfo] = Field(default_factory=list)
     controls: list[ControlEntry] = Field(default_factory=list)
+    pivot_tables: list[PivotTableInfo] = Field(
+        default_factory=list,
+        description="PivotTable inventory metadata scoped to this sheet (task_048); "
+        "metadata only, never the PivotTable cell output.",
+    )
     sections: dict[str, ModelSection] = Field(default_factory=dict)
     model_version: int = Field(default=1)
     model_hash: str | None = None

@@ -45,6 +45,7 @@ from typing import Any, TypeVar
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
 from excel_vba_mcp.application.controls_service import ControlsService
 from excel_vba_mcp.application.names_service import NamesService
+from excel_vba_mcp.application.pivot_tables_service import PivotTablesService
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.shapes_service import ShapesService
 from excel_vba_mcp.application.sheets_service import SheetsService
@@ -58,6 +59,7 @@ from excel_vba_mcp.domain.errors import (
 from excel_vba_mcp.domain.models import (
     DefinedNameInfo,
     ModelSection,
+    PivotTableInfo,
     SheetModel,
     VbaProcedureInfo,
     VbaProjectInfo,
@@ -79,6 +81,7 @@ SECTION_NAMES = "names"
 SECTION_SHAPES = "shapes"
 SECTION_CONTROLS = "controls"
 SECTION_VBA = "vba"
+SECTION_PIVOTS = "pivots"
 
 # Result of a worker call submitted by this service.
 _T = TypeVar("_T")
@@ -99,6 +102,10 @@ class WorkbookModelService:
         vba_project_service: Read-only VBA project service (optional section).
         path_policy: Allowlist policy (kept for signature symmetry / audit).
         audit: Append-only JSONL audit trail.
+        pivot_tables_service: Read-only PivotTables inventory service
+            (task_048, optional keyword section). When provided,
+            ``get_sheet_model`` adds PivotTable metadata scoped to the sheet
+            without materializing the PivotTable cell output.
     """
 
     def __init__(
@@ -113,6 +120,8 @@ class WorkbookModelService:
         vba_project_service: VBAProjectService,
         path_policy: PathPolicy,
         audit: AuditLogger,
+        *,
+        pivot_tables_service: PivotTablesService | None = None,
     ) -> None:
         self._worker = worker
         self._session = session_service
@@ -124,6 +133,7 @@ class WorkbookModelService:
         self._vba = vba_project_service
         self._path_policy = path_policy
         self._audit = audit
+        self._pivots = pivot_tables_service
 
     # ------------------------------------------------------------------
     # Public API (async; no COM here — every fact comes from a service)
@@ -218,9 +228,11 @@ class WorkbookModelService:
     async def get_sheet_model(self, workbook_id: str, sheet_name: str) -> SheetModel:
         """Return the sheet-scoped Stage 1 model for ``sheet_name``.
 
-        Aggregates the sheet metadata plus the tables, names, shapes and controls
-        scoped to that sheet from the same inventory services. Each scoped section
-        carries a status; a failing section never aborts the others.
+        Aggregates the sheet metadata plus the tables, names, shapes, controls and
+        (when the pivot service is wired) PivotTables scoped to that sheet from the
+        same inventory services. Each scoped section carries a status; a failing
+        section never aborts the others. PivotTable metadata only is added — never
+        the PivotTable cell output (task_048).
 
         Args:
             workbook_id: The id returned by :func:`excel_open`.
@@ -248,16 +260,20 @@ class WorkbookModelService:
             SECTION_CONTROLS, lambda: self._controls.list_controls(workbook_id), diagnostics
         )
 
+        all_pivots, pivot_section = await self._collect_pivots(workbook_id, diagnostics)
+
         tables = [table for table in all_tables if table.sheet_name == sheet.name]
         names = [name for name in all_names if _name_on_sheet(name, sheet.name)]
         shapes = [shape for shape in all_shapes if shape.sheet_name == sheet.name]
         controls = [control for control in all_controls if control.sheet_name == sheet.name]
+        pivots = [pivot for pivot in all_pivots if pivot.sheet_name == sheet.name]
 
         sections = {
             SECTION_TABLES: _rescope(table_section, len(tables)),
             SECTION_NAMES: _rescope(name_section, len(names)),
             SECTION_SHAPES: _rescope(shape_section, len(shapes)),
             SECTION_CONTROLS: _rescope(control_section, len(controls)),
+            SECTION_PIVOTS: _rescope(pivot_section, len(pivots)),
         }
 
         now = _utc_now()
@@ -268,6 +284,7 @@ class WorkbookModelService:
             names=names,
             shapes=shapes,
             controls=controls,
+            pivot_tables=pivots,
             sections=sections,
             created_at=now,
             updated_at=now,
@@ -281,6 +298,7 @@ class WorkbookModelService:
                 "names": len(names),
                 "shapes": len(shapes),
                 "controls": len(controls),
+                "pivot_tables": len(pivots),
                 "model_hash": model.model_hash,
             },
             info,
@@ -318,6 +336,43 @@ class WorkbookModelService:
             name=name,
             status=ModelSectionStatus.AVAILABLE,
             count=len(items),
+        )
+
+    async def _collect_pivots(
+        self, workbook_id: str, diagnostics: list[str]
+    ) -> tuple[list[PivotTableInfo], ModelSection]:
+        """Aggregate the optional PivotTable section without aborting the model.
+
+        When the pivot service is wired (``pivot_tables_service`` was provided),
+        the full PivotTable inventory is read and returned for sheet-scoping by
+        the caller. When it is not wired, or the read fails, an empty list and a
+        ``unavailable`` / ``skipped`` section status are returned so the rest of
+        the sheet model still builds (task_048).
+        """
+
+        if self._pivots is None:
+            return [], ModelSection(
+                name=SECTION_PIVOTS,
+                status=ModelSectionStatus.UNAVAILABLE,
+                count=0,
+                diagnostics=[f"{SECTION_PIVOTS}: pivot service not configured"],
+            )
+        local: list[str] = []
+        try:
+            inventory = await self._pivots.list_pivot_tables(workbook_id)
+        except Exception as exc:  # noqa: BLE001 - section isolation is intentional
+            local.append(f"{SECTION_PIVOTS}: {_describe_error(exc)}")
+            diagnostics.extend(local)
+            return [], ModelSection(
+                name=SECTION_PIVOTS,
+                status=ModelSectionStatus.UNAVAILABLE,
+                count=0,
+                diagnostics=local,
+            )
+        return inventory.pivot_tables, ModelSection(
+            name=SECTION_PIVOTS,
+            status=ModelSectionStatus.AVAILABLE,
+            count=len(inventory.pivot_tables),
         )
 
     async def _collect_vba(
@@ -470,6 +525,7 @@ def content_hash(model: WorkbookModel | SheetModel) -> str:
 __all__ = [
     "SECTION_CONTROLS",
     "SECTION_NAMES",
+    "SECTION_PIVOTS",
     "SECTION_SHAPES",
     "SECTION_SHEETS",
     "SECTION_TABLES",

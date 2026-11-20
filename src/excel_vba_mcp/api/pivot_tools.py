@@ -1,10 +1,16 @@
-"""PivotTables / PivotCaches / PivotFields MCP tool contracts (task_040).
+"""PivotTables / PivotCaches / PivotFields MCP tool contracts (task_040, task_048).
 
 This module defines the **signatures, Pydantic DTOs and docstrings** for the
-Phase 2 PivotTables surface. It is a frozen contract only (task_040): the bodies
-raise :class:`NotImplementedError` and are implemented by later tasks
-(``task_048``–``task_051``). It imports **no Excel/COM** — only domain DTOs; all
-Excel access happens on the single-STA worker inside the pivot service/adapter.
+Phase 2 PivotTables surface. The read-only inventory tools
+(``pivot_tables_list``, ``pivot_table_get``, ``pivot_cache_get``,
+``pivot_fields_list``) are implemented by ``task_048`` and delegate to
+:class:`~excel_vba_mcp.application.pivot_tables_service.PivotTablesService`; the
+mutating tools (refresh / layout / aggregation / filters) remain frozen contract
+stubs implemented by ``task_049``–``task_051`` and raise
+:class:`NotImplementedError`.
+
+It imports **no Excel/COM** — only domain DTOs; all Excel access happens on the
+single-STA worker inside the pivot service/adapter.
 
 Tool groups:
 
@@ -23,6 +29,8 @@ never refreshed. ``Workbook.RefreshAll`` is never used.
 
 from __future__ import annotations
 
+from excel_vba_mcp.application.pivot_tables_service import PivotTablesService
+from excel_vba_mcp.domain.errors import ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
     PivotCacheInfo,
     PivotFieldFilters,
@@ -34,6 +42,11 @@ from excel_vba_mcp.domain.models import (
     PivotTableInfo,
 )
 from excel_vba_mcp.domain.statuses import PivotAggregation, PivotFieldOrientation
+
+# The active pivot tables service, published by the server lifespan. ``None``
+# before startup and after shutdown; the read tools raise a clear error if used
+# out of band (e.g. in a unit test that has not installed a fake).
+_pivot_tables_service: PivotTablesService | None = None
 
 _NOT_IMPLEMENTED = (
     "PivotTables tool {name} is a frozen contract (task_040) and is implemented "
@@ -47,11 +60,54 @@ def _not_implemented(name: str) -> NotImplementedError:
     return NotImplementedError(_NOT_IMPLEMENTED.format(name=name))
 
 
-# ---------------------------------------------------------------------------
-# Read-only tools
-# ---------------------------------------------------------------------------
+def set_pivot_tables_service(service: PivotTablesService | None) -> None:
+    """Publish (or clear) the active pivot tables service used by the tools."""
+
+    global _pivot_tables_service
+    _pivot_tables_service = service
 
 
+def get_pivot_tables_service() -> PivotTablesService:
+    """Return the active pivot tables service or raise if it is not configured."""
+
+    if _pivot_tables_service is None:
+        raise ExcelVbaMcpError(
+            "The pivot tables service is not initialized.",
+            context={"tool": "pivot_tools"},
+        )
+    return _pivot_tables_service
+
+
+def _require_non_empty(value: str, field: str) -> str:
+    """Validate that a required string argument is non-empty."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ExcelVbaMcpError(
+            f"Argument {field!r} must be a non-empty string.",
+            context={"field": field},
+        )
+    return value
+
+
+def _require_int(value: object, field: str, *, minimum: int | None = None) -> int:
+    """Validate that an argument is an integer (optionally with a minimum)."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ExcelVbaMcpError(
+            f"Argument {field!r} must be an integer.",
+            context={"field": field},
+        )
+    if minimum is not None and value < minimum:
+        raise ExcelVbaMcpError(
+            f"Argument {field!r} must be >= {minimum}.",
+            context={"field": field, "value": value},
+        )
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Read-only tools (implemented: task_048)
+# ---------------------------------------------------------------------------
 async def pivot_tables_list(workbook_id: str) -> PivotInventory:
     """List every PivotTable and its cache across all worksheets.
 
@@ -63,7 +119,9 @@ async def pivot_tables_list(workbook_id: str) -> PivotInventory:
         workbook_id: The id returned by ``excel_open``.
     """
 
-    raise _not_implemented("pivot_tables_list")
+    _require_non_empty(workbook_id, "workbook_id")
+    service = get_pivot_tables_service()
+    return await service.list_pivot_tables(workbook_id)
 
 
 async def pivot_table_get(workbook_id: str, pivot_table: str) -> PivotTableInfo:
@@ -74,7 +132,10 @@ async def pivot_table_get(workbook_id: str, pivot_table: str) -> PivotTableInfo:
         pivot_table: The stable PivotTable ``Name``.
     """
 
-    raise _not_implemented("pivot_table_get")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(pivot_table, "pivot_table")
+    service = get_pivot_tables_service()
+    return await service.get_pivot_table(workbook_id, pivot_table)
 
 
 async def pivot_cache_get(workbook_id: str, cache_index: int) -> PivotCacheInfo:
@@ -85,7 +146,10 @@ async def pivot_cache_get(workbook_id: str, cache_index: int) -> PivotCacheInfo:
         cache_index: The 1-based ``CacheIndex`` linking a table to its cache.
     """
 
-    raise _not_implemented("pivot_cache_get")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_int(cache_index, "cache_index", minimum=1)
+    service = get_pivot_tables_service()
+    return await service.get_pivot_cache(workbook_id, cache_index)
 
 
 async def pivot_fields_list(workbook_id: str, pivot_table: str) -> list[PivotFieldInfo]:
@@ -96,7 +160,10 @@ async def pivot_fields_list(workbook_id: str, pivot_table: str) -> list[PivotFie
         pivot_table: The stable PivotTable ``Name``.
     """
 
-    raise _not_implemented("pivot_fields_list")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(pivot_table, "pivot_table")
+    service = get_pivot_tables_service()
+    return await service.list_pivot_fields(workbook_id, pivot_table)
 
 
 async def pivot_field_get_filters(
@@ -116,8 +183,6 @@ async def pivot_field_get_filters(
 # ---------------------------------------------------------------------------
 # Mutating tools (guarded: writable session + snapshot + approval + audit)
 # ---------------------------------------------------------------------------
-
-
 async def pivot_table_refresh(workbook_id: str, pivot_table: str) -> PivotRefreshResult:
     """Refresh one PivotTable via ``PivotTable.RefreshTable`` (table-scoped).
 
@@ -281,6 +346,7 @@ async def pivot_field_clear_filters(
 
 
 __all__ = [
+    "get_pivot_tables_service",
     "pivot_cache_get",
     "pivot_cache_refresh",
     "pivot_field_apply_filter",
@@ -294,4 +360,5 @@ __all__ = [
     "pivot_table_get",
     "pivot_table_refresh",
     "pivot_tables_list",
+    "set_pivot_tables_service",
 ]

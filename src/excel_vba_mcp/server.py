@@ -38,6 +38,7 @@ from excel_vba_mcp.api import (
     control_tools,
     macro_tools,
     name_tools,
+    pivot_tools,
     range_tools,
     shape_tools,
     sheet_tools,
@@ -60,6 +61,12 @@ from excel_vba_mcp.api.name_tools import (
     name_get,
     name_update,
     names_list,
+)
+from excel_vba_mcp.api.pivot_tools import (
+    pivot_cache_get,
+    pivot_fields_list,
+    pivot_table_get,
+    pivot_tables_list,
 )
 from excel_vba_mcp.api.range_tools import (
     range_copy,
@@ -137,6 +144,7 @@ from excel_vba_mcp.application.compile_service import CompileService
 from excel_vba_mcp.application.controls_service import ControlsService
 from excel_vba_mcp.application.macro_service import BackgroundSafetyRegistry, MacroService
 from excel_vba_mcp.application.names_service import NamesService
+from excel_vba_mcp.application.pivot_tables_service import PivotTablesService
 from excel_vba_mcp.application.ranges_service import RangesService
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.shapes_service import ShapesService
@@ -518,6 +526,34 @@ _DESC_WORKBOOK_GET_MODEL = (
     "unavailable, locked or VBOM trust is disabled the other sections are still "
     "returned and vba_access reports the state."
 )
+_DESC_PIVOT_TABLES_LIST = (
+    "List every PivotTable and its cache across all worksheets of an open "
+    "workbook. Enumeration is worksheet-scoped (a full-workbook sweep) because "
+    "Workbook.PivotTables is not a usable inventory on the target build. Each "
+    "PivotTable reports its name, sheet, cache index, TableRange1/TableRange2 "
+    "addresses, source type and supported/unsupported status; shared caches are "
+    "reported once with their affected tables. Read-only."
+)
+_DESC_PIVOT_TABLE_GET = (
+    "Return one PivotTable's metadata by its stable Name: sheet, index, cache "
+    "index, TableRange1/TableRange2/DataBodyRange addresses, row/column/page/"
+    "hidden/data field layout, source type and supported/unsupported status. "
+    "Read-only; never materializes the PivotTable cell output."
+)
+_DESC_PIVOT_CACHE_GET = (
+    "Return one PivotCache's metadata by its 1-based CacheIndex: source type "
+    "(database/external/consolidation/scenario/pivot_table/olap/data_model/"
+    "unknown), SourceData, RefreshDate, RefreshOnFileOpen, EnableRefresh, OLAP "
+    "indicator, shared-cache flag and the list of PivotTables that share this "
+    "cache. Read-only."
+)
+_DESC_PIVOT_FIELDS_LIST = (
+    "List a PivotTable's fields with source name, caption, orientation "
+    "(hidden/row/column/page/data), 1-based position within the orientation "
+    "(null when hidden), data-field aggregation function (from DataFields), "
+    "ShowAllItems, manual filter state and data-field caption/number format. "
+    "Read-only."
+)
 
 # Read-only MCP resource descriptions (spec §6.6). The URIs are per-workbook
 # templates so a client can read the model / VBA inventory / one component's
@@ -556,6 +592,7 @@ class _Runtime:
     tables: TablesService
     names: NamesService
     ranges: RangesService
+    pivots: PivotTablesService
     shapes: ShapesService
     controls: ControlsService
     compile: CompileService
@@ -634,6 +671,7 @@ def _build_runtime() -> _Runtime:
     tables = TablesService(worker, session, snapshot, approval, path_policy, audit)
     ranges = RangesService(worker, session, snapshot, approval, path_policy, audit)
     names = NamesService(worker, session, snapshot, approval, path_policy, audit)
+    pivots = PivotTablesService(worker, session, audit)
     shapes = ShapesService(worker, session, snapshot, approval, path_policy, audit)
     controls = ControlsService(worker, session, snapshot, approval, path_policy, audit)
     compile_service = CompileService(worker, session, vba, path_policy, audit)
@@ -652,6 +690,7 @@ def _build_runtime() -> _Runtime:
         vba,
         path_policy,
         audit,
+        pivot_tables_service=pivots,
     )
     # Evidence + test-run persistence (pure filesystem; no COM).
     artifacts = ArtifactStore(
@@ -685,6 +724,7 @@ def _build_runtime() -> _Runtime:
         tables=tables,
         names=names,
         ranges=ranges,
+        pivots=pivots,
         shapes=shapes,
         controls=controls,
         compile=compile_service,
@@ -745,6 +785,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         sheet_tools.set_sheets_service(runtime.sheets)
         table_tools.set_tables_service(runtime.tables)
         range_tools.set_ranges_service(runtime.ranges)
+        pivot_tools.set_pivot_tables_service(runtime.pivots)
         name_tools.set_names_service(runtime.names)
         shape_tools.set_shapes_service(runtime.shapes)
         control_tools.set_controls_service(runtime.controls)
@@ -762,6 +803,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         sheet_tools.set_sheets_service(None)
         table_tools.set_tables_service(None)
         range_tools.set_ranges_service(None)
+        pivot_tools.set_pivot_tables_service(None)
         name_tools.set_names_service(None)
         shape_tools.set_shapes_service(None)
         control_tools.set_controls_service(None)
@@ -891,6 +933,14 @@ def _register_tools(server: MCPServer) -> None:
     )
     server.add_tool(table_create, name="table_create", description=_DESC_TABLE_CREATE)
     server.add_tool(table_resize, name="table_resize", description=_DESC_TABLE_RESIZE)
+    server.add_tool(
+        pivot_tables_list, name="pivot_tables_list", description=_DESC_PIVOT_TABLES_LIST
+    )
+    server.add_tool(pivot_table_get, name="pivot_table_get", description=_DESC_PIVOT_TABLE_GET)
+    server.add_tool(pivot_cache_get, name="pivot_cache_get", description=_DESC_PIVOT_CACHE_GET)
+    server.add_tool(
+        pivot_fields_list, name="pivot_fields_list", description=_DESC_PIVOT_FIELDS_LIST
+    )
     server.add_tool(range_get, name="range_get", description=_DESC_RANGE_GET)
     server.add_tool(
         range_read_values, name="range_read_values", description=_DESC_RANGE_READ_VALUES
