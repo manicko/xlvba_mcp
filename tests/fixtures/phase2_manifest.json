@@ -1,0 +1,832 @@
+{
+  "schema_version": 1,
+  "task": "task_041",
+  "plan": ".ai/plans/plan_phase2_ranges_cells_pivottables.md",
+  "generated_at": "2026-11-20T13:57:33+00:00",
+  "target_excel_build": "16.0.14332",
+  "observed_excel_version": "16.0.14332",
+  "generator": "tests/fixtures/build_phase2_fixtures.py",
+  "environment": {
+    "python_version": "3.14.7",
+    "platform": "Windows-10-10.0.17763-SP0",
+    "windows_build": "10.17763"
+  },
+  "notes": [
+    "Expected values are literal design constants in the generator; the generator asserts Excel readback equals them before committing.",
+    "Fixtures are local/offline: no workbook connections, Power Query or Data Model.",
+    "Excel is created hidden and non-activating; no Activate/Select is used."
+  ],
+  "fixtures": {
+    "RangesCellsProject.xlsm": {
+      "path": "tests/fixtures/RangesCellsProject.xlsm",
+      "sha256": "e665cff078070a91f470c891cbd3686c3b71615b78f7dbbfac823ac7f11effa2",
+      "size_bytes": 16052,
+      "build": {
+        "vba_module": "added",
+        "sheets": [
+          "Cells",
+          "StructOps"
+        ]
+      },
+      "sheets": [
+        "Cells",
+        "StructOps"
+      ],
+      "cells": {
+        "B2": {
+          "kind": "string",
+          "value": "hello world",
+          "number_format": "General",
+          "has_formula": false,
+          "formula": null
+        },
+        "B3": {
+          "kind": "number",
+          "value": 42.0,
+          "number_format": "0",
+          "has_formula": false,
+          "formula": null
+        },
+        "B4": {
+          "kind": "number",
+          "value": 3.14,
+          "number_format": "0.00",
+          "has_formula": false,
+          "formula": null
+        },
+        "B5": {
+          "kind": "boolean",
+          "value": true,
+          "number_format": "General",
+          "has_formula": false,
+          "formula": null
+        },
+        "B6": {
+          "kind": "boolean",
+          "value": false,
+          "number_format": "General",
+          "has_formula": false,
+          "formula": null
+        },
+        "B7": {
+          "kind": "empty",
+          "value": null,
+          "number_format": "General",
+          "has_formula": false,
+          "formula": null
+        },
+        "B8": {
+          "kind": "string",
+          "value": "=1+1",
+          "number_format": "General",
+          "has_formula": false,
+          "formula": null
+        },
+        "B9": {
+          "kind": "number",
+          "value": 3.0,
+          "number_format": "General",
+          "has_formula": true,
+          "formula": "=1+2"
+        },
+        "B10": {
+          "kind": "error",
+          "value": "#DIV/0!",
+          "number_format": "General",
+          "has_formula": true,
+          "formula": "=1/0"
+        },
+        "B11": {
+          "kind": "error",
+          "value": "#N/A",
+          "number_format": "General",
+          "has_formula": true,
+          "formula": "=NA()"
+        },
+        "B12": {
+          "kind": "number",
+          "value": 84.0,
+          "number_format": "General",
+          "has_formula": true,
+          "formula": "=B3*2"
+        },
+        "B13": {
+          "kind": "date",
+          "value": "2026-01-02",
+          "number_format": "yyyy-mm-dd",
+          "has_formula": false,
+          "formula": null
+        },
+        "B14": {
+          "kind": "date",
+          "value": "2026-06-15",
+          "number_format": "yyyy-mm-dd hh:mm",
+          "has_formula": false,
+          "formula": null
+        },
+        "B15": {
+          "kind": "number",
+          "value": 45000.0,
+          "number_format": "General",
+          "has_formula": false,
+          "formula": null
+        }
+      },
+      "cell_mismatches": [],
+      "block": {
+        "address": "F1:H3",
+        "values": [
+          [
+            1.0,
+            2.0,
+            3.0
+          ],
+          [
+            4.0,
+            5.0,
+            6.0
+          ],
+          [
+            7.0,
+            8.0,
+            9.0
+          ]
+        ],
+        "matches": true
+      },
+      "merged": {
+        "address": "$J$1:$L$2",
+        "anchor": "J1",
+        "value": "merged title",
+        "matches": true
+      },
+      "data_validation": [
+        {
+          "range": "M4:M6",
+          "type": 3,
+          "operator": 1,
+          "formula1": "\"Red,Green,Blue\"",
+          "formula2": "",
+          "ignore_blank": true,
+          "in_cell_dropdown": true,
+          "alert_style": 1
+        },
+        {
+          "range": "N4:N6",
+          "type": 1,
+          "operator": 1,
+          "formula1": "1",
+          "formula2": "10",
+          "ignore_blank": true,
+          "in_cell_dropdown": false,
+          "alert_style": 1
+        }
+      ],
+      "conditional_formatting": [
+        {
+          "range": "Q1:Q5",
+          "priority": 1,
+          "type": 1,
+          "operator": 3,
+          "formula1": "=5",
+          "stop_if_true": true,
+          "applies_to": "$Q$1:$Q$5",
+          "interior_color": 255
+        },
+        {
+          "range": "R1:R5",
+          "priority": 2,
+          "type": 2,
+          "operator": null,
+          "formula1": "=R1>1",
+          "stop_if_true": true,
+          "applies_to": "$R$1:$R$5",
+          "interior_color": 65280
+        }
+      ],
+      "list_object": {
+        "name": "tblCells",
+        "sheet": "Cells",
+        "range": "$T$1:$V$4",
+        "header_row": "$T$1:$V$1",
+        "data_body": "$T$2:$V$4",
+        "headers": [
+          "id",
+          "name",
+          "qty"
+        ]
+      },
+      "list_object_ranges": {
+        "inside": [
+          "T2:V4",
+          "T1:V1"
+        ],
+        "overlap": [
+          "V2:W3",
+          "U3:V4"
+        ],
+        "outside": [
+          "A1:D16",
+          "M4:N6",
+          "Q1:R5"
+        ]
+      },
+      "struct_ops": {
+        "sheet": "StructOps",
+        "copy_source": {
+          "kind": "number",
+          "value": 1.0,
+          "number_format": "General",
+          "has_formula": false,
+          "formula": null
+        },
+        "copy_dest_empty": {
+          "kind": "empty",
+          "value": null,
+          "number_format": "General",
+          "has_formula": false,
+          "formula": null
+        },
+        "shift_block": {
+          "kind": "number",
+          "value": 10.0,
+          "number_format": "General",
+          "has_formula": false,
+          "formula": null
+        },
+        "merge_anchor": {
+          "kind": "string",
+          "value": "anchor",
+          "number_format": "General",
+          "has_formula": false,
+          "formula": null
+        },
+        "premerged_merge_area": "$J$5:$L$5"
+      },
+      "design": {
+        "scalar_cells": {
+          "B2": {
+            "kind": "string",
+            "value": "hello world",
+            "number_format": "General",
+            "has_formula": false,
+            "formula": null
+          },
+          "B3": {
+            "kind": "number",
+            "value": 42.0,
+            "number_format": "0",
+            "has_formula": false,
+            "formula": null
+          },
+          "B4": {
+            "kind": "number",
+            "value": 3.14,
+            "number_format": "0.00",
+            "has_formula": false,
+            "formula": null
+          },
+          "B5": {
+            "kind": "boolean",
+            "value": true,
+            "number_format": "General",
+            "has_formula": false,
+            "formula": null
+          },
+          "B6": {
+            "kind": "boolean",
+            "value": false,
+            "number_format": "General",
+            "has_formula": false,
+            "formula": null
+          },
+          "B7": {
+            "kind": "empty",
+            "value": null,
+            "number_format": "General",
+            "has_formula": false,
+            "formula": null
+          },
+          "B8": {
+            "kind": "string",
+            "value": "=1+1",
+            "number_format": "General",
+            "has_formula": false,
+            "formula": null
+          },
+          "B9": {
+            "kind": "number",
+            "value": 3.0,
+            "number_format": "General",
+            "has_formula": true,
+            "formula": "=1+2"
+          },
+          "B10": {
+            "kind": "error",
+            "value": "#DIV/0!",
+            "number_format": "General",
+            "has_formula": true,
+            "formula": "=1/0"
+          },
+          "B11": {
+            "kind": "error",
+            "value": "#N/A",
+            "number_format": "General",
+            "has_formula": true,
+            "formula": "=NA()"
+          },
+          "B12": {
+            "kind": "number",
+            "value": 84.0,
+            "number_format": "General",
+            "has_formula": true,
+            "formula": "=B3*2"
+          },
+          "B13": {
+            "kind": "date",
+            "value": "2026-01-02",
+            "number_format": "yyyy-mm-dd",
+            "has_formula": false,
+            "formula": null
+          },
+          "B14": {
+            "kind": "date",
+            "value": "2026-06-15",
+            "number_format": "yyyy-mm-dd hh:mm",
+            "has_formula": false,
+            "formula": null
+          },
+          "B15": {
+            "kind": "number",
+            "value": 45000.0,
+            "number_format": "General",
+            "has_formula": false,
+            "formula": null
+          }
+        },
+        "formulas": {
+          "B9": "=1+2",
+          "B10": "=1/0",
+          "B11": "=NA()",
+          "B12": "=B3*2"
+        },
+        "date_serials": {
+          "B13": 46024,
+          "B14": 46188
+        },
+        "block": {
+          "address": "F1:H3",
+          "values": [
+            [
+              1.0,
+              2.0,
+              3.0
+            ],
+            [
+              4.0,
+              5.0,
+              6.0
+            ],
+            [
+              7.0,
+              8.0,
+              9.0
+            ]
+          ]
+        },
+        "merged": {
+          "address": "J1:L2",
+          "anchor": "J1",
+          "value": "merged title"
+        },
+        "validation": [
+          {
+            "range": "M4:M6",
+            "type": 3,
+            "type_name": "list",
+            "operator": 1,
+            "formula1": "\"Red,Green,Blue\"",
+            "formula2": "",
+            "ignore_blank": true,
+            "in_cell_dropdown": true,
+            "alert_style": 1
+          },
+          {
+            "range": "N4:N6",
+            "type": 1,
+            "type_name": "whole_number",
+            "operator": 1,
+            "formula1": "1",
+            "formula2": "10",
+            "ignore_blank": true,
+            "in_cell_dropdown": false,
+            "alert_style": 1
+          }
+        ],
+        "conditional_formatting": [
+          {
+            "range": "Q1:Q5",
+            "priority": 1,
+            "type": 1,
+            "type_name": "cell_value",
+            "operator": 3,
+            "formula1": "=5",
+            "stop_if_true": true,
+            "interior_color": 255
+          },
+          {
+            "range": "R1:R5",
+            "priority": 2,
+            "type": 2,
+            "type_name": "expression",
+            "operator": null,
+            "formula1": "=R1>1",
+            "stop_if_true": true,
+            "interior_color": 65280
+          }
+        ],
+        "list_object": {
+          "name": "tblCells",
+          "sheet": "Cells",
+          "range": "T1:V4",
+          "header_row": "T1:V1",
+          "data_body": "T2:V4",
+          "headers": [
+            "id",
+            "name",
+            "qty"
+          ],
+          "rows": [
+            [
+              1.0,
+              "alpha",
+              10.0
+            ],
+            [
+              2.0,
+              "beta",
+              20.0
+            ],
+            [
+              3.0,
+              "gamma",
+              30.0
+            ]
+          ],
+          "inside_ranges": [
+            "T2:V4",
+            "T1:V1"
+          ],
+          "overlap_ranges": [
+            "V2:W3",
+            "U3:V4"
+          ],
+          "outside_ranges": [
+            "A1:D16",
+            "M4:N6",
+            "Q1:R5"
+          ]
+        },
+        "struct_ops": {
+          "copy_source": {
+            "address": "A2:B4",
+            "values": [
+              [
+                1.0,
+                2.0
+              ],
+              [
+                3.0,
+                4.0
+              ],
+              [
+                5.0,
+                6.0
+              ]
+            ]
+          },
+          "copy_dest": "D2:E4",
+          "shift_block": {
+            "address": "G2:H4",
+            "values": [
+              [
+                10.0,
+                20.0
+              ],
+              [
+                30.0,
+                40.0
+              ],
+              [
+                50.0,
+                60.0
+              ]
+            ]
+          },
+          "merge": {
+            "address": "J2:L2",
+            "values": [
+              [
+                "anchor",
+                "discard1",
+                "discard2"
+              ]
+            ]
+          },
+          "premerged": {
+            "address": "J5:L5",
+            "anchor": "J5",
+            "value": "unmerge me"
+          }
+        }
+      }
+    },
+    "PivotTablesProject.xlsm": {
+      "path": "tests/fixtures/PivotTablesProject.xlsm",
+      "sha256": "8d1fa43d841ff1e6e9740afc4aed47c6480db93c0c8ffc8adccfd41e89e32372",
+      "size_bytes": 24916,
+      "build": {
+        "vba_module": "added",
+        "sheets": [
+          "Data",
+          "TableData",
+          "PivotReport"
+        ]
+      },
+      "sheets": [
+        "Data",
+        "TableData",
+        "PivotReport"
+      ],
+      "pivot_report_sheet": "PivotReport",
+      "pivot_tables": {
+        "ptA": {
+          "name": "ptA",
+          "sheet": "PivotReport",
+          "cache_index": 1,
+          "cache_source_type": 1,
+          "cache_source_data": "Data!R1C1:R7C5",
+          "table_range1": "$A$3:$F$14",
+          "table_range2": "$A$1:$F$14",
+          "row_fields": [
+            "Region"
+          ],
+          "column_fields": [
+            "Product"
+          ],
+          "page_fields": [
+            "Quarter"
+          ],
+          "page_current_page": "(All)",
+          "data_fields": [
+            {
+              "source_name": "Sales",
+              "caption": "Sum of Sales",
+              "function": -4157,
+              "position": 1
+            },
+            {
+              "source_name": "Units",
+              "caption": "Average of Units",
+              "function": -4106,
+              "position": 2
+            }
+          ],
+          "filter": null
+        },
+        "ptB": {
+          "name": "ptB",
+          "sheet": "PivotReport",
+          "cache_index": 1,
+          "cache_source_type": 1,
+          "cache_source_data": "Data!R1C1:R7C5",
+          "table_range1": "$J$3:$K$8",
+          "table_range2": "$J$3:$K$8",
+          "row_fields": [
+            "Region"
+          ],
+          "column_fields": [],
+          "page_fields": [],
+          "page_current_page": null,
+          "data_fields": [
+            {
+              "source_name": "Units",
+              "caption": "Sum of Units",
+              "function": -4157,
+              "position": 1
+            }
+          ],
+          "filter": {
+            "field": "Region",
+            "all_items_visible": false,
+            "visible_items": [
+              "East",
+              "North",
+              "South"
+            ],
+            "hidden_items": [
+              "West"
+            ]
+          }
+        },
+        "ptC": {
+          "name": "ptC",
+          "sheet": "PivotReport",
+          "cache_index": 2,
+          "cache_source_type": 1,
+          "cache_source_data": "TableData!R1C1:R7C5",
+          "table_range1": "$S$3:$T$8",
+          "table_range2": "$S$3:$T$8",
+          "row_fields": [
+            "Product"
+          ],
+          "column_fields": [],
+          "page_fields": [],
+          "page_current_page": null,
+          "data_fields": [
+            {
+              "source_name": "Sales",
+              "caption": "Count of Sales",
+              "function": -4112,
+              "position": 1
+            }
+          ],
+          "filter": null
+        }
+      },
+      "pivot_mismatches": [],
+      "caches": [
+        {
+          "index": 1,
+          "source_type": 1,
+          "source_data": "Data!R1C1:R7C5"
+        },
+        {
+          "index": 2,
+          "source_type": 1,
+          "source_data": "TableData!R1C1:R7C5"
+        }
+      ],
+      "source_list_object": {
+        "name": "tblPivotSource",
+        "sheet": "TableData",
+        "range": "$A$1:$E$7",
+        "header_row": "$A$1:$E$1",
+        "data_body": "$A$2:$E$7",
+        "headers": [
+          "Region",
+          "Product",
+          "Quarter",
+          "Sales",
+          "Units"
+        ]
+      },
+      "design": {
+        "source_sheet": "Data",
+        "source_headers": [
+          "Region",
+          "Product",
+          "Quarter",
+          "Sales",
+          "Units"
+        ],
+        "source_rows": [
+          [
+            "North",
+            "Alpha",
+            "Q1",
+            100.0,
+            5.0
+          ],
+          [
+            "South",
+            "Beta",
+            "Q1",
+            200.0,
+            7.0
+          ],
+          [
+            "North",
+            "Beta",
+            "Q2",
+            150.0,
+            3.0
+          ],
+          [
+            "East",
+            "Gamma",
+            "Q2",
+            300.0,
+            9.0
+          ],
+          [
+            "West",
+            "Alpha",
+            "Q3",
+            250.0,
+            4.0
+          ],
+          [
+            "West",
+            "Gamma",
+            "Q4",
+            350.0,
+            11.0
+          ]
+        ],
+        "table_sheet": "TableData",
+        "list_object": "tblPivotSource",
+        "pivot_tables": [
+          {
+            "name": "ptA",
+            "sheet": "PivotReport",
+            "anchor": "A3",
+            "cache_index": 1,
+            "cache_source": "worksheet",
+            "row_fields": [
+              "Region"
+            ],
+            "column_fields": [
+              "Product"
+            ],
+            "page_fields": [
+              "Quarter"
+            ],
+            "page_current_page": "(All)",
+            "data_fields": [
+              {
+                "source_name": "Sales",
+                "caption": "Sum of Sales",
+                "function": -4157,
+                "function_name": "sum"
+              },
+              {
+                "source_name": "Units",
+                "caption": "Average of Units",
+                "function": -4106,
+                "function_name": "average"
+              }
+            ],
+            "filter": null
+          },
+          {
+            "name": "ptB",
+            "sheet": "PivotReport",
+            "anchor": "J3",
+            "cache_index": 1,
+            "cache_source": "worksheet",
+            "row_fields": [
+              "Region"
+            ],
+            "column_fields": [],
+            "page_fields": [],
+            "page_current_page": null,
+            "data_fields": [
+              {
+                "source_name": "Units",
+                "caption": "Sum of Units",
+                "function": -4157,
+                "function_name": "sum"
+              }
+            ],
+            "filter": {
+              "field": "Region",
+              "hidden_items": [
+                "West"
+              ]
+            }
+          },
+          {
+            "name": "ptC",
+            "sheet": "PivotReport",
+            "anchor": "S3",
+            "cache_index": 2,
+            "cache_source": "list_object",
+            "row_fields": [
+              "Product"
+            ],
+            "column_fields": [],
+            "page_fields": [],
+            "page_current_page": null,
+            "data_fields": [
+              {
+                "source_name": "Sales",
+                "caption": "Count of Sales",
+                "function": -4112,
+                "function_name": "count"
+              }
+            ],
+            "filter": null
+          }
+        ],
+        "shared_cache": {
+          "cache_index": 1,
+          "pivot_tables": [
+            "ptA",
+            "ptB"
+          ]
+        }
+      }
+    }
+  }
+}
