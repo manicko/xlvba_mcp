@@ -16,7 +16,7 @@ Runtime: Windows 10 Enterprise LTSC 2019 build 17763.9020 x64; Excel 16.0 build 
 
 | Task | Title | Group | Deps | Risk | Status | Commit | Notes |
 |---|---|---|---|---|---|---|---|
-| task_038 | Research Range/Cells Object Model | G11 | 037 | high | IN_PROGRESS | — | Researcher → `docs/research/ranges_cells_api.md` |
+| task_038 | Research Range/Cells Object Model | G11 | 037 | high | DONE | `docs/research/ranges_cells_api.md` | Value2 raw + NumberFormat dates; Formula2 primary; bounded format set; ListObject intersection rejected; MAX_RANGE_CELLS=100k |
 | task_039 | Research PivotTables/PivotCaches/PivotFields | G11 | 037 | critical | IN_PROGRESS | — | Researcher → `docs/research/pivot_tables_api.md` |
 | task_040 | Phase 2 DTO/tool contracts | G11 | 038,039 | high | PENDING | — | gate: frozen after research + auditor |
 | task_041 | Phase 2 fixtures (RangesCells/PivotTables) | G12 | 038,039 | high | PENDING | — | + `phase2_manifest.json` |
