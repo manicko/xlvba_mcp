@@ -22,17 +22,19 @@ with :class:`~excel_vba_mcp.domain.errors.ListObjectIntersectionError` and route
 to the table tools; the Range API never changes table row/column structure.
 
 The read-only tools (``range_get``, ``range_read_values``,
-``range_read_formulas``, task_042) are implemented here as thin async handlers
-that validate their arguments, delegate to
+``range_read_formulas``, task_042), the write/format tools (``range_write_values``,
+``range_write_formulas``, ``range_set_format``; task_043/task_044) and the
+structural tools (``range_copy``, ``range_insert``, ``range_delete``,
+``range_merge``, ``range_unmerge``; task_045) are implemented here as thin async
+handlers that validate their arguments, delegate to
 :class:`~excel_vba_mcp.application.ranges_service.RangesService` and return a
-domain DTO. The remaining stubs are implemented by later tasks
-(``task_043``–``task_046``).
+domain DTO. The remaining stubs are implemented by ``task_046``.
 """
 
 from __future__ import annotations
 
 from excel_vba_mcp.application.ranges_service import RangesService
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
     ConditionalFormatMutationResult,
     ConditionalFormatRule,
@@ -112,6 +114,56 @@ def _require_int(value: object, field: str, *, minimum: int | None = None) -> in
             context={"field": field, "value": value},
         )
     return value
+
+
+def _require_bool(value: object, field: str) -> bool:
+    """Validate that an argument is a boolean flag (structural tools)."""
+
+    if not isinstance(value, bool):
+        raise ExcelVbaMcpError(
+            f"Argument {field!r} must be a boolean.",
+            code=ErrorCode.INVALID_RANGE,
+            context={"field": field, "value": value},
+        )
+    return value
+
+
+def _require_range_text(value: object, field: str) -> str:
+    """Validate a sheet/address/destination argument of a structural tool."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ExcelVbaMcpError(
+            f"Argument {field!r} is required and must be a non-empty string.",
+            code=ErrorCode.INVALID_RANGE,
+            context={"field": field, "value": value},
+        )
+    return value.strip()
+
+
+#: Explicit shift directions accepted by ``range_insert`` (task_038 §5.2 item 2).
+_INSERT_SHIFTS = ("right", "down")
+
+#: Explicit shift directions accepted by ``range_delete`` (task_038 §5.2 item 2).
+_DELETE_SHIFTS = ("left", "up")
+
+
+def _require_shift(shift: object, allowed: tuple[str, ...], operation: str) -> str:
+    """Validate an explicit shift name; an omitted/ambiguous shift is rejected."""
+
+    if not isinstance(shift, str) or not shift.strip():
+        raise ExcelVbaMcpError(
+            f"Argument 'shift' is required for {operation} and must never be guessed.",
+            code=ErrorCode.INVALID_RANGE,
+            context={"shift": shift, "operation": operation},
+        )
+    normalized = shift.strip().lower()
+    if normalized not in allowed:
+        raise ExcelVbaMcpError(
+            f"Argument 'shift' must be one of {list(allowed)} for {operation}.",
+            code=ErrorCode.INVALID_RANGE,
+            context={"shift": shift, "operation": operation, "allowed": list(allowed)},
+        )
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +405,13 @@ async def range_copy(
         destination: The destination A1-style address.
     """
 
-    raise _not_implemented("range_copy")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(sheet, "sheet")
+    _require_range_text(source, "source")
+    _require_range_text(destination_sheet, "destination_sheet")
+    _require_range_text(destination, "destination")
+    service = get_ranges_service()
+    return await service.copy_range(workbook_id, sheet, source, destination_sheet, destination)
 
 
 async def range_insert(
@@ -378,7 +436,15 @@ async def range_insert(
         allow_merged: Permit inserting over merged cells after preview.
     """
 
-    raise _not_implemented("range_insert")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(sheet, "sheet")
+    _require_non_empty(address, "address")
+    shift_name = _require_shift(shift, _INSERT_SHIFTS, "insert")
+    allow_merged = _require_bool(allow_merged, "allow_merged")
+    service = get_ranges_service()
+    return await service.insert_range(
+        workbook_id, sheet, address, shift_name, allow_merged=allow_merged
+    )
 
 
 async def range_delete(
@@ -402,7 +468,15 @@ async def range_delete(
         allow_merged: Permit deleting over merged cells after preview.
     """
 
-    raise _not_implemented("range_delete")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(sheet, "sheet")
+    _require_non_empty(address, "address")
+    shift_name = _require_shift(shift, _DELETE_SHIFTS, "delete")
+    allow_merged = _require_bool(allow_merged, "allow_merged")
+    service = get_ranges_service()
+    return await service.delete_range(
+        workbook_id, sheet, address, shift_name, allow_merged=allow_merged
+    )
 
 
 async def range_merge(
@@ -427,7 +501,15 @@ async def range_merge(
         allow_data_loss: Permit merging when non-anchor cells hold data.
     """
 
-    raise _not_implemented("range_merge")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(sheet, "sheet")
+    _require_non_empty(address, "address")
+    across = _require_bool(across, "across")
+    allow_data_loss = _require_bool(allow_data_loss, "allow_data_loss")
+    service = get_ranges_service()
+    return await service.merge_range(
+        workbook_id, sheet, address, across=across, allow_data_loss=allow_data_loss
+    )
 
 
 async def range_unmerge(workbook_id: str, sheet: str, address: str) -> StructuralMutationResult:
@@ -441,7 +523,11 @@ async def range_unmerge(workbook_id: str, sheet: str, address: str) -> Structura
         address: The A1-style target address.
     """
 
-    raise _not_implemented("range_unmerge")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(sheet, "sheet")
+    _require_non_empty(address, "address")
+    service = get_ranges_service()
+    return await service.unmerge_range(workbook_id, sheet, address)
 
 
 async def range_set_validation(

@@ -62,11 +62,16 @@ from excel_vba_mcp.api.name_tools import (
     names_list,
 )
 from excel_vba_mcp.api.range_tools import (
+    range_copy,
+    range_delete,
     range_get,
     range_get_format,
+    range_insert,
+    range_merge,
     range_read_formulas,
     range_read_values,
     range_set_format,
+    range_unmerge,
     range_write_formulas,
     range_write_values,
 )
@@ -388,6 +393,42 @@ _DESC_RANGE_SET_FORMAT = (
     "enums are validated before any mutation; a null clears to automatic only "
     "where Excel allows. Guarded mutation: writable session + snapshot + "
     "approval + postcondition re-read."
+)
+_DESC_RANGE_COPY = (
+    "Copy a Range to an explicit destination (same workbook, no clipboard). The "
+    "destination is mandatory; an overlapping source/destination, a shape-"
+    "mismatched destination or a destination intersecting merged cells is "
+    "rejected. Structural copies that intersect an Excel Table (ListObject) are "
+    "rejected and routed to the table tools. Guarded mutation: writable session "
+    "+ snapshot + approval + postcondition re-read."
+)
+_DESC_RANGE_INSERT = (
+    "Insert cells at an explicit address and shift them in an explicit direction "
+    "('right' or 'down'). An omitted/unknown shift is rejected (never guessed). "
+    "Rejected for a protected sheet, an Excel Table (ListObject) intersection, a "
+    "dynamic-array spill range, or merged cells without allow_merged. Guarded "
+    "mutation: writable session + snapshot + approval + postcondition re-read."
+)
+_DESC_RANGE_DELETE = (
+    "Delete cells at an explicit address and shift the remainder in an explicit "
+    "direction ('left' or 'up'). An omitted/unknown shift is rejected (never "
+    "guessed). Rejected for a protected sheet, an Excel Table (ListObject) "
+    "intersection, a dynamic-array spill range, or merged cells without "
+    "allow_merged. Guarded mutation: writable session + snapshot + approval + "
+    "postcondition re-read."
+)
+_DESC_RANGE_MERGE = (
+    "Merge a Range into one cell (or one cell per row with across=true). Merging "
+    "discards non-anchor data: the preflight reports the affected cells and the "
+    "merge is blocked unless allow_data_loss=true is passed after review. "
+    "Rejected for a protected sheet, an Excel Table (ListObject) intersection or "
+    "a spill range. Guarded mutation: writable session + snapshot + approval."
+)
+_DESC_RANGE_UNMERGE = (
+    "Unmerge every merged area intersecting an explicit target. Rejected when no "
+    "merged area intersects the target, for a protected sheet, or for an Excel "
+    "Table (ListObject) intersection. Guarded mutation: writable session + "
+    "snapshot + approval + postcondition re-read."
 )
 _DESC_NAMES_LIST = (
     "List every defined name (Named Range) of an open workbook across workbook "
@@ -833,6 +874,11 @@ def _register_tools(server: MCPServer) -> None:
     )
     server.add_tool(range_get_format, name="range_get_format", description=_DESC_RANGE_GET_FORMAT)
     server.add_tool(range_set_format, name="range_set_format", description=_DESC_RANGE_SET_FORMAT)
+    server.add_tool(range_copy, name="range_copy", description=_DESC_RANGE_COPY)
+    server.add_tool(range_insert, name="range_insert", description=_DESC_RANGE_INSERT)
+    server.add_tool(range_delete, name="range_delete", description=_DESC_RANGE_DELETE)
+    server.add_tool(range_merge, name="range_merge", description=_DESC_RANGE_MERGE)
+    server.add_tool(range_unmerge, name="range_unmerge", description=_DESC_RANGE_UNMERGE)
     server.add_tool(names_list, name="names_list", description=_DESC_NAMES_LIST)
     server.add_tool(name_get, name="name_get", description=_DESC_NAME_GET)
     server.add_tool(name_create, name="name_create", description=_DESC_NAME_CREATE)

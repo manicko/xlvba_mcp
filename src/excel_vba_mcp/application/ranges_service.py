@@ -1,9 +1,11 @@
-"""Excel Range/Cells service (task_042 read, task_043 write, task_044 format).
+"""Excel Range/Cells service (task_042 read, task_043 write, task_044 format,
+task_045 structural).
 
 :class:`RangesService` is the async application-layer orchestration for the
 Range/Cells surface (``range_get``, ``range_read_values``,
 ``range_read_formulas``, ``range_write_values``, ``range_write_formulas``,
-``range_get_format``, ``range_set_format``). It is
+``range_get_format``, ``range_set_format``, ``range_copy``, ``range_insert``,
+``range_delete``, ``range_merge``, ``range_unmerge``). It is
 deliberately **COM-free**: every method resolves the ``workbook_id`` through the
 session bookkeeping, enforces the non-COM guard chain and then submits a single
 STA-local callable to the dedicated single-STA
@@ -51,6 +53,7 @@ from excel_vba_mcp.domain.models import (
     RangeMutationResult,
     RangeValues,
     RangeWriteRequest,
+    StructuralMutationResult,
     WorkbookInfo,
 )
 from excel_vba_mcp.domain.statuses import OperationClass
@@ -65,6 +68,17 @@ _DEFAULT_TIMEOUT_S = 60.0
 _ACTION_WRITE_VALUES = "range_write_values"
 _ACTION_WRITE_FORMULAS = "range_write_formulas"
 _ACTION_SET_FORMAT = "range_set_format"
+_ACTION_COPY = "range_copy"
+_ACTION_INSERT = "range_insert"
+_ACTION_DELETE = "range_delete"
+_ACTION_MERGE = "range_merge"
+_ACTION_UNMERGE = "range_unmerge"
+
+#: Explicit shift directions accepted by ``insert_range`` / ``delete_range``
+#: (task_038 §5.2 item 2). The adapter resolves the names to the Excel enum
+#: values; this set only validates the *contract* before any COM access.
+_INSERT_SHIFTS: frozenset[str] = frozenset({"right", "down"})
+_DELETE_SHIFTS: frozenset[str] = frozenset({"left", "up"})
 
 #: Return type of the worker callables submitted by this service.
 _T = TypeVar("_T")
@@ -366,6 +380,237 @@ class RangesService:
         return result
 
     # ------------------------------------------------------------------
+    # Public API — structural operations (guarded; task_045)
+    # ------------------------------------------------------------------
+    # Copy / insert / delete / merge / unmerge all follow the same guard chain
+    # (writable -> snapshot -> approval), then run one STA-local adapter call that
+    # performs the preflight guards (ListObject intersection, merged cells,
+    # protected sheet, spill ranges, merge data loss) and verifies the resulting
+    # address / dimensions / table metadata. Every call is audited.
+    async def copy_range(
+        self,
+        workbook_id: str,
+        sheet: str,
+        source: str,
+        destination_sheet: str,
+        destination: str,
+    ) -> StructuralMutationResult:
+        """Copy a range to an explicit destination (no clipboard).
+
+        The destination is mandatory: a missing/blank destination or source sheet
+        is rejected before the guard chain and before any COM access.
+        """
+
+        _require_text(source, "source")
+        _require_text(destination, "destination")
+        _require_text(destination_sheet, "destination_sheet")
+        _require_text(sheet, "sheet")
+
+        record = self._require_writable(workbook_id)
+        self._require_snapshot(workbook_id)
+        self._require_approval(record, _ACTION_COPY)
+
+        def copy_fn(wb: Any) -> StructuralMutationResult:
+            return self._adapter.copy_range(wb, sheet, source, destination_sheet, destination)
+
+        result = await self._submit_mutation(workbook_id, "range_copy", copy_fn, record)
+        self._record_audit(
+            "range_copy",
+            "mutating",
+            record,
+            {
+                "workbook_id": workbook_id,
+                "sheet": sheet,
+                "source": source,
+                "destination_sheet": destination_sheet,
+                "destination": destination,
+            },
+            {
+                "action": result.action,
+                "source": result.source.address if result.source else source,
+                "destination": result.range_after.address if result.range_after else destination,
+                "verified": result.verified,
+                "affected_addresses": result.affected_addresses,
+            },
+        )
+        return result
+
+    async def insert_range(
+        self,
+        workbook_id: str,
+        sheet: str,
+        address: str,
+        shift: str,
+        *,
+        allow_merged: bool = False,
+    ) -> StructuralMutationResult:
+        """Insert cells and shift them in an explicit direction (guarded mutation)."""
+
+        _require_text(sheet, "sheet")
+        _require_text(address, "address")
+        shift_name = _require_shift(shift, _INSERT_SHIFTS, "insert")
+
+        record = self._require_writable(workbook_id)
+        self._require_snapshot(workbook_id)
+        self._require_approval(record, _ACTION_INSERT)
+
+        def insert_fn(wb: Any) -> StructuralMutationResult:
+            return self._adapter.insert_range(
+                wb, sheet, address, shift_name, allow_merged=allow_merged
+            )
+
+        result = await self._submit_mutation(workbook_id, "range_insert", insert_fn, record)
+        self._record_audit(
+            "range_insert",
+            "mutating",
+            record,
+            {
+                "workbook_id": workbook_id,
+                "sheet": sheet,
+                "address": address,
+                "shift": shift_name,
+                "allow_merged": allow_merged,
+            },
+            {
+                "action": result.action,
+                "shift": result.shift,
+                "address": result.range_after.address if result.range_after else address,
+                "verified": result.verified,
+                "preconditions": result.preconditions,
+            },
+        )
+        return result
+
+    async def delete_range(
+        self,
+        workbook_id: str,
+        sheet: str,
+        address: str,
+        shift: str,
+        *,
+        allow_merged: bool = False,
+    ) -> StructuralMutationResult:
+        """Delete cells and shift the remainder in an explicit direction."""
+
+        _require_text(sheet, "sheet")
+        _require_text(address, "address")
+        shift_name = _require_shift(shift, _DELETE_SHIFTS, "delete")
+
+        record = self._require_writable(workbook_id)
+        self._require_snapshot(workbook_id)
+        self._require_approval(record, _ACTION_DELETE)
+
+        def delete_fn(wb: Any) -> StructuralMutationResult:
+            return self._adapter.delete_range(
+                wb, sheet, address, shift_name, allow_merged=allow_merged
+            )
+
+        result = await self._submit_mutation(workbook_id, "range_delete", delete_fn, record)
+        self._record_audit(
+            "range_delete",
+            "mutating",
+            record,
+            {
+                "workbook_id": workbook_id,
+                "sheet": sheet,
+                "address": address,
+                "shift": shift_name,
+                "allow_merged": allow_merged,
+            },
+            {
+                "action": result.action,
+                "shift": result.shift,
+                "address": result.range_after.address if result.range_after else address,
+                "verified": result.verified,
+                "preconditions": result.preconditions,
+            },
+        )
+        return result
+
+    async def merge_range(
+        self,
+        workbook_id: str,
+        sheet: str,
+        address: str,
+        *,
+        across: bool = False,
+        allow_data_loss: bool = False,
+    ) -> StructuralMutationResult:
+        """Merge a range into one cell (guarded, preview-gated mutation).
+
+        Merging discards non-anchor data; the adapter previews the affected cells
+        and blocks the merge with ``INVALID_RANGE`` unless ``allow_data_loss`` is
+        set. The flag is validated as a real boolean before the guard chain.
+        """
+
+        _require_text(sheet, "sheet")
+        _require_text(address, "address")
+        _require_bool(across, "across")
+        _require_bool(allow_data_loss, "allow_data_loss")
+
+        record = self._require_writable(workbook_id)
+        self._require_snapshot(workbook_id)
+        self._require_approval(record, _ACTION_MERGE)
+
+        def merge_fn(wb: Any) -> StructuralMutationResult:
+            return self._adapter.merge_range(
+                wb, sheet, address, across=across, allow_data_loss=allow_data_loss
+            )
+
+        result = await self._submit_mutation(workbook_id, "range_merge", merge_fn, record)
+        self._record_audit(
+            "range_merge",
+            "mutating",
+            record,
+            {
+                "workbook_id": workbook_id,
+                "sheet": sheet,
+                "address": address,
+                "across": across,
+                "allow_data_loss": allow_data_loss,
+            },
+            {
+                "action": result.action,
+                "address": result.range_after.address if result.range_after else address,
+                "verified": result.verified,
+                "affected_addresses": result.affected_addresses,
+                "preconditions": result.preconditions,
+            },
+        )
+        return result
+
+    async def unmerge_range(
+        self, workbook_id: str, sheet: str, address: str
+    ) -> StructuralMutationResult:
+        """Unmerge any merged area inside an explicit target (guarded mutation)."""
+
+        _require_text(sheet, "sheet")
+        _require_text(address, "address")
+
+        record = self._require_writable(workbook_id)
+        self._require_snapshot(workbook_id)
+        self._require_approval(record, _ACTION_UNMERGE)
+
+        def unmerge_fn(wb: Any) -> StructuralMutationResult:
+            return self._adapter.unmerge_range(wb, sheet, address)
+
+        result = await self._submit_mutation(workbook_id, "range_unmerge", unmerge_fn, record)
+        self._record_audit(
+            "range_unmerge",
+            "mutating",
+            record,
+            {"workbook_id": workbook_id, "sheet": sheet, "address": address},
+            {
+                "action": result.action,
+                "address": result.range_after.address if result.range_after else address,
+                "verified": result.verified,
+                "affected_addresses": result.affected_addresses,
+                "preconditions": result.preconditions,
+            },
+        )
+        return result
+
+    # ------------------------------------------------------------------
     # Guards (non-COM)
     # ------------------------------------------------------------------
     def _require_writable(self, workbook_id: str) -> WorkbookInfo:
@@ -535,6 +780,52 @@ def _find_open_workbook(app_adapter: ExcelAppAdapter, working_path: str) -> Any 
     except Exception:  # noqa: BLE001 - defensive COM read
         return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# Structural argument validation (pure; task_045)
+# ---------------------------------------------------------------------------
+def _require_text(value: object, field: str) -> str:
+    """Reject a blank/non-string address or sheet argument before any COM access."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ExcelVbaMcpError(
+            f"Argument {field!r} is required and must be a non-empty string.",
+            code=ErrorCode.INVALID_RANGE,
+            context={"field": field, "value": value},
+        )
+    return value.strip()
+
+
+def _require_shift(shift: object, allowed: frozenset[str], operation: str) -> str:
+    """Validate an explicit shift name (Excel never guesses it from the shape)."""
+
+    if not isinstance(shift, str) or not shift.strip():
+        raise ExcelVbaMcpError(
+            f"Argument 'shift' is required for {operation} and must never be guessed.",
+            code=ErrorCode.INVALID_RANGE,
+            context={"shift": shift, "operation": operation},
+        )
+    normalized = shift.strip().lower()
+    if normalized not in allowed:
+        raise ExcelVbaMcpError(
+            f"Argument 'shift' must be one of {sorted(allowed)} for {operation}.",
+            code=ErrorCode.INVALID_RANGE,
+            context={"shift": shift, "operation": operation, "allowed": sorted(allowed)},
+        )
+    return normalized
+
+
+def _require_bool(value: object, field: str) -> bool:
+    """Reject a non-boolean flag before the guard chain (defense in depth)."""
+
+    if not isinstance(value, bool):
+        raise ExcelVbaMcpError(
+            f"Argument {field!r} must be a boolean.",
+            code=ErrorCode.INVALID_RANGE,
+            context={"field": field, "value": value},
+        )
+    return value
 
 
 __all__ = ["RangesService"]

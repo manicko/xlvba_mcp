@@ -1,4 +1,5 @@
-"""STA-local Excel Range/Cells adapter (task_042 read, task_043 write, task_044 format).
+"""STA-local Excel Range/Cells adapter (task_042 read, task_043 write, task_044
+format, task_045 structural).
 
 Phase 2 — Range/Cells.
 
@@ -6,7 +7,8 @@ Phase 2 — Range/Cells.
 ``Range.Value2`` / ``Range.Formula2`` object model is touched for the Phase-2
 surface (``range_get``, ``range_read_values``, ``range_read_formulas``,
 ``range_write_values``, ``range_write_formulas``, ``range_get_format``,
-``range_set_format``).
+``range_set_format``, ``range_copy``, ``range_insert``, ``range_delete``,
+``range_merge``, ``range_unmerge``).
 It is a **pure STA-local helper**: every method is synchronous, receives the live
 ``Workbook`` COM proxy (``Any``) and returns only Pydantic DTOs / primitives, so
 results cross the single-STA worker boundary safely
@@ -60,10 +62,31 @@ Bounds (task_038 §3.2/§3.3): ``MAX_RANGE_CELLS`` / ``MAX_RESPONSE_CELLS`` are
 enforced **before** materializing a response; an oversized request is rejected
 and an oversized response is truncated (``truncated=True``). The whole
 ``UsedRange`` is never read unless it is explicitly requested within limits.
+
+Structural semantics (task_045, ``docs/research/ranges_cells_api.md`` §5):
+
+* ``copy_range`` always takes an **explicit destination** (the clipboard is never
+  used) and rejects an overlapping source/destination, a shape-mismatched
+  multi-cell destination and a destination that intersects merged cells.
+* ``insert_range`` / ``delete_range`` always take an **explicit shift**
+  (``right`` / ``down`` and ``left`` / ``up``); an omitted or unknown shift is
+  rejected rather than left to Excel's shape-based inference.
+* ``merge_range`` previews the non-anchor cells that hold data and blocks the
+  merge with ``INVALID_RANGE`` unless ``allow_data_loss`` is set; ``across``
+  merges one cell per row.
+* ``unmerge_range`` only acts when a merged area actually intersects the target.
+* **Hard ListObject guard:** any structural target that intersects a
+  ``ListObject.Range`` (``Application.Intersect``) is rejected with
+  :class:`~excel_vba_mcp.domain.errors.ListObjectIntersectionError` and routed to
+  the table tools; a table's structure is never changed here.
+* Merged-cell targets, protected sheets and dynamic-array spill ranges are
+  guarded per task_038 §7 (reject, or preview + ``allow_merged``).
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -71,7 +94,11 @@ from excel_vba_mcp.adapters.excel.cell_values import (
     EXCEL_ERROR_CODE_TO_LITERAL,
     classify_cell_value,
 )
-from excel_vba_mcp.domain.errors import InvalidRangeError, ListObjectIntersectionError
+from excel_vba_mcp.domain.errors import (
+    InvalidRangeError,
+    ListObjectIntersectionError,
+    ProtectedTargetError,
+)
 from excel_vba_mcp.domain.models import (
     MAX_RANGE_CELLS,
     MAX_RESPONSE_CELLS,
@@ -87,6 +114,7 @@ from excel_vba_mcp.domain.models import (
     RangeFormulas,
     RangeMutationResult,
     RangeValues,
+    StructuralMutationResult,
 )
 from excel_vba_mcp.domain.statuses import CellValueKind, RangeShape
 
@@ -200,6 +228,49 @@ _UNSUPPORTED_FORMAT_PROPERTIES: tuple[str, ...] = (
 #: §4.3, "null explicitly clears to automatic where Excel allows"). Every other
 #: field rejects an explicit ``None`` because it has no automatic state.
 _CLEARABLE_FORMAT_FIELDS: frozenset[str] = frozenset({"number_format", "font_color", "fill_color"})
+
+# ---------------------------------------------------------------------------
+# Structural operations (task_045, task_038 §5)
+# ---------------------------------------------------------------------------
+# These are the documented Excel ``XlInsertShiftDirection`` /
+# ``XlDeleteShiftDirection`` / ``XlInsertCopyOrigin`` enumeration values
+# (Microsoft Learn). They are resolved here — the only layer that touches Excel
+# constants — so the service/API validate the shift *name* without COM. The
+# ``Shift`` argument is always explicit: an omitted/ambiguous shift is rejected
+# and Excel is never allowed to guess it from the range shape (task_038 §7).
+
+#: ``Range.Insert`` shift direction (``XlInsertShiftDirection``).
+_XL_SHIFT_TO_RIGHT = -4161  # xlShiftToRight
+_XL_SHIFT_DOWN = -4121  # xlShiftDown
+
+#: ``Range.Delete`` shift direction (``XlDeleteShiftDirection``).
+_XL_SHIFT_TO_LEFT = -4159  # xlShiftToLeft
+_XL_SHIFT_UP = -4162  # xlShiftUp
+
+#: ``Range.Insert`` copy origin (``XlInsertCopyOrigin``): format from the cells
+#: above/left (the Excel default), never guessed at random.
+_XL_FORMAT_FROM_LEFT_OR_ABOVE = 0  # xlFormatFromLeftOrAbove
+
+#: Shift name -> ``Range.Insert`` enum value.
+_INSERT_SHIFT_VALUES: dict[str, int] = {
+    "right": _XL_SHIFT_TO_RIGHT,
+    "down": _XL_SHIFT_DOWN,
+}
+
+#: Shift name -> ``Range.Delete`` enum value.
+_DELETE_SHIFT_VALUES: dict[str, int] = {
+    "left": _XL_SHIFT_TO_LEFT,
+    "up": _XL_SHIFT_UP,
+}
+
+#: Upper bound on the cells scanned when locating merged areas / non-anchor data
+#: inside a partially merged target. A larger target is reported through
+#: ``preconditions`` rather than scanned cell-by-cell over COM.
+_MAX_MERGE_SCAN_CELLS = 4096
+
+#: Upper bound on the number of referencing cells reported by the best-effort
+#: same-sheet formula scan (task_038 §5.2 item 5).
+_MAX_REFERENCE_HITS = 50
 
 
 # ---------------------------------------------------------------------------
@@ -837,6 +908,458 @@ class RangesAdapter:
             ignored=[],
             verified=verified,
             result_format=post,
+            notes=notes,
+        )
+
+    # ------------------------------------------------------------------
+    # Structural operations (copy / insert / delete / merge / unmerge)
+    # ------------------------------------------------------------------
+    # Every structural operation is **explicit** (destination / shift / target),
+    # **guarded** (protected sheet, merged cells, spill ranges, ListObject
+    # intersection) and **postcondition-verified** (resulting address, dimensions
+    # and table metadata). No clipboard, no ``Select`` / ``Activate``, no UI.
+
+    def copy_range(
+        self,
+        wb: Any,
+        sheet: str,
+        source: str,
+        destination_sheet: str,
+        destination: str,
+    ) -> StructuralMutationResult:
+        """Copy ``source`` to an explicit ``destination`` in the same workbook.
+
+        The destination is mandatory (a clipboard copy is never performed). The
+        copy is rejected when source and destination overlap (ambiguous), when a
+        multi-cell destination does not match the source shape, when the
+        destination intersects merged cells, when the destination sheet is
+        protected, or when either endpoint intersects an Excel Table (ListObject).
+        The postcondition re-reads the pasted block and verifies that its values
+        and dimensions match the source.
+        """
+
+        source_ws = _require_sheet(wb, sheet)
+        source_name = _safe_str(source_ws.Name)
+        source_range = _resolve_range(source_ws, source, sheet_name=source_name)
+        source_addr = _describe_range(source_range, sheet=source_name)
+        _validate_target_cells(source_addr.rows * source_addr.cols)
+
+        destination_ws = _require_sheet(wb, destination_sheet)
+        destination_name = _safe_str(destination_ws.Name)
+        destination_range = _resolve_range(destination_ws, destination, sheet_name=destination_name)
+        destination_addr = _describe_range(destination_range, sheet=destination_name)
+        _validate_target_cells(destination_addr.rows * destination_addr.cols)
+
+        if source_name == destination_name and _ranges_intersect(source_range, destination_range):
+            raise InvalidRangeError(
+                "The copy source and destination overlap; an unambiguous copy needs a "
+                "disjoint destination.",
+                context={
+                    "source": source_addr.address,
+                    "destination": destination_addr.address,
+                    "sheet": source_name,
+                },
+            )
+
+        anchor_only = destination_addr.rows == 1 and destination_addr.cols == 1
+        if not anchor_only and (
+            destination_addr.rows != source_addr.rows or destination_addr.cols != source_addr.cols
+        ):
+            raise InvalidRangeError(
+                "The copy destination shape must match the source (or be a single anchor cell).",
+                context={
+                    "source_rows": source_addr.rows,
+                    "source_cols": source_addr.cols,
+                    "destination_rows": destination_addr.rows,
+                    "destination_cols": destination_addr.cols,
+                },
+            )
+
+        _require_unprotected(destination_ws)
+        _guard_structural_table_intersection(wb, source_ws, source_range, "copy source")
+        _guard_structural_table_intersection(
+            wb, destination_ws, destination_range, "copy destination"
+        )
+
+        merged_areas = _merged_areas(destination_range)
+        if merged_areas:
+            raise InvalidRangeError(
+                "The copy destination intersects merged cells; range_copy has no "
+                "allow_merged opt-in, so the copy is rejected.",
+                context={"merged_areas": merged_areas, "destination": destination_addr.address},
+            )
+
+        source_values = self.read_values(wb, source_name, source)
+        referenced = _referenced_formulas(source_ws, source_addr)
+        preconditions: dict[str, Any] = {
+            "source": {"sheet": source_name, "address": source_addr.address},
+            "destination": {"sheet": destination_name, "address": destination_addr.address},
+            "destination_anchor_only": anchor_only,
+            "merged_areas": merged_areas,
+            "referenced": referenced["referenced"],
+            "referencing_cells": referenced["cells"],
+            "reference_scan": referenced["note"],
+        }
+
+        try:
+            source_range.Copy(destination_range)
+        except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
+            raise InvalidRangeError(
+                "Excel rejected the copy operation.",
+                context={
+                    "source": source_addr.address,
+                    "destination": destination_addr.address,
+                    "error": str(exc),
+                },
+            ) from exc
+
+        post_address = _expanded_destination(destination_range, source_addr.rows, source_addr.cols)
+        post = self.read_values(wb, destination_name, post_address)
+        verified = _range_values_equal(source_values, post)
+
+        notes: list[str] = []
+        if not verified:
+            notes.append(
+                "Postcondition mismatch: the pasted values/dimensions differ from the source."
+            )
+        return StructuralMutationResult(
+            action="copy",
+            source=source_addr,
+            destination=destination_addr,
+            range_before=source_addr,
+            range_after=post.range,
+            affected_addresses=[source_addr.address, post.range.address],
+            table_metadata_unchanged=True,
+            verified=verified,
+            preconditions=preconditions,
+            notes=notes,
+        )
+
+    def insert_range(
+        self,
+        wb: Any,
+        sheet: str,
+        address: str,
+        shift: str,
+        *,
+        allow_merged: bool = False,
+    ) -> StructuralMutationResult:
+        """Insert cells at ``address`` and shift them in an explicit direction.
+
+        ``shift`` is mandatory (``"right"`` / ``"down"``); an omitted or unknown
+        shift is rejected and Excel is never allowed to infer it from the range
+        shape. The insert is rejected when the target is protected, intersects a
+        ListObject, lies inside a dynamic-array spill range, or intersects merged
+        cells unless ``allow_merged`` is set.
+        """
+
+        return self._shift_cells(
+            wb,
+            sheet,
+            address,
+            shift,
+            allowed_shifts=_INSERT_SHIFT_VALUES,
+            operation="insert",
+            allow_merged=allow_merged,
+            mutate=lambda range_obj, shift_value: range_obj.Insert(
+                Shift=shift_value, CopyOrigin=_XL_FORMAT_FROM_LEFT_OR_ABOVE
+            ),
+        )
+
+    def delete_range(
+        self,
+        wb: Any,
+        sheet: str,
+        address: str,
+        shift: str,
+        *,
+        allow_merged: bool = False,
+    ) -> StructuralMutationResult:
+        """Delete cells at ``address`` and shift the remainder explicitly.
+
+        ``shift`` is mandatory (``"left"`` / ``"up"``); an omitted or unknown
+        shift is rejected and Excel is never allowed to infer it from the range
+        shape. The delete is rejected when the target is protected, intersects a
+        ListObject, lies inside a dynamic-array spill range, or intersects merged
+        cells unless ``allow_merged`` is set.
+        """
+
+        return self._shift_cells(
+            wb,
+            sheet,
+            address,
+            shift,
+            allowed_shifts=_DELETE_SHIFT_VALUES,
+            operation="delete",
+            allow_merged=allow_merged,
+            mutate=lambda range_obj, shift_value: range_obj.Delete(Shift=shift_value),
+        )
+
+    def merge_range(
+        self,
+        wb: Any,
+        sheet: str,
+        address: str,
+        *,
+        across: bool = False,
+        allow_data_loss: bool = False,
+    ) -> StructuralMutationResult:
+        """Merge the cells of ``address`` into one (one per row when ``across``).
+
+        Merging discards every non-anchor value. The preflight reports the
+        affected ``cells_with_data``; the merge is blocked with ``INVALID_RANGE``
+        unless the caller passes ``allow_data_loss=True`` after reviewing that
+        preview. The merge is also rejected when the target is protected,
+        intersects a ListObject or is a dynamic-array spill range.
+        """
+
+        worksheet = _require_sheet(wb, sheet)
+        sheet_name = _safe_str(worksheet.Name)
+        range_obj = _resolve_range(worksheet, address, sheet_name=sheet_name)
+        resolved = _describe_range(range_obj, sheet=sheet_name)
+        _validate_target_cells(resolved.rows * resolved.cols)
+        _require_unprotected(worksheet)
+        _guard_structural_table_intersection(wb, worksheet, range_obj, "merge")
+
+        spill = _spill_state(range_obj)
+        if spill["spilling"] or spill["non_anchor"]:
+            raise InvalidRangeError(
+                "The merge target is a dynamic-array spill range; merging would break the spill.",
+                context={"address": resolved.address, "spill": spill},
+            )
+
+        grid = _read_value_grid(range_obj)
+        anchor_row = _safe_int(_read_attr(range_obj, "Row"))
+        anchor_col = _safe_int(_read_attr(range_obj, "Column"))
+        cells_with_data = _non_anchor_addresses(
+            grid, across=across, top=anchor_row, left=anchor_col
+        )
+        existing_merges = _merged_areas(range_obj)
+        referenced = _referenced_formulas(worksheet, resolved)
+        preconditions: dict[str, Any] = {
+            "across": across,
+            "cells_with_data": cells_with_data,
+            "merged_areas": existing_merges,
+            "referenced": referenced["referenced"],
+            "referencing_cells": referenced["cells"],
+            "reference_scan": referenced["note"],
+            "spill": spill,
+        }
+
+        if cells_with_data and not allow_data_loss:
+            raise InvalidRangeError(
+                "Merging discards non-anchor data; review the preview and pass "
+                "allow_data_loss=true to confirm.",
+                context={
+                    "address": resolved.address,
+                    "anchor": _cell_address(anchor_row, anchor_col),
+                    "cells_with_data": cells_with_data,
+                },
+            )
+
+        anchor_before = _read_attr(range_obj.Cells(1, 1), "Value2")
+        try:
+            # ``Range.Merge`` over non-anchor data raises Excel's own
+            # "keep only the upper-left value?" alert when DisplayAlerts is on.
+            # The merge is already explicitly approved by the caller
+            # (``allow_data_loss``), so the alert is suppressed for this one call
+            # and the prior setting is restored in ``finally`` — no UI is shown.
+            with _alerts_suppressed(_read_attr(wb, "Application")):
+                range_obj.Merge(Across=bool(across))
+        except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
+            raise InvalidRangeError(
+                "Excel rejected the merge operation.",
+                context={"address": resolved.address, "error": str(exc)},
+            ) from exc
+
+        merged_after = _merged_areas(range_obj)
+        anchor_after = _read_attr(range_obj.Cells(1, 1), "Value2")
+        verified = bool(merged_after) and anchor_after == anchor_before
+
+        notes: list[str] = []
+        if cells_with_data:
+            notes.append(
+                f"Merged with allow_data_loss=true; {len(cells_with_data)} non-anchor "
+                "cell(s) holding data were discarded."
+            )
+        if not verified:
+            notes.append("Postcondition mismatch: the merged geometry/value was not confirmed.")
+        return StructuralMutationResult(
+            action="merge",
+            source=resolved,
+            range_before=resolved,
+            range_after=_describe_range(range_obj, sheet=sheet_name),
+            affected_addresses=cells_with_data,
+            table_metadata_unchanged=True,
+            verified=verified,
+            preconditions=preconditions,
+            notes=notes,
+        )
+
+    def unmerge_range(self, wb: Any, sheet: str, address: str) -> StructuralMutationResult:
+        """Unmerge every merged area that intersects ``address``.
+
+        The unmerge is rejected when no merged area intersects the target (there
+        is nothing to unmerge), when the sheet is protected, or when the target
+        intersects a ListObject. The postcondition confirms that no merged area
+        remains inside the target.
+        """
+
+        worksheet = _require_sheet(wb, sheet)
+        sheet_name = _safe_str(worksheet.Name)
+        range_obj = _resolve_range(worksheet, address, sheet_name=sheet_name)
+        resolved = _describe_range(range_obj, sheet=sheet_name)
+        _validate_target_cells(resolved.rows * resolved.cols)
+        _require_unprotected(worksheet)
+        _guard_structural_table_intersection(wb, worksheet, range_obj, "unmerge")
+
+        merged_areas = _merged_areas(range_obj)
+        if not merged_areas:
+            raise InvalidRangeError(
+                "No merged area intersects the target; there is nothing to unmerge.",
+                context={"address": resolved.address},
+            )
+
+        preconditions: dict[str, Any] = {"merged_areas": merged_areas}
+        try:
+            range_obj.UnMerge()
+        except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
+            raise InvalidRangeError(
+                "Excel rejected the unmerge operation.",
+                context={"address": resolved.address, "error": str(exc)},
+            ) from exc
+
+        remaining = _merged_areas(range_obj)
+        verified = not remaining
+        notes: list[str] = []
+        if not verified:
+            notes.append(
+                "Postcondition mismatch: merged areas remain inside the target "
+                f"({', '.join(remaining)})."
+            )
+        return StructuralMutationResult(
+            action="unmerge",
+            source=resolved,
+            range_before=resolved,
+            range_after=_describe_range(range_obj, sheet=sheet_name),
+            affected_addresses=list(merged_areas),
+            table_metadata_unchanged=True,
+            verified=verified,
+            preconditions=preconditions,
+            notes=notes,
+        )
+
+    def _shift_cells(
+        self,
+        wb: Any,
+        sheet: str,
+        address: str,
+        shift: str,
+        *,
+        allowed_shifts: dict[str, int],
+        operation: str,
+        allow_merged: bool,
+        mutate: Callable[[Any, int], Any],
+    ) -> StructuralMutationResult:
+        """Shared insert/delete path: validate, preflight, mutate, verify."""
+
+        worksheet = _require_sheet(wb, sheet)
+        sheet_name = _safe_str(worksheet.Name)
+        range_obj = _resolve_range(worksheet, address, sheet_name=sheet_name)
+        resolved = _describe_range(range_obj, sheet=sheet_name)
+        _validate_target_cells(resolved.rows * resolved.cols)
+        shift_value = _resolve_shift(shift, allowed_shifts, operation)
+        _require_unprotected(worksheet)
+        _guard_structural_table_intersection(wb, worksheet, range_obj, operation)
+
+        merged_areas = _merged_areas(range_obj)
+        spill = _spill_state(range_obj)
+        grid = _read_value_grid(range_obj)
+        non_empty = _count_non_empty(grid)
+        target_top = _safe_int(_read_attr(range_obj, "Row"))
+        target_left = _safe_int(_read_attr(range_obj, "Column"))
+        referenced = _referenced_formulas(worksheet, resolved)
+        preconditions: dict[str, Any] = {
+            "shift": shift.strip().lower(),
+            "merged_areas": merged_areas,
+            "non_empty_cells": non_empty,
+            "referenced": referenced["referenced"],
+            "referencing_cells": referenced["cells"],
+            "reference_scan": referenced["note"],
+            "spill": spill,
+        }
+
+        if merged_areas and not allow_merged:
+            raise InvalidRangeError(
+                f"The {operation} target intersects merged cells; pass allow_merged=true "
+                "to confirm the merge-geometry change.",
+                context={"address": resolved.address, "merged_areas": merged_areas},
+            )
+        if spill["non_anchor"]:
+            raise InvalidRangeError(
+                f"The {operation} target lies inside a dynamic-array spill range.",
+                context={"address": resolved.address, "spill": spill},
+            )
+
+        try:
+            mutate(range_obj, shift_value)
+        except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
+            raise InvalidRangeError(
+                f"Excel rejected the {operation} operation.",
+                context={
+                    "address": resolved.address,
+                    "shift": shift.strip().lower(),
+                    "error": str(exc),
+                },
+            ) from exc
+
+        # ``Range.Insert`` re-targets the Range object at the shifted cells and
+        # ``Range.Delete`` invalidates it, so the postcondition re-resolves the
+        # original target address from the worksheet instead of trusting the
+        # mutated object.
+        target_range = _resolve_range(worksheet, resolved.address, sheet_name=sheet_name)
+        post = _describe_range(target_range, sheet=sheet_name)
+        post_values = self.read_values(wb, sheet, resolved.address)
+        shift_name = shift.strip().lower()
+        if operation == "insert":
+            if shift_name == "right":
+                shifted_values = _read_block(
+                    worksheet,
+                    target_top,
+                    target_left + resolved.cols,
+                    resolved.rows,
+                    resolved.cols,
+                )
+            else:
+                shifted_values = _read_block(
+                    worksheet,
+                    target_top + resolved.rows,
+                    target_left,
+                    resolved.rows,
+                    resolved.cols,
+                )
+            verified = _insert_verified(
+                resolved, post, post_values, shifted_values=shifted_values, pre_grid=grid
+            )
+        else:
+            verified = _delete_verified(resolved, post, post_values, before_non_empty=non_empty)
+
+        notes: list[str] = []
+        if not verified:
+            notes.append(
+                f"Postcondition mismatch: the {operation} did not produce the expected "
+                "address/dimensions/content."
+            )
+        return StructuralMutationResult(
+            action=operation,
+            source=resolved,
+            shift=shift.strip().lower(),
+            range_before=resolved,
+            range_after=post,
+            affected_addresses=[resolved.address],
+            table_metadata_unchanged=True,
+            verified=verified,
+            preconditions=preconditions,
             notes=notes,
         )
 
@@ -1539,6 +2062,459 @@ def _formulas_match(expected: list[list[str]], post: RangeFormulas) -> bool:
             if post.formulas[r][c].formula2 != value:
                 return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Structural helpers (task_045, task_038 §5)
+# ---------------------------------------------------------------------------
+def _resolve_shift(shift: str, allowed: dict[str, int], operation: str) -> int:
+    """Resolve an explicit shift *name* to its Excel enum value (never guessed).
+
+    An omitted / blank / unknown shift is rejected with a typed
+    :class:`~excel_vba_mcp.domain.errors.InvalidRangeError`; Excel is never
+    allowed to decide the shift direction from the range shape (task_038 §7).
+    """
+
+    if not isinstance(shift, str) or not shift.strip():
+        raise InvalidRangeError(
+            f"Argument 'shift' is required for {operation} and must never be guessed.",
+            context={"shift": shift, "operation": operation},
+        )
+    normalized = shift.strip().lower()
+    if normalized not in allowed:
+        raise InvalidRangeError(
+            f"Argument 'shift' must be one of {sorted(allowed)} for {operation}.",
+            context={"shift": shift, "operation": operation, "allowed": sorted(allowed)},
+        )
+    return allowed[normalized]
+
+
+def _require_unprotected(worksheet: Any) -> None:
+    """Reject a structural mutation on a protected worksheet (task_038 §7)."""
+
+    if bool(_read_attr(worksheet, "ProtectContents")):
+        raise ProtectedTargetError(
+            "The worksheet is protected; structural range operations are rejected.",
+            context={"sheet": _safe_str(worksheet.Name)},
+        )
+
+
+@contextmanager
+def _alerts_suppressed(app: Any) -> Iterator[None]:
+    """Suppress Excel's built-in alert prompts for one call, restoring the prior value.
+
+    ``Range.Merge`` over data raises Excel's own "keep only the upper-left value?"
+    alert; the caller has already approved the data loss, so the alert would be a
+    stray modal dialog. ``DisplayAlerts`` is restored in ``finally`` on every path
+    (task_038 §8.4, addendum BG03). A missing ``Application`` (unit-test fakes)
+    yields without touching any setting.
+    """
+
+    if app is None:
+        yield
+        return
+
+    prior = _read_attr(app, "DisplayAlerts")
+    try:
+        app.DisplayAlerts = False
+    except Exception:  # noqa: BLE001 - setting unavailable -> run without suppression
+        yield
+        return
+    try:
+        yield
+    finally:
+        with suppress(Exception):
+            app.DisplayAlerts = True if prior is None else prior
+
+
+def _table_intersections(wb: Any, worksheet: Any, range_obj: Any) -> list[dict[str, str]]:
+    """Return every ListObject on ``worksheet`` whose ``Range`` hits ``range_obj``.
+
+    Detection uses ``Application.Intersect`` when available (task_038 §5.3) and
+    falls back to a rectangle intersection computed from ``Top`` / ``Left`` /
+    ``Height`` / ``Width``. The intersection address is included so the caller
+    can see exactly which cells overlap the table.
+    """
+
+    intersections: list[dict[str, str]] = []
+    try:
+        list_objects = worksheet.ListObjects
+        count = _safe_int(list_objects.Count)
+    except Exception:  # noqa: BLE001 - sheet without ListObjects
+        return intersections
+
+    app = _read_attr(wb, "Application")
+    for index in range(1, count + 1):
+        try:
+            list_object = list_objects.Item(index)
+            table_range = list_object.Range
+        except Exception:  # noqa: BLE001 - defensive per-item COM read
+            continue
+        intersection = _intersection_address(app, range_obj, table_range)
+        if intersection is None:
+            continue
+        intersections.append(
+            {
+                "table": _safe_str(list_object.Name) or f"ListObject{index}",
+                "table_range": _safe_str(table_range.Address),
+                "intersection_address": intersection,
+            }
+        )
+    return intersections
+
+
+def _guard_structural_table_intersection(
+    wb: Any, worksheet: Any, range_obj: Any, operation: str
+) -> None:
+    """Reject a structural operation whose target intersects a ListObject.
+
+    Structural row/column changes are owned by the Tables/ListObject services and
+    must never be performed through the Range API (task_038 §5.3). The rejection
+    names the owning table and its range so the caller can route to the table
+    tools instead.
+    """
+
+    intersections = _table_intersections(wb, worksheet, range_obj)
+    if not intersections:
+        return
+    first = intersections[0]
+    raise ListObjectIntersectionError(
+        f"The {operation} target intersects Excel Table {first['table']!r}; "
+        "structural changes are owned by the table tools.",
+        context={
+            "operation": operation,
+            "table": first["table"],
+            "table_range": first["table_range"],
+            "intersection_address": first["intersection_address"],
+            "tables": intersections,
+        },
+    )
+
+
+def _intersection_address(app: Any, a: Any, b: Any) -> str | None:
+    """Return the address of ``a`` ∩ ``b``, or ``None`` when they do not intersect."""
+
+    if app is not None:
+        try:
+            result = app.Intersect(a, b)
+        except Exception:  # noqa: BLE001 - different sheets / COM failure -> fallback
+            result = None
+        if result is not None:
+            return _safe_str(result.Address) or None
+
+    try:
+        a_top = _safe_int(a.Top)
+        a_left = _safe_int(a.Left)
+        a_height = _safe_int(a.Height, default=1)
+        a_width = _safe_int(a.Width, default=1)
+        b_top = _safe_int(b.Top)
+        b_left = _safe_int(b.Left)
+        b_height = _safe_int(b.Height, default=1)
+        b_width = _safe_int(b.Width, default=1)
+    except Exception:  # noqa: BLE001 - defensive COM read
+        return None
+
+    top = max(a_top, b_top)
+    left = max(a_left, b_left)
+    bottom = min(a_top + a_height - 1, b_top + b_height - 1)
+    right = min(a_left + a_width - 1, b_left + b_width - 1)
+    if top > bottom or left > right:
+        return None
+    if top == bottom and left == right:
+        return _cell_address(top, left)
+    return f"{_cell_address(top, left)}:{_cell_address(bottom, right)}"
+
+
+def _declare(obj: Any) -> tuple[int, int]:
+    """Return the declared ``(rows, cols)`` of a range (0, 0 when unavailable)."""
+
+    rows_obj = _read_attr(obj, "Rows")
+    cols_obj = _read_attr(obj, "Columns")
+    rows = _safe_int(_read_attr(rows_obj, "Count") if rows_obj is not None else 0)
+    cols = _safe_int(_read_attr(cols_obj, "Count") if cols_obj is not None else 0)
+    return rows, cols
+
+
+def _read_value_grid(range_obj: Any) -> tuple[tuple[Any, ...], ...]:
+    """Read ``range_obj.Value2`` reshaped to the range's declared dimensions.
+
+    Excel returns a scalar for a single cell, a flat tuple for a single row or
+    column and a nested tuple for a block. The declared ``Rows.Count`` /
+    ``Columns.Count`` disambiguate the flat cases so a single-column range is
+    never mistaken for a single row.
+    """
+
+    raw = _read_attr(range_obj, "Value2")
+    rows, cols = _declare(range_obj)
+    if rows <= 0 or cols <= 0:
+        return _normalize_grid(raw)
+    if rows * cols == 1:
+        return ((raw,),)
+    if isinstance(raw, tuple) and raw and isinstance(raw[0], tuple):
+        return tuple(tuple(row) for row in raw)
+    if rows == 1:
+        return (tuple(raw),)
+    if cols == 1:
+        return tuple((value,) for value in raw)
+    return _normalize_grid(raw)
+
+
+def _count_non_empty(grid: tuple[tuple[Any, ...], ...]) -> int:
+    """Count the cells of a raw value grid that hold a value."""
+
+    total = 0
+    for row in grid:
+        for value in row:
+            if value is not None and value != "":
+                total += 1
+    return total
+
+
+def _non_anchor_addresses(
+    grid: tuple[tuple[Any, ...], ...], *, across: bool, top: int, left: int
+) -> list[str]:
+    """Return the sheet addresses of non-anchor cells that hold data (merge preview).
+
+    The anchor is the top-left cell of the range, or — when ``across`` is set —
+    the first cell of every row, because ``Merge(Across=True)`` keeps one value
+    per row.
+    """
+
+    rows = len(grid)
+    cols = max((len(row) for row in grid), default=0)
+    addresses: list[str] = []
+    for r in range(rows):
+        for c in range(cols):
+            is_anchor = c == 0 if across else (r == 0 and c == 0)
+            if is_anchor:
+                continue
+            value = _grid_cell(grid, r, c)
+            if value is not None and value != "":
+                addresses.append(_cell_address(top + r, left + c))
+    return addresses
+
+
+def _merged_areas(range_obj: Any) -> list[str]:
+    """Return the addresses of the merged areas that intersect ``range_obj``.
+
+    ``Range.MergeCells`` is ``True`` for a fully merged range, ``False`` for an
+    unmerged one and ``Null`` when the range mixes merged and unmerged cells. The
+    mixed case is scanned cell-by-cell, bounded by ``_MAX_MERGE_SCAN_CELLS``; the
+    caller reports the affected ``MergeArea`` addresses rather than guessing.
+    """
+
+    state = _read_attr(range_obj, "MergeCells")
+    if state is False:
+        return []
+    if state is True:
+        address = _merge_area_address(range_obj.Cells(1, 1))
+        return [address] if address else []
+
+    rows, cols = _declare(range_obj)
+    if rows <= 0 or cols <= 0:
+        return []
+
+    areas: list[str] = []
+    for r in range(1, rows + 1):
+        for c in range(1, cols + 1):
+            if (r - 1) * cols + (c - 1) >= _MAX_MERGE_SCAN_CELLS:
+                return areas
+            cell = range_obj.Cells(r, c)
+            if _read_attr(cell, "MergeCells") is not True:
+                continue
+            address = _merge_area_address(cell)
+            if address and address not in areas:
+                areas.append(address)
+    return areas
+
+
+def _merge_area_address(cell: Any) -> str | None:
+    """Return the ``MergeArea`` address of one cell, or ``None`` when unavailable."""
+
+    merge_area = _read_attr(cell, "MergeArea")
+    if merge_area is None:
+        return None
+    return _safe_str(_read_attr(merge_area, "Address")) or None
+
+
+def _spill_state(range_obj: Any) -> dict[str, Any]:
+    """Report the dynamic-array spill state of a target (best-effort, no guessing).
+
+    ``spilling`` is ``True`` when the range itself is a spill anchor and
+    ``non_anchor`` is ``True`` when the range resolves to cells inside somebody
+    else's spill range (``SpillParent`` differs from the range address). A build
+    without the dynamic-array properties yields ``None`` / ``False`` rather than
+    an invented state.
+    """
+
+    spilling = _read_attr(range_obj, "Spilling")
+    parent = _read_attr(range_obj, "SpillParent")
+    parent_address = _safe_str(_read_attr(parent, "Address")) if parent is not None else ""
+    own_address = _safe_str(_read_attr(range_obj, "Address"))
+    non_anchor = bool(parent_address) and parent_address.replace("$", "") != own_address.replace(
+        "$", ""
+    )
+    return {
+        "spilling": None if spilling is None else bool(spilling),
+        "spill_parent": parent_address or None,
+        "non_anchor": non_anchor,
+    }
+
+
+def _referenced_formulas(worksheet: Any, target: RangeAddress) -> dict[str, Any]:
+    """Best-effort same-sheet scan for formulas that reference ``target``.
+
+    The scan reads the sheet's ``UsedRange.Formula`` once and looks for the
+    target's address text (with and without ``$``) inside formula strings. It is
+    deliberately **not** presented as complete: other sheets, defined names and
+    external references are not inspected (task_038 §5.2 item 5).
+    """
+
+    note = (
+        "best-effort same-sheet UsedRange scan; other sheets, names and external "
+        "references are not inspected"
+    )
+    used = _read_attr(worksheet, "UsedRange")
+    if used is None:
+        return {"referenced": False, "cells": [], "note": f"{note} (used range unavailable)"}
+
+    row_count, col_count = _declare(used)
+    if row_count <= 0 or col_count <= 0:
+        return {"referenced": False, "cells": [], "note": f"{note} (empty used range)"}
+    if row_count * col_count > MAX_RANGE_CELLS:
+        return {
+            "referenced": False,
+            "cells": [],
+            "note": f"{note} (used range exceeds MAX_RANGE_CELLS; scan skipped)",
+        }
+
+    top = _safe_int(_read_attr(used, "Row"), default=1)
+    left = _safe_int(_read_attr(used, "Column"), default=1)
+    try:
+        grid = _normalize_grid(_read_attr(used, "Formula"))
+    except Exception:  # noqa: BLE001 - defensive COM read
+        return {"referenced": False, "cells": [], "note": f"{note} (formula read failed)"}
+
+    tokens = _reference_tokens(target)
+    hits: list[str] = []
+    for r in range(row_count):
+        for c in range(col_count):
+            text = _grid_cell(grid, r, c)
+            if not isinstance(text, str) or not text.startswith("="):
+                continue
+            upper = text.upper()
+            if any(token in upper for token in tokens):
+                hits.append(_cell_address(top + r, left + c))
+                if len(hits) >= _MAX_REFERENCE_HITS:
+                    return {"referenced": True, "cells": hits, "note": note}
+    return {"referenced": bool(hits), "cells": hits, "note": note}
+
+
+def _reference_tokens(target: RangeAddress) -> tuple[str, ...]:
+    """Return the uppercase address tokens a formula may use for ``target``."""
+
+    normalized = target.address.replace("$", "").upper()
+    if target.rows <= 1 and target.cols <= 1:
+        return (normalized,)
+    tokens = {normalized, normalized.split(":")[0]}
+    return tuple(sorted(tokens))
+
+
+def _expanded_destination(destination_range: Any, rows: int, cols: int) -> str:
+    """Return the pasted block address for a copy onto ``destination_range``.
+
+    A single anchor cell receives the whole source block; a destination that
+    already matches the source shape keeps its own address.
+    """
+
+    top = _safe_int(_read_attr(destination_range, "Row"), default=1)
+    left = _safe_int(_read_attr(destination_range, "Column"), default=1)
+    return f"{_cell_address(top, left)}:{_cell_address(top + rows - 1, left + cols - 1)}"
+
+
+def _range_values_equal(expected: RangeValues, post: RangeValues) -> bool:
+    """Compare two typed value grids cell-by-cell (postcondition helper)."""
+
+    if post.rows != expected.rows or post.cols != expected.cols:
+        return False
+    for r in range(expected.rows):
+        for c in range(expected.cols):
+            if not _cell_matches(expected.values[r][c], post.values[r][c]):
+                return False
+    return True
+
+
+def _all_cells_empty(post: RangeValues) -> bool:
+    """Return whether every cell of a re-read block is empty."""
+
+    return all(
+        cell.kind is CellValueKind.EMPTY or cell.value is None
+        for row in post.values
+        for cell in row
+    )
+
+
+def _read_block(
+    worksheet: Any, top: int, left: int, rows: int, cols: int
+) -> tuple[tuple[Any, ...], ...]:
+    """Read a raw ``rows`` x ``cols`` block anchored at ``(top, left)``."""
+
+    block = worksheet.Range(
+        worksheet.Cells(top, left), worksheet.Cells(top + rows - 1, left + cols - 1)
+    )
+    return _read_value_grid(block)
+
+
+def _insert_verified(
+    before: RangeAddress,
+    post: RangeAddress,
+    post_values: RangeValues,
+    *,
+    shifted_values: tuple[tuple[Any, ...], ...],
+    pre_grid: tuple[tuple[Any, ...], ...],
+) -> bool:
+    """Postcondition for an insert.
+
+    Excel moves the target content to the shifted block (``right`` -> the same
+    rows one block-width to the right, ``down`` -> the same columns one
+    block-height down) and leaves the inserted cells blank. The postcondition
+    verifies the target address/dimensions, that the inserted cells are empty and
+    that the pre-insert content reappears at the shifted address.
+    """
+
+    return (
+        _same_geometry(before, post)
+        and _all_cells_empty(post_values)
+        and shifted_values == pre_grid
+    )
+
+
+def _delete_verified(
+    target: RangeAddress,
+    post: RangeAddress,
+    post_values: RangeValues,
+    *,
+    before_non_empty: int,
+) -> bool:
+    """Postcondition for a delete: same address/geometry, content not increased."""
+
+    after_non_empty = sum(
+        1
+        for row in post_values.values
+        for cell in row
+        if cell.kind is not CellValueKind.EMPTY and cell.value is not None
+    )
+    return _same_geometry(target, post) and after_non_empty <= before_non_empty
+
+
+def _same_geometry(before: RangeAddress, post: RangeAddress) -> bool:
+    """Return whether the re-read range kept its address and dimensions."""
+
+    return (
+        before.address.replace("$", "") == post.address.replace("$", "")
+        and before.rows == post.rows
+        and before.cols == post.cols
+    )
 
 
 __all__ = [
