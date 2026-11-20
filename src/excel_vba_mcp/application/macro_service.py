@@ -324,6 +324,14 @@ class MacroService:
         try:
             inventory = await self._collect_inventory(workbook_id, record)
         except ExcelVbaMcpError as exc:
+            # A timeout / lost-Excel while reading the inventory is a structured
+            # error that already moved the worker into needs_recovery: report it
+            # truthfully (NEEDS_RECOVERY) and never a false success.
+            needs_recovery = exc.code in (
+                ErrorCode.EXCEL_HUNG,
+                ErrorCode.COM_BUSY,
+                ErrorCode.RPC_E_CALL_REJECTED,
+            )
             return self._finish_blocked(
                 workbook_id=workbook_id,
                 record=record,
@@ -332,11 +340,16 @@ class MacroService:
                 macro_name=macro_name,
                 args=args,
                 started_at=started_at,
-                status=MacroRunStatus.BLOCKED,
+                status=(
+                    MacroRunStatus.NEEDS_RECOVERY if needs_recovery else MacroRunStatus.BLOCKED
+                ),
                 error_code=exc.code.value,
                 error_text=f"Macro inventory unavailable; refusing to run: {exc}",
                 approval=None,
-                extra={"reason": "inventory_unavailable"},
+                extra={
+                    "reason": "inventory_unavailable",
+                    "needs_recovery": needs_recovery,
+                },
             )
 
         entry = _resolve_procedure(inventory, macro_name)
@@ -455,14 +468,23 @@ class MacroService:
         def run_fn() -> MacroRunResult:
             app = app_adapter.app
             if app is None:
-                raise ExcelVbaMcpError(
+                # The owned instance is gone (crash / lost Excel): a structured
+                # EXCEL_HUNG that requires recovery, never a false success.
+                raise ExcelHungError(
                     "The owned Excel instance is not available.",
-                    context={"workbook_id": workbook_id},
+                    context={
+                        "workbook_id": workbook_id,
+                        "needs_recovery": True,
+                    },
                 )
             if _find_open_workbook(app_adapter, record.path) is None:
-                raise ExcelVbaMcpError(
+                raise ExcelHungError(
                     "The working copy is no longer open in the owned instance.",
-                    context={"workbook_id": workbook_id, "working_path": record.path},
+                    context={
+                        "workbook_id": workbook_id,
+                        "working_path": record.path,
+                        "needs_recovery": True,
+                    },
                 )
             return MacroRunner(app).run(run_target, list(args or ()))
 
@@ -547,9 +569,13 @@ class MacroService:
 
         def collect_fn() -> list[dict[str, str]]:
             if _find_open_workbook(app_adapter, record.path) is None:
-                raise ExcelVbaMcpError(
+                raise ExcelHungError(
                     "The working copy is no longer open in the owned instance.",
-                    context={"workbook_id": workbook_id, "working_path": record.path},
+                    context={
+                        "workbook_id": workbook_id,
+                        "working_path": record.path,
+                        "needs_recovery": True,
+                    },
                 )
             return _collect_procedures(app_adapter, record.path)
 

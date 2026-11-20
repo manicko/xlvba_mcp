@@ -226,6 +226,22 @@ class PathNotAllowedError(ExcelVbaMcpError):
     default_message = "The path is not allowed by policy."
 
 
+class ArtifactWriteError(ExcelVbaMcpError):
+    """An artifact could not be written under the allowed artifact root.
+
+    Raised when the atomic temp-file write or the final ``os.replace`` fails.
+    No partial artifact is persisted and no false success is reported
+    (spec §9, §11).
+
+    The spec §11 error vocabulary is closed, so the persistence-failure code is
+    reused: ``SNAPSHOT_FAILED`` ("a persistence operation failed, nothing was
+    mutated") rather than minting a new code.
+    """
+
+    default_code = ErrorCode.SNAPSHOT_FAILED
+    default_message = "The artifact could not be written."
+
+
 def error_from_hresult(
     hresult: int,
     message: str,

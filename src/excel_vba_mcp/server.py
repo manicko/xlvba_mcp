@@ -51,6 +51,7 @@ from excel_vba_mcp.api.control_tools import (
     control_set_on_action,
     controls_list,
 )
+from excel_vba_mcp.api.health_tools import excel_health
 from excel_vba_mcp.api.macro_tools import macro_get_last_result, macro_list, macro_run
 from excel_vba_mcp.api.name_tools import (
     name_create,
@@ -153,6 +154,11 @@ _DESC_CLOSE = (
 _DESC_SAVE = "Explicitly save an open workbook's working copy."
 _DESC_STATUS = "Return session/workbook status (busy, read-only, dirty, active operation)."
 _DESC_LIST = "List currently open workbooks from session bookkeeping."
+_DESC_HEALTH = (
+    "Return worker/session health (state, accepting, owned Excel pid, active "
+    "operation, needs_recovery) without forcing a re-run or touching COM. "
+    "Read-only: use it to check whether the session needs recovery."
+)
 _DESC_SNAPSHOT_CREATE = (
     "Create an immutable snapshot of a workbook (SaveCopyAs for open books, file "
     "copy for closed) with manifest and SHA-256."
@@ -582,6 +588,7 @@ def _register_tools(server: MCPServer) -> None:
     server.add_tool(excel_save, name="excel_save", description=_DESC_SAVE)
     server.add_tool(excel_get_status, name="excel_get_status", description=_DESC_STATUS)
     server.add_tool(excel_list_workbooks, name="excel_list_workbooks", description=_DESC_LIST)
+    server.add_tool(excel_health, name="excel_health", description=_DESC_HEALTH)
     server.add_tool(snapshot_create, name="snapshot_create", description=_DESC_SNAPSHOT_CREATE)
     server.add_tool(snapshot_list, name="snapshot_list", description=_DESC_SNAPSHOT_LIST)
     server.add_tool(snapshot_restore, name="snapshot_restore", description=_DESC_SNAPSHOT_RESTORE)

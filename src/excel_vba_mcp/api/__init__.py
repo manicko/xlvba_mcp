@@ -10,6 +10,7 @@ from excel_vba_mcp.api.compile_tools import (
     vba_compile,
     vba_get_compile_diagnostics,
 )
+from excel_vba_mcp.api.health_tools import ExcelHealth, excel_health
 from excel_vba_mcp.api.macro_tools import (
     macro_get_last_result,
     macro_list,
@@ -38,8 +39,10 @@ from excel_vba_mcp.api.workbook_tools import (
 )
 
 __all__ = [
+    "ExcelHealth",
     "excel_close",
     "excel_get_status",
+    "excel_health",
     "excel_list_workbooks",
     "excel_open",
     "excel_save",

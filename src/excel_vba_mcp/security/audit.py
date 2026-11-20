@@ -84,6 +84,11 @@ def _is_path_key(key_lower: str) -> bool:
         in {
             "filename",
             "file_name",
+            # Artifact metadata keys (task_034): store basenames only, never a
+            # full artifact path, so evidence locations do not leak into the log.
+            "artifact_name",
+            "artifact_filename",
+            "file",
         }
     )
 

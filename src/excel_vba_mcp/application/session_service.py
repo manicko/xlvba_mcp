@@ -43,9 +43,9 @@ from typing import Any
 from uuid import uuid4
 
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
-from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
+from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker, WorkerStatus
 from excel_vba_mcp.adapters.excel.workbook_adapter import WorkbookAdapter
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError, MacroBlockedError
+from excel_vba_mcp.domain.errors import ExcelHungError, ExcelVbaMcpError, MacroBlockedError
 from excel_vba_mcp.domain.models import SessionStatus, WorkbookInfo
 from excel_vba_mcp.domain.statuses import (
     OperationClass,
@@ -114,6 +114,12 @@ class SessionService:
         self._workbook_adapter = WorkbookAdapter()
         self._session_id = str(uuid4())
         self._session_mode: SessionMode = SessionMode.INSPECT
+        # True once close_session() has released the owned Excel instance; a
+        # closed session refuses new work until a new worker is started.
+        self._closed = False
+        # False while recover_session() is rebuilding the instance, so no new
+        # work slips in behind the recovery.
+        self._accepting = True
         self._records: dict[str, _SessionRecord] = {}
         self._active_by_canonical: dict[str, str] = {}
         # Per-canonical-path locks, created once per path and reused so a second
@@ -137,6 +143,15 @@ class SessionService:
         """The working-copy root directory."""
 
         return self._work_dir
+
+    @property
+    def accepting(self) -> bool:
+        """Whether this session accepts new work (non-COM bookkeeping).
+
+        ``False`` while recovering (task_034) or after :meth:`close_session`.
+        """
+
+        return self._accepting
 
     # ------------------------------------------------------------------
     # Open
@@ -174,6 +189,7 @@ class SessionService:
         """
 
         mode = SessionMode(mode)
+        self._require_accepting_new_work("excel_open")
         canonical = self._path_policy.validate_path(path, OperationClass.MUTATING)
         canonical_str = str(canonical)
 
@@ -511,6 +527,210 @@ class SessionService:
         """
 
         return [record.info for record in self._records.values()]
+
+    # ------------------------------------------------------------------
+    # Recovery / session lifecycle (task_034; spec §5.6, §9.4, §11)
+    # ------------------------------------------------------------------
+
+    def worker_status(self) -> WorkerStatus:
+        """Return the worker's non-COM status snapshot (never submits work)."""
+
+        return self._worker.get_status()
+
+    async def recover_session(
+        self,
+        *,
+        reason: str = "manual",
+        timeout_s: float = _DEFAULT_TIMEOUT_S,
+    ) -> SessionStatus:
+        """Rebuild the owned hidden Excel instance after a failure (spec §9.4).
+
+        Recovery is the safe exit from a timed-out / lost-Excel state. The
+        sequence is:
+
+        1. **Stop accepting new work** (session-level ``accepting`` guard);
+        2. **close every owned workbook** with ``Close(SaveChanges=False)`` and
+           **Quit** / release the owned proxy — the worker's reset path drains
+           the owned instance (``ExcelComWorker.reset`` -> close-section drain);
+        3. **release the STA apartment and rebuild** the hidden instance via
+           ``worker.reset()`` on the same single-STA thread.
+
+        Only the automation-owned instance is touched: a user-owned Excel process
+        is never enumerated, activated or terminated (BG05).
+
+        The session bookkeeping (open workbooks, per-path locks, working copies)
+        is dropped because the rebuilt instance has no open workbooks. The method
+        **never reports a false success**: if the reset fails it returns
+        ``state=NEEDS_RECOVERY`` (or the worker's truthful ``closed``/``error``
+        state) with diagnostics in ``notes`` and keeps refusing new work.
+
+        Args:
+            reason: Short label recorded in the audit entry / notes.
+            timeout_s: Accepted for signature symmetry with the other session
+                operations; the worker's own bounded reset join is authoritative.
+
+        Returns:
+            A :class:`SessionStatus` whose state is ``running`` after a
+            successful rebuild, or ``needs_recovery`` / ``error`` with
+            diagnostics when the rebuild failed.
+        """
+
+        worker = self._worker
+        self._accepting = False
+        self._state = WorkbookSessionState.NEEDS_RECOVERY
+
+        before = worker.get_status()
+        notes: list[str] = [f"recovery requested (reason={reason})"]
+        notes.append(f"worker_state_before={before.state.value}")
+        if before.owned_pid is not None:
+            notes.append(f"owned_pid_before={before.owned_pid}")
+        if before.last_error:
+            notes.append(f"last_error_before={before.last_error}")
+
+        discarded = self._discard_open_workbooks()
+        notes.append(f"discarded_open_workbooks={discarded}")
+
+        reset_error: str | None = None
+        if before.state == WorkbookSessionState.CLOSED:
+            # A stopped worker cannot be reset on its thread; report truthfully
+            # instead of waiting for a bounded join that can never complete.
+            reset_error = "worker is closed; a new worker must be started"
+        else:
+            try:
+                await worker.reset()
+            except ExcelHungError as exc:
+                reset_error = f"worker reset timed out: {exc}"
+            except Exception as exc:  # noqa: BLE001 - recovery reports, never raises
+                reset_error = f"worker reset failed: {exc.__class__.__name__}: {exc}"
+        notes.append(reset_error or "worker reset completed")
+
+        after = worker.get_status()
+        if reset_error is None and after.state == WorkbookSessionState.RUNNING:
+            self._state = WorkbookSessionState.RUNNING
+            self._accepting = True
+            self._closed = False
+            notes.append("owned Excel instance rebuilt (hidden)")
+        else:
+            failed_state = (
+                after.state
+                if after.state
+                in (
+                    WorkbookSessionState.NEEDS_RECOVERY,
+                    WorkbookSessionState.ERROR,
+                    WorkbookSessionState.CLOSED,
+                )
+                else WorkbookSessionState.NEEDS_RECOVERY
+            )
+            self._state = failed_state
+            self._accepting = False
+            notes.append(reset_error or f"reset did not reach running (state={after.state.value})")
+            notes.append("new work is refused until recovery succeeds")
+        if after.owned_pid is not None:
+            notes.append(f"owned_pid_after={after.owned_pid}")
+
+        status = self._build_status(
+            workbook_id=None,
+            mode=self._session_mode,
+            read_only=False,
+            dirty=False,
+            notes=notes,
+            worker_status=after,
+        )
+        self._record_audit(
+            tool="recover_session",
+            operation_class="executing",
+            params={"reason": reason, "discarded_workbooks": discarded},
+            result={
+                "needs_recovery": self._state != WorkbookSessionState.RUNNING,
+                "state": self._state.value,
+                "owned_pid_after": after.owned_pid,
+                "reset_error": reset_error,
+            },
+        )
+        return status
+
+    async def close_session(self, *, timeout_s: float = _DEFAULT_TIMEOUT_S) -> SessionStatus:
+        """Close the owned Excel session (workbooks + Quit + release); idempotent.
+
+        Closes every owned workbook with ``Close(SaveChanges=False)``, quits the
+        owned instance and releases it, then marks the session closed. A second
+        call is a no-op that still returns a truthful ``closed`` status. Only the
+        automation-owned instance is touched; a user-owned Excel process is never
+        enumerated, activated or terminated (BG05).
+
+        Args:
+            timeout_s: Accepted for signature symmetry; the worker's own bounded
+                join is authoritative.
+
+        Returns:
+            A :class:`SessionStatus` with state ``closed`` (or the worker's
+            error/closed state if the release failed).
+        """
+
+        if self._closed:
+            return self._build_status(
+                workbook_id=None,
+                mode=self._session_mode,
+                read_only=False,
+                dirty=False,
+                notes=["session already closed"],
+            )
+
+        self._accepting = False
+        self._state = WorkbookSessionState.CLOSING
+        discarded = self._discard_open_workbooks()
+        with contextlib.suppress(Exception):
+            await self._worker.shutdown()
+        after = self._worker.get_status()
+        self._closed = True
+        self._state = after.state
+        self._record_audit(
+            tool="close_session",
+            operation_class="mutating",
+            params={"discarded_workbooks": discarded},
+            result={"needs_recovery": False, "state": after.state.value},
+        )
+        return self._build_status(
+            workbook_id=None,
+            mode=self._session_mode,
+            read_only=False,
+            dirty=False,
+            notes=[f"closed owned workbooks={discarded}"],
+            worker_status=after,
+        )
+
+    def _require_accepting_new_work(self, tool: str) -> None:
+        """Refuse new work while recovering or after the session was closed."""
+
+        if self._accepting and not self._closed:
+            return
+        raise ExcelHungError(
+            "The Excel session is not accepting new work.",
+            context={
+                "tool": tool,
+                "needs_recovery": True,
+                "state": self._state.value,
+                "closed": self._closed,
+            },
+        )
+
+    def _discard_open_workbooks(self) -> int:
+        """Drop all workbook bookkeeping (the owned instance is being reset).
+
+        Releases each held per-path lock, removes the working copies and clears
+        the lock registry. Returns the number of workbooks that were tracked.
+        """
+
+        records = list(self._records.values())
+        self._records.clear()
+        self._active_by_canonical.clear()
+        for record in records:
+            with contextlib.suppress(RuntimeError):
+                if record.lock.locked():
+                    record.lock.release()
+            self._cleanup_working_copy(record.working_path)
+        self._locks.clear()
+        return len(records)
 
     # ------------------------------------------------------------------
     # Internal helpers

@@ -50,6 +50,7 @@ from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.vba_project_service import VBAProjectService
 from excel_vba_mcp.domain.errors import (
     AccessVbomDisabledError,
+    ExcelHungError,
     ExcelVbaMcpError,
     VbaProjectLockedError,
 )
@@ -180,19 +181,34 @@ class CompileService:
         def compile_fn() -> dict[str, Any]:
             wb = _find_open_workbook(app_adapter, record.path)
             if wb is None:
-                raise ExcelVbaMcpError(
+                # The owned instance lost the working copy (crash / close / a
+                # prior hang): a structured EXCEL_HUNG that requires recovery,
+                # never a false ``compiled`` / ``compile_error``.
+                raise ExcelHungError(
                     "The working copy is no longer open in the owned instance.",
-                    context={"workbook_id": workbook_id, "working_path": record.path},
+                    context={
+                        "workbook_id": workbook_id,
+                        "working_path": record.path,
+                        "needs_recovery": True,
+                    },
                 )
             return _collect_probe(wb, app_adapter)
 
         compile_fn.__name__ = "vba_compile"
-        payload = await self._worker.submit(
-            compile_fn,
-            timeout=timeout_s,
-            section="diagnostic",
-            op_class=OperationClass.EXECUTING,
-        )
+        try:
+            payload = await self._worker.submit(
+                compile_fn,
+                timeout=timeout_s,
+                section="diagnostic",
+                op_class=OperationClass.EXECUTING,
+            )
+        except ExcelVbaMcpError as exc:
+            # A COM/UIA timeout or lost-Excel condition is already a structured
+            # error (EXCEL_HUNG / COM_BUSY) that moved the worker into
+            # needs_recovery; audit it as such and re-raise so no false
+            # ``compiled`` / ``compile_error`` is reported.
+            self._record_recovery_failure(workbook_id, record, exc)
+            raise
 
         result = self._build_result(workbook_id, payload)
         self._last[workbook_id] = result
@@ -244,6 +260,35 @@ class CompileService:
                 context={"tool": "vba_compile"},
             )
         return adapter
+
+    def _record_recovery_failure(
+        self, workbook_id: str, record: WorkbookInfo, exc: ExcelVbaMcpError
+    ) -> None:
+        """Audit a failed compile probe as ``needs_recovery`` (never false success)."""
+
+        needs_recovery = exc.code in (
+            "EXCEL_HUNG",
+            "COM_BUSY",
+            "RPC_E_CALL_REJECTED",
+        )
+        self._audit.record(
+            tool="vba_compile",
+            operation_class="executing",
+            params={
+                "workbook_id": workbook_id,
+                "status": "error",
+                "error_code": exc.code,
+                "is_compile": False,
+            },
+            session_id=getattr(self._session, "session_id", None),
+            workbook={"canonical_path": record.source_path or record.path},
+            result={
+                "status": "error",
+                "error_code": exc.code,
+                "needs_recovery": needs_recovery,
+                "error": str(exc),
+            },
+        )
 
     @staticmethod
     def _build_result(workbook_id: str, payload: dict[str, Any]) -> CompileResult:

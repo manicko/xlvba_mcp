@@ -321,3 +321,17 @@ class VbaAccessStatus(StrEnum):
     LOCKED = "locked"
     VBOM_DISABLED = "vbom_disabled"
     SKIPPED = "skipped"
+
+
+class HealthStatus(StrEnum):
+    """Overall health reported by ``excel_health`` (task_034; spec §5.6, §11).
+
+    * ``OK`` — the worker is running and accepting work.
+    * ``NEEDS_RECOVERY`` — the worker is alive but not accepting work (a prior
+      call timed out / lost Excel); recovery is required before new work.
+    * ``UNAVAILABLE`` — the worker is not started, closed, or shutting down.
+    """
+
+    OK = "ok"
+    NEEDS_RECOVERY = "needs_recovery"
+    UNAVAILABLE = "unavailable"
