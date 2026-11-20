@@ -92,6 +92,8 @@ from excel_vba_mcp.api.test_tools import (
     snapshot_diff,
     snapshot_list,
     snapshot_restore,
+    test_get_run,
+    test_run_suite,
 )
 from excel_vba_mcp.api.vba_tools import (
     vba_export_project,
@@ -121,6 +123,7 @@ from excel_vba_mcp.application.shapes_service import ShapesService
 from excel_vba_mcp.application.sheets_service import SheetsService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
 from excel_vba_mcp.application.tables_service import TablesService
+from excel_vba_mcp.application.test_runner import TestRunner
 from excel_vba_mcp.application.vba_project_service import VBAProjectService
 from excel_vba_mcp.application.workbook_model_service import WorkbookModelService
 from excel_vba_mcp.domain.errors import (
@@ -132,6 +135,8 @@ from excel_vba_mcp.domain.statuses import VbaAccessStatus
 from excel_vba_mcp.security.approval import ApprovalPolicy
 from excel_vba_mcp.security.audit import AuditLogger
 from excel_vba_mcp.security.path_policy import PathPolicy
+from excel_vba_mcp.storage.artifact_store import ARTIFACT_ROOT_NAME, ArtifactStore
+from excel_vba_mcp.storage.run_repository import RunRepository
 from excel_vba_mcp.storage.snapshot_store import SnapshotStore
 
 logger = logging.getLogger("excel_vba_mcp.server")
@@ -141,6 +146,8 @@ _ENV_ROOTS = "EXCEL_VBA_MCP_ROOTS"
 _ENV_AUDIT = "EXCEL_VBA_MCP_AUDIT_LOG"
 _ENV_WORK_DIR = "EXCEL_VBA_MCP_WORK_DIR"
 _ENV_SNAPSHOT_DIR = "EXCEL_VBA_MCP_SNAPSHOT_DIR"
+_ENV_ARTIFACT_DIR = "EXCEL_VBA_MCP_ARTIFACT_DIR"
+_ENV_RUN_DIR = "EXCEL_VBA_MCP_RUN_DIR"
 
 # Tool descriptions surfaced over MCP (kept explicit for a stable contract).
 _DESC_OPEN = (
@@ -170,6 +177,20 @@ _DESC_SNAPSHOT_RESTORE = (
     "macro side effects."
 )
 _DESC_SNAPSHOT_DIFF = "Compare two snapshots by manifest metadata and file hash."
+_DESC_TEST_RUN_SUITE = (
+    "Run a bounded declarative test suite on disposable copies of an open "
+    "workbook. Actions and assertions come from closed allowlists, so no "
+    "arbitrary Python, shell, COM or VBA can be expressed; an unknown action or "
+    "assertion is rejected before any Excel call. Every case starts from its own "
+    "disposable working copy of one immutable baseline snapshot (one case cannot "
+    "contaminate another); a failed compile step blocks the case's macro steps. "
+    "Returns per-case and per-step statuses; external macro side effects are NOT "
+    "rolled back by the snapshot."
+)
+_DESC_TEST_GET_RUN = (
+    "Return a previously persisted test run by run_id (statuses, per-case steps, "
+    "assertions, artifact references). Read-only: it never touches Excel."
+)
 _DESC_VBA_PROJECT_INFO = (
     "Return the VBA project summary: name, protection/lock state, component "
     "inventory and references (missing references are reported)."
@@ -382,6 +403,11 @@ _DESC_RES_VBA_SOURCE = (
     "Read-only VBA source code (text) of one component of an open workbook. The "
     "workbook is never modified and no VBA is executed."
 )
+_DESC_RES_TEST_RUN = (
+    "Read-only summary of one declarative test run (JSON): suite, overall status, "
+    "baseline snapshot id, per-case statuses/steps/assertions and the artifact "
+    "references. Never touches Excel and never re-runs anything."
+)
 
 
 @dataclasses.dataclass
@@ -401,6 +427,9 @@ class _Runtime:
     compile: CompileService
     macro: MacroService
     model: WorkbookModelService
+    artifacts: ArtifactStore
+    runs: RunRepository
+    runner: TestRunner
     path_policy: PathPolicy
     approval: ApprovalPolicy
     audit: AuditLogger
@@ -413,6 +442,10 @@ def _configured_roots() -> dict[str, str]:
     When unset, the current working directory and the system temp directory are
     used so the server is usable out of the box; production deployments should
     set an explicit allowlist.
+
+    The artifact root is always registered under the ``artifacts`` logical name
+    (required by :class:`~excel_vba_mcp.storage.artifact_store.ArtifactStore`) in
+    addition to the generic ``root_N`` entries.
     """
 
     raw = os.environ.get(_ENV_ROOTS, "").strip()
@@ -420,7 +453,11 @@ def _configured_roots() -> dict[str, str]:
         dirs = [part.strip() for part in raw.split(os.pathsep) if part.strip()]
     else:
         dirs = [str(Path.cwd()), tempfile.gettempdir()]
-    return {f"root_{idx}": d for idx, d in enumerate(dirs)}
+    roots = {f"root_{idx}": d for idx, d in enumerate(dirs)}
+    roots[ARTIFACT_ROOT_NAME] = str(
+        _resolve_runtime_path(_ENV_ARTIFACT_DIR, _default_artifact_dir())
+    )
+    return roots
 
 
 def _resolve_runtime_path(env_name: str, default: Path) -> Path:
@@ -481,6 +518,28 @@ def _build_runtime() -> _Runtime:
         path_policy,
         audit,
     )
+    # Evidence + test-run persistence (pure filesystem; no COM).
+    artifacts = ArtifactStore(
+        _resolve_runtime_path(_ENV_ARTIFACT_DIR, _default_artifact_dir()),
+        path_policy,
+        audit,
+    )
+    runs = RunRepository(_resolve_runtime_path(_ENV_RUN_DIR, _default_run_dir()))
+    runner = TestRunner(
+        worker,
+        session,
+        snapshot,
+        compile_service,
+        macro_service,
+        sheets,
+        tables,
+        names,
+        artifacts,
+        runs,
+        path_policy,
+        audit,
+        shapes_service=shapes,
+    )
     return _Runtime(
         worker=worker,
         app_adapter=app_adapter,
@@ -495,6 +554,9 @@ def _build_runtime() -> _Runtime:
         compile=compile_service,
         macro=macro_service,
         model=model_service,
+        artifacts=artifacts,
+        runs=runs,
+        runner=runner,
         path_policy=path_policy,
         approval=approval,
         audit=audit,
@@ -511,6 +573,14 @@ def _default_work_dir() -> Path:
 
 def _default_snapshot_dir() -> Path:
     return Path(tempfile.gettempdir()) / "excel_vba_mcp" / "snapshots"
+
+
+def _default_artifact_dir() -> Path:
+    return Path(tempfile.gettempdir()) / "excel_vba_mcp" / "artifacts"
+
+
+def _default_run_dir() -> Path:
+    return Path(tempfile.gettempdir()) / "excel_vba_mcp" / "runs"
 
 
 @asynccontextmanager
@@ -534,6 +604,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
     else:
         workbook_tools.set_session_service(runtime.session)
         test_tools.set_snapshot_service(runtime.snapshot)
+        test_tools.set_test_runner(runtime.runner)
         vba_tools.set_vba_project_service(runtime.vba)
         sheet_tools.set_sheets_service(runtime.sheets)
         table_tools.set_tables_service(runtime.tables)
@@ -549,6 +620,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         workbook_tools.set_session_service(None)
         workbook_tools.set_workbook_model_service(None)
         test_tools.set_snapshot_service(None)
+        test_tools.set_test_runner(None)
         vba_tools.set_vba_project_service(None)
         sheet_tools.set_sheets_service(None)
         table_tools.set_tables_service(None)
@@ -593,6 +665,8 @@ def _register_tools(server: MCPServer) -> None:
     server.add_tool(snapshot_list, name="snapshot_list", description=_DESC_SNAPSHOT_LIST)
     server.add_tool(snapshot_restore, name="snapshot_restore", description=_DESC_SNAPSHOT_RESTORE)
     server.add_tool(snapshot_diff, name="snapshot_diff", description=_DESC_SNAPSHOT_DIFF)
+    server.add_tool(test_run_suite, name="test_run_suite", description=_DESC_TEST_RUN_SUITE)
+    server.add_tool(test_get_run, name="test_get_run", description=_DESC_TEST_GET_RUN)
     server.add_tool(vba_project_info, name="vba_project_info", description=_DESC_VBA_PROJECT_INFO)
     server.add_tool(
         vba_list_components, name="vba_list_components", description=_DESC_VBA_LIST_COMPONENTS
@@ -804,6 +878,22 @@ async def workbook_vba_component_source_resource(workbook_id: str, component_nam
     except ExcelVbaMcpError as exc:
         raise ResourceError(str(exc)) from exc
     return source.source
+
+
+@mcp.resource(
+    "excel://test-runs/{run_id}",
+    name="test_run_summary",
+    description=_DESC_RES_TEST_RUN,
+    mime_type="application/json",
+)
+async def test_run_resource(run_id: str) -> str:
+    """Read-only summary of one declarative test run (never re-runs anything)."""
+
+    try:
+        run = test_tools.get_test_runner().get_run(run_id)
+    except ExcelVbaMcpError as exc:
+        raise ResourceError(str(exc)) from exc
+    return run.model_dump_json(indent=2)
 
 
 def main() -> None:
