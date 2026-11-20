@@ -34,6 +34,7 @@ from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
 from excel_vba_mcp.api import (
     compile_tools,
     macro_tools,
+    name_tools,
     sheet_tools,
     table_tools,
     test_tools,
@@ -42,6 +43,13 @@ from excel_vba_mcp.api import (
 )
 from excel_vba_mcp.api.compile_tools import vba_compile, vba_get_compile_diagnostics
 from excel_vba_mcp.api.macro_tools import macro_get_last_result, macro_list, macro_run
+from excel_vba_mcp.api.name_tools import (
+    name_create,
+    name_delete,
+    name_get,
+    name_update,
+    names_list,
+)
 from excel_vba_mcp.api.sheet_tools import (
     sheet_add,
     sheet_copy,
@@ -90,6 +98,7 @@ from excel_vba_mcp.api.workbook_tools import (
 )
 from excel_vba_mcp.application.compile_service import CompileService
 from excel_vba_mcp.application.macro_service import BackgroundSafetyRegistry, MacroService
+from excel_vba_mcp.application.names_service import NamesService
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.sheets_service import SheetsService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
@@ -271,6 +280,29 @@ _DESC_TABLE_RESIZE = (
     "Resize a table to a new A1 range via ListObject.Resize. Guarded mutation: "
     "writable session + snapshot + approval."
 )
+_DESC_NAMES_LIST = (
+    "List every defined name (Named Range) of an open workbook across workbook "
+    "and worksheet scopes with scope, NameLocal, Visible, RefersTo/RefersToLocal "
+    "and target_kind (range with sheet+address, constant, formula, external, "
+    "error or unknown)."
+)
+_DESC_NAME_GET = (
+    "Return one defined name by name and explicit scope ('workbook' or "
+    "'worksheet'; worksheet scope also requires the owning sheet)."
+)
+_DESC_NAME_CREATE = (
+    "Create a defined name in an explicit scope. Guarded mutation: requires a "
+    "writable session, a snapshot and an approval grant; duplicate and "
+    "cross-scope conflicts are rejected."
+)
+_DESC_NAME_UPDATE = (
+    "Update a defined name's RefersTo in an explicit scope (scope is preserved). "
+    "Guarded mutation: writable session + snapshot + approval."
+)
+_DESC_NAME_DELETE = (
+    "Delete a defined name in an explicit scope. Guarded mutation: writable "
+    "session + snapshot + approval. Returns the pre-delete name."
+)
 
 
 @dataclasses.dataclass
@@ -284,6 +316,7 @@ class _Runtime:
     vba: VBAProjectService
     sheets: SheetsService
     tables: TablesService
+    names: NamesService
     compile: CompileService
     macro: MacroService
     path_policy: PathPolicy
@@ -346,6 +379,7 @@ def _build_runtime() -> _Runtime:
     )
     sheets = SheetsService(worker, session, snapshot, approval, path_policy, audit)
     tables = TablesService(worker, session, snapshot, approval, path_policy, audit)
+    names = NamesService(worker, session, snapshot, approval, path_policy, audit)
     compile_service = CompileService(worker, session, vba, path_policy, audit)
     # background_safe starts empty (deny-by-default, BG06): no procedure is
     # eligible for background execution until it is explicitly classified for the
@@ -359,6 +393,7 @@ def _build_runtime() -> _Runtime:
         vba=vba,
         sheets=sheets,
         tables=tables,
+        names=names,
         compile=compile_service,
         macro=macro_service,
         path_policy=path_policy,
@@ -403,6 +438,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         vba_tools.set_vba_project_service(runtime.vba)
         sheet_tools.set_sheets_service(runtime.sheets)
         table_tools.set_tables_service(runtime.tables)
+        name_tools.set_names_service(runtime.names)
         compile_tools.set_compile_service(runtime.compile)
         macro_tools.set_macro_service(runtime.macro)
     try:
@@ -413,6 +449,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         vba_tools.set_vba_project_service(None)
         sheet_tools.set_sheets_service(None)
         table_tools.set_tables_service(None)
+        name_tools.set_names_service(None)
         compile_tools.set_compile_service(None)
         macro_tools.set_macro_service(None)
         await _safe_shutdown(runtime.worker)
@@ -536,6 +573,11 @@ def _register_tools(server: MCPServer) -> None:
     )
     server.add_tool(table_create, name="table_create", description=_DESC_TABLE_CREATE)
     server.add_tool(table_resize, name="table_resize", description=_DESC_TABLE_RESIZE)
+    server.add_tool(names_list, name="names_list", description=_DESC_NAMES_LIST)
+    server.add_tool(name_get, name="name_get", description=_DESC_NAME_GET)
+    server.add_tool(name_create, name="name_create", description=_DESC_NAME_CREATE)
+    server.add_tool(name_update, name="name_update", description=_DESC_NAME_UPDATE)
+    server.add_tool(name_delete, name="name_delete", description=_DESC_NAME_DELETE)
 
 
 _configure_logging()

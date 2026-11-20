@@ -196,11 +196,18 @@ class NameScope(StrEnum):
 
 
 class NameTargetKind(StrEnum):
-    """What a defined name refers to (spec §7.7: range vs non-range)."""
+    """What a defined name refers to (spec §7.7: range vs non-range).
+
+    ``RANGE`` names resolve through ``Name.RefersToRange``; every other kind is
+    classified heuristically from the ``RefersTo`` string without evaluating the
+    formula/expression (no ``Application.Evaluate``, no Python ``eval``).
+    """
 
     RANGE = "range"
     FORMULA = "formula"
     CONSTANT = "constant"
+    EXTERNAL = "external"
+    ERROR = "error"
     UNKNOWN = "unknown"
 
 
