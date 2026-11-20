@@ -1,8 +1,9 @@
-"""Excel Range/Cells service (task_042 read, task_043 write, spec §14 Phase 2 — Range/Cells).
+"""Excel Range/Cells service (task_042 read, task_043 write, task_044 format).
 
 :class:`RangesService` is the async application-layer orchestration for the
 Range/Cells surface (``range_get``, ``range_read_values``,
-``range_read_formulas``, ``range_write_values``, ``range_write_formulas``). It is
+``range_read_formulas``, ``range_write_values``, ``range_write_formulas``,
+``range_get_format``, ``range_set_format``). It is
 deliberately **COM-free**: every method resolves the ``workbook_id`` through the
 session bookkeeping, enforces the non-COM guard chain and then submits a single
 STA-local callable to the dedicated single-STA
@@ -36,13 +37,16 @@ from typing import Any, TypeVar, cast
 
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
-from excel_vba_mcp.adapters.excel.ranges_adapter import RangesAdapter
+from excel_vba_mcp.adapters.excel.ranges_adapter import RangesAdapter, validate_format_patch
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
 from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
+    FormatInfo,
+    FormatMutationResult,
     FormulaWriteRequest,
     RangeAddress,
+    RangeFormatPatch,
     RangeFormulas,
     RangeMutationResult,
     RangeValues,
@@ -60,6 +64,7 @@ _DEFAULT_TIMEOUT_S = 60.0
 #: Approval action names (stable identities for the range mutation surface).
 _ACTION_WRITE_VALUES = "range_write_values"
 _ACTION_WRITE_FORMULAS = "range_write_formulas"
+_ACTION_SET_FORMAT = "range_set_format"
 
 #: Return type of the worker callables submitted by this service.
 _T = TypeVar("_T")
@@ -201,6 +206,35 @@ class RangesService:
         )
         return result
 
+    async def get_format(self, workbook_id: str, sheet: str, address: str) -> FormatInfo:
+        """Read the bounded, tri-state formatting of a Range (read-only).
+
+        Returns a :class:`~excel_vba_mcp.domain.models.FormatInfo` whose values
+        are tri-state (``value`` / ``mixed`` / ``unsupported``): a range with
+        mixed formatting lists the affected properties in ``mixed_properties``
+        instead of flattening them to one cell's value (task_038 §4.2).
+        """
+
+        record = self._resolve_record(workbook_id)
+        result = await self._submit_read(
+            workbook_id,
+            "range_get_format",
+            lambda wb: self._adapter.get_format(wb, sheet, address),
+            record,
+        )
+        self._record_audit(
+            "range_get_format",
+            "read_only",
+            record,
+            {"workbook_id": workbook_id, "sheet": sheet, "address": address},
+            {
+                "sheet": result.range.sheet,
+                "address": result.range.address,
+                "mixed_properties": result.mixed_properties,
+            },
+        )
+        return result
+
     # ------------------------------------------------------------------
     # Public API — mutations (guarded; task_043)
     # ------------------------------------------------------------------
@@ -282,6 +316,50 @@ class RangesService:
                 "action": result.action,
                 "sheet": result.range_after.sheet if result.range_after else sheet,
                 "address": result.range_after.address if result.range_after else address,
+                "verified": result.verified,
+            },
+        )
+        return result
+
+    async def set_format(
+        self, workbook_id: str, sheet: str, address: str, patch: RangeFormatPatch
+    ) -> FormatMutationResult:
+        """Apply a partial formatting update to a bounded Range (guarded mutation).
+
+        Only the fields the caller explicitly set (``patch.model_fields_set``) are
+        written; absent fields are left untouched (task_038 §4.3). The patch is
+        validated before any COM mutation. Requires a writable working copy, a
+        successful snapshot and an approval grant; the targeted properties are
+        re-read after the write and reported through ``verified``.
+        """
+
+        # Validate the patch first (pure, pre-COM) so malformed input is rejected
+        # before the guard chain and before the STA worker touches Excel.
+        validate_format_patch(patch)
+
+        record = self._require_writable(workbook_id)
+        self._require_snapshot(workbook_id)
+        self._require_approval(record, _ACTION_SET_FORMAT)
+
+        def apply_fn(wb: Any) -> FormatMutationResult:
+            return self._adapter.set_format(wb, sheet, address, patch)
+
+        result = await self._submit_mutation(workbook_id, "range_set_format", apply_fn, record)
+        self._record_audit(
+            "range_set_format",
+            "mutating",
+            record,
+            {
+                "workbook_id": workbook_id,
+                "sheet": sheet,
+                "address": address,
+                "applied": result.applied,
+            },
+            {
+                "action": result.action,
+                "sheet": result.range.sheet,
+                "address": result.range.address,
+                "applied": result.applied,
                 "verified": result.verified,
             },
         )

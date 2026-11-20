@@ -1,11 +1,12 @@
-"""STA-local Excel Range/Cells adapter (task_042 read, task_043 write, spec §14).
+"""STA-local Excel Range/Cells adapter (task_042 read, task_043 write, task_044 format).
 
 Phase 2 — Range/Cells.
 
 :class:`RangesAdapter` is the single place where the Excel ``Worksheet.Range`` /
 ``Range.Value2`` / ``Range.Formula2`` object model is touched for the Phase-2
 surface (``range_get``, ``range_read_values``, ``range_read_formulas``,
-``range_write_values``, ``range_write_formulas``).
+``range_write_values``, ``range_write_formulas``, ``range_get_format``,
+``range_set_format``).
 It is a **pure STA-local helper**: every method is synchronous, receives the live
 ``Workbook`` COM proxy (``Any``) and returns only Pydantic DTOs / primitives, so
 results cross the single-STA worker boundary safely
@@ -39,6 +40,22 @@ Write semantics (task_043):
   :class:`~excel_vba_mcp.domain.errors.ListObjectIntersectionError`.
 * The adapter never evaluates a formula; strings are passed verbatim to Excel.
 
+Format semantics (task_044, ``docs/research/ranges_cells_api.md`` §4):
+
+* ``get_format`` reads a **bounded, tri-state** format DTO (``number_format``;
+  ``font.{name,bold,italic,size,color}``; ``fill.{color,pattern}``;
+  ``alignment.{horizontal,vertical,wrap_text}``). Each property is ``value`` /
+  ``mixed`` (Excel returns ``Null`` when the cells disagree — the property is
+  ``None`` and named in ``mixed_properties``) / ``unsupported`` (aspects the DTO
+  deliberately does not model, always reported in ``unsupported``). Mixed
+  formatting is never flattened to one cell's value.
+* ``set_format`` applies **only** the fields the caller explicitly set
+  (``RangeFormatPatch.model_fields_set``); absent fields are left untouched.
+  Values/enums are validated before any COM mutation; a present ``None`` clears
+  to automatic only where Excel allows (``number_format`` -> ``General``,
+  ``font_color`` -> automatic, ``fill_color`` -> no fill). The targeted
+  properties are re-read after the write as a postcondition.
+
 Bounds (task_038 §3.2/§3.3): ``MAX_RANGE_CELLS`` / ``MAX_RESPONSE_CELLS`` are
 enforced **before** materializing a response; an oversized request is rejected
 and an oversized response is truncated (``truncated=True``). The whole
@@ -58,9 +75,15 @@ from excel_vba_mcp.domain.errors import InvalidRangeError, ListObjectIntersectio
 from excel_vba_mcp.domain.models import (
     MAX_RANGE_CELLS,
     MAX_RESPONSE_CELLS,
+    AlignmentFormat,
     CellValue,
+    FillFormat,
+    FontFormat,
+    FormatInfo,
+    FormatMutationResult,
     FormulaCell,
     RangeAddress,
+    RangeFormatPatch,
     RangeFormulas,
     RangeMutationResult,
     RangeValues,
@@ -85,6 +108,98 @@ _DATE_FORMAT_TOKENS: tuple[str, ...] = ("yy", "dd", "mmm")
 
 #: Excel's 1900 date system epoch (``serial 0`` renders as 1899-12-30).
 _EXCEL_EPOCH = datetime(1899, 12, 30)
+
+
+# ---------------------------------------------------------------------------
+# Formatting enums (task_044, task_038 §4.2)
+# ---------------------------------------------------------------------------
+# These are the documented Excel ``XlHAlign`` / ``XlVAlign`` / ``XlPattern``
+# enumeration values (Microsoft Learn). They are resolved here — the only layer
+# that touches Excel constants — so the service/API validate names without COM.
+
+#: ``Range.HorizontalAlignment`` (``XlHAlign``) name -> value.
+_HORIZONTAL_ALIGNMENT_VALUES: dict[str, int] = {
+    "xlGeneral": 1,  # xlHAlignGeneral
+    "xlLeft": -4131,  # xlHAlignLeft
+    "xlCenter": -4108,  # xlHAlignCenter
+    "xlRight": -4152,  # xlHAlignRight
+    "xlFill": 5,  # xlHAlignFill
+    "xlJustify": -4130,  # xlHAlignJustify
+    "xlCenterAcrossSelection": 7,  # xlHAlignCenterAcrossSelection
+    "xlDistributed": -4117,  # xlHAlignDistributed
+}
+
+#: ``Range.VerticalAlignment`` (``XlVAlign``) name -> value.
+_VERTICAL_ALIGNMENT_VALUES: dict[str, int] = {
+    "xlTop": -4160,  # xlVAlignTop
+    "xlCenter": -4108,  # xlVAlignCenter
+    "xlBottom": -4107,  # xlVAlignBottom
+    "xlJustify": -4130,  # xlVAlignJustify
+    "xlDistributed": -4117,  # xlVAlignDistributed
+}
+
+#: ``Range.Interior.Pattern`` (``XlPattern``) name -> value.
+_FILL_PATTERN_VALUES: dict[str, int] = {
+    "xlNone": -4142,  # xlPatternNone
+    "xlSolid": 1,  # xlPatternSolid
+    "xlAutomatic": -4105,  # xlPatternAutomatic
+    "xlGray25": -4124,  # xlPatternGray25
+    "xlGray50": -4125,  # xlPatternGray50
+    "xlGray75": -4126,  # xlPatternGray75
+    "xlGray8": 18,  # xlPatternGray8
+    "xlGray16": 17,  # xlPatternGray16
+    "xlHorizontal": -4128,  # xlPatternHorizontal
+    "xlVertical": -4166,  # xlPatternVertical
+    "xlDown": -4121,  # xlPatternDown
+    "xlUp": -4162,  # xlPatternUp
+    "xlChecker": 9,  # xlPatternChecker
+    "xlGrid": 15,  # xlPatternGrid
+    "xlCrissCross": 16,  # xlPatternCrissCross
+    "xlLightHorizontal": 11,  # xlPatternLightHorizontal
+    "xlLightVertical": 12,  # xlPatternLightVertical
+    "xlLightDown": 13,  # xlPatternLightDown
+    "xlLightUp": 14,  # xlPatternLightUp
+    "xlSemiGray75": 10,  # xlPatternSemiGray75
+    "xlLinearGradient": 4000,  # xlPatternLinearGradient
+    "xlRectangularGradient": 4001,  # xlPatternRectangularGradient
+}
+
+#: Reverse lookups (value -> name) for reading a format property back.
+_HORIZONTAL_ALIGNMENT_NAMES: dict[int, str] = {
+    value: name for name, value in _HORIZONTAL_ALIGNMENT_VALUES.items()
+}
+_VERTICAL_ALIGNMENT_NAMES: dict[int, str] = {
+    value: name for name, value in _VERTICAL_ALIGNMENT_VALUES.items()
+}
+_FILL_PATTERN_NAMES: dict[int, str] = {value: name for name, value in _FILL_PATTERN_VALUES.items()}
+
+#: ``XlColorIndex`` sentinels used to detect an automatic / absent font/fill color.
+_XL_COLOR_INDEX_AUTOMATIC = -4105  # xlColorIndexAutomatic
+_XL_COLOR_INDEX_NONE = -4142  # xlColorIndexNone
+
+#: RGB color ceiling (``0xFFFFFF``) and font-size bounds accepted by Excel.
+_MAX_RGB_COLOR = 0xFFFFFF
+_MIN_FONT_SIZE = 1.0
+_MAX_FONT_SIZE = 1638.0
+
+#: ``Range.NumberFormat`` / ``Font.Name`` string length ceiling (Excel UI limit).
+_MAX_FORMAT_STRING_LENGTH = 255
+
+#: Range formatting aspects that exist but are intentionally not represented by
+#: :class:`~excel_vba_mcp.domain.models.FormatInfo` (task_038 §4.2). Reported on
+#: every read so a caller never assumes the bounded DTO is the full format state.
+_UNSUPPORTED_FORMAT_PROPERTIES: tuple[str, ...] = (
+    "borders",
+    "gradient",
+    "theme_color",
+    "number_format_local",
+    "protect_contents",
+)
+
+#: Format fields a caller may clear to automatic by passing ``None`` (task_038
+#: §4.3, "null explicitly clears to automatic where Excel allows"). Every other
+#: field rejects an explicit ``None`` because it has no automatic state.
+_CLEARABLE_FORMAT_FIELDS: frozenset[str] = frozenset({"number_format", "font_color", "fill_color"})
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +766,495 @@ class RangesAdapter:
             notes=notes,
         )
 
+    # ------------------------------------------------------------------
+    # Formatting (read-only tri-state; guarded partial write; task_044)
+    # ------------------------------------------------------------------
+    def get_format(self, wb: Any, sheet: str, address: str) -> FormatInfo:
+        """Read the bounded, tri-state formatting of a Range (read-only).
+
+        Each supported property is reported as a value, ``mixed`` (Excel returns
+        ``Null`` when the cells disagree — the value is ``None`` and the property
+        is named in ``mixed_properties``) or, for aspects outside the DTO,
+        ``unsupported`` (always listed in ``unsupported``). A mixed range is never
+        flattened to a single cell's value (task_038 §4.2).
+        """
+
+        worksheet = _require_sheet(wb, sheet)
+        sheet_name = _safe_str(worksheet.Name)
+        range_obj = _resolve_range(worksheet, address, sheet_name=sheet_name)
+        resolved = _describe_range(range_obj, sheet=sheet_name)
+
+        mixed: list[str] = []
+        number_format = _read_number_format(range_obj, mixed)
+        font = _read_font(range_obj, mixed)
+        fill = _read_fill(range_obj, mixed)
+        alignment = _read_alignment(range_obj, mixed)
+
+        return FormatInfo(
+            range=resolved,
+            number_format=number_format,
+            font=font,
+            fill=fill,
+            alignment=alignment,
+            mixed_properties=mixed,
+            unsupported=list(_UNSUPPORTED_FORMAT_PROPERTIES),
+        )
+
+    def set_format(
+        self, wb: Any, sheet: str, address: str, patch: RangeFormatPatch
+    ) -> FormatMutationResult:
+        """Apply a partial formatting update and verify the targeted properties.
+
+        Only the fields the caller explicitly set (``patch.model_fields_set``)
+        are written; absent fields are left untouched (task_038 §4.3). The patch
+        is validated before any COM mutation (a bad enum/value leaves the workbook
+        unchanged). After the writes the same properties are re-read as a
+        postcondition and ``verified`` reflects whether every targeted property
+        matches the request.
+        """
+
+        worksheet = _require_sheet(wb, sheet)
+        sheet_name = _safe_str(worksheet.Name)
+        range_obj = _resolve_range(worksheet, address, sheet_name=sheet_name)
+        resolved = _describe_range(range_obj, sheet=sheet_name)
+
+        # Validate the whole patch before touching Excel (defense in depth; the
+        # service already validated before submitting to the STA worker).
+        validate_format_patch(patch)
+
+        applied = patch.applied_fields()
+        _apply_format(range_obj, patch)
+
+        post = self.get_format(wb, sheet, address)
+        verified = _format_matches_patch(range_obj, patch, post)
+        notes: list[str] = []
+        if not verified:
+            notes.append("Postcondition mismatch: the re-read formatting differs from the patch.")
+        return FormatMutationResult(
+            action="set_format",
+            range=resolved,
+            applied=applied,
+            ignored=[],
+            verified=verified,
+            result_format=post,
+            notes=notes,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers (task_044)
+# ---------------------------------------------------------------------------
+def validate_format_patch(patch: RangeFormatPatch) -> None:
+    """Validate a :class:`RangeFormatPatch` before any COM mutation (pure).
+
+    Rejects a bad enum name, an out-of-range numeric value, an over-long string,
+    or an explicit ``None`` on a field that has no automatic state. Only the
+    fields the caller set (``model_fields_set``) are validated.
+    """
+
+    fields = patch.model_fields_set
+
+    if "number_format" in fields and patch.number_format is not None:
+        _require_format_string(patch.number_format, "number_format")
+
+    if "font_name" in fields:
+        _reject_null(patch.font_name, "font_name")
+        if patch.font_name is not None:
+            _require_format_string(patch.font_name, "font_name")
+
+    if "font_bold" in fields:
+        _reject_null(patch.font_bold, "font_bold")
+        if patch.font_bold is not None:
+            _require_bool(patch.font_bold, "font_bold")
+
+    if "font_italic" in fields:
+        _reject_null(patch.font_italic, "font_italic")
+        if patch.font_italic is not None:
+            _require_bool(patch.font_italic, "font_italic")
+
+    if "font_size" in fields:
+        _reject_null(patch.font_size, "font_size")
+        if patch.font_size is not None:
+            size = patch.font_size
+            if isinstance(size, bool) or not isinstance(size, (int, float)):
+                raise InvalidRangeError(
+                    "Argument 'font_size' must be a number.", context={"font_size": size}
+                )
+            if size < _MIN_FONT_SIZE or size > _MAX_FONT_SIZE:
+                raise InvalidRangeError(
+                    f"Argument 'font_size' must be within {_MIN_FONT_SIZE}..{_MAX_FONT_SIZE}.",
+                    context={"font_size": size},
+                )
+
+    if "font_color" in fields and patch.font_color is not None:
+        _require_color(patch.font_color, "font_color")
+
+    if "fill_color" in fields and patch.fill_color is not None:
+        _require_color(patch.fill_color, "fill_color")
+
+    if "fill_pattern" in fields:
+        _reject_null(patch.fill_pattern, "fill_pattern")
+        if patch.fill_pattern is not None:
+            _require_enum(patch.fill_pattern, _FILL_PATTERN_VALUES, "fill_pattern")
+
+    if "alignment_horizontal" in fields:
+        _reject_null(patch.alignment_horizontal, "alignment_horizontal")
+        if patch.alignment_horizontal is not None:
+            _require_enum(
+                patch.alignment_horizontal,
+                _HORIZONTAL_ALIGNMENT_VALUES,
+                "alignment_horizontal",
+            )
+
+    if "alignment_vertical" in fields:
+        _reject_null(patch.alignment_vertical, "alignment_vertical")
+        if patch.alignment_vertical is not None:
+            _require_enum(
+                patch.alignment_vertical, _VERTICAL_ALIGNMENT_VALUES, "alignment_vertical"
+            )
+
+    if "alignment_wrap_text" in fields:
+        _reject_null(patch.alignment_wrap_text, "alignment_wrap_text")
+        if patch.alignment_wrap_text is not None:
+            _require_bool(patch.alignment_wrap_text, "alignment_wrap_text")
+
+
+def _require_format_string(value: str, field: str) -> None:
+    """Reject an empty or over-long format/name string."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise InvalidRangeError(
+            f"Argument {field!r} must be a non-empty string.", context={field: value}
+        )
+    if len(value) > _MAX_FORMAT_STRING_LENGTH:
+        raise InvalidRangeError(
+            f"Argument {field!r} exceeds the {_MAX_FORMAT_STRING_LENGTH}-character limit.",
+            context={field: value},
+        )
+
+
+def _reject_null(value: object, field: str) -> None:
+    """Reject an explicit ``None`` on a field that has no automatic state.
+
+    Only the clearable fields (``number_format``, ``font_color``,
+    ``fill_color``) accept ``None`` to mean "clear to automatic"; every other
+    field must omit the value to leave it untouched (task_038 §4.3).
+    """
+
+    if value is None and field not in _CLEARABLE_FORMAT_FIELDS:
+        raise InvalidRangeError(
+            f"Argument {field!r} does not accept null; omit it to leave the property unchanged.",
+            context={field: None},
+        )
+
+
+def _require_bool(value: object, field: str) -> None:
+    """Reject a non-boolean flag."""
+
+    if not isinstance(value, bool):
+        raise InvalidRangeError(f"Argument {field!r} must be a boolean.", context={field: value})
+
+
+def _require_color(value: object, field: str) -> None:
+    """Reject a non-integer or out-of-range RGB color."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidRangeError(
+            f"Argument {field!r} must be an integer RGB color (0x000000..0x{_MAX_RGB_COLOR:06X}).",
+            context={field: value},
+        )
+    if value < 0 or value > _MAX_RGB_COLOR:
+        raise InvalidRangeError(
+            f"Argument {field!r} must be within 0..0x{_MAX_RGB_COLOR:06X}.",
+            context={field: value},
+        )
+
+
+def _require_enum(value: object, allowed: dict[str, int], field: str) -> None:
+    """Reject an enum name outside the supported set."""
+
+    if not isinstance(value, str) or value not in allowed:
+        raise InvalidRangeError(
+            f"Argument {field!r} is not a supported value; expected one of {sorted(allowed)}.",
+            context={field: value, "supported": sorted(allowed)},
+        )
+
+
+def _apply_format(range_obj: Any, patch: RangeFormatPatch) -> None:
+    """Write only the fields the caller set on ``range_obj`` (STA-local).
+
+    A present ``None`` clears to automatic only for the clearable fields
+    (``number_format``, ``font_color``, ``fill_color``); every other field was
+    rejected by :func:`validate_format_patch`.
+    """
+
+    fields = patch.model_fields_set
+
+    if "number_format" in fields:
+        _set_com(
+            range_obj,
+            "NumberFormat",
+            "General" if patch.number_format is None else patch.number_format,
+        )
+
+    if "font_name" in fields:
+        _set_com(range_obj.Font, "Name", patch.font_name)
+
+    if "font_bold" in fields:
+        _set_com(range_obj.Font, "Bold", patch.font_bold)
+
+    if "font_italic" in fields:
+        _set_com(range_obj.Font, "Italic", patch.font_italic)
+
+    if "font_size" in fields:
+        _set_com(range_obj.Font, "Size", patch.font_size)
+
+    if "font_color" in fields:
+        if patch.font_color is None:
+            _set_com(range_obj.Font, "ColorIndex", _XL_COLOR_INDEX_AUTOMATIC)
+        else:
+            _set_com(range_obj.Font, "Color", patch.font_color)
+
+    if "fill_color" in fields:
+        if patch.fill_color is None:
+            _set_com(range_obj.Interior, "ColorIndex", _XL_COLOR_INDEX_NONE)
+        else:
+            _set_com(range_obj.Interior, "Color", patch.fill_color)
+
+    if "fill_pattern" in fields:
+        _set_com(range_obj.Interior, "Pattern", _FILL_PATTERN_VALUES[str(patch.fill_pattern)])
+
+    if "alignment_horizontal" in fields:
+        _set_com(
+            range_obj,
+            "HorizontalAlignment",
+            _HORIZONTAL_ALIGNMENT_VALUES[str(patch.alignment_horizontal)],
+        )
+
+    if "alignment_vertical" in fields:
+        _set_com(
+            range_obj,
+            "VerticalAlignment",
+            _VERTICAL_ALIGNMENT_VALUES[str(patch.alignment_vertical)],
+        )
+
+    if "alignment_wrap_text" in fields:
+        _set_com(range_obj, "WrapText", patch.alignment_wrap_text)
+
+
+def _set_com(obj: Any, attribute: str, value: Any) -> None:
+    """Assign one COM property, converting a rejection into a typed error."""
+
+    try:
+        setattr(obj, attribute, value)
+    except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
+        raise InvalidRangeError(
+            f"Excel rejected setting {attribute!r}.",
+            context={"attribute": attribute, "error": str(exc)},
+        ) from exc
+
+
+def _format_matches_patch(range_obj: Any, patch: RangeFormatPatch, post: FormatInfo) -> bool:
+    """Return whether every targeted property was applied (postcondition)."""
+
+    fields = patch.model_fields_set
+
+    if "number_format" in fields:
+        expected = "General" if patch.number_format is None else patch.number_format
+        if post.number_format != expected:
+            return False
+
+    if "font_name" in fields and post.font.name != patch.font_name:
+        return False
+
+    if "font_bold" in fields and post.font.bold != patch.font_bold:
+        return False
+
+    if "font_italic" in fields and post.font.italic != patch.font_italic:
+        return False
+
+    if "font_size" in fields:
+        if patch.font_size is None or post.font.size is None:
+            return False
+        if abs(float(post.font.size) - float(patch.font_size)) > 1e-6:
+            return False
+
+    if "font_color" in fields:
+        if patch.font_color is None:
+            if _read_int_or_none(range_obj.Font, "ColorIndex") != _XL_COLOR_INDEX_AUTOMATIC:
+                return False
+        elif post.font.color != patch.font_color:
+            return False
+
+    if "fill_color" in fields:
+        if patch.fill_color is None:
+            if _read_int_or_none(range_obj.Interior, "ColorIndex") != _XL_COLOR_INDEX_NONE:
+                return False
+        elif post.fill.color != patch.fill_color:
+            return False
+
+    if "fill_pattern" in fields and post.fill.pattern != patch.fill_pattern:
+        return False
+
+    if "alignment_horizontal" in fields and post.alignment.horizontal != patch.alignment_horizontal:
+        return False
+
+    if "alignment_vertical" in fields and post.alignment.vertical != patch.alignment_vertical:
+        return False
+
+    if "alignment_wrap_text" in fields:
+        return post.alignment.wrap_text == patch.alignment_wrap_text
+
+    return True
+
+
+def _read_number_format(range_obj: Any, mixed: list[str]) -> str | None:
+    """Read ``Range.NumberFormat`` (``None`` = mixed across the range)."""
+
+    value = _read_attr(range_obj, "NumberFormat")
+    if value is None:
+        mixed.append("number_format")
+        return None
+    return str(value)
+
+
+def _read_font(range_obj: Any, mixed: list[str]) -> FontFormat:
+    """Read the bounded ``Range.Font`` subset (tri-state)."""
+
+    font = range_obj.Font
+    name = _read_str_prop(font, "Name", "font.name", mixed)
+    bold = _read_bool_prop(font, "Bold", "font.bold", mixed)
+    italic = _read_bool_prop(font, "Italic", "font.italic", mixed)
+    size = _read_float_prop(font, "Size", "font.size", mixed)
+    color = _read_int_prop(font, "Color", "font.color", mixed)
+    return FontFormat(name=name, bold=bold, italic=italic, size=size, color=color)
+
+
+def _read_fill(range_obj: Any, mixed: list[str]) -> FillFormat:
+    """Read the bounded ``Range.Interior`` subset (tri-state, no-fill aware)."""
+
+    interior = range_obj.Interior
+
+    color_index = _read_int_or_none(interior, "ColorIndex")
+    if color_index is not None and color_index == _XL_COLOR_INDEX_NONE:
+        color: int | None = None  # no fill, not mixed
+    else:
+        raw_color = _read_int_or_none(interior, "Color")
+        if raw_color is None:
+            mixed.append("fill.color")
+            color = None
+        else:
+            color = raw_color
+
+    pattern_value = _read_int_or_none(interior, "Pattern")
+    if pattern_value is None:
+        mixed.append("fill.pattern")
+        pattern: str | None = None
+    else:
+        pattern = _FILL_PATTERN_NAMES.get(pattern_value, str(pattern_value))
+
+    return FillFormat(color=color, pattern=pattern)
+
+
+def _read_alignment(range_obj: Any, mixed: list[str]) -> AlignmentFormat:
+    """Read the bounded ``Range`` alignment subset (tri-state)."""
+
+    horizontal = _read_enum_prop(
+        range_obj, "HorizontalAlignment", _HORIZONTAL_ALIGNMENT_NAMES, "alignment.horizontal", mixed
+    )
+    vertical = _read_enum_prop(
+        range_obj, "VerticalAlignment", _VERTICAL_ALIGNMENT_NAMES, "alignment.vertical", mixed
+    )
+    wrap_text = _read_bool_prop(range_obj, "WrapText", "alignment.wrap_text", mixed)
+    return AlignmentFormat(horizontal=horizontal, vertical=vertical, wrap_text=wrap_text)
+
+
+def _read_attr(obj: Any, attribute: str) -> Any:
+    """Read a COM property; return ``None`` for ``Null`` or any failure."""
+
+    try:
+        value = getattr(obj, attribute)
+    except Exception:  # noqa: BLE001 - defensive COM read
+        return None
+    return value
+
+
+def _read_int_or_none(obj: Any, attribute: str) -> int | None:
+    """Read an integer COM property; ``None`` for ``Null`` or failure."""
+
+    value = _read_attr(obj, attribute)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:  # noqa: BLE001 - defensive COM read
+        return None
+
+
+def _read_str_prop(obj: Any, attribute: str, path: str, mixed: list[str]) -> str | None:
+    """Read a string property; ``None`` (mixed) when Excel returns ``Null``."""
+
+    value = _read_attr(obj, attribute)
+    if value is None:
+        mixed.append(path)
+        return None
+    return str(value)
+
+
+def _read_bool_prop(obj: Any, attribute: str, path: str, mixed: list[str]) -> bool | None:
+    """Read a boolean property; ``None`` (mixed) when Excel returns ``Null``."""
+
+    value = _read_attr(obj, attribute)
+    if value is None:
+        mixed.append(path)
+        return None
+    return bool(value)
+
+
+def _read_float_prop(obj: Any, attribute: str, path: str, mixed: list[str]) -> float | None:
+    """Read a float property; ``None`` (mixed) when Excel returns ``Null``."""
+
+    value = _read_attr(obj, attribute)
+    if value is None:
+        mixed.append(path)
+        return None
+    try:
+        return float(value)
+    except Exception:  # noqa: BLE001 - defensive COM read
+        mixed.append(path)
+        return None
+
+
+def _read_int_prop(obj: Any, attribute: str, path: str, mixed: list[str]) -> int | None:
+    """Read an integer property; ``None`` (mixed) when Excel returns ``Null``."""
+
+    value = _read_attr(obj, attribute)
+    if value is None:
+        mixed.append(path)
+        return None
+    try:
+        return int(value)
+    except Exception:  # noqa: BLE001 - defensive COM read
+        mixed.append(path)
+        return None
+
+
+def _read_enum_prop(
+    obj: Any, attribute: str, name_map: dict[int, str], path: str, mixed: list[str]
+) -> str | None:
+    """Read an enum property; ``None`` (mixed) when Excel returns ``Null``."""
+
+    value = _read_attr(obj, attribute)
+    if value is None:
+        mixed.append(path)
+        return None
+    try:
+        int_value = int(value)
+    except Exception:  # noqa: BLE001 - defensive COM read
+        mixed.append(path)
+        return None
+    return name_map.get(int_value, str(int_value))
+
 
 # ---------------------------------------------------------------------------
 # Write helpers (task_043)
@@ -937,7 +1541,10 @@ def _formulas_match(expected: list[list[str]], post: RangeFormulas) -> bool:
     return True
 
 
-__all__ = ["RangesAdapter"]
+__all__ = [
+    "RangesAdapter",
+    "validate_format_patch",
+]
 
 
 def _validate_window(offset: int, limit: int | None) -> None:
@@ -986,4 +1593,7 @@ def _window(
     return start, end, truncated
 
 
-__all__ = ["RangesAdapter"]
+__all__ = [
+    "RangesAdapter",
+    "validate_format_patch",
+]

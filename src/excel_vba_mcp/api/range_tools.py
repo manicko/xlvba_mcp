@@ -211,7 +211,11 @@ async def range_get_format(workbook_id: str, sheet: str, address: str) -> Format
         address: An A1-style address for the target block.
     """
 
-    raise _not_implemented("range_get_format")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(sheet, "sheet")
+    _require_non_empty(address, "address")
+    service = get_ranges_service()
+    return await service.get_format(workbook_id, sheet, address)
 
 
 async def range_get_validation(workbook_id: str, sheet: str, address: str) -> ValidationRule:
@@ -321,7 +325,11 @@ async def range_set_format(
         patch: The sparse format update (:class:`RangeFormatPatch`).
     """
 
-    raise _not_implemented("range_set_format")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(sheet, "sheet")
+    _require_non_empty(address, "address")
+    service = get_ranges_service()
+    return await service.set_format(workbook_id, sheet, address, patch)
 
 
 async def range_copy(

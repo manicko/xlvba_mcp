@@ -63,8 +63,10 @@ from excel_vba_mcp.api.name_tools import (
 )
 from excel_vba_mcp.api.range_tools import (
     range_get,
+    range_get_format,
     range_read_formulas,
     range_read_values,
+    range_set_format,
     range_write_formulas,
     range_write_values,
 )
@@ -372,6 +374,20 @@ _DESC_RANGE_WRITE_FORMULAS = (
     "belongs in range_write_values. Guarded mutation: writable session + "
     "snapshot + approval + postcondition re-read. Cell writes inside an Excel "
     "Table are allowed only when the table row/column structure is unchanged."
+)
+_DESC_RANGE_GET_FORMAT = (
+    "Read bounded, tri-state formatting for a Range: number_format, font "
+    "(name/bold/italic/size/color), fill (color/pattern) and alignment "
+    "(horizontal/vertical/wrap_text). Each property is a value, mixed (cells "
+    "disagree; listed in mixed_properties) or unsupported (listed in "
+    "unsupported); a mixed range is never flattened. Read-only."
+)
+_DESC_RANGE_SET_FORMAT = (
+    "Apply a partial formatting update to a Range. Only the fields explicitly "
+    "set in the patch are written; absent fields are left untouched. Values and "
+    "enums are validated before any mutation; a null clears to automatic only "
+    "where Excel allows. Guarded mutation: writable session + snapshot + "
+    "approval + postcondition re-read."
 )
 _DESC_NAMES_LIST = (
     "List every defined name (Named Range) of an open workbook across workbook "
@@ -815,6 +831,8 @@ def _register_tools(server: MCPServer) -> None:
         name="range_write_formulas",
         description=_DESC_RANGE_WRITE_FORMULAS,
     )
+    server.add_tool(range_get_format, name="range_get_format", description=_DESC_RANGE_GET_FORMAT)
+    server.add_tool(range_set_format, name="range_set_format", description=_DESC_RANGE_SET_FORMAT)
     server.add_tool(names_list, name="names_list", description=_DESC_NAMES_LIST)
     server.add_tool(name_get, name="name_get", description=_DESC_NAME_GET)
     server.add_tool(name_create, name="name_create", description=_DESC_NAME_CREATE)
