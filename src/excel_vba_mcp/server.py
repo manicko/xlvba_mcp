@@ -31,9 +31,25 @@ from mcp.server.mcpserver import MCPServer
 from excel_vba_mcp import __version__
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
-from excel_vba_mcp.api import compile_tools, macro_tools, test_tools, vba_tools, workbook_tools
+from excel_vba_mcp.api import (
+    compile_tools,
+    macro_tools,
+    sheet_tools,
+    test_tools,
+    vba_tools,
+    workbook_tools,
+)
 from excel_vba_mcp.api.compile_tools import vba_compile, vba_get_compile_diagnostics
 from excel_vba_mcp.api.macro_tools import macro_get_last_result, macro_list, macro_run
+from excel_vba_mcp.api.sheet_tools import (
+    sheet_add,
+    sheet_copy,
+    sheet_delete,
+    sheet_get,
+    sheet_rename,
+    sheet_set_visibility,
+    sheets_list,
+)
 from excel_vba_mcp.api.test_tools import (
     snapshot_create,
     snapshot_diff,
@@ -61,6 +77,7 @@ from excel_vba_mcp.api.workbook_tools import (
 from excel_vba_mcp.application.compile_service import CompileService
 from excel_vba_mcp.application.macro_service import BackgroundSafetyRegistry, MacroService
 from excel_vba_mcp.application.session_service import SessionService
+from excel_vba_mcp.application.sheets_service import SheetsService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
 from excel_vba_mcp.application.vba_project_service import VBAProjectService
 from excel_vba_mcp.security.approval import ApprovalPolicy
@@ -164,6 +181,33 @@ _DESC_MACRO_GET_LAST_RESULT = (
     "Return the cached last macro run result (status, duration, return value, "
     "structured error) without re-running the macro."
 )
+_DESC_SHEETS_LIST = (
+    "List every sheet of an open workbook (all types: Worksheet / Chart / Macro "
+    "/ Dialog) with name, index, object_type, visibility and — for worksheets — "
+    "code_name (read-only), protected, table_count and used_range."
+)
+_DESC_SHEET_GET = "Return one sheet's SheetInfo by name (Sheets vs Worksheets aware)."
+_DESC_SHEET_ADD = (
+    "Add a worksheet (MVP: Worksheet only). Guarded mutation: requires a writable "
+    "session, a successful snapshot and an approval grant (deny-by-default)."
+)
+_DESC_SHEET_RENAME = (
+    "Rename a sheet; CodeName is never changed. Guarded mutation: requires a "
+    "writable session, a snapshot and an approval grant."
+)
+_DESC_SHEET_COPY = (
+    "Copy a sheet and return the new sheet's DTO. Guarded mutation: requires a "
+    "writable session, a snapshot and an approval grant."
+)
+_DESC_SHEET_DELETE = (
+    "Delete a sheet (destructive). Requires a writable session, a snapshot and an "
+    "approval grant; rejected when it would leave no visible worksheet."
+)
+_DESC_SHEET_SET_VISIBILITY = (
+    "Set a sheet's visibility (xlSheetVisible / xlSheetHidden). Guarded mutation: "
+    "requires a writable session, a snapshot and an approval grant; hiding the "
+    "last visible worksheet is rejected."
+)
 
 
 @dataclasses.dataclass
@@ -175,6 +219,7 @@ class _Runtime:
     session: SessionService
     snapshot: SnapshotService
     vba: VBAProjectService
+    sheets: SheetsService
     compile: CompileService
     macro: MacroService
     path_policy: PathPolicy
@@ -235,6 +280,7 @@ def _build_runtime() -> _Runtime:
         snapshot_service=snapshot,
         approval=approval,
     )
+    sheets = SheetsService(worker, session, snapshot, approval, path_policy, audit)
     compile_service = CompileService(worker, session, vba, path_policy, audit)
     # background_safe starts empty (deny-by-default, BG06): no procedure is
     # eligible for background execution until it is explicitly classified for the
@@ -246,6 +292,7 @@ def _build_runtime() -> _Runtime:
         session=session,
         snapshot=snapshot,
         vba=vba,
+        sheets=sheets,
         compile=compile_service,
         macro=macro_service,
         path_policy=path_policy,
@@ -288,6 +335,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         workbook_tools.set_session_service(runtime.session)
         test_tools.set_snapshot_service(runtime.snapshot)
         vba_tools.set_vba_project_service(runtime.vba)
+        sheet_tools.set_sheets_service(runtime.sheets)
         compile_tools.set_compile_service(runtime.compile)
         macro_tools.set_macro_service(runtime.macro)
     try:
@@ -296,6 +344,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         workbook_tools.set_session_service(None)
         test_tools.set_snapshot_service(None)
         vba_tools.set_vba_project_service(None)
+        sheet_tools.set_sheets_service(None)
         compile_tools.set_compile_service(None)
         macro_tools.set_macro_service(None)
         await _safe_shutdown(runtime.worker)
@@ -372,6 +421,17 @@ def _register_tools(server: MCPServer) -> None:
         macro_get_last_result,
         name="macro_get_last_result",
         description=_DESC_MACRO_GET_LAST_RESULT,
+    )
+    server.add_tool(sheets_list, name="sheets_list", description=_DESC_SHEETS_LIST)
+    server.add_tool(sheet_get, name="sheet_get", description=_DESC_SHEET_GET)
+    server.add_tool(sheet_add, name="sheet_add", description=_DESC_SHEET_ADD)
+    server.add_tool(sheet_rename, name="sheet_rename", description=_DESC_SHEET_RENAME)
+    server.add_tool(sheet_copy, name="sheet_copy", description=_DESC_SHEET_COPY)
+    server.add_tool(sheet_delete, name="sheet_delete", description=_DESC_SHEET_DELETE)
+    server.add_tool(
+        sheet_set_visibility,
+        name="sheet_set_visibility",
+        description=_DESC_SHEET_SET_VISIBILITY,
     )
 
 

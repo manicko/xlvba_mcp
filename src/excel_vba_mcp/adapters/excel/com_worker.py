@@ -630,6 +630,11 @@ class ExcelComWorker:
         while True:
             try:
                 return item.fn()
+            except ExcelVbaMcpError:
+                # Domain errors already carry a precise code (preconditions, guards,
+                # policy). Never re-wrap them into a generic COM error, which would
+                # mask the real reason (e.g. "last visible sheet" -> COM_BUSY).
+                raise
             except Exception as exc:  # noqa: BLE001 - classified below
                 hresult = _hresult_of(exc)
                 if hresult == RPC_E_CALL_REJECTED:
