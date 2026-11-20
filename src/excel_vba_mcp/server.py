@@ -38,6 +38,7 @@ from excel_vba_mcp.api import (
     control_tools,
     macro_tools,
     name_tools,
+    range_tools,
     shape_tools,
     sheet_tools,
     table_tools,
@@ -59,6 +60,11 @@ from excel_vba_mcp.api.name_tools import (
     name_get,
     name_update,
     names_list,
+)
+from excel_vba_mcp.api.range_tools import (
+    range_get,
+    range_read_formulas,
+    range_read_values,
 )
 from excel_vba_mcp.api.shape_tools import (
     shape_get,
@@ -118,6 +124,7 @@ from excel_vba_mcp.application.compile_service import CompileService
 from excel_vba_mcp.application.controls_service import ControlsService
 from excel_vba_mcp.application.macro_service import BackgroundSafetyRegistry, MacroService
 from excel_vba_mcp.application.names_service import NamesService
+from excel_vba_mcp.application.ranges_service import RangesService
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.shapes_service import ShapesService
 from excel_vba_mcp.application.sheets_service import SheetsService
@@ -331,6 +338,23 @@ _DESC_TABLE_RESIZE = (
     "Resize a table to a new A1 range via ListObject.Resize. Guarded mutation: "
     "writable session + snapshot + approval."
 )
+_DESC_RANGE_GET = (
+    "Resolve an explicit worksheet + A1-style address to Range metadata "
+    "(address, rows, cols, shape, merged/table flags). Read-only; multi-area or "
+    "invalid addresses are rejected with a structured error."
+)
+_DESC_RANGE_READ_VALUES = (
+    "Read typed cell values from a bounded Range window. Values are typed "
+    "(empty/string/number/boolean/date/error) with no lossy string coercion; "
+    "offset is a 0-based row index and limit caps the rows. The response is "
+    "size-limited (truncated flag); oversized requests are rejected."
+)
+_DESC_RANGE_READ_FORMULAS = (
+    "Read typed formulas from a bounded Range window (Formula2 primary, Formula "
+    "fallback). _xlfn/_xlws/_xlpm prefixes are returned verbatim and flagged. "
+    "offset is a 0-based row index and limit caps the rows; oversized requests "
+    "are rejected."
+)
 _DESC_NAMES_LIST = (
     "List every defined name (Named Range) of an open workbook across workbook "
     "and worksheet scopes with scope, NameLocal, Visible, RefersTo/RefersToLocal "
@@ -422,6 +446,7 @@ class _Runtime:
     sheets: SheetsService
     tables: TablesService
     names: NamesService
+    ranges: RangesService
     shapes: ShapesService
     controls: ControlsService
     compile: CompileService
@@ -498,6 +523,7 @@ def _build_runtime() -> _Runtime:
     )
     sheets = SheetsService(worker, session, snapshot, approval, path_policy, audit)
     tables = TablesService(worker, session, snapshot, approval, path_policy, audit)
+    ranges = RangesService(worker, session, snapshot, approval, path_policy, audit)
     names = NamesService(worker, session, snapshot, approval, path_policy, audit)
     shapes = ShapesService(worker, session, snapshot, approval, path_policy, audit)
     controls = ControlsService(worker, session, snapshot, approval, path_policy, audit)
@@ -549,6 +575,7 @@ def _build_runtime() -> _Runtime:
         sheets=sheets,
         tables=tables,
         names=names,
+        ranges=ranges,
         shapes=shapes,
         controls=controls,
         compile=compile_service,
@@ -608,6 +635,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         vba_tools.set_vba_project_service(runtime.vba)
         sheet_tools.set_sheets_service(runtime.sheets)
         table_tools.set_tables_service(runtime.tables)
+        range_tools.set_ranges_service(runtime.ranges)
         name_tools.set_names_service(runtime.names)
         shape_tools.set_shapes_service(runtime.shapes)
         control_tools.set_controls_service(runtime.controls)
@@ -624,6 +652,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         vba_tools.set_vba_project_service(None)
         sheet_tools.set_sheets_service(None)
         table_tools.set_tables_service(None)
+        range_tools.set_ranges_service(None)
         name_tools.set_names_service(None)
         shape_tools.set_shapes_service(None)
         control_tools.set_controls_service(None)
@@ -753,6 +782,13 @@ def _register_tools(server: MCPServer) -> None:
     )
     server.add_tool(table_create, name="table_create", description=_DESC_TABLE_CREATE)
     server.add_tool(table_resize, name="table_resize", description=_DESC_TABLE_RESIZE)
+    server.add_tool(range_get, name="range_get", description=_DESC_RANGE_GET)
+    server.add_tool(
+        range_read_values, name="range_read_values", description=_DESC_RANGE_READ_VALUES
+    )
+    server.add_tool(
+        range_read_formulas, name="range_read_formulas", description=_DESC_RANGE_READ_FORMULAS
+    )
     server.add_tool(names_list, name="names_list", description=_DESC_NAMES_LIST)
     server.add_tool(name_get, name="name_get", description=_DESC_NAME_GET)
     server.add_tool(name_create, name="name_create", description=_DESC_NAME_CREATE)

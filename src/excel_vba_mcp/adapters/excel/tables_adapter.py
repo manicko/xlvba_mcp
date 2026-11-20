@@ -33,9 +33,14 @@ the Excel object-model calls on the STA thread and captures before/after metadat
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 
+from excel_vba_mcp.adapters.excel.cell_values import (
+    EXCEL_ERROR_CODE_TO_LITERAL,
+    EXCEL_ERROR_CODES,
+    classify_cell_kind_name,
+    classify_cell_value,
+)
 from excel_vba_mcp.domain.errors import ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
     CellValue,
@@ -43,7 +48,13 @@ from excel_vba_mcp.domain.models import (
     TableColumnInfo,
     TableInfo,
 )
-from excel_vba_mcp.domain.statuses import CellValueKind
+
+# Excel error literals returned by ``Range.Value`` for error cells and the OLE
+# error code -> literal map live in
+# :mod:`excel_vba_mcp.adapters.excel.cell_values` (shared with the Range adapter
+# so both classify cells identically). They are imported above and re-exported
+# from this module in ``__all__`` for backward compatibility with earlier
+# internal callers.
 
 # Upper bound on the number of cells a single ``read_rows`` response returns. A
 # larger table is truncated (``TableRows.truncated`` is set) rather than dumping
@@ -53,34 +64,10 @@ _MAX_RESPONSE_CELLS = 2000
 # Upper bound on the number of preview rows attached to an ambiguity error.
 _MAX_PREVIEW_ROWS = 10
 
-# Excel error literals returned by ``Range.Value`` for error cells (spec §7.6:
-# "представлять ошибки ячеек отдельным типизированным значением").
-_EXCEL_ERROR_CODES: frozenset[str] = frozenset(
-    {
-        "#NULL!",
-        "#DIV/0!",
-        "#VALUE!",
-        "#REF!",
-        "#NAME?",
-        "#NUM!",
-        "#N/A",
-        "#GETTING_DATA",
-    }
-)
-
-# Excel error cells read through ``Range.Value`` surface as signed OLE error
-# codes (``xlErr*``), not as the literal text. Map the code -> literal so error
-# cells are typed as ``CellValueKind.ERROR`` instead of a bogus number.
-_EXCEL_ERROR_CODE_TO_LITERAL: dict[int, str] = {
-    -2147221244: "#NULL!",
-    -2146826281: "#DIV/0!",
-    -2146826273: "#VALUE!",
-    -2146826265: "#REF!",
-    -2146826259: "#NAME?",
-    -2146826252: "#NUM!",
-    -2146826246: "#N/A",
-    -2146826245: "#GETTING_DATA",
-}
+# Excel error literals and the OLE error-code -> literal map live in
+# :mod:`excel_vba_mcp.adapters.excel.cell_values` (shared with the Range adapter
+# so both classify cells identically). They are imported above and re-exported
+# in the module ``__all__`` for backward compatibility.
 
 # ``ListColumn.TotalsCalculation`` codes -> stable function names.
 _TOTALS_FUNCTIONS: dict[int, str] = {
@@ -203,46 +190,17 @@ def _safe_address(range_obj: Any) -> str | None:
 def _cell_value(value: Any, *, address: str) -> CellValue:
     """Classify a raw cell value into a typed :class:`CellValue`.
 
-    Order matters: ``bool`` is checked before ``int`` (``bool`` is an ``int``
-    subclass), and error codes/literals before the generic number / string case.
+    Thin alias of :func:`excel_vba_mcp.adapters.excel.cell_values.classify_cell_value`
+    kept for backward compatibility with existing callers.
     """
 
-    if value is None:
-        return CellValue(kind=CellValueKind.EMPTY, value=None, address=address)
-    if isinstance(value, bool):
-        return CellValue(kind=CellValueKind.BOOLEAN, value=value, address=address)
-    if isinstance(value, datetime):
-        return CellValue(kind=CellValueKind.DATE, value=value.isoformat(), address=address)
-    if isinstance(value, int) and value in _EXCEL_ERROR_CODE_TO_LITERAL:
-        return CellValue(
-            kind=CellValueKind.ERROR, value=_EXCEL_ERROR_CODE_TO_LITERAL[value], address=address
-        )
-    if isinstance(value, (int, float)):
-        return CellValue(kind=CellValueKind.NUMBER, value=value, address=address)
-    if isinstance(value, str):
-        if value in _EXCEL_ERROR_CODES:
-            return CellValue(kind=CellValueKind.ERROR, value=value, address=address)
-        return CellValue(kind=CellValueKind.STRING, value=value, address=address)
-    # Unknown COM variant: fall back to its string form rather than leaking it.
-    return CellValue(kind=CellValueKind.STRING, value=str(value), address=address)
+    return classify_cell_value(value, address=address)
 
 
 def _cell_kind_name(value: Any) -> str:
     """Return a coarse type name for a sampled cell (``TableColumnInfo.data_type``)."""
 
-    if value is None:
-        return "empty"
-    if isinstance(value, bool):
-        return "boolean"
-    if isinstance(value, datetime):
-        return "date"
-    if isinstance(value, int) and value in _EXCEL_ERROR_CODE_TO_LITERAL:
-        return "error"
-    if isinstance(value, (int, float)):
-        return "number"
-    if isinstance(value, str) and value in _EXCEL_ERROR_CODES:
-        return "error"
-    return "string"
+    return classify_cell_kind_name(value)
 
 
 def _normalize_grid(raw: Any) -> tuple[tuple[Any, ...], ...]:
@@ -1132,6 +1090,8 @@ def _resolve_source_range(wb: Any, worksheet: Any, range_or_name: str) -> Any:
 
 
 __all__ = [
+    "EXCEL_ERROR_CODES",
+    "EXCEL_ERROR_CODE_TO_LITERAL",
     "TableMutationResult",
     "TableRows",
     "TablesAdapter",

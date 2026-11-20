@@ -20,10 +20,19 @@ Tool groups:
 Structural operations that intersect an Excel Table (ListObject) are rejected
 with :class:`~excel_vba_mcp.domain.errors.ListObjectIntersectionError` and routed
 to the table tools; the Range API never changes table row/column structure.
+
+The read-only tools (``range_get``, ``range_read_values``,
+``range_read_formulas``, task_042) are implemented here as thin async handlers
+that validate their arguments, delegate to
+:class:`~excel_vba_mcp.application.ranges_service.RangesService` and return a
+domain DTO. The remaining stubs are implemented by later tasks
+(``task_043``–``task_046``).
 """
 
 from __future__ import annotations
 
+from excel_vba_mcp.application.ranges_service import RangesService
+from excel_vba_mcp.domain.errors import ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
     ConditionalFormatMutationResult,
     ConditionalFormatRule,
@@ -55,6 +64,57 @@ def _not_implemented(name: str) -> NotImplementedError:
 
 
 # ---------------------------------------------------------------------------
+# Active service wiring (read tools; published by the server lifespan)
+# ---------------------------------------------------------------------------
+_ranges_service: RangesService | None = None
+
+
+def set_ranges_service(service: RangesService | None) -> None:
+    """Publish (or clear) the active ranges service used by the tools."""
+
+    global _ranges_service
+    _ranges_service = service
+
+
+def get_ranges_service() -> RangesService:
+    """Return the active ranges service or raise if it is not configured."""
+
+    if _ranges_service is None:
+        raise ExcelVbaMcpError(
+            "The ranges service is not initialized.",
+            context={"tool": "range_tools"},
+        )
+    return _ranges_service
+
+
+def _require_non_empty(value: str, field: str) -> str:
+    """Validate that a required string argument is non-empty."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ExcelVbaMcpError(
+            f"Argument {field!r} must be a non-empty string.",
+            context={"field": field},
+        )
+    return value
+
+
+def _require_int(value: object, field: str, *, minimum: int | None = None) -> int:
+    """Validate that an argument is an integer (optionally with a minimum)."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ExcelVbaMcpError(
+            f"Argument {field!r} must be an integer.",
+            context={"field": field},
+        )
+    if minimum is not None and value < minimum:
+        raise ExcelVbaMcpError(
+            f"Argument {field!r} must be >= {minimum}.",
+            context={"field": field, "value": value},
+        )
+    return value
+
+
+# ---------------------------------------------------------------------------
 # Read-only tools
 # ---------------------------------------------------------------------------
 
@@ -72,7 +132,11 @@ async def range_get(workbook_id: str, sheet: str, address: str) -> RangeAddress:
         A :class:`RangeAddress` with the resolved dimensions and shape.
     """
 
-    raise _not_implemented("range_get")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(sheet, "sheet")
+    _require_non_empty(address, "address")
+    service = get_ranges_service()
+    return await service.get_range(workbook_id, sheet, address)
 
 
 async def range_read_values(
@@ -97,7 +161,14 @@ async def range_read_values(
         limit: Optional cap on the number of rows returned.
     """
 
-    raise _not_implemented("range_read_values")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(sheet, "sheet")
+    _require_non_empty(address, "address")
+    offset = _require_int(offset, "offset", minimum=0)
+    if limit is not None:
+        limit = _require_int(limit, "limit", minimum=1)
+    service = get_ranges_service()
+    return await service.read_values(workbook_id, sheet, address, offset=offset, limit=limit)
 
 
 async def range_read_formulas(
@@ -117,7 +188,14 @@ async def range_read_formulas(
         limit: Optional cap on the number of rows returned.
     """
 
-    raise _not_implemented("range_read_formulas")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(sheet, "sheet")
+    _require_non_empty(address, "address")
+    offset = _require_int(offset, "offset", minimum=0)
+    if limit is not None:
+        limit = _require_int(limit, "limit", minimum=1)
+    service = get_ranges_service()
+    return await service.read_formulas(workbook_id, sheet, address, offset=offset, limit=limit)
 
 
 async def range_get_format(workbook_id: str, sheet: str, address: str) -> FormatInfo:
