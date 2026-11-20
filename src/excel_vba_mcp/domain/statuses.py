@@ -335,3 +335,167 @@ class HealthStatus(StrEnum):
     OK = "ok"
     NEEDS_RECOVERY = "needs_recovery"
     UNAVAILABLE = "unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 statuses — Ranges & Cells + PivotTables (task_038, task_039, task_040)
+# ---------------------------------------------------------------------------
+# These closed vocabularies are derived from the Phase 2 research decision
+# records ``docs/research/ranges_cells_api.md`` (task_038) and
+# ``docs/research/pivot_tables_api.md`` (task_039). They are additive and never
+# change a Stage 1 value.
+
+
+class RangeShape(StrEnum):
+    """Normalized shape of a read Range value block (task_038 §1.4).
+
+    Excel returns a scalar for a single-cell range and a 2-D array for any
+    multi-cell range (even a single row ``A1:C1`` or column ``A1:A3``). The
+    contract normalizes everything to a 2-D grid and reports this tag so a
+    single row/column is unambiguous to the client.
+    """
+
+    SCALAR = "scalar"
+    ROW = "row"
+    COLUMN = "column"
+    BLOCK = "block"
+
+
+class DataValidationType(StrEnum):
+    """``Range.Validation.Type`` (``XlDVType``) supported by Phase 2 (task_038 §6.1).
+
+    Only the rule-bearing types are supported for ``set``; ``INPUT_ONLY`` carries
+    no rule semantics and is read-only (``present`` reported, never set).
+    """
+
+    WHOLE_NUMBER = "whole_number"
+    DECIMAL = "decimal"
+    LIST = "list"
+    DATE = "date"
+    TIME = "time"
+    TEXT_LENGTH = "text_length"
+    CUSTOM = "custom"
+    INPUT_ONLY = "input_only"
+    NONE = "none"
+
+
+class ValidationOperator(StrEnum):
+    """``XlFormatConditionOperator`` shared by validation and CF (task_038 §6.1)."""
+
+    BETWEEN = "between"
+    EQUAL = "equal"
+    GREATER = "greater"
+    GREATER_EQUAL = "greater_equal"
+    LESS = "less"
+    LESS_EQUAL = "less_equal"
+    NOT_BETWEEN = "not_between"
+    NOT_EQUAL = "not_equal"
+
+
+class ConditionalFormatType(StrEnum):
+    """``XlFormatConditionType`` supported by Phase 2 (task_038 §6.3).
+
+    Plain ``FormatCondition`` types are supported. The distinct COM objects
+    ``COLOR_SCALE`` / ``DATA_BAR`` / ``ICON_SET`` are detected but reported as
+    ``unsupported`` (out of the bounded Phase 2 scope).
+    """
+
+    CELL_VALUE = "cell_value"
+    EXPRESSION = "expression"
+    TEXT_STRING = "text_string"
+    BLANKS = "blanks"
+    NO_BLANKS = "no_blanks"
+    ERRORS = "errors"
+    NO_ERRORS = "no_errors"
+    TIME_PERIOD = "time_period"
+    TOP10 = "top10"
+    ABOVE_AVERAGE = "above_average"
+    UNIQUE_VALUES = "unique_values"
+    COLOR_SCALE = "color_scale"
+    DATA_BAR = "data_bar"
+    ICON_SET = "icon_set"
+    UNSUPPORTED = "unsupported"
+
+
+class PivotSourceType(StrEnum):
+    """``PivotCache.SourceType`` classification (task_039 §7).
+
+    ``DATABASE`` (worksheet range / ListObject, ``SourceType == 1``) is the only
+    supported refresh/source type. Every other determinable source is
+    ``unsupported`` / read-only; ``OLAP`` and ``DATA_MODEL`` are detected but
+    never refreshed through this increment.
+    """
+
+    DATABASE = "database"
+    EXTERNAL = "external"
+    CONSOLIDATION = "consolidation"
+    SCENARIO = "scenario"
+    PIVOT_TABLE = "pivot_table"
+    OLAP = "olap"
+    DATA_MODEL = "data_model"
+    UNSUPPORTED = "unsupported"
+    UNKNOWN = "unknown"
+
+
+class PivotFieldOrientation(StrEnum):
+    """``PivotField.Orientation`` layout bucket (task_039 §5)."""
+
+    HIDDEN = "hidden"
+    ROW = "row"
+    COLUMN = "column"
+    PAGE = "page"
+    DATA = "data"
+
+
+class PivotAggregation(StrEnum):
+    """``DataFields[i].Function`` aggregation (``XlConsolidationFunction``).
+
+    Only the eleven codes accepted by the target build (Excel 16.0 14332) are
+    modelled; the legacy values that build rejects are intentionally absent
+    (task_039 §5). Values are the Excel function names for readability.
+    """
+
+    SUM = "sum"
+    AVERAGE = "average"
+    COUNT = "count"
+    COUNT_NUMS = "countNums"
+    MAX = "max"
+    MIN = "min"
+    PRODUCT = "product"
+    STDEV = "stDev"
+    STDEVP = "stDevP"
+    VAR = "var"
+    VARP = "varP"
+
+
+class PivotRefreshStatus(StrEnum):
+    """Outcome of a targeted PivotTable/PivotCache refresh (task_039 §4)."""
+
+    REFRESHED = "refreshed"
+    UNSUPPORTED_SOURCE = "unsupported_source"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+
+
+class PivotRefreshMethod(StrEnum):
+    """Which refresh entry point produced a :class:`PivotRefreshResult`."""
+
+    REFRESH_TABLE = "refresh_table"
+    REFRESH_CACHE = "refresh_cache"
+
+
+class PivotFilterKind(StrEnum):
+    """Filter kind for a PivotField (task_039 §6).
+
+    Only ``MANUAL`` (hide/show items) is supported on the target build; label,
+    value, date and top/bottom filters (``PivotFilters.Add``) fail at runtime and
+    are reported as ``UNSUPPORTED``.
+    """
+
+    NONE = "none"
+    MANUAL = "manual"
+    LABEL = "label"
+    VALUE = "value"
+    DATE = "date"
+    TOP_BOTTOM = "top_bottom"
+    UNSUPPORTED = "unsupported"

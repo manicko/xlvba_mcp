@@ -13,25 +13,34 @@ The models intentionally cover only Stage 1 entities. Phase 2 concepts
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from excel_vba_mcp.domain.statuses import (
     CaseStatus,
     CellValueKind,
     CompileMethod,
     CompileStatus,
+    ConditionalFormatType,
     ControlFormType,
     ControlKind,
+    DataValidationType,
     DiagnosticConfidence,
     MacroMappingStatus,
     MacroRunStatus,
     ModelSectionStatus,
     NameScope,
     NameTargetKind,
+    PivotAggregation,
+    PivotFieldOrientation,
+    PivotFilterKind,
+    PivotRefreshMethod,
+    PivotRefreshStatus,
+    PivotSourceType,
     ProcedureType,
     ProcedureVisibility,
+    RangeShape,
     ReferenceStatus,
     SessionMode,
     ShapeKind,
@@ -40,6 +49,7 @@ from excel_vba_mcp.domain.statuses import (
     SnapshotStatus,
     StepStatus,
     TestRunStatus,
+    ValidationOperator,
     VbaAccessStatus,
     VbaComponentType,
     VbaExportStatus,
@@ -611,3 +621,598 @@ class TestRunResult(TimestampedModel):
     finished_at: datetime | None = None
     duration_ms: int | None = None
     artifact_paths: list[str] = Field(default_factory=list)
+
+
+# ===========================================================================
+# Phase 2 — Ranges & Cells and PivotTables contracts (task_040)
+# ===========================================================================
+# These DTOs extend the Stage 1 domain additively. They are derived from the
+# Phase 2 research decision records (task_038: docs/research/ranges_cells_api.md;
+# task_039: docs/research/pivot_tables_api.md) and are JSON-serializable with no
+# COM references. No Phase 2 cell matrix is ever unbounded: bulk requests are
+# capped by the constants below and enforced by request validators.
+
+# Bounded Range limits (task_038 §3.2). Cell/row/column/byte ceilings shared by
+# the Range read/write requests and the STA-worker adapter.
+MAX_RANGE_CELLS = 100_000
+MAX_RANGE_ROWS = 100_000
+MAX_RANGE_COLS = 512  # practical default; the hard Excel ceiling is XFD (16,384)
+MAX_RANGE_COLS_HARD = 16_384
+MAX_RESPONSE_CELLS = 50_000
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_WRITE_PAYLOAD_CELLS = 100_000
+MAX_VALIDATION_FORMULA_LENGTH = 255
+
+
+# ---------------------------------------------------------------------------
+# Range address / metadata
+# ---------------------------------------------------------------------------
+
+
+class RangeAddress(DomainModel):
+    """Resolved target address of a Range (task_038 §8.2).
+
+    ``rows``/``cols`` are the target dimensions; ``shape`` is the normalized
+    value-block shape (:class:`RangeShape`). ``areas`` is the number of areas
+    (multi-area targets are rejected upstream). ``is_merged`` / ``merged_area``
+    report merged-cell geometry; ``in_table`` / ``table_name`` flag a target that
+    intersects an Excel Table (ListObject). ``spilling`` / ``spill_parent`` carry
+    dynamic-array spill diagnostics when available.
+    """
+
+    sheet: str
+    address: str
+    rows: int = Field(ge=0)
+    cols: int = Field(ge=0)
+    shape: RangeShape = RangeShape.BLOCK
+    areas: int = Field(default=1, ge=1)
+    is_merged: bool = False
+    merged_area: str | None = None
+    in_table: bool | None = None
+    table_name: str | None = None
+    spilling: bool | None = None
+    spill_parent: str | None = None
+
+
+class RangeMetadata(DomainModel):
+    """Compact Range metadata (task_040 required surface).
+
+    ``dimensions`` is a human-readable ``"<rows>x<cols>"`` string;
+    ``cell_count`` is ``rows * cols``.
+    """
+
+    sheet: str
+    address: str
+    rows: int = Field(ge=0)
+    cols: int = Field(ge=0)
+    dimensions: str
+    cell_count: int
+
+
+# ---------------------------------------------------------------------------
+# Range values / formulas (2-D normalized)
+# ---------------------------------------------------------------------------
+
+
+class RangeValues(DomainModel):
+    """Typed, 2-D-normalized Range values (task_038 §1.4).
+
+    ``values`` holds one inner list per row, each aligned to ``cols``. Every
+    cell is a typed :class:`CellValue` (never a lossy string coercion). The
+    returned grid is bounded by :data:`MAX_RESPONSE_CELLS`; ``truncated`` marks
+    a response cut short by an offset/limit window.
+    """
+
+    range: RangeAddress
+    shape: RangeShape
+    rows: int
+    cols: int
+    values: list[list[CellValue]]
+    truncated: bool = False
+    notes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_response_bounds(self) -> Self:
+        if self.rows * self.cols > MAX_RESPONSE_CELLS:
+            raise ValueError(
+                f"Range response {self.rows}x{self.cols} exceeds "
+                f"MAX_RESPONSE_CELLS ({MAX_RESPONSE_CELLS})."
+            )
+        if len(self.values) != self.rows:
+            raise ValueError("RangeValues.values row count must equal rows.")
+        return self
+
+
+class FormulaCell(DomainModel):
+    """One cell's formula data (task_038 §2.4).
+
+    ``formula2`` is the primary Dynamic-Array formula-bar form;
+    ``formula`` is the pre-DA (IIE) form when it differs. ``is_array`` /
+    ``saved_as_array`` report legacy array participation.
+    """
+
+    address: str
+    formula2: str
+    formula: str | None = None
+    is_array: bool | None = None
+    saved_as_array: bool | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
+class RangeFormulas(DomainModel):
+    """Typed, 2-D-normalized Range formulas (task_038 §2.4)."""
+
+    range: RangeAddress
+    shape: RangeShape
+    rows: int
+    cols: int
+    formulas: list[list[FormulaCell]]
+    truncated: bool = False
+    notes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_response_bounds(self) -> Self:
+        if self.rows * self.cols > MAX_RESPONSE_CELLS:
+            raise ValueError(
+                f"Range formula response {self.rows}x{self.cols} exceeds "
+                f"MAX_RESPONSE_CELLS ({MAX_RESPONSE_CELLS})."
+            )
+        if len(self.formulas) != self.rows:
+            raise ValueError("RangeFormulas.formulas row count must equal rows.")
+        return self
+
+
+# ---------------------------------------------------------------------------
+# Range formatting (bounded, tri-state)
+# ---------------------------------------------------------------------------
+
+
+class FontFormat(DomainModel):
+    """Bounded font formatting (task_038 §4.2).
+
+    Each field is tri-state: a value, ``None`` (mixed across the range — also
+    listed in ``FormatInfo.mixed_properties``), or absent from the DTO (not
+    represented). ``color`` is the OLE ``RGB`` integer.
+    """
+
+    name: str | None = None
+    bold: bool | None = None
+    italic: bool | None = None
+    size: float | None = None
+    color: int | None = None
+
+
+class FillFormat(DomainModel):
+    """Bounded interior fill formatting (task_038 §4.2). ``color`` is an RGB int."""
+
+    color: int | None = None
+    pattern: str | None = None
+
+
+class AlignmentFormat(DomainModel):
+    """Bounded alignment formatting (task_038 §4.2)."""
+
+    horizontal: str | None = None
+    vertical: str | None = None
+    wrap_text: bool | None = None
+
+
+class FormatInfo(DomainModel):
+    """Typed, bounded Range formatting (task_038 §4.2).
+
+    Tri-state on read: each value is ``None`` when cells disagree. The property
+    names that returned mixed are listed in ``mixed_properties``; properties that
+    exist but are not represented by this DTO are listed in ``unsupported``
+    (never silently flattened).
+    """
+
+    range: RangeAddress
+    number_format: str | None = None
+    font: FontFormat = Field(default_factory=FontFormat)
+    fill: FillFormat = Field(default_factory=FillFormat)
+    alignment: AlignmentFormat = Field(default_factory=AlignmentFormat)
+    mixed_properties: list[str] = Field(default_factory=list)
+    unsupported: list[str] = Field(default_factory=list)
+
+
+class RangeFormatPatch(DomainModel):
+    """Sparse, partial Range format update (task_038 §4.3).
+
+    Every field is optional; only fields explicitly set by the caller are
+    written (use :meth:`applied_fields` to distinguish "set" from "left
+    untouched" via Pydantic ``model_fields_set``).
+    """
+
+    number_format: str | None = None
+    font_name: str | None = None
+    font_bold: bool | None = None
+    font_italic: bool | None = None
+    font_size: float | None = None
+    font_color: int | None = None
+    fill_color: int | None = None
+    fill_pattern: str | None = None
+    alignment_horizontal: str | None = None
+    alignment_vertical: str | None = None
+    alignment_wrap_text: bool | None = None
+
+    def applied_fields(self) -> list[str]:
+        """Return the sorted names of the fields the caller explicitly set."""
+
+        return sorted(self.model_fields_set)
+
+
+class FormatMutationResult(DomainModel):
+    """Result of ``range_set_format`` (task_038 §4.4)."""
+
+    action: str = "set_format"
+    range: RangeAddress
+    applied: list[str] = Field(default_factory=list)
+    ignored: list[str] = Field(default_factory=list)
+    verified: bool = False
+    result_format: FormatInfo | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Range data validation & conditional formatting (task_038 §6)
+# ---------------------------------------------------------------------------
+
+
+class ValidationRule(DomainModel):
+    """Typed ``Range.Validation`` rule (task_038 §6.1).
+
+    ``present`` is ``False`` when the range has no validation. Unsupported or
+    mixed pieces are reported in ``unsupported`` rather than silently dropped.
+    """
+
+    present: bool = False
+    type: DataValidationType = DataValidationType.NONE
+    operator: ValidationOperator | None = None
+    formula1: str | None = None
+    formula2: str | None = None
+    ignore_blank: bool | None = None
+    in_cell_dropdown: bool | None = None
+    apply_to: str | None = None
+    alert_style: str | None = None
+    error_message: str | None = None
+    error_title: str | None = None
+    input_message: str | None = None
+    input_title: str | None = None
+    show_error: bool | None = None
+    show_input: bool | None = None
+    unsupported: list[str] = Field(default_factory=list)
+
+
+class ValidationSpec(DomainModel):
+    """Request payload for ``range_set_validation`` (task_038 §6.1).
+
+    Enforces the documented 255-character ``Formula1``/``Formula2`` limit before
+    any COM mutation. Formulas are opaque strings passed to Excel; never
+    evaluated in Python.
+    """
+
+    type: DataValidationType
+    operator: ValidationOperator | None = None
+    formula1: str | None = None
+    formula2: str | None = None
+    ignore_blank: bool | None = None
+    in_cell_dropdown: bool | None = None
+    alert_style: str | None = None
+    error_message: str | None = None
+    error_title: str | None = None
+    input_message: str | None = None
+    input_title: str | None = None
+    show_error: bool | None = None
+    show_input: bool | None = None
+
+    @model_validator(mode="after")
+    def _check_formula_lengths(self) -> Self:
+        for name in ("formula1", "formula2"):
+            value = getattr(self, name)
+            if value is not None and len(value) > MAX_VALIDATION_FORMULA_LENGTH:
+                raise ValueError(
+                    f"{name} exceeds the {MAX_VALIDATION_FORMULA_LENGTH}-character limit."
+                )
+        return self
+
+
+class ConditionalFormatRule(DomainModel):
+    """Typed conditional-formatting rule (task_038 §6.3).
+
+    ``supported`` is ``False`` for ``ColorScale`` / ``DataBar`` / ``IconSet``
+    (distinct COM objects outside the bounded Phase 2 scope); ``unsupported``
+    lists those types rather than silently omitting them.
+    """
+
+    priority: int = Field(ge=1)
+    type: ConditionalFormatType
+    operator: ValidationOperator | None = None
+    formula1: str | None = None
+    formula2: str | None = None
+    stop_if_true: bool | None = None
+    applies_to: str | None = None
+    interior_color: int | None = None
+    font: FontFormat | None = None
+    supported: bool = True
+    unsupported_reason: str | None = None
+
+
+class ConditionalFormatSpec(DomainModel):
+    """Request payload for one conditional-formatting rule (task_038 §6.3)."""
+
+    type: ConditionalFormatType
+    operator: ValidationOperator | None = None
+    formula1: str | None = None
+    formula2: str | None = None
+    stop_if_true: bool | None = None
+    applies_to: str | None = None
+    interior_color: int | None = None
+    font: FontFormat | None = None
+    priority: int | None = Field(default=None, ge=1)
+
+
+class ConditionalFormatMutationResult(DomainModel):
+    """Result of ``range_set_conditional_formatting`` (priority preserved)."""
+
+    action: str
+    range: RangeAddress
+    rules: list[ConditionalFormatRule] = Field(default_factory=list)
+    applied_priorities: list[int] = Field(default_factory=list)
+    unsupported: list[str] = Field(default_factory=list)
+    verified: bool = False
+    notes: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Range write request (bounded bulk) + mutation results
+# ---------------------------------------------------------------------------
+
+
+class RangeWriteRequest(DomainModel):
+    """Bounded 2-D bulk write payload for values/formulas (task_038 §3.3).
+
+    Rejected before any COM mutation when the grid exceeds the row/column/cell
+    ceilings or when ``values`` shape does not match ``rows`` × ``cols``. A
+    string beginning with ``=`` is **not** a formula: value writes store text;
+    formula writes use :class:`FormulaWriteRequest`.
+    """
+
+    rows: int = Field(ge=1)
+    cols: int = Field(ge=1)
+    values: list[list[CellValue]]
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> Self:
+        if self.rows > MAX_RANGE_ROWS:
+            raise ValueError(f"rows exceeds MAX_RANGE_ROWS ({MAX_RANGE_ROWS}).")
+        if self.cols > MAX_RANGE_COLS:
+            raise ValueError(f"cols exceeds MAX_RANGE_COLS ({MAX_RANGE_COLS}).")
+        cells = self.rows * self.cols
+        if cells > MAX_WRITE_PAYLOAD_CELLS:
+            raise ValueError(
+                f"write payload {self.rows}x{self.cols}={cells} exceeds "
+                f"MAX_WRITE_PAYLOAD_CELLS ({MAX_WRITE_PAYLOAD_CELLS})."
+            )
+        if len(self.values) != self.rows:
+            raise ValueError("values row count must equal rows.")
+        for index, row in enumerate(self.values):
+            if len(row) != self.cols:
+                raise ValueError(f"values[{index}] width must equal cols.")
+        return self
+
+
+class FormulaWriteRequest(DomainModel):
+    """Bounded 2-D bulk formula-write payload (task_038 §2.4).
+
+    Each entry must be an actual formula string beginning with ``=``; a bare
+    constant belongs in :class:`RangeWriteRequest`.
+    """
+
+    rows: int = Field(ge=1)
+    cols: int = Field(ge=1)
+    formulas: list[list[str]]
+
+    @model_validator(mode="after")
+    def _check_bounds_and_formulas(self) -> Self:
+        if self.rows > MAX_RANGE_ROWS:
+            raise ValueError(f"rows exceeds MAX_RANGE_ROWS ({MAX_RANGE_ROWS}).")
+        if self.cols > MAX_RANGE_COLS:
+            raise ValueError(f"cols exceeds MAX_RANGE_COLS ({MAX_RANGE_COLS}).")
+        cells = self.rows * self.cols
+        if cells > MAX_WRITE_PAYLOAD_CELLS:
+            raise ValueError(
+                f"write payload {self.rows}x{self.cols}={cells} exceeds "
+                f"MAX_WRITE_PAYLOAD_CELLS ({MAX_WRITE_PAYLOAD_CELLS})."
+            )
+        if len(self.formulas) != self.rows:
+            raise ValueError("formulas row count must equal rows.")
+        for index, row in enumerate(self.formulas):
+            if len(row) != self.cols:
+                raise ValueError(f"formulas[{index}] width must equal cols.")
+        return self
+
+
+class RangeMutationResult(DomainModel):
+    """Before/after metadata + postcondition for a Range value/formula write.
+
+    ``range_before`` / ``range_after`` are the resolved target addresses;
+    ``postcondition_values`` holds the re-read values used to verify the write.
+    """
+
+    action: str
+    range_before: RangeAddress | None = None
+    range_after: RangeAddress | None = None
+    verified: bool = False
+    postcondition_values: RangeValues | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
+class StructuralMutationResult(DomainModel):
+    """Result of copy/insert/delete/merge/unmerge (task_038 §5.4).
+
+    ``table_metadata_unchanged`` is ``True`` only when the operation did not
+    intersect a ListObject. ``preconditions`` carries the best-effort preflight
+    preview (merged cells, non-anchor data, referenced formulas).
+    """
+
+    action: str
+    source: RangeAddress | None = None
+    destination: RangeAddress | None = None
+    shift: str | None = None
+    range_before: RangeAddress | None = None
+    range_after: RangeAddress | None = None
+    affected_addresses: list[str] = Field(default_factory=list)
+    table_metadata_unchanged: bool = True
+    verified: bool = False
+    preconditions: dict[str, Any] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# PivotTables / PivotCaches / PivotFields (task_039 §8)
+# ---------------------------------------------------------------------------
+
+
+class PivotFieldInfo(DomainModel):
+    """Bounded ``PivotField`` metadata (task_039 §3, §8).
+
+    ``source_name`` is the stable identity; ``data_field_name`` (the caption) is
+    set for data fields. ``orientation`` is the layout bucket; ``position`` is
+    ``None`` when the field is hidden / unplaced. ``function`` is set for data
+    fields only. ``filter_state`` summarizes the current filter kind.
+    """
+
+    source_name: str
+    caption: str | None = None
+    orientation: PivotFieldOrientation = PivotFieldOrientation.HIDDEN
+    position: int | None = None
+    function: PivotAggregation | None = None
+    show_all_items: bool | None = None
+    all_items_visible: bool | None = None
+    filter_state: PivotFilterKind = PivotFilterKind.NONE
+    is_data_field: bool = False
+    data_field_name: str | None = None
+    number_format: str | None = None
+
+
+class PivotCacheInfo(DomainModel):
+    """Bounded ``PivotCache`` metadata (task_039 §3, §8).
+
+    ``source_data`` is the text form for database/Table sources;
+    ``source_data_kind`` is ``"text" | "array" | "unavailable"``. ``olap`` and
+    ``source_type`` drive the unsupported-source policy. ``shared_cache`` and
+    ``affected_pivot_tables`` record the N:1 cache relationship.
+    """
+
+    cache_index: int
+    source_type: PivotSourceType
+    source_data: str | None = None
+    source_data_kind: str = "text"
+    refresh_date: datetime | None = None
+    refresh_on_file_open: bool | None = None
+    enable_refresh: bool | None = None
+    record_count: int | None = None
+    olap: bool = False
+    shared_cache: bool = False
+    affected_pivot_tables: list[str] = Field(default_factory=list)
+
+
+class PivotTableInfo(DomainModel):
+    """Bounded ``PivotTable`` metadata (task_039 §3, §8).
+
+    ``name`` is the stable report key; ``cache_index`` links the table to its
+    :class:`PivotCacheInfo`. ``source_status`` is ``"supported"`` or
+    ``"unsupported_source"``. Fields are grouped by orientation; this never
+    materializes the PivotTable cell output.
+    """
+
+    name: str
+    sheet_name: str
+    sheet_index: int
+    index: int
+    cache_index: int
+    table_range1: str | None = None
+    table_range2: str | None = None
+    data_body_range: str | None = None
+    row_grand: bool | None = None
+    column_grand: bool | None = None
+    refresh_date: datetime | None = None
+    source_type: PivotSourceType = PivotSourceType.UNKNOWN
+    source_status: str = "supported"
+    data_fields: list[PivotFieldInfo] = Field(default_factory=list)
+    row_fields: list[PivotFieldInfo] = Field(default_factory=list)
+    column_fields: list[PivotFieldInfo] = Field(default_factory=list)
+    page_fields: list[PivotFieldInfo] = Field(default_factory=list)
+    hidden_fields: list[PivotFieldInfo] = Field(default_factory=list)
+
+
+class PivotInventory(DomainModel):
+    """Full-workbook PivotTable + PivotCache inventory (task_039 §2, §8)."""
+
+    workbook_id: str
+    pivot_tables: list[PivotTableInfo] = Field(default_factory=list)
+    caches: list[PivotCacheInfo] = Field(default_factory=list)
+
+
+class PivotFieldLayout(DomainModel):
+    """Target orientation/position for a field layout change (task_039 §5)."""
+
+    orientation: PivotFieldOrientation
+    position: int | None = None
+
+
+class PivotFieldProperties(DomainModel):
+    """Bounded, sparse PivotField property update (task_039 §5)."""
+
+    caption: str | None = None
+    number_format: str | None = None
+    show_all_items: bool | None = None
+
+
+class PivotFilterSpec(DomainModel):
+    """Manual (visible-items) filter request (task_039 §6).
+
+    Only ``MANUAL`` (hide/show items) is supported on the target build; label,
+    value, date and top/bottom filters are reported as ``UNSUPPORTED``.
+    """
+
+    kind: PivotFilterKind = PivotFilterKind.MANUAL
+    visible_items: list[str] = Field(default_factory=list)
+    supported: bool = True
+    unsupported_reason: str | None = None
+
+
+class PivotFieldFilters(DomainModel):
+    """Current filter state of one PivotField (task_039 §6)."""
+
+    pivot_table: str
+    field: str
+    all_items_visible: bool | None = None
+    visible_items: list[str] = Field(default_factory=list)
+    hidden_items: list[str] = Field(default_factory=list)
+    filter: PivotFilterSpec = Field(default_factory=PivotFilterSpec)
+    unsupported: list[str] = Field(default_factory=list)
+
+
+class PivotRefreshResult(DomainModel):
+    """Result of a targeted refresh (task_039 §4).
+
+    A refresh is successful only when ``refreshed`` is ``True`` (Excel returned a
+    truth signal and/or ``refresh_date`` advanced) — absence of a COM exception
+    alone is not success. ``affected_pivot_tables`` lists every table sharing the
+    cache, regardless of which entry point triggered the refresh.
+    """
+
+    pivot_table: str
+    cache_index: int
+    method: PivotRefreshMethod
+    affected_pivot_tables: list[str] = Field(default_factory=list)
+    refreshed: bool = False
+    refresh_return: bool | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    duration_ms: int | None = None
+    refresh_date_before: datetime | None = None
+    refresh_date_after: datetime | None = None
+    status: PivotRefreshStatus = PivotRefreshStatus.FAILED
+    error: dict[str, Any] | None = None

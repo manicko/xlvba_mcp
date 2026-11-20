@@ -17,7 +17,13 @@ from typing import Any
 
 
 class ErrorCode(StrEnum):
-    """Stable, machine-readable error codes from spec §11 (Stage 1)."""
+    """Stable, machine-readable error codes from spec §11 (Stage 1).
+
+    The Stage 1 codes below are closed (spec §11). The Phase 2 codes appended
+    afterwards (task_040) extend the vocabulary additively for the Ranges &
+    Cells and PivotTables surface; none of the Stage 1 codes are removed or
+    changed.
+    """
 
     ACCESS_VBOM_DISABLED = "ACCESS_VBOM_DISABLED"
     VBA_PROJECT_LOCKED = "VBA_PROJECT_LOCKED"
@@ -34,6 +40,15 @@ class ErrorCode(StrEnum):
     SNAPSHOT_FAILED = "SNAPSHOT_FAILED"
     WORKBOOK_READ_ONLY = "WORKBOOK_READ_ONLY"
     PATH_NOT_ALLOWED = "PATH_NOT_ALLOWED"
+    # --- Phase 2 additions (task_040; additive, do not remove Stage 1 codes) ---
+    INVALID_RANGE = "INVALID_RANGE"
+    PROTECTED_TARGET = "PROTECTED_TARGET"
+    UNSUPPORTED_PIVOT_SOURCE = "UNSUPPORTED_PIVOT_SOURCE"
+    STALE_TARGET = "STALE_TARGET"
+    AMBIGUOUS_FILTER = "AMBIGUOUS_FILTER"
+    REFRESH_FAILED = "REFRESH_FAILED"
+    MODAL_UI_BLOCKED = "MODAL_UI_BLOCKED"
+    LISTOBJECT_INTERSECTION = "LISTOBJECT_INTERSECTION"
 
 
 # Well-known HRESULT values that map to domain codes (hex shown for readability).
@@ -242,6 +257,75 @@ class ArtifactWriteError(ExcelVbaMcpError):
     default_message = "The artifact could not be written."
 
 
+# ---------------------------------------------------------------------------
+# Phase 2 typed errors (task_040; additive to the closed spec §11 set)
+# ---------------------------------------------------------------------------
+
+
+class InvalidRangeError(ExcelVbaMcpError):
+    """A Range target is invalid, ambiguous, multi-area, or oversized (task_038 §7)."""
+
+    default_code = ErrorCode.INVALID_RANGE
+    default_message = "The range reference is invalid or out of bounds."
+
+
+class ProtectedTargetError(ExcelVbaMcpError):
+    """The mutation target is protected, locked, or otherwise read-only."""
+
+    default_code = ErrorCode.PROTECTED_TARGET
+    default_message = "The target is protected or read-only."
+
+
+class UnsupportedPivotSourceError(ExcelVbaMcpError):
+    """The PivotTable/PivotCache source is external, OLAP, or Data Model (task_039 §7)."""
+
+    default_code = ErrorCode.UNSUPPORTED_PIVOT_SOURCE
+    default_message = "The PivotTable source is not supported for this operation."
+
+
+class StaleTargetError(ExcelVbaMcpError):
+    """A PivotTable/PivotCache identity no longer matches the workbook state."""
+
+    default_code = ErrorCode.STALE_TARGET
+    default_message = "The target changed since it was read; retry with fresh identity."
+
+
+class AmbiguousFilterError(ExcelVbaMcpError):
+    """A field/caption/item filter resolved to zero or more than one target."""
+
+    default_code = ErrorCode.AMBIGUOUS_FILTER
+    default_message = "The filter target is missing or ambiguous."
+
+
+class RefreshFailedError(ExcelVbaMcpError):
+    """A PivotTable/PivotCache refresh returned no success signal (task_039 §4)."""
+
+    default_code = ErrorCode.REFRESH_FAILED
+    default_message = "The PivotTable refresh did not complete successfully."
+
+
+class ModalUiBlockedError(ExcelVbaMcpError):
+    """An unexpected modal dialog blocked the operation; recovery is required.
+
+    The window is never surfaced or dismissed; the caller receives a truthful
+    blocked/indeterminate outcome (background contract).
+    """
+
+    default_code = ErrorCode.MODAL_UI_BLOCKED
+    default_message = "A modal dialog blocked the operation."
+
+
+class ListObjectIntersectionError(ExcelVbaMcpError):
+    """A structural Range operation intersects an Excel Table (task_038 §5.3).
+
+    Structural row/column changes are owned by the Tables/ListObject services and
+    must not be performed through the Range API.
+    """
+
+    default_code = ErrorCode.LISTOBJECT_INTERSECTION
+    default_message = "The range intersects an Excel Table; use the table tools instead."
+
+
 def error_from_hresult(
     hresult: int,
     message: str,
@@ -278,4 +362,13 @@ _ERROR_BY_CODE: dict[ErrorCode, type[ExcelVbaMcpError]] = {
     ErrorCode.SNAPSHOT_FAILED: SnapshotFailedError,
     ErrorCode.WORKBOOK_READ_ONLY: WorkbookReadOnlyError,
     ErrorCode.PATH_NOT_ALLOWED: PathNotAllowedError,
+    # Phase 2 additions (task_040).
+    ErrorCode.INVALID_RANGE: InvalidRangeError,
+    ErrorCode.PROTECTED_TARGET: ProtectedTargetError,
+    ErrorCode.UNSUPPORTED_PIVOT_SOURCE: UnsupportedPivotSourceError,
+    ErrorCode.STALE_TARGET: StaleTargetError,
+    ErrorCode.AMBIGUOUS_FILTER: AmbiguousFilterError,
+    ErrorCode.REFRESH_FAILED: RefreshFailedError,
+    ErrorCode.MODAL_UI_BLOCKED: ModalUiBlockedError,
+    ErrorCode.LISTOBJECT_INTERSECTION: ListObjectIntersectionError,
 }

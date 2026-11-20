@@ -192,7 +192,9 @@ def test_validate_action_and_assertion_reject_unknown() -> None:
 
 
 def test_all_spec_11_error_codes_exist() -> None:
-    assert {code.value for code in ErrorCode} == _SPEC_11_CODES
+    # Stage 1 keeps the closed spec §11 set; Phase 2 (task_040) appends codes
+    # additively, so the §11 set must remain a subset of the full enum.
+    assert {code.value for code in ErrorCode} >= _SPEC_11_CODES
 
 
 def test_error_preserves_hresult_and_hex() -> None:
