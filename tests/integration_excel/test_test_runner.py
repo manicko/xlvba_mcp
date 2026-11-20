@@ -38,6 +38,7 @@ import json
 import shutil
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -444,7 +445,6 @@ async def test_suite_with_macro_step_passes(tmp_path: Path) -> None:
     try:
         committed_hash = _sha256(fixture)
         original_hash = _sha256(rig.original)
-        fg_before = _foreground()
 
         info = await rig.open()
         owned_pid = rig.worker.get_status().owned_pid
@@ -506,9 +506,11 @@ async def test_suite_with_macro_step_passes(tmp_path: Path) -> None:
         assert _sha256(fixture) == committed_hash, "committed fixture must never change"
         assert _sha256(Path(rig.baseline.stored_path)) == rig.baseline.sha256
 
-        fg_after = _foreground()
-        if fg_before is not None and fg_after is not None:
-            assert fg_before["hwnd"] == fg_after["hwnd"]
+        # BG03: the owned automation instance never held the foreground. The
+        # desktop foreground is allowed to change (a shared session can move
+        # focus), so the assertion is about the automation PID, not about
+        # "nothing else changed".
+        _assert_owned_never_foreground(owned_pid, "test-runner-end")
     finally:
         await rig.stop()
 
@@ -745,7 +747,7 @@ async def test_owned_excel_process_is_reaped_after_shutdown(tmp_path: Path) -> N
     finally:
         await rig.stop()
 
-    assert not _pid_alive(owned_pid or 0), f"owned PID {owned_pid} survived shutdown"
+    assert _wait_pid_gone(owned_pid or 0), f"owned PID {owned_pid} survived shutdown"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -761,3 +763,14 @@ def _pid_alive(pid: int) -> bool:
     except Exception:  # noqa: BLE001
         return True
     return str(pid) in out.stdout
+
+
+def _wait_pid_gone(pid: int) -> bool:
+    """Poll until ``pid`` disappears (process reaping is asynchronous)."""
+
+    deadline = time.monotonic() + _ORPHAN_POLL_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return True
+        time.sleep(_ORPHAN_POLL_INTERVAL_S)
+    return not _pid_alive(pid)
