@@ -685,6 +685,9 @@ extra_context: |
   Excel открывается в отдельном DispatchEx instance. Inspection: AutomationSecurity=ForceDisable.
   Execution: пользователь/политика предварительно доверяет файлу; ByUI непосредственно перед
   Workbooks.Open. Close без явного save_changes не должен сохранять изменения.
+  **Addendum (BG03/BG04/BG08):** owned instance всегда Visible=False/non-activating; никаких
+  .Activate/.Select; DisplayAlerts/ScreenUpdating узко и с восстановлением в finally; compile/macro UI
+  → blocked/indeterminate (не показывать). api/* не трогают COM (ARCH-009) — только await worker.submit.
 files:
   - path: src/excel_vba_mcp/application/session_service.py
     targets:
