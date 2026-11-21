@@ -21,6 +21,7 @@ Covered:
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,7 @@ from excel_vba_mcp.adapters.excel.com_worker import WorkerStatus
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.domain.errors import ExcelVbaMcpError, MacroBlockedError
 from excel_vba_mcp.domain.statuses import (
+    AccessMode,
     OperationClass,
     SessionMode,
     WorkbookSessionState,
@@ -466,3 +468,50 @@ async def test_duplicate_open_same_path_errors(tmp_path: Path) -> None:
 
     # Cleanup so the held lock / temp file do not leak across the test.
     await service.close_workbook(first.workbook_id)
+
+
+# ---------------------------------------------------------------------------
+# Status reports the configured access mode (task_b2 / fix_002)
+# ---------------------------------------------------------------------------
+async def test_get_status_reports_full_access_mode(tmp_path: Path) -> None:
+    service, _app, _worker, _original, _work_dir = _make_service(
+        tmp_path, approval=ApprovalPolicy(mode=AccessMode.FULL)
+    )
+
+    status = await service.get_status()
+
+    assert status.access_mode == AccessMode.FULL
+
+
+async def test_get_status_reports_restricted_access_mode_by_default(tmp_path: Path) -> None:
+    # The default object mode is RESTRICTED (deny-by-default); status reflects it.
+    service, _app, _worker, _original, _work_dir = _make_service(tmp_path)
+
+    status = await service.get_status()
+
+    assert status.access_mode == AccessMode.RESTRICTED
+
+
+async def test_approval_denial_emits_macro_blocked_audit_event(tmp_path: Path) -> None:
+    # F-02: a denial emits exactly one audit event (MACRO_BLOCKED) before raising.
+    service, _app, _worker, original, _work_dir = _make_service(tmp_path)
+
+    with pytest.raises(MacroBlockedError):
+        await service.open_workbook(str(original), mode=SessionMode.EXECUTE)
+
+    audit_path = tmp_path / "audit.jsonl"
+    events = [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    denials = [
+        event
+        for event in events
+        if event.get("tool") == "excel_open"
+        and (event.get("result") or {}).get("error_code") == "MACRO_BLOCKED"
+    ]
+    assert len(denials) == 1
+    approval = denials[0]["approval"]
+    assert approval["allowed"] is False
+    assert approval["reason"]

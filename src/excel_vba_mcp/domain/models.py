@@ -18,6 +18,7 @@ from typing import Any, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from excel_vba_mcp.domain.statuses import (
+    AccessMode,
     CaseStatus,
     CellValueKind,
     CompileMethod,
@@ -107,6 +108,7 @@ class SessionStatus(TimestampedModel):
     dirty: bool = False
     active_operation: str | None = None
     active_test_run_id: str | None = None
+    access_mode: AccessMode | None = None
     notes: list[str] = Field(default_factory=list)
 
 

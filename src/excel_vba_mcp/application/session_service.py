@@ -37,6 +37,7 @@ import contextlib
 import dataclasses
 import shutil
 import tempfile
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -45,7 +46,12 @@ from uuid import uuid4
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker, WorkerStatus
 from excel_vba_mcp.adapters.excel.workbook_adapter import WorkbookAdapter
-from excel_vba_mcp.domain.errors import ExcelHungError, ExcelVbaMcpError, MacroBlockedError
+from excel_vba_mcp.domain.errors import (
+    ErrorCode,
+    ExcelHungError,
+    ExcelVbaMcpError,
+    MacroBlockedError,
+)
 from excel_vba_mcp.domain.models import SessionStatus, WorkbookInfo
 from excel_vba_mcp.domain.statuses import (
     OperationClass,
@@ -767,6 +773,7 @@ class SessionService:
             read_only=read_only,
             dirty=dirty,
             active_operation=active_operation,
+            access_mode=self._approval.access_mode,
             notes=merged_notes,
             created_at=now,
             updated_at=_utc_now(),
@@ -795,6 +802,17 @@ class SessionService:
             operation_class=operation_class,
         )
         if not decision.allowed:
+            self._record_audit(
+                tool=key.action,
+                operation_class=operation_class.value,
+                params={"action": key.action, "canonical_path": key.canonical_path},
+                approval={
+                    "allowed": False,
+                    "source": decision.source.value if decision.source else None,
+                    "reason": decision.reason,
+                },
+                result={"error_code": ErrorCode.MACRO_BLOCKED.value},
+            )
             raise MacroBlockedError(
                 f"Operation {key.action!r} denied by approval policy: {decision.reason}",
                 context={
@@ -827,6 +845,7 @@ class SessionService:
         operation_class: str,
         params: dict[str, Any],
         workbook: dict[str, Any] | None = None,
+        approval: Mapping[str, Any] | None = None,
         result: dict[str, Any] | None = None,
     ) -> None:
         self._audit.record(
@@ -835,6 +854,7 @@ class SessionService:
             params=params,
             session_id=self._session_id,
             workbook=workbook,
+            approval=approval,
             result=result,
         )
 

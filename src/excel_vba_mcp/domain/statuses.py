@@ -46,6 +46,20 @@ class SessionMode(StrEnum):
     EXECUTE = "execute"
 
 
+class AccessMode(StrEnum):
+    """Server access policy controlling approval behavior (task_b2, fix_002).
+
+    Shared, zero-dependency vocabulary consumed by the approval policy and the
+    server configuration. ``FULL`` authorizes mutating/executing operations by
+    default (no per-action grant); ``RESTRICTED`` keeps the deny-by-default gate
+    and is an explicit opt-in. Neither mode bypasses PathPolicy / Office-trust /
+    snapshot / audit.
+    """
+
+    FULL = "full"
+    RESTRICTED = "restricted"
+
+
 class CompileStatus(StrEnum):
     """VBE compile outcome (spec §6.3, §8.1)."""
 

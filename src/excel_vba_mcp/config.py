@@ -1,10 +1,15 @@
 """Application configuration (typed).
 
-Configuration is loaded from environment variables and validated with Pydantic.
-Currently the only supported variable is ``EXCEL_VBA_MCP_LOG_LEVEL``, which sets
-``ServerConfig.log_level`` (one of ``DEBUG``, ``INFO``, ``WARNING``, ``ERROR``,
-``CRITICAL``). When the variable is unset the level defaults to ``INFO``. An
-invalid value raises a Pydantic ``ValidationError`` with a clear message.
+Configuration is loaded from environment variables and validated with Pydantic:
+
+* ``EXCEL_VBA_MCP_LOG_LEVEL`` sets ``ServerConfig.log_level`` (one of ``DEBUG``,
+  ``INFO``, ``WARNING``, ``ERROR``, ``CRITICAL``). When unset it defaults to
+  ``INFO``; an empty string is invalid.
+* ``EXCEL_VBA_MCP_ACCESS_MODE`` sets ``ServerConfig.access_mode`` (``full`` or
+  ``restricted``). When unset it defaults to ``full``.
+
+Both variables are validated together: an invalid value for either raises a
+Pydantic ``ValidationError`` regardless of whether the other is set.
 
 Sensitive values must never be logged or written to artifacts.
 """
@@ -16,15 +21,23 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from excel_vba_mcp.domain.statuses import AccessMode
+
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
 _ENV_LOG_LEVEL = "EXCEL_VBA_MCP_LOG_LEVEL"
+_ENV_ACCESS_MODE = "EXCEL_VBA_MCP_ACCESS_MODE"
 
 
 class ServerConfig(BaseModel):
     """Server runtime configuration."""
 
     log_level: LogLevel = Field(default="INFO", description="Log level for stderr logging.")
+    access_mode: AccessMode = Field(
+        default=AccessMode.FULL,
+        description="Server access policy: 'full' allows mutations/execution by default; "
+        "'restricted' is deny-by-default (approval grants required).",
+    )
 
 
 class Config(BaseModel):
@@ -36,9 +49,10 @@ class Config(BaseModel):
 def load_config() -> Config:
     """Load configuration from defaults and the environment.
 
-    Reads ``EXCEL_VBA_MCP_LOG_LEVEL`` when present and validates it through the
-    Pydantic model so that an invalid value raises a ``ValidationError``. When the
-    variable is unset, ``ServerConfig`` falls back to its ``INFO`` default.
+    Reads ``EXCEL_VBA_MCP_LOG_LEVEL`` and ``EXCEL_VBA_MCP_ACCESS_MODE`` when
+    present and validates them together through the Pydantic model, so that an
+    invalid value for either raises a ``ValidationError`` even when the other is
+    unset. Unset variables fall back to their ``ServerConfig`` defaults.
 
     Returns:
         Parsed configuration.
@@ -47,8 +61,11 @@ def load_config() -> Config:
         pydantic.ValidationError: If an environment value fails validation.
     """
 
-    env_log_level = os.environ.get(_ENV_LOG_LEVEL)
-    if env_log_level is None:
-        return Config()
-    server = ServerConfig.model_validate({"log_level": env_log_level})
-    return Config(server=server)
+    present: dict[str, object] = {}
+    log_level = os.environ.get(_ENV_LOG_LEVEL)
+    if log_level is not None:
+        present["log_level"] = log_level
+    access_mode = os.environ.get(_ENV_ACCESS_MODE)
+    if access_mode is not None:
+        present["access_mode"] = access_mode
+    return Config(server=ServerConfig.model_validate(present))

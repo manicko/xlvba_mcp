@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from excel_vba_mcp.domain.statuses import OperationClass
+from excel_vba_mcp.domain.statuses import AccessMode, OperationClass
 from excel_vba_mcp.security.approval import (
     AllowlistEntry,
     ApprovalGrant,
@@ -211,3 +211,46 @@ def test_procedure_wildcard_and_exact() -> None:
         exact.check(_key(action="macro_run", procedure="Mod.Beta"), operation_class=EX).allowed
         is False
     )
+
+
+# ---------------------------------------------------------------------------
+# Full-access mode (task_b2 / fix_002)
+# ---------------------------------------------------------------------------
+def test_full_mode_allows_mutating_and_executing() -> None:
+    policy = ApprovalPolicy(mode=AccessMode.FULL, now=lambda: _T0)
+
+    mutating = policy.check(_key(action="sheet_delete"), operation_class=MU)
+    assert mutating.allowed is True
+    assert mutating.source is ApprovalSource.POLICY
+    assert mutating.grant_id is None
+
+    executing = policy.check(
+        _key(action="macro_run", procedure="Mod.Run"), operation_class=EX
+    )
+    assert executing.allowed is True
+    assert executing.source is ApprovalSource.POLICY
+    assert executing.grant_id is None
+
+
+def test_full_mode_read_only_still_source_none() -> None:
+    policy = ApprovalPolicy(mode=AccessMode.FULL, now=lambda: _T0)
+
+    decision = policy.check(_key(), operation_class=RO)
+    assert decision.allowed is True
+    assert decision.source is None
+
+
+def test_explicit_restricted_mode_still_denies() -> None:
+    policy = ApprovalPolicy(mode=AccessMode.RESTRICTED, now=lambda: _T0)
+
+    assert policy.check(_key(), operation_class=MU).allowed is False
+    assert (
+        policy.check(_key(action="macro_run", procedure="Mod.Run"), operation_class=EX).allowed
+        is False
+    )
+
+
+def test_full_mode_access_mode_property() -> None:
+    assert ApprovalPolicy(mode=AccessMode.FULL).access_mode is AccessMode.FULL
+    # The object default stays restricted (deny-by-default).
+    assert ApprovalPolicy().access_mode is AccessMode.RESTRICTED

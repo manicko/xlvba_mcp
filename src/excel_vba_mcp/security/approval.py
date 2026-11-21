@@ -37,7 +37,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 from excel_vba_mcp.domain.models import DomainModel
-from excel_vba_mcp.domain.statuses import OperationClass
+from excel_vba_mcp.domain.statuses import AccessMode, OperationClass
 
 
 class ApprovalScope(StrEnum):
@@ -53,6 +53,7 @@ class ApprovalSource(StrEnum):
     CLIENT = "client"
     ALLOWLIST = "allowlist"
     CONFIG = "config"
+    POLICY = "policy"
 
 
 class ApprovalKey(DomainModel):
@@ -140,6 +141,9 @@ class ApprovalPolicy:
     Args:
         allowlist: Static :class:`AllowlistEntry` items (config/allowlist source).
         now: Injectable clock returning the current UTC time (tests override it).
+        mode: Server access policy. The object default is :attr:`AccessMode.RESTRICTED`
+            (deny-by-default); the server passes :attr:`AccessMode.FULL` to authorize
+            mutating/executing operations by default (see :meth:`check`).
     """
 
     def __init__(
@@ -147,9 +151,11 @@ class ApprovalPolicy:
         allowlist: Iterable[AllowlistEntry] = (),
         *,
         now: Callable[[], datetime] = _utcnow,
+        mode: AccessMode = AccessMode.RESTRICTED,
     ) -> None:
         self._allowlist: list[AllowlistEntry] = list(allowlist)
         self._now: Callable[[], datetime] = now
+        self._mode = mode
         # Grants are stored with an optional bound session id (used only for
         # SESSION-scoped grants to detect a session change).
         self._grants: list[tuple[ApprovalGrant, str | None]] = []
@@ -160,6 +166,12 @@ class ApprovalPolicy:
         """Read-only snapshot of the configured allowlist."""
 
         return list(self._allowlist)
+
+    @property
+    def access_mode(self) -> AccessMode:
+        """The configured server access policy."""
+
+        return self._mode
 
     def grant(self, grant: ApprovalGrant, *, session_id: str | None = None) -> None:
         """Register a grant.
@@ -190,8 +202,12 @@ class ApprovalPolicy:
                 without consulting the allowlist or grants.
 
         Returns:
-            An :class:`ApprovalDecision`. ``MUTATING``/``EXECUTING`` requests with
-            no allowlist match and no live grant are denied (deny-by-default).
+            An :class:`ApprovalDecision`. ``READ_ONLY`` requests are auto-allowed
+            with ``source=None``. In :attr:`AccessMode.FULL`, ``MUTATING`` and
+            ``EXECUTING`` requests are allowed by policy (source
+            ``ApprovalSource.POLICY``, no grant). In the default
+            :attr:`AccessMode.RESTRICTED`, requests with no allowlist match and no
+            live grant are denied (deny-by-default).
         """
 
         if operation_class == OperationClass.READ_ONLY:
@@ -200,6 +216,17 @@ class ApprovalPolicy:
                 source=None,
                 grant_id=None,
                 reason="read-only operations require no approval",
+            )
+
+        # Full-access policy: mutations/executions are authorized by default
+        # (no per-action grant). This does not touch PathPolicy / Office-trust /
+        # snapshot / audit — those gates run independently upstream.
+        if self._mode is AccessMode.FULL:
+            return ApprovalDecision(
+                allowed=True,
+                source=ApprovalSource.POLICY,
+                grant_id=None,
+                reason="allowed by full-access policy",
             )
 
         now = self._now()

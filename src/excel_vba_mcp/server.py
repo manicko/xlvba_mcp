@@ -26,9 +26,12 @@ import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
-from mcp.server.mcpserver import MCPServer
-from mcp.server.mcpserver.exceptions import ResourceError
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ResourceError, ToolError
+from mcp.types import CallToolResult, InputRequiredResult
+from pydantic import ValidationError
 
 from excel_vba_mcp import __version__
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
@@ -164,6 +167,7 @@ from excel_vba_mcp.application.tables_service import TablesService
 from excel_vba_mcp.application.test_runner import TestRunner
 from excel_vba_mcp.application.vba_project_service import VBAProjectService
 from excel_vba_mcp.application.workbook_model_service import WorkbookModelService
+from excel_vba_mcp.config import Config, load_config
 from excel_vba_mcp.domain.errors import (
     AccessVbomDisabledError,
     ExcelVbaMcpError,
@@ -190,8 +194,8 @@ _ENV_RUN_DIR = "EXCEL_VBA_MCP_RUN_DIR"
 # Tool descriptions surfaced over MCP (kept explicit for a stable contract).
 _DESC_OPEN = (
     "Open an allowlisted workbook as a hidden working copy. mode='inspect' "
-    "disables macros; mode='execute' applies macro-by-UI and requires approval. "
-    "The original file is never modified."
+    "disables macros; mode='execute' applies macro-by-UI (allowed by default; "
+    "restricted mode requires approval). The original file is never modified."
 )
 _DESC_CLOSE = (
     "Close an open workbook. Defaults to NOT saving; set save_changes=true to persist changes."
@@ -266,9 +270,10 @@ _DESC_VBA_SEARCH_CODE = (
 )
 _DESC_VBA_REPLACE_COMPONENT_SOURCE = (
     "Replace the entire code module of a Standard/Class VBA component. Guarded "
-    "mutation: requires a writable session, a successful snapshot, a matching "
-    "expected_source_hash (revision check) and an approval grant. Document "
-    "modules and UserForms are rejected."
+    "mutation: requires a writable session, a successful snapshot and a matching "
+    "expected_source_hash (revision check); allowed by default (full-access "
+    "policy), with approval required only in restricted mode. Document modules "
+    "and UserForms are rejected."
 )
 _DESC_VBA_INSERT_CODE = (
     "Insert VBA code at a semantic position in a Standard/Class component. "
@@ -293,7 +298,8 @@ _DESC_MACRO_LIST = (
 )
 _DESC_MACRO_RUN = (
     "Run one approved, background-safe macro of an execute-mode workbook. The "
-    "macro runs only when it is approved (deny-by-default), classified "
+    "macro runs only when it is approved (allowed by default; restricted mode is "
+    "opt-in), classified "
     "background_safe for the current workbook hash (BG06) and passes the "
     "interactive-UI preflight (R13); otherwise a truthful blocked result is "
     "returned and the macro is NOT dispatched. Never dismisses a dialog or reports "
@@ -311,24 +317,29 @@ _DESC_SHEETS_LIST = (
 _DESC_SHEET_GET = "Return one sheet's SheetInfo by name (Sheets vs Worksheets aware)."
 _DESC_SHEET_ADD = (
     "Add a worksheet (MVP: Worksheet only). Guarded mutation: requires a writable "
-    "session, a successful snapshot and an approval grant (deny-by-default)."
+    "session and a snapshot; allowed by default (full-access policy), with approval "
+    "required only in restricted mode."
 )
 _DESC_SHEET_RENAME = (
     "Rename a sheet; CodeName is never changed. Guarded mutation: requires a "
-    "writable session, a snapshot and an approval grant."
+    "writable session and a snapshot; allowed by default (full-access policy), "
+    "with approval required only in restricted mode."
 )
 _DESC_SHEET_COPY = (
     "Copy a sheet and return the new sheet's DTO. Guarded mutation: requires a "
-    "writable session, a snapshot and an approval grant."
+    "writable session and a snapshot; allowed by default (full-access policy), "
+    "with approval required only in restricted mode."
 )
 _DESC_SHEET_DELETE = (
-    "Delete a sheet (destructive). Requires a writable session, a snapshot and an "
-    "approval grant; rejected when it would leave no visible worksheet."
+    "Delete a sheet (destructive). Requires a writable session and a snapshot; "
+    "allowed by default (full-access policy), with approval required only in "
+    "restricted mode; rejected when it would leave no visible worksheet."
 )
 _DESC_SHEET_SET_VISIBILITY = (
     "Set a sheet's visibility (xlSheetVisible / xlSheetHidden). Guarded mutation: "
-    "requires a writable session, a snapshot and an approval grant; hiding the "
-    "last visible worksheet is rejected."
+    "requires a writable session and a snapshot; allowed by default (full-access "
+    "policy), with approval required only in restricted mode; hiding the last "
+    "visible worksheet is rejected."
 )
 _DESC_TABLES_LIST = (
     "List every Excel Table (ListObject) of an open workbook with name, sheet, "
@@ -346,11 +357,13 @@ _DESC_TABLE_READ_ROWS = (
 )
 _DESC_TABLE_APPEND_ROWS = (
     "Append rows through ListRows.Add (table structure preserved). Guarded "
-    "mutation: requires a writable session, a snapshot and an approval grant."
+    "mutation: requires a writable session and a snapshot; allowed by default "
+    "(full-access policy), with approval required only in restricted mode."
 )
 _DESC_TABLE_INSERT_ROW = (
     "Insert one data row at a 1-based position via ListRows.Add. Guarded mutation: "
-    "requires a writable session, a snapshot and an approval grant."
+    "requires a writable session and a snapshot; allowed by default (full-access "
+    "policy), with approval required only in restricted mode."
 )
 _DESC_TABLE_UPDATE_ROWS = (
     "Update rows by explicit index or an unambiguous where filter. Ambiguous "
@@ -400,7 +413,8 @@ _DESC_RANGE_WRITE_VALUES = (
     "against the target before any mutation (a wrong-sized payload is rejected "
     "with no change). A string beginning with '=' is stored as text, not a "
     "formula. Guarded mutation: requires a writable working copy, a successful "
-    "snapshot, an approval grant and a postcondition re-read. Cell writes inside "
+    "snapshot and a postcondition re-read; allowed by default (full-access "
+    "policy), with approval required only in restricted mode. Cell writes inside "
     "an Excel Table are allowed only when the table row/column structure is "
     "unchanged."
 )
@@ -503,8 +517,9 @@ _DESC_NAME_GET = (
 )
 _DESC_NAME_CREATE = (
     "Create a defined name in an explicit scope. Guarded mutation: requires a "
-    "writable session, a snapshot and an approval grant; duplicate and "
-    "cross-scope conflicts are rejected."
+    "writable session and a snapshot; allowed by default (full-access policy), "
+    "with approval required only in restricted mode; duplicate and cross-scope "
+    "conflicts are rejected."
 )
 _DESC_NAME_UPDATE = (
     "Update a defined name's RefersTo in an explicit scope (scope is preserved). "
@@ -523,7 +538,8 @@ _DESC_SHAPES_LIST = (
 _DESC_SHAPE_GET = "Return one shape's ShapeInfo by name (case-insensitive)."
 _DESC_SHAPE_SET_ON_ACTION = (
     "Assign OnAction to a shape (the macro is NOT executed). Guarded mutation: "
-    "requires a writable session, a snapshot and an approval grant. An empty "
+    "requires a writable session and a snapshot; allowed by default (full-access "
+    "policy), with approval required only in restricted mode. An empty "
     "macro_name clears the assignment."
 )
 _DESC_CONTROLS_LIST = (
@@ -535,8 +551,9 @@ _DESC_CONTROLS_LIST = (
 _DESC_CONTROL_GET = "Return one control's ControlEntry by name (case-insensitive)."
 _DESC_CONTROL_SET_ON_ACTION = (
     "Assign OnAction to a Form Control (the macro is NOT executed; ActiveX "
-    "controls are rejected). Guarded mutation: requires a writable session, a "
-    "snapshot and an approval grant."
+    "controls are rejected). Guarded mutation: requires a writable session and a "
+    "snapshot; allowed by default (full-access policy), with approval required "
+    "only in restricted mode."
 )
 _DESC_WORKBOOK_GET_MODEL = (
     "Return the aggregated Stage 1 workbook model: sheets, tables, names, shapes, "
@@ -748,13 +765,16 @@ def _resolve_runtime_path(env_name: str, default: Path) -> Path:
     return Path(raw) if raw else default
 
 
-def _build_runtime() -> _Runtime:
-    """Construct the Excel runtime from environment configuration."""
+def _build_runtime(config: Config) -> _Runtime:
+    """Construct the Excel runtime from environment + typed configuration."""
 
     path_policy = PathPolicy(_configured_roots())
     app_adapter = ExcelAppAdapter()
     worker = ExcelComWorker(app_adapter)
-    approval = ApprovalPolicy()  # deny-by-default; grants/allowlist: task_014
+    # The sole production ApprovalPolicy: full-access by default (mutations and
+    # executions authorized without per-action grants), restricted as an explicit
+    # opt-in. Grants/allowlist are wired separately (task_014).
+    approval = ApprovalPolicy(mode=config.server.access_mode)
     audit = AuditLogger(_resolve_runtime_path(_ENV_AUDIT, _default_audit_path()))
     session = SessionService(
         worker,
@@ -887,7 +907,18 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
     smoke test robust across hosts.
     """
 
-    runtime = _build_runtime()
+    try:
+        config = load_config()
+    except ValidationError as exc:
+        logger.error("Invalid server configuration: %s", exc)
+        raise
+    runtime = _build_runtime(config)
+    runtime.audit.record(
+        tool="server_startup",
+        operation_class="config",
+        params={"access_mode": config.server.access_mode.value},
+        result={"version": __version__},
+    )
     try:
         await runtime.worker.start()
     except Exception as exc:  # noqa: BLE001 - degrade gracefully, never crash stdio
@@ -1171,9 +1202,55 @@ def _register_tools(server: MCPServer) -> None:
     )
 
 
+def _find_domain_cause(exc: BaseException) -> ExcelVbaMcpError | None:
+    """Return the first :class:`ExcelVbaMcpError` in ``exc``'s cause chain.
+
+    Cycle-safe (a seen-id set guards a self-referential ``__cause__`` chain).
+    Returns ``None`` when no domain error is present so callers re-raise the
+    original exception unchanged.
+    """
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, ExcelVbaMcpError):
+            return current
+        seen.add(id(current))
+        current = current.__cause__
+    return None
+
+
+class ExcelVbaMcpServer(MCPServer[_Runtime]):
+    """MCPServer that surfaces domain errors as structured ``ToolError`` payloads.
+
+    The MCP SDK wraps any non-``ToolError`` exception raised by a tool into
+    ``UnexpectedToolError("Error executing tool <name>")``, discarding the
+    :class:`ExcelVbaMcpError` ``code`` and ``context``. This subclass catches that
+    wrapper, locates the underlying domain error in the ``__cause__`` chain and
+    re-raises a ``ToolError`` whose message is the JSON of ``to_dict()`` so real
+    MCP clients can observe the stable ``code`` and structured ``context``. Any
+    other exception is re-raised unchanged (the SDK still reports it as an
+    unexpected tool failure).
+    """
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        context: Context[_Runtime, Any] | None = None,
+    ) -> CallToolResult | InputRequiredResult:
+        try:
+            return await super().call_tool(name, arguments, context)
+        except ToolError as exc:
+            cause = _find_domain_cause(exc)
+            if cause is None:
+                raise
+            raise ToolError(json.dumps(cause.to_dict(), ensure_ascii=False)) from cause
+
+
 _configure_logging()
 
-mcp: MCPServer = MCPServer("excel-vba-mcp", version=__version__, lifespan=lifespan)
+mcp: ExcelVbaMcpServer = ExcelVbaMcpServer("excel-vba-mcp", version=__version__, lifespan=lifespan)
 
 
 @mcp.tool()
