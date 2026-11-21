@@ -1,26 +1,29 @@
-"""Excel PivotTables / PivotCaches / PivotFields service (task_048, task_049).
+"""Excel PivotTables / PivotCaches / PivotFields service (task_048, task_049, task_050).
 
 :class:`PivotTablesService` is the async application-layer orchestration for the
 Phase 2 PivotTables surface. The read-only inventory tools
 (``pivot_tables_list``, ``pivot_table_get``, ``pivot_cache_get``,
 ``pivot_fields_list``) are implemented by ``task_048``; the targeted refresh
-tools (``pivot_table_refresh``, ``pivot_cache_refresh``) are implemented by
-``task_049``. It is deliberately **COM-free**: every method resolves the
-``workbook_id`` through the session bookkeeping and then submits a single
-STA-local callable to the dedicated single-STA
+tools (``pivot_table_refresh``, ``pivot_cache_refresh``) by ``task_049``; and the
+PivotField configuration tools (``set_pivot_field_layout``,
+``set_pivot_field_position``, ``set_pivot_field_aggregation``,
+``set_pivot_field_properties``) by ``task_050``. It is deliberately **COM-free**:
+every method resolves the ``workbook_id`` through the session bookkeeping and
+then submits a single STA-local callable to the dedicated single-STA
 :class:`~excel_vba_mcp.adapters.excel.com_worker.ExcelComWorker`. Only domain
-DTOs cross the worker boundary (ARCH-009).
+DTOs / plain containers cross the worker boundary (ARCH-009).
 
 Read-only path (task_048): no snapshot / approval guard chain is required (this
 task never mutates a PivotTable, PivotCache or PivotField). Every call is
 recorded in the append-only audit trail as ``read_only``.
 
-Mutation path (task_049): ``refresh_pivot_table`` / ``refresh_pivot_cache`` run
-the full guard chain — writable working copy, successful snapshot, deny-by-default
+Mutation path (task_049, task_050): ``refresh_pivot_table`` /
+``refresh_pivot_cache`` and the four ``set_pivot_field_*`` tools run the full
+guard chain — writable working copy, successful snapshot, deny-by-default
 approval — then a single mutating STA dispatch, recorded as ``mutating``. Only a
-worksheet/Table-backed (``database``) cache is refreshed; external / OLAP / Data
-Model sources return ``unsupported_source`` and are never refreshed.
-``Workbook.RefreshAll`` is never used.
+worksheet/Table-backed (``database``) cache is refreshed or reconfigured;
+external / OLAP / Data Model sources are rejected with ``UNSUPPORTED_PIVOT_SOURCE``
+and never touched. ``Workbook.RefreshAll`` is never used.
 
 Design (task_039 decision record, ``docs/research/pivot_tables_api.md``):
 
@@ -52,30 +55,49 @@ from typing import Any, TypeVar, cast
 
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
-from excel_vba_mcp.adapters.excel.pivot_tables_adapter import PivotTablesAdapter
+from excel_vba_mcp.adapters.excel.pivot_tables_adapter import (
+    PivotTablesAdapter,
+    validate_field_properties,
+)
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
 from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
     PivotCacheInfo,
     PivotFieldInfo,
+    PivotFieldProperties,
     PivotInventory,
     PivotRefreshResult,
     PivotTableInfo,
     WorkbookInfo,
 )
-from excel_vba_mcp.domain.statuses import OperationClass
+from excel_vba_mcp.domain.statuses import OperationClass, PivotAggregation, PivotFieldOrientation
 from excel_vba_mcp.security.approval import ApprovalKey, ApprovalPolicy
 from excel_vba_mcp.security.audit import AuditLogger
 
-#: Default per-call soft ceiling (seconds) for a pivot inventory/refresh call on
-#: the STA worker. Inventory reads are bounded and fast; a targeted refresh of a
-#: local cache is also bounded, so the same ceiling as the other services is used.
+#: Default per-call soft ceiling (seconds) for a pivot inventory/refresh/config
+#: call on the STA worker. Inventory reads are bounded and fast; a targeted
+#: refresh of a local cache is also bounded, so the same ceiling as the other
+#: services is used.
 _DEFAULT_TIMEOUT_S = 60.0
 
 #: Approval action names (stable identities for the pivot mutation surface).
 _ACTION_REFRESH_TABLE = "pivot_table_refresh"
 _ACTION_REFRESH_CACHE = "pivot_cache_refresh"
+_ACTION_SET_LAYOUT = "pivot_field_set_layout"
+_ACTION_SET_POSITION = "pivot_field_set_position"
+_ACTION_SET_AGGREGATION = "pivot_field_set_aggregation"
+_ACTION_SET_PROPERTIES = "pivot_field_set_properties"
+
+#: The orientation buckets a field's ``Orientation`` may be assigned to.
+_LAYOUT_ORIENTATIONS: frozenset[PivotFieldOrientation] = frozenset(
+    {
+        PivotFieldOrientation.HIDDEN,
+        PivotFieldOrientation.ROW,
+        PivotFieldOrientation.COLUMN,
+        PivotFieldOrientation.PAGE,
+    }
+)
 
 #: Return type of the worker callables submitted by this service.
 _T = TypeVar("_T")
@@ -307,6 +329,223 @@ class PivotTablesService:
         return result
 
     # ------------------------------------------------------------------
+    # Public API — PivotField configuration (guarded; task_050)
+    # ------------------------------------------------------------------
+    async def set_pivot_field_layout(
+        self,
+        workbook_id: str,
+        pivot_table: str,
+        field: str,
+        orientation: PivotFieldOrientation,
+        *,
+        delete: bool = False,
+    ) -> PivotFieldInfo:
+        """Set one field's layout bucket, or remove it (guarded).
+
+        ``orientation`` must be one of ``hidden`` / ``row`` / ``column`` /
+        ``page``; ``data`` is rejected before the STA dispatch because assigning
+        ``Orientation = xlDataField`` never creates a data field — that is
+        :meth:`set_pivot_field_aggregation` (``PivotTable.AddDataField``).
+
+        Removal is exposed two ways: ``orientation="hidden"`` (default) is the
+        **non-destructive** ``Orientation = 0``; ``delete=True`` (which requires
+        ``orientation="hidden"``) is the **destructive** ``PivotField.Delete``.
+        The guard chain (writable → snapshot → approval) runs before any STA
+        dispatch and the adapter re-reads the field afterwards.
+        """
+
+        normalized = _require_layout_orientation(orientation)
+        record = self._require_writable(workbook_id)
+        self._require_snapshot(workbook_id)
+        self._require_approval(record, _ACTION_SET_LAYOUT)
+
+        outcome = await self._submit_mutation(
+            workbook_id,
+            "pivot_field_set_layout",
+            lambda wb: self._adapter.set_field_layout(
+                wb, pivot_table, field, normalized, delete=delete
+            ),
+            record,
+        )
+        field_info = cast("PivotFieldInfo", outcome["field"])
+        self._record_audit(
+            "pivot_field_set_layout",
+            "mutating",
+            record,
+            {
+                "workbook_id": workbook_id,
+                "pivot_table": pivot_table,
+                "field": field,
+                "orientation": normalized.value,
+                "delete": delete,
+            },
+            {
+                "pivot_table": pivot_table,
+                "field": field_info.source_name,
+                "orientation": field_info.orientation.value,
+                "position": field_info.position,
+                "verified": outcome["verified"],
+                "orientation_order": outcome["orientation_order"],
+                "before": _field_state(outcome["before"]),
+                "after": _field_state(field_info),
+            },
+        )
+        return field_info
+
+    async def set_pivot_field_position(
+        self, workbook_id: str, pivot_table: str, field: str, position: int
+    ) -> PivotFieldInfo:
+        """Set one field's 1-based position within its orientation (guarded).
+
+        The position is validated against the orientation's field count inside
+        the adapter **before** any COM mutation, so an out-of-range position is
+        rejected without touching Excel. The resulting order of the orientation
+        is recorded in the audit entry.
+        """
+
+        _require_position(position)
+        record = self._require_writable(workbook_id)
+        self._require_snapshot(workbook_id)
+        self._require_approval(record, _ACTION_SET_POSITION)
+
+        outcome = await self._submit_mutation(
+            workbook_id,
+            "pivot_field_set_position",
+            lambda wb: self._adapter.set_field_position(wb, pivot_table, field, position),
+            record,
+        )
+        field_info = cast("PivotFieldInfo", outcome["field"])
+        self._record_audit(
+            "pivot_field_set_position",
+            "mutating",
+            record,
+            {
+                "workbook_id": workbook_id,
+                "pivot_table": pivot_table,
+                "field": field,
+                "position": position,
+            },
+            {
+                "pivot_table": pivot_table,
+                "field": field_info.source_name,
+                "orientation": field_info.orientation.value,
+                "position": field_info.position,
+                "verified": outcome["verified"],
+                "orientation_order": outcome["orientation_order"],
+                "before": _field_state(outcome["before"]),
+                "after": _field_state(field_info),
+            },
+        )
+        return field_info
+
+    async def set_pivot_field_aggregation(
+        self,
+        workbook_id: str,
+        pivot_table: str,
+        field: str,
+        function: PivotAggregation,
+        *,
+        caption: str | None = None,
+    ) -> PivotFieldInfo:
+        """Add or update one data field's aggregation via ``AddDataField`` (guarded).
+
+        An existing data field on the same source field is updated in place; a
+        source field without a data field is added with
+        ``PivotTable.AddDataField`` (assigning ``Orientation = xlDataField`` does
+        not create one). ``caption`` identifies the data field and must be
+        unique; only the eleven accepted aggregation codes are allowed (legacy
+        codes are rejected before the STA dispatch).
+        """
+
+        _require_aggregation(function)
+        record = self._require_writable(workbook_id)
+        self._require_snapshot(workbook_id)
+        self._require_approval(record, _ACTION_SET_AGGREGATION)
+
+        outcome = await self._submit_mutation(
+            workbook_id,
+            "pivot_field_set_aggregation",
+            lambda wb: self._adapter.set_field_aggregation(
+                wb, pivot_table, field, function, caption=caption
+            ),
+            record,
+        )
+        field_info = cast("PivotFieldInfo", outcome["field"])
+        self._record_audit(
+            "pivot_field_set_aggregation",
+            "mutating",
+            record,
+            {
+                "workbook_id": workbook_id,
+                "pivot_table": pivot_table,
+                "field": field,
+                "function": _aggregation_value(function),
+                "caption": caption,
+            },
+            {
+                "pivot_table": pivot_table,
+                "field": field_info.source_name,
+                "function": field_info.function.value if field_info.function else None,
+                "caption": field_info.data_field_name,
+                "verified": outcome["verified"],
+                "data_field_order": outcome["orientation_order"],
+                "before": _field_state(outcome["before"]),
+                "after": _field_state(field_info),
+            },
+        )
+        return field_info
+
+    async def set_pivot_field_properties(
+        self,
+        workbook_id: str,
+        pivot_table: str,
+        field: str,
+        properties: PivotFieldProperties,
+    ) -> PivotFieldInfo:
+        """Set bounded PivotField properties (caption/number format/show-all) (guarded).
+
+        The sparse patch is validated before the STA dispatch (an empty patch, a
+        blank caption or number format, or a duplicate caption is rejected
+        without touching Excel); the adapter writes only the properties the
+        caller explicitly set and re-reads them as a postcondition.
+        """
+
+        validate_field_properties(properties)
+        record = self._require_writable(workbook_id)
+        self._require_snapshot(workbook_id)
+        self._require_approval(record, _ACTION_SET_PROPERTIES)
+
+        outcome = await self._submit_mutation(
+            workbook_id,
+            "pivot_field_set_properties",
+            lambda wb: self._adapter.set_field_properties(wb, pivot_table, field, properties),
+            record,
+        )
+        field_info = cast("PivotFieldInfo", outcome["field"])
+        self._record_audit(
+            "pivot_field_set_properties",
+            "mutating",
+            record,
+            {
+                "workbook_id": workbook_id,
+                "pivot_table": pivot_table,
+                "field": field,
+                "applied": sorted(properties.model_fields_set),
+            },
+            {
+                "pivot_table": pivot_table,
+                "field": field_info.source_name,
+                "caption": field_info.data_field_name,
+                "number_format": field_info.number_format,
+                "show_all_items": field_info.show_all_items,
+                "verified": outcome["verified"],
+                "before": _field_state(outcome["before"]),
+                "after": _field_state(field_info),
+            },
+        )
+        return field_info
+
+    # ------------------------------------------------------------------
     # Guards (non-COM)
     # ------------------------------------------------------------------
     def _require_writable(self, workbook_id: str) -> WorkbookInfo:
@@ -315,7 +554,7 @@ class PivotTablesService:
         record = self._resolve_record(workbook_id)
         if record.read_only:
             raise ExcelVbaMcpError(
-                "Pivot refresh requires a writable working copy.",
+                "A pivot mutation requires a writable working copy.",
                 code=ErrorCode.WORKBOOK_READ_ONLY,
                 context={"workbook_id": workbook_id, "path": record.path},
             )
@@ -329,9 +568,9 @@ class PivotTablesService:
 
         if self._snapshot is None:
             raise ExcelVbaMcpError(
-                "The snapshot service is not configured; refresh requires it.",
+                "The snapshot service is not configured; a pivot mutation requires it.",
                 code=ErrorCode.SNAPSHOT_FAILED,
-                context={"tool": "pivot_refresh"},
+                context={"tool": "pivot_mutation"},
             )
         self._snapshot.require_snapshot(workbook_id)
 
@@ -340,9 +579,9 @@ class PivotTablesService:
 
         if self._approval is None:
             raise ExcelVbaMcpError(
-                "The approval policy is not configured; refresh requires it.",
+                "The approval policy is not configured; a pivot mutation requires it.",
                 code=ErrorCode.COM_BUSY,
-                context={"tool": "pivot_refresh", "action": action},
+                context={"tool": "pivot_mutation", "action": action},
             )
         key = ApprovalKey(
             canonical_path=record.source_path or record.path,
@@ -352,7 +591,7 @@ class PivotTablesService:
         decision = self._approval.authorize_vba_write(key)
         if not decision.allowed:
             raise ExcelVbaMcpError(
-                f"Pivot refresh {action!r} denied by approval policy: {decision.reason}",
+                f"Pivot mutation {action!r} denied by approval policy: {decision.reason}",
                 code=ErrorCode.COM_BUSY,
                 context={
                     "action": action,
@@ -497,6 +736,96 @@ class PivotTablesService:
             workbook={"canonical_path": canonical},
             result=result,
         )
+
+
+def _require_layout_orientation(orientation: PivotFieldOrientation) -> PivotFieldOrientation:
+    """Validate a target orientation for ``set_pivot_field_layout`` (non-COM).
+
+    Only the layout buckets are assignable; ``data`` is rejected here (before any
+    STA dispatch) because assigning ``Orientation = xlDataField`` never creates a
+    data field — that is ``PivotTable.AddDataField``.
+    """
+
+    if not isinstance(orientation, PivotFieldOrientation):
+        raise ExcelVbaMcpError(
+            f"Argument 'orientation' must be a PivotFieldOrientation, got {orientation!r}.",
+            code=ErrorCode.INVALID_RANGE,
+            context={"orientation": repr(orientation), "reason": "invalid_orientation"},
+        )
+    if orientation not in _LAYOUT_ORIENTATIONS:
+        raise ExcelVbaMcpError(
+            "Orientation 'data' cannot be assigned: it does not create a data "
+            "field. Use pivot_field_set_aggregation (AddDataField) instead; the "
+            "layout buckets are 'hidden', 'row', 'column' and 'page'.",
+            code=ErrorCode.INVALID_RANGE,
+            context={
+                "orientation": orientation.value,
+                "reason": "invalid_orientation",
+            },
+        )
+    return orientation
+
+
+def _require_position(position: int) -> int:
+    """Validate a 1-based field position (non-COM)."""
+
+    if isinstance(position, bool) or not isinstance(position, int):
+        raise ExcelVbaMcpError(
+            f"Argument 'position' must be an integer, got {position!r}.",
+            code=ErrorCode.INVALID_RANGE,
+            context={"position": repr(position), "reason": "position_out_of_range"},
+        )
+    if position < 1:
+        raise ExcelVbaMcpError(
+            f"Argument 'position' must be >= 1, got {position}.",
+            code=ErrorCode.INVALID_RANGE,
+            context={"position": position, "reason": "position_out_of_range"},
+        )
+    return position
+
+
+def _require_aggregation(function: PivotAggregation) -> PivotAggregation:
+    """Validate an aggregation request (non-COM).
+
+    Only the eleven accepted ``PivotAggregation`` members are allowed; legacy
+    codes the target build rejects cannot be expressed and are refused by the
+    adapter's code table as well.
+    """
+
+    if not isinstance(function, PivotAggregation):
+        raise ExcelVbaMcpError(
+            f"Argument 'function' must be a PivotAggregation, got {function!r}. "
+            "Legacy codes (9, -4114, -4153, -4154) are not accepted.",
+            code=ErrorCode.INVALID_RANGE,
+            context={
+                "function": repr(function),
+                "accepted": [member.value for member in PivotAggregation],
+                "reason": "invalid_function",
+            },
+        )
+    return function
+
+
+def _aggregation_value(function: PivotAggregation) -> str:
+    """Return the audit-friendly value of an aggregation argument."""
+
+    return function.value if isinstance(function, PivotAggregation) else repr(function)
+
+
+def _field_state(info: PivotFieldInfo) -> dict[str, Any]:
+    """Return the audit-friendly subset of a field's post-mutation state."""
+
+    return {
+        "source_name": info.source_name,
+        "caption": info.caption,
+        "orientation": info.orientation.value,
+        "position": info.position,
+        "is_data_field": info.is_data_field,
+        "function": info.function.value if info.function else None,
+        "data_field_name": info.data_field_name,
+        "number_format": info.number_format,
+        "show_all_items": info.show_all_items,
+    }
 
 
 def _find_open_workbook(app_adapter: ExcelAppAdapter, working_path: str) -> Any | None:

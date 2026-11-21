@@ -1,16 +1,21 @@
-"""STA-local Excel PivotTables / PivotCaches / PivotFields adapter (task_048, task_049).
+"""STA-local Excel PivotTables / PivotCaches / PivotFields adapter (task_048, task_049, task_050).
 
-Phase 2 — PivotTables inventory (read-only) and targeted refresh (task_049).
+Phase 2 — PivotTables inventory (read-only), targeted refresh (task_049) and
+PivotField configuration (task_050).
 
 :class:`PivotTablesAdapter` is the single place where the Excel ``PivotTables`` /
-``PivotCache`` / ``PivotField`` object model is touched for the Phase-2 inventory
-surface (``pivot_tables_list``, ``pivot_table_get``, ``pivot_cache_get``,
-``pivot_fields_list``). It is a **pure STA-local helper**: every method is
-synchronous, receives the live ``Workbook`` COM proxy (``Any``) and returns only
-Pydantic DTOs / primitives, so results cross the single-STA worker boundary
-safely (:func:`~excel_vba_mcp.adapters.excel.com_worker._ensure_dto`). It never
-imports ``pywin32`` at module import time and never calls ``.Activate`` /
-``.Select`` on any object (addendum BG03/BG04/BG05).
+``PivotCache`` / ``PivotField`` object model is touched for the Phase-2
+PivotTables surface (``pivot_tables_list``, ``pivot_table_get``,
+``pivot_cache_get``, ``pivot_fields_list``, ``pivot_table_refresh``,
+``pivot_cache_refresh``, ``pivot_field_set_layout``,
+``pivot_field_set_position``, ``pivot_field_set_aggregation``,
+``pivot_field_set_properties``). It is a **pure STA-local helper**: every method
+is synchronous, receives the live ``Workbook`` COM proxy (``Any``) and returns
+only Pydantic DTOs / primitives / plain containers, so results cross the
+single-STA worker boundary safely
+(:func:`~excel_vba_mcp.adapters.excel.com_worker._ensure_dto`). It never imports
+``pywin32`` at module import time and never calls ``.Activate`` / ``.Select`` on
+any object (addendum BG03/BG04/BG05).
 
 Inventory semantics (task_039 decision record, ``docs/research/pivot_tables_api.md``):
 
@@ -50,11 +55,21 @@ Int  ``XlPivotTableSourceType``  ``PivotSourceType``
 —    anything else              ``UNKNOWN``
 ===  ==========================  =========================
 
-This adapter is **read-only** except for the bounded targeted refresh added by
-task_049: it never creates/deletes PivotTables, and never touches
+This adapter never creates/deletes PivotTables and never touches
 ``Workbook.RefreshAll``, Connections/QueryTables/Power Query/Data Model. A
 refresh is confirmed only by Excel's truth signal (the ``RefreshTable`` Boolean
 and/or an advanced ``RefreshDate``), never by the absence of a COM exception.
+
+Field-configuration semantics (task_050, ``docs/research/pivot_tables_api.md``
+§5): ``Orientation`` accepts only the layout buckets — ``xlDataField`` (4) is
+rejected because assigning it does **not** create a data field, which is
+``PivotTable.AddDataField``. Removal is ``Orientation = 0`` (non-destructive,
+the default) or ``PivotField.Delete`` (destructive, explicit). ``Position`` is
+1-based within one orientation and validated before the write. Aggregation is
+read/written only through ``DataFields[i].Function`` (eleven accepted codes;
+legacy codes are rejected) and ``DataFields[i].Caption`` is the data-field
+caption (unique). Every mutation is followed by a post-mutation re-read; a
+mismatch is reported through ``verified=False`` rather than claimed as success.
 """
 
 from __future__ import annotations
@@ -62,10 +77,17 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import (
+    AmbiguousFilterError,
+    ErrorCode,
+    ExcelVbaMcpError,
+    InvalidRangeError,
+    UnsupportedPivotSourceError,
+)
 from excel_vba_mcp.domain.models import (
     PivotCacheInfo,
     PivotFieldInfo,
+    PivotFieldProperties,
     PivotRefreshResult,
     PivotTableInfo,
 )
@@ -118,6 +140,46 @@ _XL_FUNCTION_BY_INT: dict[int, PivotAggregation] = {
     -4164: PivotAggregation.VAR,
     -4165: PivotAggregation.VARP,
 }
+
+# The layout buckets a field's ``Orientation`` may be **assigned** to (task_039
+# §5). ``xlDataField`` (4) is deliberately absent: assigning it does not create a
+# data field, so ``PivotTable.AddDataField`` is the only way into the data area.
+_XL_ORIENTATION_CODES: dict[PivotFieldOrientation, int] = {
+    PivotFieldOrientation.HIDDEN: 0,
+    PivotFieldOrientation.ROW: 1,
+    PivotFieldOrientation.COLUMN: 2,
+    PivotFieldOrientation.PAGE: 3,
+}
+
+# The accepted ``DataFields[i].Function`` codes (task_039 §5). Legacy codes the
+# target build rejects (``9``, ``-4114``, ``-4153``, ``-4154``) are absent, so an
+# unknown code is rejected rather than silently written.
+_XL_FUNCTION_CODES: dict[PivotAggregation, int] = {
+    PivotAggregation.SUM: -4157,
+    PivotAggregation.AVERAGE: -4106,
+    PivotAggregation.COUNT: -4112,
+    PivotAggregation.COUNT_NUMS: -4113,
+    PivotAggregation.MAX: -4136,
+    PivotAggregation.MIN: -4139,
+    PivotAggregation.PRODUCT: -4149,
+    PivotAggregation.STDEV: -4155,
+    PivotAggregation.STDEVP: -4156,
+    PivotAggregation.VAR: -4164,
+    PivotAggregation.VARP: -4165,
+}
+
+# The orientation collections used to validate a position and to report the
+# resulting order. A hidden field has no such collection (its order is the
+# ``PivotFields`` order).
+_ORIENTATION_COLLECTION: dict[PivotFieldOrientation, str] = {
+    PivotFieldOrientation.ROW: "RowFields",
+    PivotFieldOrientation.COLUMN: "ColumnFields",
+    PivotFieldOrientation.PAGE: "PageFields",
+    PivotFieldOrientation.DATA: "DataFields",
+}
+
+# ``PivotFieldProperties`` fields accepted by ``set_field_properties``.
+_FIELD_PROPERTY_NAMES: frozenset[str] = frozenset({"caption", "number_format", "show_all_items"})
 
 # Source types that are determinable but unsupported for refresh / field mutation
 # (task_039 §7). ``DATABASE`` is the only supported source type.
@@ -762,13 +824,373 @@ def _advance_confirms(before: datetime | None, after: datetime | None) -> bool:
     return after > before
 
 
+# ---------------------------------------------------------------------------
+# PivotField configuration helpers (task_050; STA-local, no COM at import)
+# ---------------------------------------------------------------------------
+def _require_supported_source(pivot: Any) -> PivotSourceType:
+    """Reject an OLAP / Data Model / external cache before any field mutation.
+
+    ``DATABASE`` (a worksheet or ListObject range) is the only source type whose
+    PivotFields may be reconfigured (task_039 §7). The check runs before the
+    first mutation, so an unsupported field is never touched.
+    """
+
+    cache = pivot.PivotCache()
+    source_type, _olap = _classify_source_type(cache)
+    if source_type is not PivotSourceType.DATABASE:
+        raise UnsupportedPivotSourceError(
+            _unsupported_reason(source_type),
+            context={
+                "source_type": source_type.value,
+                "reason": "unsupported_pivot_source",
+            },
+        )
+    return source_type
+
+
+def _source_field_entries(pivot: Any) -> list[tuple[Any, str]]:
+    """Return ``(field, source_name)`` for every non-synthetic ``PivotFields`` entry."""
+
+    entries: list[tuple[Any, str]] = []
+    try:
+        pivot_fields = pivot.PivotFields()
+        count = _safe_int(pivot_fields.Count, default=0) or 0
+    except Exception:  # noqa: BLE001 - defensive COM read
+        return entries
+    for position in range(1, count + 1):
+        try:
+            field = pivot_fields.Item(position)
+        except Exception:  # noqa: BLE001 - defensive per-item COM read
+            continue
+        if _is_synthetic_data_placeholder(field):
+            continue
+        source_name = _get_str(field, "SourceName") or ""
+        entries.append((field, source_name))
+    return entries
+
+
+def _data_field_entries(pivot: Any) -> list[tuple[int, str, str]]:
+    """Return ``(position, caption, source_name)`` for every ``DataFields`` entry."""
+
+    entries: list[tuple[int, str, str]] = []
+    try:
+        data_fields = pivot.DataFields
+        count = _safe_int(data_fields.Count, default=0) or 0
+    except Exception:  # noqa: BLE001 - defensive COM read
+        return entries
+    for position in range(1, count + 1):
+        try:
+            item = data_fields.Item(position)
+        except Exception:  # noqa: BLE001 - defensive per-item COM read
+            continue
+        caption = _get_str(item, "Name") or ""
+        source_name = _get_str(item, "SourceName") or ""
+        entries.append((position, caption, source_name))
+    return entries
+
+
+def _raw_orientation(field: Any) -> PivotFieldOrientation | None:
+    """Read a field's own ``Orientation`` (no data-field override)."""
+
+    code = _get_int(field, "Orientation")
+    if code is None:
+        return None
+    return _XL_ORIENTATION_BY_INT.get(code)
+
+
+def _raw_position(field: Any) -> int | None:
+    """Read a field's own 1-based ``Position`` (sentinel -> ``None``)."""
+
+    return _position_of(field)
+
+
+def _field_dto(
+    pivot: Any,
+    field: Any,
+    data_field_index: dict[str, dict[str, Any]],
+    *,
+    source_layout: bool,
+) -> PivotFieldInfo:
+    """Describe a field, optionally keeping its **own** orientation/position.
+
+    ``_describe_field`` reports a source field that also has a data field as
+    ``DATA`` (the inventory convention). A layout operation is explicitly about
+    the source field's placement, so it re-reads the field's own orientation and
+    position instead; every other attribute (aggregation, caption, number
+    format, filter state) is unchanged.
+    """
+
+    described = _describe_field(pivot, field, data_field_index)
+    if not source_layout:
+        return described
+    raw_orientation = _raw_orientation(field)
+    if raw_orientation is None:
+        return described
+    return described.model_copy(
+        update={"orientation": raw_orientation, "position": _raw_position(field)}
+    )
+
+
+def _resolve_source_field(pivot: Any, field: str) -> tuple[Any, PivotFieldInfo]:
+    """Resolve ``field`` to its unique ``PivotField`` and describe its state.
+
+    The identity is the source field ``SourceName`` (task_039 §8). A name that
+    matches no source field, or more than one, is rejected as an ambiguous
+    identity rather than guessed.
+    """
+
+    target_name = field.strip().lower()
+    matches = [
+        (candidate, name)
+        for candidate, name in _source_field_entries(pivot)
+        if name.strip().lower() == target_name
+    ]
+    if not matches:
+        raise AmbiguousFilterError(
+            f"Field {field!r} was not found in the PivotTable.",
+            context={"field": field, "reason": "field_not_found"},
+        )
+    if len(matches) > 1:
+        raise AmbiguousFilterError(
+            f"Field {field!r} resolved to {len(matches)} source fields; the identity is ambiguous.",
+            context={"field": field, "match_count": len(matches), "reason": "ambiguous_field"},
+        )
+    candidate, source_name = matches[0]
+    info = _describe_field(pivot, candidate, _data_field_index(pivot))
+    return candidate, info
+
+
+def _resolve_field_target(pivot: Any, field: str) -> tuple[Any, PivotFieldInfo]:
+    """Resolve ``field`` by data-field caption first, then by source name.
+
+    ``set_field_properties`` accepts either a data-field caption (the display
+    ``Name`` of a ``DataFields`` entry) or a source field ``SourceName``; a
+    caption match is preferred because it is the data field's own identity
+    (task_039 §8, P12).
+    """
+
+    target_name = field.strip().lower()
+    caption_matches = [
+        entry for entry in _data_field_entries(pivot) if entry[1].strip().lower() == target_name
+    ]
+    if len(caption_matches) == 1:
+        return _resolve_source_field(pivot, caption_matches[0][2])
+    return _resolve_source_field(pivot, field)
+
+
+def _field_absent(pivot: Any, field: str) -> bool:
+    """Return whether ``field`` is gone from ``PivotFields`` (postcondition)."""
+
+    target_name = field.strip().lower()
+    return not any(name.strip().lower() == target_name for _f, name in _source_field_entries(pivot))
+
+
+def _orientation_collection(pivot: Any, orientation: PivotFieldOrientation) -> Any:
+    """Return the orientation's field collection, or ``None`` for a hidden field."""
+
+    collection_name = _ORIENTATION_COLLECTION.get(orientation)
+    if collection_name is None:
+        return None
+    try:
+        return getattr(pivot, collection_name)
+    except Exception:  # noqa: BLE001 - defensive COM read
+        return None
+
+
+def _orientation_count(pivot: Any, orientation: PivotFieldOrientation) -> int:
+    """Return the number of fields in one orientation (0 when unreadable)."""
+
+    collection = _orientation_collection(pivot, orientation)
+    if collection is None:
+        return 0
+    try:
+        return _safe_int(collection.Count, default=0) or 0
+    except Exception:  # noqa: BLE001 - defensive COM read
+        return 0
+
+
+def _orientation_order(pivot: Any, orientation: PivotFieldOrientation) -> list[str]:
+    """Return the field names of one orientation in their current order.
+
+    Used to surface the resulting order after a position change so the caller can
+    verify the swap semantics without materializing the PivotTable output
+    (task_039 §5).
+    """
+
+    if orientation is PivotFieldOrientation.HIDDEN:
+        return [name for _f, name in _source_field_entries(pivot)]
+    collection = _orientation_collection(pivot, orientation)
+    if collection is None:
+        return []
+    try:
+        count = _safe_int(collection.Count, default=0) or 0
+    except Exception:  # noqa: BLE001 - defensive COM read
+        return []
+    entries: list[tuple[int | None, str]] = []
+    for position in range(1, count + 1):
+        try:
+            item = collection.Item(position)
+        except Exception:  # noqa: BLE001 - defensive per-item COM read
+            continue
+        # ``Name`` is the data-field caption for a DataFields entry and the field
+        # name for a source field; fall back to ``SourceName``.
+        name = _get_str(item, "Name") or _get_str(item, "SourceName") or ""
+        entries.append((_get_int(item, "Position"), name))
+    entries.sort(key=lambda pair: (pair[0] is None, pair[0] or 0))
+    return [name for _position, name in entries]
+
+
+def _require_layout_code(orientation: PivotFieldOrientation, *, delete: bool) -> int:
+    """Validate a target orientation and return its ``Orientation`` code."""
+
+    if delete and orientation is not PivotFieldOrientation.HIDDEN:
+        raise InvalidRangeError(
+            "A destructive field removal (delete=True) requires orientation "
+            "'hidden'; set the orientation to 'hidden' to remove the field.",
+            context={
+                "orientation": orientation.value,
+                "reason": "invalid_orientation",
+            },
+        )
+    if orientation is PivotFieldOrientation.DATA:
+        raise InvalidRangeError(
+            "Orientation 'data' cannot be assigned: setting Orientation = "
+            "xlDataField does not create a data field. Use "
+            "pivot_field_set_aggregation (PivotTable.AddDataField) instead.",
+            context={"orientation": "data", "reason": "invalid_orientation"},
+        )
+    code = _XL_ORIENTATION_CODES.get(orientation)
+    if code is None:
+        raise InvalidRangeError(
+            f"Orientation {orientation.value!r} is not a layout bucket; use one "
+            "of 'hidden', 'row', 'column' or 'page'.",
+            context={"orientation": orientation.value, "reason": "invalid_orientation"},
+        )
+    return code
+
+
+def _require_function_code(function: PivotAggregation | int | str) -> int:
+    """Validate an aggregation and return its ``XlConsolidationFunction`` code.
+
+    Only the eleven accepted codes are allowed. Legacy codes (``9``, ``-4114``,
+    ``-4153``, ``-4154``) that the target build rejects are refused with the
+    accepted set in the error context rather than silently written.
+    """
+
+    accepted = sorted(code for code in _XL_FUNCTION_BY_INT)
+    if isinstance(function, PivotAggregation):
+        return _XL_FUNCTION_CODES[function]
+    if isinstance(function, str):
+        try:
+            return _XL_FUNCTION_CODES[PivotAggregation(function.strip().lower())]
+        except ValueError as exc:
+            raise InvalidRangeError(
+                f"Aggregation {function!r} is not accepted; accepted values are "
+                f"{[a.value for a in PivotAggregation]}.",
+                context={
+                    "function": function,
+                    "accepted": [a.value for a in PivotAggregation],
+                    "reason": "invalid_function",
+                },
+            ) from exc
+    if isinstance(function, int) and not isinstance(function, bool):
+        if function in _XL_FUNCTION_BY_INT:
+            return function
+        raise InvalidRangeError(
+            f"Aggregation code {function} is not accepted by the target build; "
+            f"accepted codes are {accepted}. Legacy codes (9, -4114, -4153, "
+            "-4154) are rejected.",
+            context={
+                "function": function,
+                "accepted": accepted,
+                "reason": "invalid_function",
+            },
+        )
+    raise InvalidRangeError(
+        f"Aggregation {function!r} is not accepted; expected a PivotAggregation, "
+        "its string name or one of the accepted codes.",
+        context={"function": repr(function), "reason": "invalid_function"},
+    )
+
+
+def validate_field_properties(properties: PivotFieldProperties) -> list[str]:
+    """Validate a sparse PivotField property patch before any COM mutation.
+
+    Returns the sorted names of the properties the caller explicitly set. An
+    empty patch, a blank caption / number format, or a non-boolean
+    ``show_all_items`` leaves the workbook untouched (task_039 §5).
+    """
+
+    applied = sorted(properties.model_fields_set)
+    unknown = set(applied) - _FIELD_PROPERTY_NAMES
+    if unknown:
+        raise InvalidRangeError(
+            f"Unknown PivotField property/ies {sorted(unknown)}; supported: "
+            f"{sorted(_FIELD_PROPERTY_NAMES)}.",
+            context={"unknown": sorted(unknown), "reason": "invalid_property"},
+        )
+    if not applied:
+        raise InvalidRangeError(
+            "The PivotField property patch is empty; set at least one of "
+            "'caption', 'number_format' or 'show_all_items'.",
+            context={"reason": "empty_patch"},
+        )
+    if "caption" in applied:
+        caption = properties.caption
+        if not isinstance(caption, str) or not caption.strip():
+            raise InvalidRangeError(
+                "Argument 'caption' must be a non-empty string.",
+                context={"property": "caption", "reason": "invalid_caption"},
+            )
+    if "number_format" in applied:
+        number_format = properties.number_format
+        if not isinstance(number_format, str) or not number_format.strip():
+            raise InvalidRangeError(
+                "Argument 'number_format' must be a non-empty format string.",
+                context={"property": "number_format", "reason": "invalid_number_format"},
+            )
+    if "show_all_items" in applied and not isinstance(properties.show_all_items, bool):
+        raise InvalidRangeError(
+            "Argument 'show_all_items' must be a boolean.",
+            context={"property": "show_all_items", "reason": "invalid_property"},
+        )
+    return applied
+
+
+def _write_data_field_property(
+    pivot: Any, position: int, attribute: str, value: Any, pivot_table: str
+) -> None:
+    """Write one property of a ``DataFields`` entry, raising a truthful error."""
+
+    try:
+        data_field = pivot.DataFields.Item(position)
+        setattr(data_field, attribute, value)
+    except ExcelVbaMcpError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a blocked/failed write
+        raise ExcelVbaMcpError(
+            f"DataFields[{position}].{attribute} could not be set: "
+            f"{str(exc) or exc.__class__.__name__}",
+            code=ErrorCode.COM_BUSY,
+            context={
+                "pivot_table": pivot_table,
+                "data_field": position,
+                "attribute": attribute,
+            },
+        ) from exc
+
+
 class PivotTablesAdapter:
     """STA-local PivotTables / PivotCaches / PivotFields adapter (no COM at import).
 
     All methods are synchronous, operate on the live ``Workbook`` proxy and
-    return only Pydantic DTOs. They never create or delete a PivotTable,
-    PivotCache or PivotField (task_048 is read-only); task_049 adds the bounded
-    targeted refresh of a worksheet/Table-backed PivotTable or its cache.
+    return only Pydantic DTOs / plain containers, so results cross the
+    single-STA worker boundary safely. They never create a PivotTable or
+    PivotCache (task_048 is read-only); task_049 adds the bounded targeted
+    refresh of a worksheet/Table-backed PivotTable or its cache; task_050 adds
+    the bounded configuration of an **existing** PivotField (layout, position,
+    data-field aggregation and properties) with a pre-mutation source check and
+    a post-mutation re-read. No ``.Activate`` / ``.Select`` is ever called.
     """
 
     # ------------------------------------------------------------------
@@ -987,6 +1409,502 @@ class PivotTablesAdapter:
             finished_at=finished_at,
             reason="Refresh returned but the shared RefreshDate did not advance.",
         )
+
+    # ------------------------------------------------------------------
+    # PivotField configuration (task_050; guarded mutations)
+    # ------------------------------------------------------------------
+    def set_field_layout(
+        self,
+        wb: Any,
+        pivot_table: str,
+        field: str,
+        orientation: PivotFieldOrientation,
+        *,
+        delete: bool = False,
+    ) -> dict[str, Any]:
+        """Set one field's layout bucket, or remove it, and verify the result.
+
+        ``orientation`` must be one of the layout buckets (``hidden`` / ``row`` /
+        ``column`` / ``page``): ``xlDataField`` (4) is rejected because assigning
+        ``Orientation = 4`` never creates a data field — that is
+        ``PivotTable.AddDataField`` via :meth:`set_field_aggregation`
+        (task_039 §5).
+
+        Removal is exposed two ways (task_039 §5):
+
+        * ``orientation="hidden"`` and ``delete=False`` (default) is the
+          **non-destructive** removal: ``PivotField.Orientation = 0`` leaves the
+          field in ``PivotFields`` and its items and filter state intact.
+        * ``delete=True`` (which requires ``orientation="hidden"``) is the
+          **destructive** removal: ``PivotField.Delete`` drops the field from
+          ``PivotFields``. The returned DTO then describes the last-known state
+          (``orientation="hidden"``, ``position=None``); the field is verified
+          absent from ``PivotFields``.
+
+        The cache source type is checked before any mutation: an OLAP / Data
+        Model / external cache is rejected with ``UNSUPPORTED_PIVOT_SOURCE``.
+        The post-mutation state is re-read from the PivotTable as a
+        postcondition; a mismatch is reported through ``verified=False`` and
+        never claimed as success.
+        """
+
+        pivot = _find_pivot(wb, pivot_table)
+        _require_supported_source(pivot)
+        target, before = _resolve_source_field(pivot, field)
+        code = _require_layout_code(orientation, delete=delete)
+
+        if delete:
+            try:
+                target.Delete()
+            except ExcelVbaMcpError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a blocked/failed delete
+                raise ExcelVbaMcpError(
+                    f"PivotField.Delete failed for field {field!r}: "
+                    f"{str(exc) or exc.__class__.__name__}",
+                    code=ErrorCode.COM_BUSY,
+                    context={"pivot_table": pivot_table, "field": field},
+                ) from exc
+            data_field_index = _data_field_index(pivot)
+            absent = _field_absent(pivot, field)
+            notes: list[str] = []
+            if not absent:
+                notes.append(
+                    "PivotField.Delete returned but the field is still present in "
+                    "PivotFields; the removal is not confirmed."
+                )
+            removed = before.model_copy(
+                update={"orientation": PivotFieldOrientation.HIDDEN, "position": None},
+                deep=True,
+            )
+            return {
+                "field": removed,
+                "verified": absent,
+                "notes": notes,
+                "orientation_order": [],
+                "data_field_index": data_field_index,
+                "before": before,
+            }
+
+        try:
+            target.Orientation = code
+        except ExcelVbaMcpError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a blocked/failed write
+            raise ExcelVbaMcpError(
+                f"PivotField.Orientation could not be set for field {field!r}: "
+                f"{str(exc) or exc.__class__.__name__}",
+                code=ErrorCode.COM_BUSY,
+                context={"pivot_table": pivot_table, "field": field},
+            ) from exc
+
+        data_field_index = _data_field_index(pivot)
+        after = _field_dto(pivot, target, data_field_index, source_layout=True)
+        if orientation is PivotFieldOrientation.HIDDEN:
+            verified = _raw_position(target) is None
+        else:
+            verified = _raw_orientation(target) is orientation
+        layout_notes: list[str] = []
+        if not verified:
+            layout_notes.append(
+                "Postcondition mismatch: the re-read orientation differs from the "
+                f"request ({orientation.value!r})."
+            )
+        return {
+            "field": after,
+            "verified": verified,
+            "notes": layout_notes,
+            "orientation_order": _orientation_order(pivot, orientation),
+            "data_field_index": data_field_index,
+            "before": before,
+        }
+
+    def set_field_position(
+        self, wb: Any, pivot_table: str, field: str, position: int
+    ) -> dict[str, Any]:
+        """Set one field's 1-based position within its current orientation.
+
+        The field must already be placed in a layout bucket (``row`` /
+        ``column`` / ``page``) or be a data field; a hidden field has no
+        position and is rejected before any COM mutation. ``position`` is
+        validated against the target orientation's field count before the write,
+        so an out-of-range position never reaches Excel.
+
+        The post-mutation position is re-read and the resulting order of the
+        whole orientation is returned (``orientation_order``) so the caller can
+        verify the swap semantics (task_039 §5).
+        """
+
+        pivot = _find_pivot(wb, pivot_table)
+        _require_supported_source(pivot)
+        target, before = _resolve_source_field(pivot, field)
+        orientation = before.orientation
+        data_matches = [
+            entry
+            for entry in _data_field_entries(pivot)
+            if entry[2].strip().lower() == before.source_name.strip().lower()
+        ]
+
+        if orientation is PivotFieldOrientation.HIDDEN:
+            if not data_matches:
+                raise ExcelVbaMcpError(
+                    f"Field {field!r} is hidden and has no position to set; set its "
+                    "orientation first.",
+                    code=ErrorCode.INVALID_RANGE,
+                    context={
+                        "pivot_table": pivot_table,
+                        "field": field,
+                        "reason": "field_not_placed",
+                    },
+                )
+            orientation = PivotFieldOrientation.DATA
+
+        count = _orientation_count(pivot, orientation)
+        if count == 0 or position > count:
+            raise ExcelVbaMcpError(
+                f"Position {position} is out of range for orientation "
+                f"{orientation.value!r} ({count} field(s)).",
+                code=ErrorCode.INVALID_RANGE,
+                context={
+                    "pivot_table": pivot_table,
+                    "field": field,
+                    "orientation": orientation.value,
+                    "position": position,
+                    "count": count,
+                    "reason": "position_out_of_range",
+                },
+            )
+
+        try:
+            if orientation is PivotFieldOrientation.DATA:
+                pivot.DataFields.Item(data_matches[0][0]).Position = position
+            else:
+                target.Position = position
+        except ExcelVbaMcpError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a blocked/failed write
+            raise ExcelVbaMcpError(
+                f"PivotField.Position could not be set for field {field!r}: "
+                f"{str(exc) or exc.__class__.__name__}",
+                code=ErrorCode.COM_BUSY,
+                context={"pivot_table": pivot_table, "field": field},
+            ) from exc
+
+        after = _field_dto(
+            pivot,
+            target,
+            _data_field_index(pivot),
+            source_layout=orientation is not PivotFieldOrientation.DATA,
+        )
+        written = (
+            pivot.DataFields.Item(data_matches[0][0])
+            if orientation is PivotFieldOrientation.DATA
+            else target
+        )
+        verified = _raw_position(written) == position
+        notes: list[str] = []
+        if not verified:
+            notes.append(
+                "Postcondition mismatch: the re-read position differs from the "
+                f"request ({position})."
+            )
+        return {
+            "field": after,
+            "verified": verified,
+            "notes": notes,
+            "orientation_order": _orientation_order(pivot, orientation),
+            "data_field_index": _data_field_index(pivot),
+            "before": before,
+        }
+
+    def set_field_aggregation(
+        self,
+        wb: Any,
+        pivot_table: str,
+        field: str,
+        function: PivotAggregation,
+        *,
+        caption: str | None = None,
+    ) -> dict[str, Any]:
+        """Add or update one data field's aggregation and verify the result.
+
+        An existing data field on the same source field has its
+        ``DataFields[i].Function`` updated in place. A source field without a
+        data field is added with ``PivotTable.AddDataField`` (assigning
+        ``Orientation = xlDataField`` does **not** create one — task_039 §5).
+
+        ``caption`` identifies the data field when it is supplied; it must be
+        unique among the PivotTable's data-field captions and must not equal a
+        source field name, otherwise the request is rejected **before** COM
+        (Excel itself rejects duplicate captions). When ``caption`` is omitted
+        the single existing data field of that source is updated; zero or several
+        are rejected as an ambiguous identity.
+
+        Only the eleven accepted ``XlConsolidationFunction`` codes are accepted;
+        legacy codes (``9``, ``-4114``, ``-4153``, ``-4154``) are rejected.
+        """
+
+        pivot = _find_pivot(wb, pivot_table)
+        _require_supported_source(pivot)
+        target, info = _resolve_source_field(pivot, field)
+        code = _require_function_code(function)
+        source_name = info.source_name
+
+        entries = _data_field_entries(pivot)
+        by_caption = {entry[1].strip().lower(): entry for entry in entries}
+        by_source: dict[str, list[tuple[int, str, str]]] = {}
+        for entry in entries:
+            by_source.setdefault(entry[2].strip().lower(), []).append(entry)
+
+        target_position: int
+        if caption is not None:
+            clean_caption = caption.strip()
+            if not clean_caption:
+                raise ExcelVbaMcpError(
+                    "Argument 'caption' must be a non-empty string.",
+                    code=ErrorCode.INVALID_RANGE,
+                    context={"pivot_table": pivot_table, "reason": "empty_caption"},
+                )
+            existing = by_caption.get(clean_caption.lower())
+            if existing is not None and existing[2].strip().lower() == source_name.strip().lower():
+                target_position = existing[0]
+                try:
+                    pivot.DataFields.Item(target_position).Function = code
+                except ExcelVbaMcpError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - a blocked/failed write
+                    raise ExcelVbaMcpError(
+                        f"The data field caption {clean_caption!r} could not be "
+                        f"updated: {str(exc) or exc.__class__.__name__}",
+                        code=ErrorCode.COM_BUSY,
+                        context={"pivot_table": pivot_table, "field": field},
+                    ) from exc
+            else:
+                source_names = {name.strip().lower() for _f, name in _source_field_entries(pivot)}
+                if clean_caption.lower() in source_names:
+                    raise ExcelVbaMcpError(
+                        f"The data-field caption {clean_caption!r} duplicates a "
+                        "source field name; Excel rejects that caption.",
+                        code=ErrorCode.AMBIGUOUS_FILTER,
+                        context={
+                            "pivot_table": pivot_table,
+                            "field": field,
+                            "caption": clean_caption,
+                            "reason": "duplicate_caption",
+                        },
+                    )
+                try:
+                    pivot.AddDataField(target, clean_caption, code)
+                except ExcelVbaMcpError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - a blocked/failed add
+                    raise ExcelVbaMcpError(
+                        f"AddDataField failed for field {field!r} with caption "
+                        f"{clean_caption!r}: {str(exc) or exc.__class__.__name__}",
+                        code=ErrorCode.AMBIGUOUS_FILTER,
+                        context={
+                            "pivot_table": pivot_table,
+                            "field": field,
+                            "caption": clean_caption,
+                            "reason": "duplicate_caption",
+                        },
+                    ) from exc
+                new_entries = _data_field_entries(pivot)
+                created = [
+                    entry
+                    for entry in new_entries
+                    if entry[1].strip().lower() == clean_caption.lower()
+                ]
+                if not created:
+                    raise ExcelVbaMcpError(
+                        "AddDataField returned but no data field with the requested "
+                        "caption exists; the aggregation is not confirmed.",
+                        code=ErrorCode.AMBIGUOUS_FILTER,
+                        context={
+                            "pivot_table": pivot_table,
+                            "field": field,
+                            "caption": clean_caption,
+                            "reason": "postcondition_mismatch",
+                        },
+                    )
+                target_position = created[0][0]
+        else:
+            positions = by_source.get(source_name.strip().lower(), [])
+            if len(positions) != 1:
+                raise ExcelVbaMcpError(
+                    f"Field {field!r} resolves to {len(positions)} data field(s); "
+                    "supply 'caption' to identify the data field.",
+                    code=ErrorCode.AMBIGUOUS_FILTER,
+                    context={
+                        "pivot_table": pivot_table,
+                        "field": field,
+                        "data_field_count": len(positions),
+                        "reason": "ambiguous_data_field",
+                    },
+                )
+            target_position = positions[0][0]
+            try:
+                pivot.DataFields.Item(target_position).Function = code
+            except ExcelVbaMcpError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a blocked/failed write
+                raise ExcelVbaMcpError(
+                    f"The data field {target_position} Function could not be set: "
+                    f"{str(exc) or exc.__class__.__name__}",
+                    code=ErrorCode.COM_BUSY,
+                    context={"pivot_table": pivot_table, "field": field},
+                ) from exc
+
+        final_entries = _data_field_entries(pivot)
+        final = next((entry for entry in final_entries if entry[0] == target_position), None)
+        verified = final is not None
+        notes: list[str] = []
+        if final is None:
+            notes.append(
+                "Postcondition mismatch: the data field disappeared after the aggregation change."
+            )
+        else:
+            final_function = _get_int(pivot.DataFields.Item(target_position), "Function")
+            if final_function != code:
+                notes.append(
+                    "Postcondition mismatch: the re-read Function differs from the "
+                    "requested aggregation."
+                )
+        after = _describe_field(pivot, target, _data_field_index(pivot))
+        return {
+            "field": after,
+            "verified": verified and not notes,
+            "notes": notes,
+            "orientation_order": _orientation_order(pivot, PivotFieldOrientation.DATA),
+            "data_field_index": _data_field_index(pivot),
+            "before": info,
+        }
+
+    def set_field_properties(
+        self, wb: Any, pivot_table: str, field: str, properties: PivotFieldProperties
+    ) -> dict[str, Any]:
+        """Set bounded PivotField properties and verify the targeted ones.
+
+        The sparse patch is validated before any COM mutation (an empty patch,
+        a blank caption or number format, or a caption that duplicates another
+        data-field caption leaves the workbook untouched). Only the properties
+        the caller explicitly set are written:
+
+        * ``caption`` / ``number_format`` target the **data field** (a source
+          field without a data field is rejected — task_039 §5);
+        * ``show_all_items`` targets the source ``PivotField`` itself.
+
+        Each targeted property is re-read after the write; a mismatch is
+        reported through ``verified=False`` and ``notes`` rather than claimed as
+        success.
+        """
+
+        pivot = _find_pivot(wb, pivot_table)
+        _require_supported_source(pivot)
+        applied = validate_field_properties(properties)
+        target, info = _resolve_field_target(pivot, field)
+
+        needs_data_field = bool({"caption", "number_format"} & set(applied))
+        data_position: int | None = None
+        if needs_data_field:
+            if not info.is_data_field:
+                raise ExcelVbaMcpError(
+                    f"Field {field!r} is not a data field; 'caption' and "
+                    "'number_format' apply to data fields only (add it with "
+                    "pivot_field_set_aggregation first).",
+                    code=ErrorCode.INVALID_RANGE,
+                    context={
+                        "pivot_table": pivot_table,
+                        "field": field,
+                        "reason": "not_a_data_field",
+                    },
+                )
+            matches = [
+                entry
+                for entry in _data_field_entries(pivot)
+                if entry[2].strip().lower() == info.source_name.strip().lower()
+            ]
+            if len(matches) != 1:
+                raise ExcelVbaMcpError(
+                    f"Field {field!r} resolves to {len(matches)} data field(s); "
+                    "identify the data field by its caption.",
+                    code=ErrorCode.AMBIGUOUS_FILTER,
+                    context={
+                        "pivot_table": pivot_table,
+                        "field": field,
+                        "data_field_count": len(matches),
+                        "reason": "ambiguous_data_field",
+                    },
+                )
+            data_position = matches[0][0]
+
+        if "caption" in applied:
+            new_caption = str(properties.caption).strip()
+            duplicate = any(
+                entry[0] != data_position and entry[1].strip().lower() == new_caption.lower()
+                for entry in _data_field_entries(pivot)
+            )
+            if duplicate:
+                raise ExcelVbaMcpError(
+                    f"The data-field caption {new_caption!r} duplicates another "
+                    "data-field caption.",
+                    code=ErrorCode.AMBIGUOUS_FILTER,
+                    context={
+                        "pivot_table": pivot_table,
+                        "field": field,
+                        "caption": new_caption,
+                        "reason": "duplicate_caption",
+                    },
+                )
+
+        if "caption" in applied and data_position is not None:
+            _write_data_field_property(
+                pivot, data_position, "Caption", str(properties.caption).strip(), pivot_table
+            )
+        if "number_format" in applied and data_position is not None:
+            _write_data_field_property(
+                pivot,
+                data_position,
+                "NumberFormat",
+                str(properties.number_format),
+                pivot_table,
+            )
+        if "show_all_items" in applied:
+            try:
+                target.ShowAllItems = bool(properties.show_all_items)
+            except ExcelVbaMcpError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a blocked/failed write
+                raise ExcelVbaMcpError(
+                    f"PivotField.ShowAllItems could not be set for field {field!r}: "
+                    f"{str(exc) or exc.__class__.__name__}",
+                    code=ErrorCode.COM_BUSY,
+                    context={"pivot_table": pivot_table, "field": field},
+                ) from exc
+
+        final_data_field_index = _data_field_index(pivot)
+        after = _describe_field(pivot, target, final_data_field_index)
+        notes: list[str] = []
+        if "caption" in applied and after.data_field_name != str(properties.caption).strip():
+            notes.append(
+                "Postcondition mismatch: the re-read data-field caption differs from the request."
+            )
+        if "number_format" in applied and after.number_format != str(properties.number_format):
+            notes.append(
+                "Postcondition mismatch: the re-read number format differs from the request."
+            )
+        if "show_all_items" in applied and after.show_all_items != bool(properties.show_all_items):
+            notes.append(
+                "Postcondition mismatch: the re-read ShowAllItems differs from the request."
+            )
+        return {
+            "field": after,
+            "verified": not notes,
+            "notes": notes,
+            "orientation_order": _orientation_order(pivot, after.orientation),
+            "data_field_index": final_data_field_index,
+            "before": info,
+        }
 
     # ------------------------------------------------------------------
     # Internal helpers

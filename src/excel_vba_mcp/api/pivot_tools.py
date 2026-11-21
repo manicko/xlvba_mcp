@@ -3,11 +3,13 @@
 This module defines the **signatures, Pydantic DTOs and docstrings** for the
 Phase 2 PivotTables surface. The read-only inventory tools
 (``pivot_tables_list``, ``pivot_table_get``, ``pivot_cache_get``,
-``pivot_fields_list``) are implemented by ``task_048`` and the targeted refresh
-tools (``pivot_table_refresh``, ``pivot_cache_refresh``) by ``task_049``; both
-delegate to :class:`~excel_vba_mcp.application.pivot_tables_service.PivotTablesService`.
-The remaining mutating tools (layout / aggregation / filters) stay frozen
-contract stubs implemented by ``task_050``–``task_051`` and raise
+``pivot_fields_list``) are implemented by ``task_048``, the targeted refresh
+tools (``pivot_table_refresh``, ``pivot_cache_refresh``) by ``task_049`` and the
+PivotField configuration tools (``pivot_field_set_layout``,
+``pivot_field_set_position``, ``pivot_field_set_aggregation``,
+``pivot_field_set_properties``) by ``task_050``; all of them delegate to
+:class:`~excel_vba_mcp.application.pivot_tables_service.PivotTablesService`.
+The filter tools stay frozen contract stubs implemented by ``task_051`` and raise
 :class:`NotImplementedError`.
 
 It imports **no Excel/COM** — only domain DTOs; all Excel access happens on the
@@ -17,21 +19,21 @@ Tool groups:
 
 * Read-only (no snapshot/approval): ``pivot_tables_list``, ``pivot_table_get``,
   ``pivot_cache_get``, ``pivot_fields_list``, ``pivot_field_get_filters``.
-* Mutating (snapshot + approval + audit + postcondition): ``pivot_table_refresh``,
-  ``pivot_cache_refresh`` (task_049), ``pivot_field_set_layout``,
-  ``pivot_field_set_position``, ``pivot_field_set_aggregation``,
-  ``pivot_field_set_properties``, ``pivot_field_apply_filter``,
-  ``pivot_field_clear_filters``.
+* Mutating (writable + snapshot + approval + audit + postcondition):
+  ``pivot_table_refresh``, ``pivot_cache_refresh`` (task_049),
+  ``pivot_field_set_layout``, ``pivot_field_set_position``,
+  ``pivot_field_set_aggregation``, ``pivot_field_set_properties`` (task_050),
+  ``pivot_field_apply_filter``, ``pivot_field_clear_filters`` (task_051).
 
 Only worksheet/Table-backed caches (``SourceType == database``) are supported;
 external, OLAP and Data Model sources are reported as ``unsupported_source`` and
-never refreshed. ``Workbook.RefreshAll`` is never used.
+never refreshed or reconfigured. ``Workbook.RefreshAll`` is never used.
 """
 
 from __future__ import annotations
 
 from excel_vba_mcp.application.pivot_tables_service import PivotTablesService
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
     PivotCacheInfo,
     PivotFieldFilters,
@@ -104,6 +106,69 @@ def _require_int(value: object, field: str, *, minimum: int | None = None) -> in
             context={"field": field, "value": value},
         )
     return value
+
+
+def _require_orientation(value: object) -> PivotFieldOrientation:
+    """Validate a target orientation (accepts the enum or its string name)."""
+
+    if isinstance(value, PivotFieldOrientation):
+        return value
+    if isinstance(value, str):
+        try:
+            return PivotFieldOrientation(value.strip().lower())
+        except ValueError as exc:
+            raise ExcelVbaMcpError(
+                f"Argument 'orientation' {value!r} is not a valid orientation; use "
+                "one of 'hidden', 'row', 'column', 'page' or 'data'.",
+                code=ErrorCode.INVALID_RANGE,
+                context={
+                    "orientation": value,
+                    "accepted": [member.value for member in PivotFieldOrientation],
+                    "reason": "invalid_orientation",
+                },
+            ) from exc
+    raise ExcelVbaMcpError(
+        f"Argument 'orientation' must be a PivotFieldOrientation or its string "
+        f"name, got {value!r}.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"orientation": repr(value), "reason": "invalid_orientation"},
+    )
+
+
+def _require_aggregation(value: object) -> PivotAggregation:
+    """Validate an aggregation (accepts the enum or its string name).
+
+    Legacy integer codes (``9``, ``-4114``, ``-4153``, ``-4154``) are refused
+    here: the accepted vocabulary is the eleven :class:`PivotAggregation` members.
+    """
+
+    if isinstance(value, PivotAggregation):
+        return value
+    if isinstance(value, str):
+        try:
+            return PivotAggregation(value.strip().lower())
+        except ValueError as exc:
+            raise ExcelVbaMcpError(
+                f"Argument 'function' {value!r} is not an accepted aggregation; use "
+                f"one of {[member.value for member in PivotAggregation]}. Legacy "
+                "codes (9, -4114, -4153, -4154) are rejected.",
+                code=ErrorCode.INVALID_RANGE,
+                context={
+                    "function": value,
+                    "accepted": [member.value for member in PivotAggregation],
+                    "reason": "invalid_function",
+                },
+            ) from exc
+    raise ExcelVbaMcpError(
+        f"Argument 'function' must be a PivotAggregation or its string name, got "
+        f"{value!r}. Legacy codes (9, -4114, -4153, -4154) are rejected.",
+        code=ErrorCode.INVALID_RANGE,
+        context={
+            "function": repr(value),
+            "accepted": [member.value for member in PivotAggregation],
+            "reason": "invalid_function",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -227,21 +292,43 @@ async def pivot_field_set_layout(
     pivot_table: str,
     field: str,
     orientation: PivotFieldOrientation,
+    *,
+    delete: bool = False,
 ) -> PivotFieldInfo:
-    """Set a field's orientation (hidden/row/column/page).
+    """Set a field's orientation (hidden/row/column/page), or remove it.
 
-    Moving a field into the data area is ``AddDataField``, not ``xlDataField``;
-    only the layout buckets (hidden/row/column/page) are set through orientation.
+    Moving a field into the data area is ``AddDataField``, not ``xlDataField``:
+    ``orientation="data"`` is rejected here and the caller is pointed at
+    ``pivot_field_set_aggregation``. Removal is explicit:
+
+    * ``orientation="hidden"`` (default) removes the field from the layout
+      **non-destructively** (``PivotField.Orientation = 0``); the field and its
+      items/filter state stay in the PivotTable.
+    * ``orientation="hidden"`` with ``delete=True`` removes it **destructively**
+      (``PivotField.Delete``).
+
     Guarded mutation: writable session + snapshot + approval + postcondition.
+    The returned :class:`PivotFieldInfo` is the post-mutation state re-read from
+    the PivotTable (for a destructive removal, the last-known state).
 
     Args:
         workbook_id: The id returned by ``excel_open``.
         pivot_table: The stable PivotTable ``Name``.
         field: The field ``SourceName``.
-        orientation: The target orientation bucket.
+        orientation: The target orientation bucket (hidden/row/column/page).
+        delete: ``True`` for the destructive ``PivotField.Delete`` removal;
+            requires ``orientation="hidden"``. ``False`` (default) is the
+            non-destructive ``Orientation = 0``.
     """
 
-    raise _not_implemented("pivot_field_set_layout")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(pivot_table, "pivot_table")
+    _require_non_empty(field, "field")
+    normalized = _require_orientation(orientation)
+    service = get_pivot_tables_service()
+    return await service.set_pivot_field_layout(
+        workbook_id, pivot_table, field, normalized, delete=delete
+    )
 
 
 async def pivot_field_set_position(
@@ -252,16 +339,24 @@ async def pivot_field_set_position(
 ) -> PivotFieldInfo:
     """Set a field's 1-based position within its current orientation.
 
-    Out-of-range positions are rejected before mutation. Guarded mutation.
+    Out-of-range positions and hidden (unplaced) fields are rejected before any
+    COM mutation. The returned :class:`PivotFieldInfo` is the post-mutation state
+    re-read from the PivotTable; the resulting orientation order is recorded in
+    the audit entry. Guarded mutation.
 
     Args:
         workbook_id: The id returned by ``excel_open``.
         pivot_table: The stable PivotTable ``Name``.
-        field: The field ``SourceName``.
+        field: The field ``SourceName`` (or a data field's caption).
         position: The new 1-based position within the orientation.
     """
 
-    raise _not_implemented("pivot_field_set_position")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(pivot_table, "pivot_table")
+    _require_non_empty(field, "field")
+    _require_int(position, "position", minimum=1)
+    service = get_pivot_tables_service()
+    return await service.set_pivot_field_position(workbook_id, pivot_table, field, position)
 
 
 async def pivot_field_set_aggregation(
@@ -274,8 +369,13 @@ async def pivot_field_set_aggregation(
 ) -> PivotFieldInfo:
     """Add/update a data field's aggregation via ``AddDataField``/``Function``.
 
-    ``caption`` must be unique when supplied (duplicates are rejected by Excel).
-    Only the eleven accepted aggregation codes are allowed. Guarded mutation.
+    Only the eleven accepted aggregation codes are allowed; legacy codes
+    (``9``, ``-4114``, ``-4153``, ``-4154``) are rejected. ``caption`` must be
+    unique when supplied (duplicates are rejected by Excel and pre-validated
+    here). An existing data field on the same source field is updated in place;
+    a source field without a data field is added with ``AddDataField``
+    (assigning ``Orientation = xlDataField`` does not create one). Guarded
+    mutation.
 
     Args:
         workbook_id: The id returned by ``excel_open``.
@@ -285,7 +385,16 @@ async def pivot_field_set_aggregation(
         caption: Optional unique data-field caption.
     """
 
-    raise _not_implemented("pivot_field_set_aggregation")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(pivot_table, "pivot_table")
+    _require_non_empty(field, "field")
+    _require_aggregation(function)
+    if caption is not None:
+        _require_non_empty(caption, "caption")
+    service = get_pivot_tables_service()
+    return await service.set_pivot_field_aggregation(
+        workbook_id, pivot_table, field, function, caption=caption
+    )
 
 
 async def pivot_field_set_properties(
@@ -296,7 +405,12 @@ async def pivot_field_set_properties(
 ) -> PivotFieldInfo:
     """Set bounded PivotField properties (caption/number format/show-all-items).
 
-    Guarded mutation: writable session + snapshot + approval + postcondition.
+    Only the properties explicitly set on ``properties`` are written;
+    ``caption`` / ``number_format`` target the data field (a source field without
+    one is rejected) and ``show_all_items`` targets the source ``PivotField``.
+    An empty patch, a blank caption/number format or a duplicate caption is
+    rejected before any COM mutation. Guarded mutation: writable session +
+    snapshot + approval + postcondition.
 
     Args:
         workbook_id: The id returned by ``excel_open``.
@@ -305,7 +419,16 @@ async def pivot_field_set_properties(
         properties: The sparse property update (:class:`PivotFieldProperties`).
     """
 
-    raise _not_implemented("pivot_field_set_properties")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(pivot_table, "pivot_table")
+    _require_non_empty(field, "field")
+    if not isinstance(properties, PivotFieldProperties):
+        raise ExcelVbaMcpError(
+            "Argument 'properties' must be a PivotFieldProperties patch.",
+            context={"properties": repr(properties)},
+        )
+    service = get_pivot_tables_service()
+    return await service.set_pivot_field_properties(workbook_id, pivot_table, field, properties)
 
 
 async def pivot_field_apply_filter(

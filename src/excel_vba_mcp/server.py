@@ -65,6 +65,10 @@ from excel_vba_mcp.api.name_tools import (
 from excel_vba_mcp.api.pivot_tools import (
     pivot_cache_get,
     pivot_cache_refresh,
+    pivot_field_set_aggregation,
+    pivot_field_set_layout,
+    pivot_field_set_position,
+    pivot_field_set_properties,
     pivot_fields_list,
     pivot_table_get,
     pivot_table_refresh,
@@ -576,6 +580,51 @@ _DESC_PIVOT_CACHE_REFRESH = (
     "connections/queries. Guarded mutation: writable session + snapshot + "
     "approval + audit."
 )
+_DESC_PIVOT_FIELD_SET_LAYOUT = (
+    "Set one PivotField's orientation bucket (hidden/row/column/page), or "
+    "remove it. orientation='data' is rejected: assigning xlDataField does not "
+    "create a data field, so use pivot_field_set_aggregation "
+    "(PivotTable.AddDataField) for the data area. Removal is explicit: "
+    "orientation='hidden' (default) is the non-destructive "
+    "PivotField.Orientation=0 (the field and its items/filter state stay), "
+    "while orientation='hidden' with delete=true is the destructive "
+    "PivotField.Delete. External/OLAP/Data Model sources are rejected with "
+    "unsupported_source. The returned PivotFieldInfo is the post-mutation state "
+    "re-read from the PivotTable. Guarded mutation: writable session + snapshot "
+    "+ approval + audit + postcondition."
+)
+_DESC_PIVOT_FIELD_SET_POSITION = (
+    "Set one PivotField's 1-based position within its current orientation "
+    "(row/column/page/data). Out-of-range positions and hidden (unplaced) "
+    "fields are rejected before any COM mutation; the resulting orientation "
+    "order is recorded in the audit entry. External/OLAP/Data Model sources are "
+    "rejected with unsupported_source. The returned PivotFieldInfo is the "
+    "post-mutation state re-read from the PivotTable. Guarded mutation: "
+    "writable session + snapshot + approval + audit + postcondition."
+)
+_DESC_PIVOT_FIELD_SET_AGGREGATION = (
+    "Add or update one data field's aggregation. An existing data field on the "
+    "same source field is updated in place (DataFields[i].Function); a source "
+    "field without a data field is added with PivotTable.AddDataField "
+    "(assigning Orientation=xlDataField does not create one). Only the eleven "
+    "accepted aggregation codes are allowed; legacy codes (9, -4114, -4153, "
+    "-4154) are rejected. caption must be unique when supplied (duplicates are "
+    "pre-validated here and rejected by Excel). External/OLAP/Data Model "
+    "sources are rejected with unsupported_source. The returned PivotFieldInfo "
+    "is the post-mutation state re-read from the PivotTable. Guarded mutation: "
+    "writable session + snapshot + approval + audit + postcondition."
+)
+_DESC_PIVOT_FIELD_SET_PROPERTIES = (
+    "Set bounded PivotField properties (caption / number_format / "
+    "show_all_items). Only the properties explicitly set on the patch are "
+    "written: caption and number_format target the data field (a source field "
+    "without one is rejected) and show_all_items targets the source PivotField. "
+    "An empty patch, a blank caption/number format or a duplicate caption is "
+    "rejected before any COM mutation. External/OLAP/Data Model sources are "
+    "rejected with unsupported_source. The returned PivotFieldInfo is the "
+    "post-mutation state re-read from the PivotTable. Guarded mutation: "
+    "writable session + snapshot + approval + audit + postcondition."
+)
 
 # Read-only MCP resource descriptions (spec §6.6). The URIs are per-workbook
 # templates so a client can read the model / VBA inventory / one component's
@@ -974,6 +1023,26 @@ def _register_tools(server: MCPServer) -> None:
         pivot_cache_refresh,
         name="pivot_cache_refresh",
         description=_DESC_PIVOT_CACHE_REFRESH,
+    )
+    server.add_tool(
+        pivot_field_set_layout,
+        name="pivot_field_set_layout",
+        description=_DESC_PIVOT_FIELD_SET_LAYOUT,
+    )
+    server.add_tool(
+        pivot_field_set_position,
+        name="pivot_field_set_position",
+        description=_DESC_PIVOT_FIELD_SET_POSITION,
+    )
+    server.add_tool(
+        pivot_field_set_aggregation,
+        name="pivot_field_set_aggregation",
+        description=_DESC_PIVOT_FIELD_SET_AGGREGATION,
+    )
+    server.add_tool(
+        pivot_field_set_properties,
+        name="pivot_field_set_properties",
+        description=_DESC_PIVOT_FIELD_SET_PROPERTIES,
     )
     server.add_tool(range_get, name="range_get", description=_DESC_RANGE_GET)
     server.add_tool(
