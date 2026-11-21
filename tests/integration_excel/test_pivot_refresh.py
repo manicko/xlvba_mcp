@@ -24,6 +24,12 @@ fixture. They assert:
 Excel is created with ``DispatchEx`` and always ``Visible = False``; no
 ``.Activate`` / ``.Select`` is ever called.
 
+task_052 adds independent acceptance coverage to this module: the refreshed
+result range is re-read from Excel (address, shape and a changed source value),
+a targeted ``ptC`` refresh is shown to leave cache 1 untouched, the public
+``pivot_tools`` layer is checked, and a real consolidation-sourced cache is
+rejected with ``UNSUPPORTED_PIVOT_SOURCE`` for the cache-scoped entry point.
+
 Run serially (no xdist)::
 
     uv run pytest tests/integration_excel/test_pivot_refresh.py -v -s
@@ -59,6 +65,7 @@ except Exception:  # noqa: BLE001 - optional dependency probe
 
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
+from excel_vba_mcp.api import pivot_tools
 from excel_vba_mcp.application.pivot_tables_service import PivotTablesService
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
@@ -68,6 +75,7 @@ from excel_vba_mcp.domain.statuses import (
     OperationClass,
     PivotRefreshMethod,
     PivotRefreshStatus,
+    PivotSourceType,
     SessionMode,
     WorkbookSessionState,
 )
@@ -532,3 +540,365 @@ async def test_owned_excel_reaped_after_shutdown() -> None:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
     assert _wait_pid_gone(owned_pid), f"owned PID {owned_pid} still alive after shutdown"
+
+
+# ---------------------------------------------------------------------------
+# STA-local readers (independent evidence from the live Excel object model)
+# ---------------------------------------------------------------------------
+async def _read_pivot_body(rig: Rig, pivot_table: str) -> dict[str, Any]:
+    """Read ``DataBodyRange`` geometry and the grand-total cell from Excel."""
+
+    def read() -> dict[str, Any]:
+        app = rig.app.app
+        assert app is not None
+        target = pivot_table.strip().lower()
+        for workbook in app.Workbooks:
+            for sheet in workbook.Worksheets:
+                try:
+                    pivots = sheet.PivotTables()
+                    count = int(pivots.Count)
+                except Exception:  # noqa: BLE001 - sheet without PivotTables
+                    continue
+                for index in range(1, count + 1):
+                    pivot = pivots.Item(index)
+                    if str(pivot.Name).lower() != target:
+                        continue
+                    body = pivot.DataBodyRange
+                    rows = int(body.Rows.Count)
+                    cols = int(body.Columns.Count)
+                    return {
+                        "address": str(body.Address),
+                        "rows": rows,
+                        "cols": cols,
+                        "grand_total": body.Cells(rows, cols).Value,
+                        "sales_total": _sales_grand_total(pivot),
+                        "refresh_date": str(pivot.RefreshDate),
+                    }
+        raise AssertionError(f"pivot {pivot_table!r} not found")
+
+    read.__name__ = "read_pivot_body"
+    return dict(
+        await rig.worker.submit(
+            read,
+            timeout=_TEST_TIMEOUT_S,
+            section="diagnostic",
+            op_class=OperationClass.READ_ONLY,
+        )
+    )
+
+
+def _sales_grand_total(pivot: Any) -> Any:
+    """Return the "Total Sum of Sales" row's grand-total cell (STA-local).
+
+    ``ptA`` stacks two data fields vertically, so the bottom-right body cell is
+    the *average* total. The Sales total is the last column of the
+    ``Total Sum of Sales`` row; ``None`` when the label is absent.
+    """
+
+    table = pivot.TableRange1
+    rows = int(table.Rows.Count)
+    cols = int(table.Columns.Count)
+    for row in range(1, rows + 1):
+        label = table.Cells(row, 1).Value
+        if isinstance(label, str) and label.startswith("Total Sum of Sales"):
+            return table.Cells(row, cols).Value
+    return None
+
+
+async def _read_cache_refresh_date(rig: Rig, pivot_table: str) -> datetime:
+    """Read the owning cache's ``RefreshDate`` through a PivotTable name.
+
+    The cache index is deliberately *not* used: Excel renumbers
+    ``PivotCaches`` after a refresh (the refreshed cache moves to the end of the
+    collection), so post-refresh reads must resolve the cache by PivotTable name.
+    """
+
+    def read() -> str:
+        app = rig.app.app
+        assert app is not None
+        target = pivot_table.strip().lower()
+        for workbook in app.Workbooks:
+            for sheet in workbook.Worksheets:
+                try:
+                    pivots = sheet.PivotTables()
+                    count = int(pivots.Count)
+                except Exception:  # noqa: BLE001 - sheet without PivotTables
+                    continue
+                for index in range(1, count + 1):
+                    pivot = pivots.Item(index)
+                    if str(pivot.Name).lower() == target:
+                        return str(pivot.PivotCache().RefreshDate)
+        raise AssertionError(f"pivot {pivot_table!r} not found")
+
+    read.__name__ = "read_cache_refresh_date"
+    payload = await rig.worker.submit(
+        read,
+        timeout=_TEST_TIMEOUT_S,
+        section="diagnostic",
+        op_class=OperationClass.READ_ONLY,
+    )
+    return datetime.fromisoformat(payload)
+
+
+async def _replace_source_sales(rig: Rig, value: float) -> float:
+    """Write ``Data!D2`` (the first Sales value) and return the previous value."""
+
+    def write() -> float:
+        app = rig.app.app
+        assert app is not None
+        workbook = app.Workbooks(1)
+        sheet = workbook.Worksheets("Data")
+        previous = float(sheet.Range("D2").Value)
+        sheet.Range("D2").Value = value
+        return previous
+
+    write.__name__ = "replace_source_sales"
+    return float(
+        await rig.worker.submit(
+            write,
+            timeout=_TEST_TIMEOUT_S,
+            section="diagnostic",
+            op_class=OperationClass.MUTATING,
+        )
+    )
+
+
+async def _build_consolidation_pivot(rig: Rig) -> dict[str, Any]:
+    """Add a consolidation-sourced PivotTable to the open working copy (STA)."""
+
+    def build() -> dict[str, Any]:
+        app = rig.app.app
+        assert app is not None
+        workbook = app.Workbooks(1)
+        sheet = workbook.Worksheets.Add(After=workbook.Worksheets(workbook.Worksheets.Count))
+        sheet.Name = "Unsupported"
+        cache = workbook.PivotCaches().Create(3, ("Data!R1C1:R7C2",))
+        pivot = cache.CreatePivotTable(
+            TableDestination=sheet.Range("B3"), TableName="ptConsolidated"
+        )
+        return {
+            "name": str(pivot.Name),
+            "cache_index": int(pivot.CacheIndex),
+            "source_type": int(pivot.PivotCache().SourceType),
+        }
+
+    build.__name__ = "build_consolidation_pivot"
+    return dict(
+        await rig.worker.submit(
+            build,
+            timeout=_TEST_TIMEOUT_S,
+            section="diagnostic",
+            op_class=OperationClass.MUTATING,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# 1. RefreshTable: truth signal + advanced RefreshDate + result range
+# ---------------------------------------------------------------------------
+@requires_excel
+async def test_refresh_table_advances_refresh_date_and_keeps_result_range(rig: Rig) -> None:
+    info = await rig.open_for_refresh()
+    await rig.snapshot.create_snapshot(info.workbook_id)
+    wid = info.workbook_id
+
+    before = await rig.pivots.get_pivot_table(wid, "ptA")
+    body_before = await _read_pivot_body(rig, "ptA")
+
+    result = await rig.pivots.refresh_pivot_table(wid, "ptA")
+
+    assert isinstance(result, PivotRefreshResult)
+    assert result.method is PivotRefreshMethod.REFRESH_TABLE
+    assert result.status is PivotRefreshStatus.REFRESHED
+    assert result.refreshed is True
+    assert result.refresh_return is True
+    assert result.cache_index == 1
+    assert sorted(result.affected_pivot_tables) == ["ptA", "ptB"]
+    assert result.duration_ms is not None
+    assert result.duration_ms >= 0
+
+    # The success signal is Excel's own RefreshDate, not "no exception".
+    assert result.refresh_date_before is not None
+    assert result.refresh_date_after is not None
+    assert result.refresh_date_after > result.refresh_date_before
+
+    after = await rig.pivots.get_pivot_table(wid, "ptA")
+    assert before.refresh_date is not None
+    assert after.refresh_date is not None
+    assert after.refresh_date > before.refresh_date
+
+    # The result range keeps its address/shape and its values (no source change).
+    body_after = await _read_pivot_body(rig, "ptA")
+    assert body_after["address"] == body_before["address"] == "$C$5:$F$14"
+    assert (body_after["rows"], body_after["cols"]) == (body_before["rows"], body_before["cols"])
+    assert body_after["grand_total"] == pytest.approx(body_before["grand_total"])
+    assert body_after["sales_total"] == pytest.approx(body_before["sales_total"])
+
+    # A sibling table on the same cache keeps its own (unchanged) result range.
+    sibling = await _read_pivot_body(rig, "ptB")
+    assert sibling["address"] == "$K$5:$K$8"
+    assert sibling["grand_total"] == pytest.approx(24.0)
+
+    await rig.session.close_workbook(wid)
+
+
+# ---------------------------------------------------------------------------
+# 2. RefreshTable re-reads changed source data into the result range
+# ---------------------------------------------------------------------------
+@requires_excel
+async def test_refresh_reflects_new_source_values_in_the_result_range(rig: Rig) -> None:
+    info = await rig.open_for_refresh()
+    await rig.snapshot.create_snapshot(info.workbook_id)
+    wid = info.workbook_id
+
+    body_before = await _read_pivot_body(rig, "ptA")
+    assert body_before["sales_total"] == pytest.approx(1350.0)
+    previous = await _replace_source_sales(rig, 200.0)
+    assert previous == pytest.approx(100.0)
+
+    # Without a refresh the pivot output is stale.
+    stale = await _read_pivot_body(rig, "ptA")
+    assert stale["sales_total"] == pytest.approx(body_before["sales_total"])
+
+    result = await rig.pivots.refresh_pivot_table(wid, "ptA")
+    assert result.status is PivotRefreshStatus.REFRESHED
+    assert sorted(result.affected_pivot_tables) == ["ptA", "ptB"]
+
+    body_after = await _read_pivot_body(rig, "ptA")
+    assert body_after["address"] == body_before["address"]
+    assert (body_after["rows"], body_after["cols"]) == (body_before["rows"], body_before["cols"])
+    # The North/Alpha Sales row grew by 100, so the Sales grand total grows by 100.
+    assert body_after["sales_total"] == pytest.approx(body_before["sales_total"] + 100.0)
+    # The average data field is unaffected, so the bottom-right body cell is not.
+    assert body_after["grand_total"] == pytest.approx(body_before["grand_total"])
+
+    # The sibling table's own data field (Sum of Units) is unaffected.
+    sibling = await _read_pivot_body(rig, "ptB")
+    assert sibling["grand_total"] == pytest.approx(24.0)
+
+    await rig.session.close_workbook(wid)
+
+
+# ---------------------------------------------------------------------------
+# 3. RefreshCache: shared cache reports both tables and advances RefreshDate
+# ---------------------------------------------------------------------------
+@requires_excel
+async def test_refresh_cache_refreshes_shared_cache_and_advances_date(rig: Rig) -> None:
+    info = await rig.open_for_refresh()
+    await rig.snapshot.create_snapshot(info.workbook_id)
+    wid = info.workbook_id
+
+    cache_before = await rig.pivots.get_pivot_cache(wid, 1)
+    refresh_date_before = await _read_cache_refresh_date(rig, "ptA")
+
+    result = await rig.pivots.refresh_pivot_cache(wid, 1)
+
+    assert result.method is PivotRefreshMethod.REFRESH_CACHE
+    assert result.status is PivotRefreshStatus.REFRESHED
+    assert result.refreshed is True
+    assert result.refresh_return is None  # PivotCache.Refresh returns no Boolean
+    assert result.cache_index == 1
+    assert sorted(result.affected_pivot_tables) == ["ptA", "ptB"]
+
+    # Read the refreshed cache back by PivotTable name: Excel renumbers the
+    # PivotCaches collection after a refresh, so index 1 no longer identifies
+    # the same cache.
+    refresh_date_after = await _read_cache_refresh_date(rig, "ptA")
+    assert cache_before.refresh_date is not None
+    assert refresh_date_after > refresh_date_before
+    # The refreshed cache really is the one ptA/ptB share (not ptC's cache).
+    assert await _read_cache_refresh_date(rig, "ptB") == refresh_date_after
+
+    await rig.session.close_workbook(wid)
+
+
+# ---------------------------------------------------------------------------
+# 4. RefreshTable is targeted: refreshing ptC leaves cache 1 untouched
+# ---------------------------------------------------------------------------
+@requires_excel
+async def test_refresh_listobject_cache_is_targeted(rig: Rig) -> None:
+    info = await rig.open_for_refresh()
+    await rig.snapshot.create_snapshot(info.workbook_id)
+    wid = info.workbook_id
+
+    pta_before = await rig.pivots.get_pivot_table(wid, "ptA")
+    ptb_before = await rig.pivots.get_pivot_table(wid, "ptB")
+    ptc_before = await rig.pivots.get_pivot_table(wid, "ptC")
+
+    result = await rig.pivots.refresh_pivot_table(wid, "ptC")
+
+    assert result.method is PivotRefreshMethod.REFRESH_TABLE
+    assert result.status is PivotRefreshStatus.REFRESHED
+    assert result.cache_index == 2
+    assert result.affected_pivot_tables == ["ptC"]
+
+    ptc_after = await rig.pivots.get_pivot_table(wid, "ptC")
+    assert ptc_before.refresh_date is not None
+    assert ptc_after.refresh_date is not None
+    assert ptc_after.refresh_date > ptc_before.refresh_date
+
+    # Cache 1 (ptA/ptB) was not refreshed by the targeted ptC call.
+    pta_after = await rig.pivots.get_pivot_table(wid, "ptA")
+    ptb_after = await rig.pivots.get_pivot_table(wid, "ptB")
+    assert pta_after.refresh_date == pta_before.refresh_date
+    assert ptb_after.refresh_date == ptb_before.refresh_date
+
+    await rig.session.close_workbook(wid)
+
+
+# ---------------------------------------------------------------------------
+# 5. Public tool layer reports the same refresh result
+# ---------------------------------------------------------------------------
+@requires_excel
+async def test_api_tools_refresh_reports_the_same_result(rig: Rig) -> None:
+    info = await rig.open_for_refresh()
+    await rig.snapshot.create_snapshot(info.workbook_id)
+    wid = info.workbook_id
+
+    pivot_tools.set_pivot_tables_service(rig.pivots)
+    try:
+        # Cache 1 is refreshed first: a refresh renumbers the PivotCaches
+        # collection, so the table-scoped call below must resolve ptC by name.
+        cache_result = await pivot_tools.pivot_cache_refresh(wid, 1)
+        table_result = await pivot_tools.pivot_table_refresh(wid, "ptC")
+    finally:
+        pivot_tools.set_pivot_tables_service(None)
+
+    assert isinstance(cache_result, PivotRefreshResult)
+    assert cache_result.status is PivotRefreshStatus.REFRESHED
+    assert cache_result.method is PivotRefreshMethod.REFRESH_CACHE
+    assert cache_result.cache_index == 1
+    assert sorted(cache_result.affected_pivot_tables) == ["ptA", "ptB"]
+
+    assert isinstance(table_result, PivotRefreshResult)
+    assert table_result.status is PivotRefreshStatus.REFRESHED
+    assert table_result.method is PivotRefreshMethod.REFRESH_TABLE
+    assert table_result.affected_pivot_tables == ["ptC"]
+
+    await rig.session.close_workbook(wid)
+
+
+# ---------------------------------------------------------------------------
+# 6. Unsupported (consolidation) cache: cache-scoped refresh is refused
+# ---------------------------------------------------------------------------
+@requires_excel
+async def test_unsupported_cache_refresh_is_reported(rig: Rig) -> None:
+    info = await rig.open_for_refresh()
+    wid = info.workbook_id
+    built = await _build_consolidation_pivot(rig)
+    assert built["source_type"] == 3  # xlSourceTypeConsolidation
+
+    cache = await rig.pivots.get_pivot_cache(wid, built["cache_index"])
+    assert cache.source_type is PivotSourceType.CONSOLIDATION
+
+    await rig.snapshot.create_snapshot(wid)
+    result = await rig.pivots.refresh_pivot_cache(wid, built["cache_index"])
+
+    assert result.status is PivotRefreshStatus.UNSUPPORTED_SOURCE
+    assert result.refreshed is False
+    assert result.refresh_return is None
+    assert result.error is not None
+    assert result.error["code"] == "UNSUPPORTED_PIVOT_SOURCE"
+    assert result.refresh_date_before == result.refresh_date_after
+
+    await rig.session.close_workbook(wid)
