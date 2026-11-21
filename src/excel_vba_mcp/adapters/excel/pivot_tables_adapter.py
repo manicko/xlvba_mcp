@@ -1,6 +1,6 @@
-"""STA-local Excel PivotTables / PivotCaches / PivotFields adapter (task_048).
+"""STA-local Excel PivotTables / PivotCaches / PivotFields adapter (task_048, task_049).
 
-Phase 2 — PivotTables inventory (read-only).
+Phase 2 — PivotTables inventory (read-only) and targeted refresh (task_049).
 
 :class:`PivotTablesAdapter` is the single place where the Excel ``PivotTables`` /
 ``PivotCache`` / ``PivotField`` object model is touched for the Phase-2 inventory
@@ -50,26 +50,31 @@ Int  ``XlPivotTableSourceType``  ``PivotSourceType``
 —    anything else              ``UNKNOWN``
 ===  ==========================  =========================
 
-This adapter is **read-only**: it never creates/deletes PivotTables, never
-refreshes, never mutates fields or filters. ``Workbook.RefreshAll`` and
-Connections/QueryTables/Power Query/Data Model are never touched.
+This adapter is **read-only** except for the bounded targeted refresh added by
+task_049: it never creates/deletes PivotTables, and never touches
+``Workbook.RefreshAll``, Connections/QueryTables/Power Query/Data Model. A
+refresh is confirmed only by Excel's truth signal (the ``RefreshTable`` Boolean
+and/or an advanced ``RefreshDate``), never by the absence of a COM exception.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from excel_vba_mcp.domain.errors import ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
     PivotCacheInfo,
     PivotFieldInfo,
+    PivotRefreshResult,
     PivotTableInfo,
 )
 from excel_vba_mcp.domain.statuses import (
     PivotAggregation,
     PivotFieldOrientation,
     PivotFilterKind,
+    PivotRefreshMethod,
+    PivotRefreshStatus,
     PivotSourceType,
 )
 
@@ -593,12 +598,177 @@ def _describe_cache(
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Targeted refresh (task_049)
+# ---------------------------------------------------------------------------
+def _affected_pivot_tables(pivot_tables: list[PivotTableInfo], cache_index: int) -> list[str]:
+    """Return the names of every PivotTable sharing ``cache_index`` (sorted)."""
+
+    return sorted(pt.name for pt in pivot_tables if pt.cache_index == cache_index)
+
+
+def _find_pivot(wb: Any, pivot_table: str) -> Any:
+    """Return the live ``PivotTable`` proxy named ``pivot_table`` (STA-local)."""
+
+    target = pivot_table.strip().lower()
+    for _sheet, _sheet_index, pivot in _iter_pivot_tables(wb):
+        name = _get_str(pivot, "Name") or ""
+        if name.lower() == target:
+            return pivot
+    raise ExcelVbaMcpError(
+        f"PivotTable {pivot_table!r} was not found in the workbook.",
+        context={"pivot_table": pivot_table},
+    )
+
+
+def _find_cache(wb: Any, cache_index: int) -> Any:
+    """Return the live ``PivotCache`` proxy for ``cache_index`` (STA-local).
+
+    ``Workbook.PivotCaches`` is unusable for enumeration on the target build
+    (task_039 §3), so the cache is resolved through the PivotTable that
+    references it.
+    """
+
+    for _sheet, _sheet_index, pivot in _iter_pivot_tables(wb):
+        if _get_int(pivot, "CacheIndex") == cache_index:
+            try:
+                return pivot.PivotCache()
+            except Exception as exc:  # noqa: BLE001 - defensive COM read
+                raise ExcelVbaMcpError(
+                    f"The PivotCache for index {cache_index} could not be resolved.",
+                    context={"cache_index": cache_index},
+                ) from exc
+    raise ExcelVbaMcpError(
+        f"PivotCache {cache_index} was not found in the workbook.",
+        context={"cache_index": cache_index},
+    )
+
+
+def _unsupported_reason(source_type: PivotSourceType) -> str:
+    """Return the human-readable reason a source type cannot be refreshed."""
+
+    return (
+        f"Pivot source type {source_type.value!r} is external, OLAP, Data Model "
+        "or otherwise unsupported; only worksheet/Table-backed (database) caches "
+        "are refreshed."
+    )
+
+
+def _unsupported_result(
+    *,
+    pivot_table: str,
+    cache_index: int,
+    method: PivotRefreshMethod,
+    affected: list[str],
+    source_type: PivotSourceType,
+    before: datetime | None,
+) -> PivotRefreshResult:
+    """Build the structured ``unsupported_source`` result (no refresh invoked)."""
+
+    return PivotRefreshResult(
+        pivot_table=pivot_table,
+        cache_index=cache_index,
+        method=method,
+        affected_pivot_tables=affected,
+        refreshed=False,
+        refresh_return=None,
+        refresh_date_before=before,
+        refresh_date_after=before,
+        status=PivotRefreshStatus.UNSUPPORTED_SOURCE,
+        error={
+            "code": "UNSUPPORTED_PIVOT_SOURCE",
+            "source_type": source_type.value,
+            "reason": _unsupported_reason(source_type),
+        },
+    )
+
+
+def _failed_result(
+    *,
+    pivot_table: str,
+    cache_index: int,
+    method: PivotRefreshMethod,
+    affected: list[str],
+    before: datetime | None,
+    after: datetime | None,
+    refresh_return: bool | None,
+    started_at: datetime,
+    finished_at: datetime,
+    reason: str,
+) -> PivotRefreshResult:
+    """Build the structured ``failed`` result (no truth signal from Excel)."""
+
+    duration_ms = int((finished_at - started_at).total_seconds() * 1000)
+    return PivotRefreshResult(
+        pivot_table=pivot_table,
+        cache_index=cache_index,
+        method=method,
+        affected_pivot_tables=affected,
+        refreshed=False,
+        refresh_return=refresh_return,
+        started_at=started_at,
+        finished_at=finished_at,
+        duration_ms=duration_ms,
+        refresh_date_before=before,
+        refresh_date_after=after,
+        status=PivotRefreshStatus.FAILED,
+        error={"code": "REFRESH_FAILED", "reason": reason},
+    )
+
+
+def _refreshed_result(
+    *,
+    pivot_table: str,
+    cache_index: int,
+    method: PivotRefreshMethod,
+    affected: list[str],
+    before: datetime | None,
+    after: datetime | None,
+    refresh_return: bool | None,
+    started_at: datetime,
+    finished_at: datetime,
+) -> PivotRefreshResult:
+    """Build the successful ``refreshed`` result."""
+
+    duration_ms = int((finished_at - started_at).total_seconds() * 1000)
+    return PivotRefreshResult(
+        pivot_table=pivot_table,
+        cache_index=cache_index,
+        method=method,
+        affected_pivot_tables=affected,
+        refreshed=True,
+        refresh_return=refresh_return,
+        started_at=started_at,
+        finished_at=finished_at,
+        duration_ms=duration_ms,
+        refresh_date_before=before,
+        refresh_date_after=after,
+        status=PivotRefreshStatus.REFRESHED,
+    )
+
+
+def _advance_confirms(before: datetime | None, after: datetime | None) -> bool:
+    """Return whether ``after`` shows the refresh advanced past ``before``.
+
+    A refresh is confirmed only by a truth signal: ``RefreshDate`` moved forward,
+    or a previously-absent ``RefreshDate`` is now present. Equal timestamps are
+    not proof (task_039 §4 verification rule).
+    """
+
+    if after is None:
+        return False
+    if before is None:
+        return True
+    return after > before
+
+
 class PivotTablesAdapter:
-    """STA-local PivotTables / PivotCaches / PivotFields inventory (no COM at import).
+    """STA-local PivotTables / PivotCaches / PivotFields adapter (no COM at import).
 
     All methods are synchronous, operate on the live ``Workbook`` proxy and
-    return only Pydantic DTOs. They never create, delete, refresh or mutate a
-    PivotTable, PivotCache or PivotField (task_048 is read-only).
+    return only Pydantic DTOs. They never create or delete a PivotTable,
+    PivotCache or PivotField (task_048 is read-only); task_049 adds the bounded
+    targeted refresh of a worksheet/Table-backed PivotTable or its cache.
     """
 
     # ------------------------------------------------------------------
@@ -650,6 +820,172 @@ class PivotTablesAdapter:
         raise ExcelVbaMcpError(
             f"PivotTable {pivot_table!r} was not found in the workbook.",
             context={"pivot_table": pivot_table},
+        )
+
+    # ------------------------------------------------------------------
+    # Targeted refresh (task_049)
+    # ------------------------------------------------------------------
+    def refresh_pivot_table(self, wb: Any, pivot_table: str) -> PivotRefreshResult:
+        """Refresh one PivotTable via ``PivotTable.RefreshTable`` (table-scoped).
+
+        The cache source type is checked **before** invocation: an external, OLAP,
+        Data Model or otherwise unsupported cache returns ``unsupported_source``
+        and is never refreshed. A successful refresh is confirmed only by Excel's
+        truth signal — the ``RefreshTable`` Boolean return and/or an advanced
+        ``RefreshDate`` — never by the absence of a COM exception (task_039 §4).
+
+        ``affected_pivot_tables`` always lists every table sharing the cache,
+        because ``RefreshTable`` refreshes the shared cache.
+        """
+
+        pivot = _find_pivot(wb, pivot_table)
+        name = _get_str(pivot, "Name") or pivot_table
+        cache_index = _get_int(pivot, "CacheIndex", default=0) or 0
+        inventory = self.enumerate_pivot_tables(wb)
+        affected = _affected_pivot_tables(inventory, cache_index)
+        before = _get_datetime(pivot, "RefreshDate")
+
+        cache = pivot.PivotCache()
+        source_type, _olap = _classify_source_type(cache)
+        if source_type is not PivotSourceType.DATABASE:
+            return _unsupported_result(
+                pivot_table=name,
+                cache_index=cache_index,
+                method=PivotRefreshMethod.REFRESH_TABLE,
+                affected=affected,
+                source_type=source_type,
+                before=before,
+            )
+
+        started_at = datetime.now(UTC)
+        refresh_return: bool | None
+        try:
+            raw = pivot.RefreshTable()
+            refresh_return = bool(raw)
+        except ExcelVbaMcpError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a blocked/failed refresh
+            return _failed_result(
+                pivot_table=name,
+                cache_index=cache_index,
+                method=PivotRefreshMethod.REFRESH_TABLE,
+                affected=affected,
+                before=before,
+                after=None,
+                refresh_return=None,
+                started_at=started_at,
+                finished_at=datetime.now(UTC),
+                reason=str(exc) or exc.__class__.__name__,
+            )
+        finished_at = datetime.now(UTC)
+        after = _get_datetime(pivot, "RefreshDate")
+
+        if refresh_return or _advance_confirms(before, after):
+            return _refreshed_result(
+                pivot_table=name,
+                cache_index=cache_index,
+                method=PivotRefreshMethod.REFRESH_TABLE,
+                affected=affected,
+                before=before,
+                after=after,
+                refresh_return=refresh_return,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+        return _failed_result(
+            pivot_table=name,
+            cache_index=cache_index,
+            method=PivotRefreshMethod.REFRESH_TABLE,
+            affected=affected,
+            before=before,
+            after=after,
+            refresh_return=refresh_return,
+            started_at=started_at,
+            finished_at=finished_at,
+            reason=("RefreshTable returned no success signal and RefreshDate did not advance."),
+        )
+
+    def refresh_pivot_cache(self, wb: Any, cache_index: int) -> PivotRefreshResult:
+        """Refresh one PivotCache via ``PivotCache.Refresh`` (cache-scoped).
+
+        A cache is shared N:1 with PivotTables, so this refreshes every table on
+        the cache; ``affected_pivot_tables`` reports them. The source type is
+        checked before invocation and an unsupported cache returns
+        ``unsupported_source``. ``PivotCache.Refresh`` returns no Boolean, so
+        success is confirmed by the shared cache's advanced ``RefreshDate``
+        (task_039 §4).
+
+        ``pivot_table`` is the sorted-first affected table name (the cache has no
+        single owning PivotTable).
+        """
+
+        inventory = self.enumerate_pivot_tables(wb)
+        affected = _affected_pivot_tables(inventory, cache_index)
+        if not affected:
+            raise ExcelVbaMcpError(
+                f"PivotCache {cache_index} was not found in the workbook.",
+                context={"cache_index": cache_index},
+            )
+        pivot_table = affected[0]
+
+        cache = _find_cache(wb, cache_index)
+        source_type, _olap = _classify_source_type(cache)
+        before = _get_datetime(cache, "RefreshDate")
+
+        if source_type is not PivotSourceType.DATABASE:
+            return _unsupported_result(
+                pivot_table=pivot_table,
+                cache_index=cache_index,
+                method=PivotRefreshMethod.REFRESH_CACHE,
+                affected=affected,
+                source_type=source_type,
+                before=before,
+            )
+
+        started_at = datetime.now(UTC)
+        try:
+            cache.Refresh()
+        except ExcelVbaMcpError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a blocked/failed refresh
+            return _failed_result(
+                pivot_table=pivot_table,
+                cache_index=cache_index,
+                method=PivotRefreshMethod.REFRESH_CACHE,
+                affected=affected,
+                before=before,
+                after=None,
+                refresh_return=None,
+                started_at=started_at,
+                finished_at=datetime.now(UTC),
+                reason=str(exc) or exc.__class__.__name__,
+            )
+        finished_at = datetime.now(UTC)
+        after = _get_datetime(cache, "RefreshDate")
+
+        if _advance_confirms(before, after):
+            return _refreshed_result(
+                pivot_table=pivot_table,
+                cache_index=cache_index,
+                method=PivotRefreshMethod.REFRESH_CACHE,
+                affected=affected,
+                before=before,
+                after=after,
+                refresh_return=None,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+        return _failed_result(
+            pivot_table=pivot_table,
+            cache_index=cache_index,
+            method=PivotRefreshMethod.REFRESH_CACHE,
+            affected=affected,
+            before=before,
+            after=after,
+            refresh_return=None,
+            started_at=started_at,
+            finished_at=finished_at,
+            reason="Refresh returned but the shared RefreshDate did not advance.",
         )
 
     # ------------------------------------------------------------------

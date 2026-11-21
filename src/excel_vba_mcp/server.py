@@ -64,8 +64,10 @@ from excel_vba_mcp.api.name_tools import (
 )
 from excel_vba_mcp.api.pivot_tools import (
     pivot_cache_get,
+    pivot_cache_refresh,
     pivot_fields_list,
     pivot_table_get,
+    pivot_table_refresh,
     pivot_tables_list,
 )
 from excel_vba_mcp.api.range_tools import (
@@ -554,6 +556,26 @@ _DESC_PIVOT_FIELDS_LIST = (
     "ShowAllItems, manual filter state and data-field caption/number format. "
     "Read-only."
 )
+_DESC_PIVOT_TABLE_REFRESH = (
+    "Refresh one PivotTable via PivotTable.RefreshTable (table-scoped, no "
+    "Workbook.RefreshAll). The cache source type is checked first; external, "
+    "OLAP and Data Model sources return unsupported_source and are not "
+    "refreshed. The result reports every table sharing the cache "
+    "(affected_pivot_tables), the RefreshDate before/after and a refreshed "
+    "status confirmed by Excel's truth signal (the RefreshTable Boolean and/or "
+    "an advanced RefreshDate), never by the absence of a COM exception. "
+    "Guarded mutation: writable session + snapshot + approval + audit."
+)
+_DESC_PIVOT_CACHE_REFRESH = (
+    "Refresh one PivotCache via PivotCache.Refresh (cache-scoped). A cache is "
+    "shared N:1 with PivotTables, so affected_pivot_tables reports every table "
+    "using the cache. Only a database/Table-backed cache is refreshed; "
+    "external/OLAP/Data Model sources return unsupported_source. PivotCache."
+    "Refresh returns no Boolean, so success is confirmed by the shared "
+    "RefreshDate advancing. Never touches Workbook.RefreshAll or unrelated "
+    "connections/queries. Guarded mutation: writable session + snapshot + "
+    "approval + audit."
+)
 
 # Read-only MCP resource descriptions (spec §6.6). The URIs are per-workbook
 # templates so a client can read the model / VBA inventory / one component's
@@ -671,7 +693,9 @@ def _build_runtime() -> _Runtime:
     tables = TablesService(worker, session, snapshot, approval, path_policy, audit)
     ranges = RangesService(worker, session, snapshot, approval, path_policy, audit)
     names = NamesService(worker, session, snapshot, approval, path_policy, audit)
-    pivots = PivotTablesService(worker, session, audit)
+    pivots = PivotTablesService(
+        worker, session, audit, snapshot_service=snapshot, approval=approval
+    )
     shapes = ShapesService(worker, session, snapshot, approval, path_policy, audit)
     controls = ControlsService(worker, session, snapshot, approval, path_policy, audit)
     compile_service = CompileService(worker, session, vba, path_policy, audit)
@@ -940,6 +964,16 @@ def _register_tools(server: MCPServer) -> None:
     server.add_tool(pivot_cache_get, name="pivot_cache_get", description=_DESC_PIVOT_CACHE_GET)
     server.add_tool(
         pivot_fields_list, name="pivot_fields_list", description=_DESC_PIVOT_FIELDS_LIST
+    )
+    server.add_tool(
+        pivot_table_refresh,
+        name="pivot_table_refresh",
+        description=_DESC_PIVOT_TABLE_REFRESH,
+    )
+    server.add_tool(
+        pivot_cache_refresh,
+        name="pivot_cache_refresh",
+        description=_DESC_PIVOT_CACHE_REFRESH,
     )
     server.add_tool(range_get, name="range_get", description=_DESC_RANGE_GET)
     server.add_tool(

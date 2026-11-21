@@ -3,10 +3,11 @@
 This module defines the **signatures, Pydantic DTOs and docstrings** for the
 Phase 2 PivotTables surface. The read-only inventory tools
 (``pivot_tables_list``, ``pivot_table_get``, ``pivot_cache_get``,
-``pivot_fields_list``) are implemented by ``task_048`` and delegate to
-:class:`~excel_vba_mcp.application.pivot_tables_service.PivotTablesService`; the
-mutating tools (refresh / layout / aggregation / filters) remain frozen contract
-stubs implemented by ``task_049``–``task_051`` and raise
+``pivot_fields_list``) are implemented by ``task_048`` and the targeted refresh
+tools (``pivot_table_refresh``, ``pivot_cache_refresh``) by ``task_049``; both
+delegate to :class:`~excel_vba_mcp.application.pivot_tables_service.PivotTablesService`.
+The remaining mutating tools (layout / aggregation / filters) stay frozen
+contract stubs implemented by ``task_050``–``task_051`` and raise
 :class:`NotImplementedError`.
 
 It imports **no Excel/COM** — only domain DTOs; all Excel access happens on the
@@ -17,7 +18,7 @@ Tool groups:
 * Read-only (no snapshot/approval): ``pivot_tables_list``, ``pivot_table_get``,
   ``pivot_cache_get``, ``pivot_fields_list``, ``pivot_field_get_filters``.
 * Mutating (snapshot + approval + audit + postcondition): ``pivot_table_refresh``,
-  ``pivot_cache_refresh``, ``pivot_field_set_layout``,
+  ``pivot_cache_refresh`` (task_049), ``pivot_field_set_layout``,
   ``pivot_field_set_position``, ``pivot_field_set_aggregation``,
   ``pivot_field_set_properties``, ``pivot_field_apply_filter``,
   ``pivot_field_clear_filters``.
@@ -196,7 +197,10 @@ async def pivot_table_refresh(workbook_id: str, pivot_table: str) -> PivotRefres
         pivot_table: The stable PivotTable ``Name``.
     """
 
-    raise _not_implemented("pivot_table_refresh")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(pivot_table, "pivot_table")
+    service = get_pivot_tables_service()
+    return await service.refresh_pivot_table(workbook_id, pivot_table)
 
 
 async def pivot_cache_refresh(workbook_id: str, cache_index: int) -> PivotRefreshResult:
@@ -212,7 +216,10 @@ async def pivot_cache_refresh(workbook_id: str, cache_index: int) -> PivotRefres
         cache_index: The 1-based ``CacheIndex``.
     """
 
-    raise _not_implemented("pivot_cache_refresh")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_int(cache_index, "cache_index", minimum=1)
+    service = get_pivot_tables_service()
+    return await service.refresh_pivot_cache(workbook_id, cache_index)
 
 
 async def pivot_field_set_layout(
