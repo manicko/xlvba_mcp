@@ -83,15 +83,21 @@ def _require_non_empty(value: str, field: str) -> str:
 
 async def excel_open(
     path: str,
-    mode: SessionMode = SessionMode.INSPECT,
+    mode: SessionMode = SessionMode.EXECUTE,
     read_only: bool = False,
 ) -> WorkbookInfo:
     """Open an allowlisted workbook as a hidden working copy.
 
+    By default this creates a writable, execution-capable session
+    (``mode=execute``, ``read_only=False``). Pass ``mode=inspect`` and/or
+    ``read_only=True`` to opt into a macros-disabled or read-only session.
+
     Args:
         path: Path to the workbook; validated against the allowlist.
         mode: ``inspect`` (macros disabled) or ``execute`` (macros by UI).
-        read_only: Open the working copy read-only.
+            Default ``execute`` so a normal open is writable and
+            execution-capable.
+        read_only: Open the working copy read-only. Default ``False``.
 
     Returns:
         A :class:`WorkbookInfo` describing the opened working copy.

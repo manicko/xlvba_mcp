@@ -111,13 +111,13 @@ async def test_excel_open_delegates_with_mode_and_read_only(
     assert kwargs == {"mode": SessionMode.EXECUTE, "read_only": True}
 
 
-async def test_excel_open_defaults_to_inspect_not_read_only(
+async def test_excel_open_defaults_to_execute_writable(
     _install_fake_service: FakeSessionService,
 ) -> None:
     await excel_open("C:/data/Book.xlsm")
 
     _name, _args, kwargs = _install_fake_service.calls[-1]
-    assert kwargs == {"mode": SessionMode.INSPECT, "read_only": False}
+    assert kwargs == {"mode": SessionMode.EXECUTE, "read_only": False}
 
 
 async def test_excel_close_defaults_to_no_save(

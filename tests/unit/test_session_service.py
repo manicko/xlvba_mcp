@@ -310,6 +310,33 @@ async def test_open_execute_allowed_with_grant(tmp_path: Path) -> None:
     assert app.AutomationSecurity == 1
 
 
+async def test_open_execute_writable_allowed_in_full_mode(tmp_path: Path) -> None:
+    # Full-access policy authorizes an execute-capable writable open with no grant.
+    service, app, _worker, original, _work_dir = _make_service(
+        tmp_path, approval=ApprovalPolicy(mode=AccessMode.FULL)
+    )
+
+    info = await service.open_workbook(str(original), mode=SessionMode.EXECUTE, read_only=False)
+    assert info.mode == SessionMode.EXECUTE
+    assert info.read_only is False
+
+    # Status reflects the writable, executing session.
+    status = await service.get_status(info.workbook_id)
+    assert status.mode == SessionMode.EXECUTE
+    assert status.read_only is False
+
+    # Execute mode maps to ByUI (2); restore to the prior value (1) in finally.
+    assert app.AutomationSecurity == 1
+
+    # A mutation persists to the working copy; the original stays byte-identical.
+    original_bytes = original.read_bytes()
+    refreshed = await service.save_workbook(info.workbook_id)
+    wb = app.Workbooks.items[-1]
+    assert wb.save_count == 1, "save_workbook must call Save exactly once"
+    assert refreshed.workbook_id == info.workbook_id
+    assert original.read_bytes() == original_bytes
+
+
 # ---------------------------------------------------------------------------
 # Close: default no-save; explicit save-on-close
 # ---------------------------------------------------------------------------
