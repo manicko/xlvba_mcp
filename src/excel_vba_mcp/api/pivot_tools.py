@@ -1,16 +1,16 @@
-"""PivotTables / PivotCaches / PivotFields MCP tool contracts (task_040, task_048).
+"""PivotTables / PivotCaches / PivotFields MCP tool contracts (task_040, task_048–task_051).
 
 This module defines the **signatures, Pydantic DTOs and docstrings** for the
 Phase 2 PivotTables surface. The read-only inventory tools
 (``pivot_tables_list``, ``pivot_table_get``, ``pivot_cache_get``,
 ``pivot_fields_list``) are implemented by ``task_048``, the targeted refresh
-tools (``pivot_table_refresh``, ``pivot_cache_refresh``) by ``task_049`` and the
+tools (``pivot_table_refresh``, ``pivot_cache_refresh``) by ``task_049``, the
 PivotField configuration tools (``pivot_field_set_layout``,
 ``pivot_field_set_position``, ``pivot_field_set_aggregation``,
-``pivot_field_set_properties``) by ``task_050``; all of them delegate to
+``pivot_field_set_properties``) by ``task_050`` and the filter tools
+(``pivot_field_get_filters``, ``pivot_field_apply_filter``,
+``pivot_field_clear_filters``) by ``task_051``; all of them delegate to
 :class:`~excel_vba_mcp.application.pivot_tables_service.PivotTablesService`.
-The filter tools stay frozen contract stubs implemented by ``task_051`` and raise
-:class:`NotImplementedError`.
 
 It imports **no Excel/COM** — only domain DTOs; all Excel access happens on the
 single-STA worker inside the pivot service/adapter.
@@ -51,17 +51,6 @@ from excel_vba_mcp.domain.statuses import PivotAggregation, PivotFieldOrientatio
 # out of band (e.g. in a unit test that has not installed a fake).
 _pivot_tables_service: PivotTablesService | None = None
 
-_NOT_IMPLEMENTED = (
-    "PivotTables tool {name} is a frozen contract (task_040) and is implemented "
-    "in a later task; it performs no Excel/COM access here."
-)
-
-
-def _not_implemented(name: str) -> NotImplementedError:
-    """Return the canonical not-yet-implemented error for a contract stub."""
-
-    return NotImplementedError(_NOT_IMPLEMENTED.format(name=name))
-
 
 def set_pivot_tables_service(service: PivotTablesService | None) -> None:
     """Publish (or clear) the active pivot tables service used by the tools."""
@@ -81,7 +70,7 @@ def get_pivot_tables_service() -> PivotTablesService:
     return _pivot_tables_service
 
 
-def _require_non_empty(value: str, field: str) -> str:
+def _require_non_empty(value: object, field: str) -> str:
     """Validate that a required string argument is non-empty."""
 
     if not isinstance(value, str) or not value.strip():
@@ -171,6 +160,34 @@ def _require_aggregation(value: object) -> PivotAggregation:
     )
 
 
+def _require_filter_spec(value: object) -> PivotFilterSpec:
+    """Validate that a filter argument is a :class:`PivotFilterSpec`."""
+
+    if not isinstance(value, PivotFilterSpec):
+        raise ExcelVbaMcpError(
+            "Argument 'spec' must be a PivotFilterSpec.",
+            code=ErrorCode.INVALID_RANGE,
+            context={"spec": repr(value), "reason": "invalid_filter_spec"},
+        )
+    return value
+
+
+def _require_scope(value: object) -> str:
+    """Validate a clear scope (``"field"`` or ``"table"``)."""
+
+    if isinstance(value, str) and value.strip().lower() in {"field", "table"}:
+        return value.strip().lower()
+    raise ExcelVbaMcpError(
+        f"Argument 'scope' must be 'field' or 'table', got {value!r}.",
+        code=ErrorCode.INVALID_RANGE,
+        context={
+            "scope": repr(value),
+            "accepted": ["field", "table"],
+            "reason": "invalid_scope",
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Read-only tools (implemented: task_048)
 # ---------------------------------------------------------------------------
@@ -237,13 +254,21 @@ async def pivot_field_get_filters(
 ) -> PivotFieldFilters:
     """Read a PivotField's current filter state (manual visible/hidden items).
 
+    Reports ``all_items_visible``, the visible and hidden ``PivotItems`` (the
+    manual filter), the classified filter kind and any detected
+    ``PivotFilters`` entries. Read-only; ``PivotFilters.Add`` is never called.
+
     Args:
         workbook_id: The id returned by ``excel_open``.
         pivot_table: The stable PivotTable ``Name``.
-        field: The field ``SourceName`` or data-field caption.
+        field: The field ``SourceName`` (or a data-field caption).
     """
 
-    raise _not_implemented("pivot_field_get_filters")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(pivot_table, "pivot_table")
+    _require_non_empty(field, "field")
+    service = get_pivot_tables_service()
+    return await service.get_pivot_field_filters(workbook_id, pivot_table, field)
 
 
 # ---------------------------------------------------------------------------
@@ -439,18 +464,26 @@ async def pivot_field_apply_filter(
 ) -> PivotFieldFilters:
     """Apply a supported (manual, visible-items) filter to one field.
 
-    Label/value/date/top-bottom filters are unsupported on the target build and
-    return an explicit ``unsupported`` result rather than being silently
-    converted. Guarded mutation.
+    Only a supported ``manual`` filter is applied (``PivotItems[i].Visible``).
+    Label / value / date / top-bottom filters map to ``PivotFilters.Add``, which
+    is unsupported on the target build: they return an explicit ``unsupported``
+    result (``filter.supported = False`` with a reason) and are never silently
+    converted into a manual filter. The request is validated before any mutation.
+    Guarded mutation: writable session + snapshot + approval + postcondition.
 
     Args:
         workbook_id: The id returned by ``excel_open``.
         pivot_table: The stable PivotTable ``Name``.
-        field: The field ``SourceName``.
+        field: The field ``SourceName`` (or a data-field caption).
         spec: The filter request (:class:`PivotFilterSpec`).
     """
 
-    raise _not_implemented("pivot_field_apply_filter")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(pivot_table, "pivot_table")
+    _require_non_empty(field, "field")
+    normalized = _require_filter_spec(spec)
+    service = get_pivot_tables_service()
+    return await service.apply_pivot_field_filter(workbook_id, pivot_table, field, normalized)
 
 
 async def pivot_field_clear_filters(
@@ -462,8 +495,12 @@ async def pivot_field_clear_filters(
 ) -> PivotFieldFilters:
     """Clear filters for one field or the whole PivotTable.
 
-    ``scope`` is ``"field"`` (default; requires ``field``) or ``"table"``
-    (clears all filters of the PivotTable). Guarded mutation.
+    ``scope="field"`` (default; requires ``field``) calls
+    ``PivotField.ClearAllFilters``; ``scope="table"`` calls
+    ``PivotTable.ClearAllFilters`` and returns a table-level result whose
+    ``field`` is empty. The scope and the field requirement are validated before
+    any mutation. Guarded mutation: writable session + snapshot + approval +
+    postcondition.
 
     Args:
         workbook_id: The id returned by ``excel_open``.
@@ -472,7 +509,15 @@ async def pivot_field_clear_filters(
         scope: ``"field"`` or ``"table"``.
     """
 
-    raise _not_implemented("pivot_field_clear_filters")
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(pivot_table, "pivot_table")
+    normalized_scope = _require_scope(scope)
+    if normalized_scope == "field":
+        _require_non_empty(field, "field")
+    service = get_pivot_tables_service()
+    return await service.clear_pivot_field_filters(
+        workbook_id, pivot_table, field, scope=normalized_scope
+    )
 
 
 __all__ = [

@@ -65,6 +65,9 @@ from excel_vba_mcp.api.name_tools import (
 from excel_vba_mcp.api.pivot_tools import (
     pivot_cache_get,
     pivot_cache_refresh,
+    pivot_field_apply_filter,
+    pivot_field_clear_filters,
+    pivot_field_get_filters,
     pivot_field_set_aggregation,
     pivot_field_set_layout,
     pivot_field_set_position,
@@ -626,6 +629,34 @@ _DESC_PIVOT_FIELD_SET_PROPERTIES = (
     "writable session + snapshot + approval + audit + postcondition."
 )
 
+_DESC_PIVOT_FIELD_GET_FILTERS = (
+    "Read one PivotField's current filter state: AllItemsVisible, the visible and "
+    "hidden PivotItems (the manual PivotItems.Visible filter), the classified "
+    "filter kind (none/manual) and any detected PivotFilters entries. Read-only; "
+    "PivotFilters.Add is never called."
+)
+_DESC_PIVOT_FIELD_APPLY_FILTER = (
+    "Apply a supported manual (visible-items) filter to one PivotField by setting "
+    "PivotItems[i].Visible. Only the manual kind is supported: label, value, date "
+    "and top/bottom filters (PivotFilters.Add) are unsupported on the target "
+    "build, return an explicit unsupported result with filter.supported=false and "
+    "a reason, and are never silently converted into a manual filter. The request "
+    "(field identity, item names, duplicates, size) is validated before any "
+    "mutation. External/OLAP/Data Model sources are rejected with "
+    "unsupported_source. The returned PivotFieldFilters is the post-mutation state "
+    "re-read from the PivotTable. Guarded mutation: writable session + snapshot + "
+    "approval + audit + postcondition."
+)
+_DESC_PIVOT_FIELD_CLEAR_FILTERS = (
+    "Clear PivotField filters with an explicit scope. scope='field' (default; "
+    "requires field) calls PivotField.ClearAllFilters on that field; scope='table' "
+    "calls PivotTable.ClearAllFilters for the whole PivotTable and returns a "
+    "table-level result whose field is empty. External/OLAP/Data Model sources are "
+    "rejected with unsupported_source. The result is confirmed by a post-mutation "
+    "re-read. Guarded mutation: writable session + snapshot + approval + audit + "
+    "postcondition."
+)
+
 # Read-only MCP resource descriptions (spec §6.6). The URIs are per-workbook
 # templates so a client can read the model / VBA inventory / one component's
 # source without mutating the workbook and without running VBA.
@@ -1043,6 +1074,21 @@ def _register_tools(server: MCPServer) -> None:
         pivot_field_set_properties,
         name="pivot_field_set_properties",
         description=_DESC_PIVOT_FIELD_SET_PROPERTIES,
+    )
+    server.add_tool(
+        pivot_field_get_filters,
+        name="pivot_field_get_filters",
+        description=_DESC_PIVOT_FIELD_GET_FILTERS,
+    )
+    server.add_tool(
+        pivot_field_apply_filter,
+        name="pivot_field_apply_filter",
+        description=_DESC_PIVOT_FIELD_APPLY_FILTER,
+    )
+    server.add_tool(
+        pivot_field_clear_filters,
+        name="pivot_field_clear_filters",
+        description=_DESC_PIVOT_FIELD_CLEAR_FILTERS,
     )
     server.add_tool(range_get, name="range_get", description=_DESC_RANGE_GET)
     server.add_tool(

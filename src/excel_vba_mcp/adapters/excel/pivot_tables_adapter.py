@@ -86,8 +86,10 @@ from excel_vba_mcp.domain.errors import (
 )
 from excel_vba_mcp.domain.models import (
     PivotCacheInfo,
+    PivotFieldFilters,
     PivotFieldInfo,
     PivotFieldProperties,
+    PivotFilterSpec,
     PivotRefreshResult,
     PivotTableInfo,
 )
@@ -1180,6 +1182,300 @@ def _write_data_field_property(
         ) from exc
 
 
+# ---------------------------------------------------------------------------
+# PivotField filters (task_051; STA-local, no COM at import)
+# ---------------------------------------------------------------------------
+#: Maximum number of ``visible_items`` accepted by one manual-filter request.
+_MAX_FILTER_ITEMS = 1000
+
+#: Upper bounds on the ``PivotItems`` / ``PivotFilters`` read from one field.
+_MAX_PIVOT_ITEMS = 10000
+_MAX_PIVOT_FILTERS = 100
+
+#: The clear scopes accepted by ``clear_field_filters``.
+_FILTER_SCOPES: frozenset[str] = frozenset({"field", "table"})
+
+#: Human-readable reason used when ``PivotFilters.Add`` is requested.
+_FILTERS_ADD_UNSUPPORTED = (
+    "PivotFilters.Add is unsupported on the target build (Excel 16.0.14332): "
+    "label, value, date and top/bottom filters cannot be created. Apply a manual "
+    "(visible-items) filter or clear filters instead; no filter was added."
+)
+
+
+def _filter_kind_for_code(code: int | None) -> PivotFilterKind:
+    """Map an ``XlPivotFilterType`` code to a :class:`PivotFilterKind` (task_039 §6).
+
+    The code ranges are the documented ``XlPivotFilterType`` groups: 1–6
+    top/bottom, 7–14 value, 15–28 caption (label), 29–68 date. An absent or
+    unknown code is reported as ``UNSUPPORTED`` rather than guessed.
+    """
+
+    if code is None:
+        return PivotFilterKind.UNSUPPORTED
+    if 1 <= code <= 6:
+        return PivotFilterKind.TOP_BOTTOM
+    if 7 <= code <= 14:
+        return PivotFilterKind.VALUE
+    if 15 <= code <= 28:
+        return PivotFilterKind.LABEL
+    if 29 <= code <= 68:
+        return PivotFilterKind.DATE
+    return PivotFilterKind.UNSUPPORTED
+
+
+def normalize_filter_scope(scope: str) -> str:
+    """Validate a clear scope (``"field"`` or ``"table"``) before any COM access."""
+
+    if isinstance(scope, str) and scope.strip().lower() in _FILTER_SCOPES:
+        return scope.strip().lower()
+    raise InvalidRangeError(
+        f"Argument 'scope' must be 'field' or 'table', got {scope!r}.",
+        context={
+            "scope": repr(scope),
+            "accepted": sorted(_FILTER_SCOPES),
+            "reason": "invalid_scope",
+        },
+    )
+
+
+def normalize_filter_spec(spec: PivotFilterSpec) -> PivotFilterSpec:
+    """Validate a filter request before any COM mutation (task_039 §6).
+
+    Validation is deliberately performed here (STA-local, pre-mutation) and again
+    in the service so an invalid request never reaches Excel:
+
+    * ``spec`` must be a :class:`PivotFilterSpec` with a known
+      :class:`PivotFilterKind`;
+    * ``visible_items`` must be a bounded list of non-blank strings with no
+      duplicates (case-insensitive) — an ambiguous item set is rejected;
+    * a supported manual filter must name at least one item (an empty set would
+      hide every item and is rejected as ambiguous; use ``clear`` to show all).
+
+    The returned spec carries the cleaned item list.
+    """
+
+    if not isinstance(spec, PivotFilterSpec):
+        raise InvalidRangeError(
+            "Argument 'spec' must be a PivotFilterSpec.",
+            context={"spec": repr(spec), "reason": "invalid_filter_spec"},
+        )
+    if not isinstance(spec.kind, PivotFilterKind):
+        raise InvalidRangeError(
+            f"Argument 'spec.kind' must be a PivotFilterKind, got {spec.kind!r}.",
+            context={
+                "kind": repr(spec.kind),
+                "accepted": [member.value for member in PivotFilterKind],
+                "reason": "invalid_filter_kind",
+            },
+        )
+    raw_items = spec.visible_items
+    if not isinstance(raw_items, list):
+        raise InvalidRangeError(
+            "Argument 'spec.visible_items' must be a list of item strings.",
+            context={"visible_items": repr(raw_items), "reason": "invalid_filter_items"},
+        )
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, str) or not item.strip():
+            raise InvalidRangeError(
+                "Every entry of 'spec.visible_items' must be a non-empty string.",
+                context={"visible_items": repr(raw_items), "reason": "invalid_filter_item"},
+            )
+        key = item.strip().casefold()
+        if key in seen:
+            raise AmbiguousFilterError(
+                f"Item {item!r} appears more than once in 'spec.visible_items'; "
+                "the filter target is ambiguous.",
+                context={
+                    "item": item,
+                    "visible_items": list(raw_items),
+                    "reason": "ambiguous_filter_item",
+                },
+            )
+        seen.add(key)
+        cleaned.append(item.strip())
+    if len(cleaned) > _MAX_FILTER_ITEMS:
+        raise InvalidRangeError(
+            f"The manual filter names {len(cleaned)} items; at most "
+            f"{_MAX_FILTER_ITEMS} are accepted per request.",
+            context={
+                "item_count": len(cleaned),
+                "limit": _MAX_FILTER_ITEMS,
+                "reason": "too_many_filter_items",
+            },
+        )
+    if spec.kind is PivotFilterKind.MANUAL and spec.supported and not cleaned:
+        raise InvalidRangeError(
+            "A manual filter must name at least one visible item; an empty set "
+            "would hide every item. Use pivot_field_clear_filters to show all items.",
+            context={"kind": spec.kind.value, "reason": "empty_filter"},
+        )
+    return spec.model_copy(update={"visible_items": cleaned})
+
+
+def unsupported_filter_reason(spec: PivotFilterSpec) -> str | None:
+    """Return why ``spec`` cannot be applied, or ``None`` when it is supported.
+
+    Only a supported manual (``PivotItems.Visible``) filter can be applied on the
+    target build. Every other kind maps to ``PivotFilters.Add``, which fails at
+    runtime on Excel 16.0 14332 (task_039 §6); such a request is reported as
+    unsupported and is **never** silently converted into a manual filter.
+    """
+
+    if not isinstance(spec.kind, PivotFilterKind) or spec.kind is not PivotFilterKind.MANUAL:
+        kind = getattr(spec.kind, "value", repr(spec.kind))
+        return f"{_FILTERS_ADD_UNSUPPORTED} Requested kind: {kind!r}."
+    if not spec.supported:
+        return (
+            spec.unsupported_reason
+            or "The filter request is marked unsupported; no filter was applied."
+        )
+    return None
+
+
+def _unsupported_filter_result(
+    pivot_table: str, field: str, spec: PivotFilterSpec, reason: str
+) -> PivotFieldFilters:
+    """Build the explicit ``unsupported`` result (no Excel mutation)."""
+
+    kind = spec.kind if isinstance(spec.kind, PivotFilterKind) else PivotFilterKind.UNSUPPORTED
+    return PivotFieldFilters(
+        pivot_table=pivot_table,
+        field=field,
+        all_items_visible=None,
+        visible_items=[],
+        hidden_items=[],
+        filter=PivotFilterSpec(
+            kind=kind,
+            visible_items=[],
+            supported=False,
+            unsupported_reason=reason,
+        ),
+        unsupported=[kind.value],
+    )
+
+
+def _pivot_item_entries(field: Any) -> list[tuple[Any, str]]:
+    """Return ``(item, value)`` for every ``PivotItems`` entry of one field.
+
+    ``PivotItems`` is a **method** on this build (task_039 §3); it is called and
+    then indexed with ``Item(i)``. The read is bounded and defensive: an
+    unreadable item is skipped rather than guessed.
+    """
+
+    try:
+        items = field.PivotItems()
+    except Exception:  # noqa: BLE001 - defensive COM read
+        return []
+    try:
+        count = _safe_int(items.Count, default=0) or 0
+    except Exception:  # noqa: BLE001 - defensive COM read
+        return []
+    entries: list[tuple[Any, str]] = []
+    for position in range(1, min(count, _MAX_PIVOT_ITEMS) + 1):
+        try:
+            item = items.Item(position)
+        except Exception:  # noqa: BLE001 - defensive per-item COM read
+            continue
+        value = _get_str(item, "Value") or _get_str(item, "Name") or f"item[{position}]"
+        entries.append((item, value))
+    return entries
+
+
+def _pivot_item_state(field: Any) -> tuple[list[str], list[str]]:
+    """Return ``(visible_items, hidden_items)`` for one field (STA-local)."""
+
+    visible: list[str] = []
+    hidden: list[str] = []
+    for item, value in _pivot_item_entries(field):
+        is_visible = _get_bool(item, "Visible", default=True)
+        if is_visible:
+            visible.append(value)
+        else:
+            hidden.append(value)
+    return visible, hidden
+
+
+def _detected_filter_types(field: Any) -> list[str]:
+    """Return a bounded description of any ``PivotFilters`` entries on a field.
+
+    On the target build ``PivotFilters`` is empty (adding one fails), so this is
+    normally ``[]``. When a build does expose filters, each entry is reported as
+    ``"<kind>(<XlPivotFilterType code>)"`` so an unsupported filter is explicit
+    rather than silently ignored (task_039 §6).
+    """
+
+    try:
+        filters = field.PivotFilters
+    except Exception:  # noqa: BLE001 - defensive COM read
+        return []
+    if callable(filters):
+        try:
+            filters = filters()
+        except Exception:  # noqa: BLE001 - defensive COM read
+            return []
+    try:
+        count = _safe_int(filters.Count, default=0) or 0
+    except Exception:  # noqa: BLE001 - defensive COM read
+        return []
+    detected: list[str] = []
+    for position in range(1, min(count, _MAX_PIVOT_FILTERS) + 1):
+        try:
+            entry = filters.Item(position)
+        except Exception:  # noqa: BLE001 - defensive per-item COM read
+            continue
+        code = _get_int(entry, "Type")
+        kind = _filter_kind_for_code(code)
+        detected.append(f"{kind.value}({code})" if code is not None else kind.value)
+    return detected
+
+
+def _field_filters(pivot_name: str, field: Any, source_name: str) -> PivotFieldFilters:
+    """Describe one field's current filter state (STA-local, read-only)."""
+
+    visible, hidden = _pivot_item_state(field)
+    return PivotFieldFilters(
+        pivot_table=pivot_name,
+        field=source_name,
+        all_items_visible=_get_bool(field, "AllItemsVisible", default=None),
+        visible_items=visible,
+        hidden_items=hidden,
+        filter=PivotFilterSpec(
+            kind=PivotFilterKind.MANUAL if hidden else PivotFilterKind.NONE,
+            visible_items=list(visible),
+            supported=True,
+        ),
+        unsupported=_detected_filter_types(field),
+    )
+
+
+def _filters_all_visible(filters: PivotFieldFilters) -> bool:
+    """Return whether a field's re-read state shows every item (postcondition)."""
+
+    if filters.all_items_visible is False:
+        return False
+    if filters.hidden_items:
+        return False
+    return bool(filters.visible_items) or filters.all_items_visible is True
+
+
+def _filter_state(filters: PivotFieldFilters) -> dict[str, Any]:
+    """Return the audit-friendly primitive subset of a filter DTO."""
+
+    return {
+        "pivot_table": filters.pivot_table,
+        "field": filters.field,
+        "all_items_visible": filters.all_items_visible,
+        "visible_items": list(filters.visible_items),
+        "hidden_items": list(filters.hidden_items),
+        "kind": filters.filter.kind.value,
+        "supported": filters.filter.supported,
+        "unsupported": list(filters.unsupported),
+    }
+
+
 class PivotTablesAdapter:
     """STA-local PivotTables / PivotCaches / PivotFields adapter (no COM at import).
 
@@ -1190,7 +1486,11 @@ class PivotTablesAdapter:
     refresh of a worksheet/Table-backed PivotTable or its cache; task_050 adds
     the bounded configuration of an **existing** PivotField (layout, position,
     data-field aggregation and properties) with a pre-mutation source check and
-    a post-mutation re-read. No ``.Activate`` / ``.Select`` is ever called.
+    a post-mutation re-read; task_051 adds the bounded filter surface (read the
+    manual state, apply a manual ``PivotItems.Visible`` filter, clear one field or
+    the whole PivotTable). ``PivotFilters.Add`` is unsupported on the target build
+    and is reported as such, never silently converted. No ``.Activate`` /
+    ``.Select`` is ever called.
     """
 
     # ------------------------------------------------------------------
@@ -1904,6 +2204,229 @@ class PivotTablesAdapter:
             "orientation_order": _orientation_order(pivot, after.orientation),
             "data_field_index": final_data_field_index,
             "before": info,
+        }
+
+    # ------------------------------------------------------------------
+    # PivotField filters (task_051)
+    # ------------------------------------------------------------------
+    def get_field_filters(self, wb: Any, pivot_table: str, field: str) -> PivotFieldFilters:
+        """Return one field's current filter state (read-only).
+
+        The state reports ``all_items_visible``, the visible/hidden ``PivotItems``
+        (manual filter), the classified filter kind and any detected
+        ``PivotFilters`` entries (normally none on the target build). No mutation
+        is performed and no ``PivotFilters.Add`` is ever attempted.
+        """
+
+        pivot = _find_pivot(wb, pivot_table)
+        target, info = _resolve_field_target(pivot, field)
+        pivot_name = _get_str(pivot, "Name") or pivot_table
+        return _field_filters(pivot_name, target, info.source_name)
+
+    def apply_field_filter(
+        self, wb: Any, pivot_table: str, field: str, spec: PivotFilterSpec
+    ) -> dict[str, Any]:
+        """Apply a supported manual filter, or report an unsupported one.
+
+        Only a supported ``MANUAL`` (visible-items) filter is applied, by setting
+        ``PivotItems[i].Visible`` on the resolved source field. Label / value /
+        date / top-bottom requests (``PivotFilters.Add``) return an explicit
+        ``unsupported`` result with a reason and never touch Excel — they are
+        never converted into a manual filter (task_039 §6).
+
+        The request is validated **before** any mutation (field identity, item
+        names, duplicate/blank/too-many items). The post-mutation visible/hidden
+        sets are re-read; a mismatch is reported truthfully as a structured error
+        rather than a false success. The cache source type is checked first, so an
+        OLAP / Data Model / external cache is rejected with
+        ``UNSUPPORTED_PIVOT_SOURCE``.
+        """
+
+        pivot = _find_pivot(wb, pivot_table)
+        pivot_name = _get_str(pivot, "Name") or pivot_table
+        normalized = normalize_filter_spec(spec)
+        reason = unsupported_filter_reason(normalized)
+        if reason is not None:
+            return {
+                "filters": _unsupported_filter_result(pivot_table, field, normalized, reason),
+                "verified": False,
+                "applied": False,
+                "notes": [],
+                "before": None,
+            }
+
+        _require_supported_source(pivot)
+        target, info = _resolve_field_target(pivot, field)
+        before = _field_filters(pivot_name, target, info.source_name)
+
+        entries = _pivot_item_entries(target)
+        requested = {item.strip().casefold() for item in normalized.visible_items}
+        available = {value.strip().casefold(): (item, value) for item, value in entries}
+        unknown = sorted(requested - set(available))
+        if unknown:
+            raise AmbiguousFilterError(
+                f"Item(s) {unknown} do not exist on field {field!r}; the manual "
+                "filter was not applied.",
+                context={
+                    "pivot_table": pivot_table,
+                    "field": info.source_name,
+                    "unknown_items": unknown,
+                    "reason": "unknown_filter_item",
+                },
+            )
+
+        for item, value in entries:
+            try:
+                item.Visible = value.strip().casefold() in requested
+            except ExcelVbaMcpError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a blocked/failed write
+                raise ExcelVbaMcpError(
+                    f"PivotItem.Visible could not be set on field {field!r}: "
+                    f"{str(exc) or exc.__class__.__name__}",
+                    code=ErrorCode.COM_BUSY,
+                    context={"pivot_table": pivot_table, "field": info.source_name},
+                ) from exc
+
+        after = _field_filters(pivot_name, target, info.source_name)
+        visible_after = {item.strip().casefold() for item in after.visible_items}
+        if visible_after != requested:
+            raise ExcelVbaMcpError(
+                "The manual filter postcondition failed: the re-read visible items "
+                "differ from the request.",
+                code=ErrorCode.AMBIGUOUS_FILTER,
+                context={
+                    "pivot_table": pivot_table,
+                    "field": info.source_name,
+                    "requested": sorted(requested),
+                    "visible_after": sorted(visible_after),
+                    "reason": "postcondition_mismatch",
+                },
+            )
+        return {
+            "filters": after,
+            "verified": True,
+            "applied": True,
+            "notes": [],
+            "before": before,
+        }
+
+    def clear_field_filters(
+        self,
+        wb: Any,
+        pivot_table: str,
+        field: str | None = None,
+        *,
+        scope: str = "field",
+    ) -> dict[str, Any]:
+        """Clear filters for one field or the whole PivotTable.
+
+        ``scope="field"`` (the default) calls ``PivotField.ClearAllFilters`` on the
+        resolved field and returns that field's post-clear state. ``scope="table"``
+        calls ``PivotTable.ClearAllFilters`` for the whole PivotTable and returns a
+        table-level result whose ``field`` is empty. The source type is checked
+        first; both clear paths are confirmed by a post-mutation re-read and a
+        mismatch is reported truthfully.
+        """
+
+        pivot = _find_pivot(wb, pivot_table)
+        pivot_name = _get_str(pivot, "Name") or pivot_table
+        normalized_scope = normalize_filter_scope(scope)
+        _require_supported_source(pivot)
+
+        if normalized_scope == "field":
+            if not isinstance(field, str) or not field.strip():
+                raise AmbiguousFilterError(
+                    "Argument 'field' is required when scope is 'field'.",
+                    context={"pivot_table": pivot_table, "reason": "field_required"},
+                )
+            target, info = _resolve_field_target(pivot, field)
+            before = _field_filters(pivot_name, target, info.source_name)
+            try:
+                target.ClearAllFilters()
+            except ExcelVbaMcpError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a blocked/failed clear
+                raise ExcelVbaMcpError(
+                    f"PivotField.ClearAllFilters failed for field {field!r}: "
+                    f"{str(exc) or exc.__class__.__name__}",
+                    code=ErrorCode.COM_BUSY,
+                    context={"pivot_table": pivot_table, "field": info.source_name},
+                ) from exc
+            after = _field_filters(pivot_name, target, info.source_name)
+            if not _filters_all_visible(after):
+                raise ExcelVbaMcpError(
+                    "ClearAllFilters returned but the field still reports hidden "
+                    "items; the clear is not confirmed.",
+                    code=ErrorCode.AMBIGUOUS_FILTER,
+                    context={
+                        "pivot_table": pivot_table,
+                        "field": info.source_name,
+                        "hidden_items": list(after.hidden_items),
+                        "reason": "postcondition_mismatch",
+                    },
+                )
+            return {
+                "filters": after,
+                "verified": True,
+                "applied": True,
+                "notes": [],
+                "before": before,
+                "scope": "field",
+                "field": info.source_name,
+                "cleared_fields": [info.source_name],
+            }
+
+        before_states = {
+            name: _field_filters(pivot_name, source_field, name)
+            for source_field, name in _source_field_entries(pivot)
+        }
+        try:
+            pivot.ClearAllFilters()
+        except ExcelVbaMcpError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a blocked/failed clear
+            raise ExcelVbaMcpError(
+                f"PivotTable.ClearAllFilters failed for {pivot_table!r}: "
+                f"{str(exc) or exc.__class__.__name__}",
+                code=ErrorCode.COM_BUSY,
+                context={"pivot_table": pivot_table, "scope": "table"},
+            ) from exc
+        still_filtered = [
+            name
+            for source_field, name in _source_field_entries(pivot)
+            if not _filters_all_visible(_field_filters(pivot_name, source_field, name))
+        ]
+        if still_filtered:
+            raise ExcelVbaMcpError(
+                "ClearAllFilters returned but some fields still report hidden items; "
+                "the table-wide clear is not confirmed.",
+                code=ErrorCode.AMBIGUOUS_FILTER,
+                context={
+                    "pivot_table": pivot_table,
+                    "scope": "table",
+                    "still_filtered": still_filtered,
+                    "reason": "postcondition_mismatch",
+                },
+            )
+        table_state = PivotFieldFilters(
+            pivot_table=pivot_name,
+            field="",
+            all_items_visible=None,
+            visible_items=[],
+            hidden_items=[],
+            filter=PivotFilterSpec(kind=PivotFilterKind.NONE, visible_items=[], supported=True),
+            unsupported=[],
+        )
+        return {
+            "filters": table_state,
+            "verified": True,
+            "applied": True,
+            "notes": [],
+            "before": before_states,
+            "scope": "table",
+            "field": "",
+            "cleared_fields": sorted(before_states),
         }
 
     # ------------------------------------------------------------------

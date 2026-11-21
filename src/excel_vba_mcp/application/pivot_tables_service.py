@@ -4,26 +4,31 @@
 Phase 2 PivotTables surface. The read-only inventory tools
 (``pivot_tables_list``, ``pivot_table_get``, ``pivot_cache_get``,
 ``pivot_fields_list``) are implemented by ``task_048``; the targeted refresh
-tools (``pivot_table_refresh``, ``pivot_cache_refresh``) by ``task_049``; and the
+tools (``pivot_table_refresh``, ``pivot_cache_refresh``) by ``task_049``; the
 PivotField configuration tools (``set_pivot_field_layout``,
 ``set_pivot_field_position``, ``set_pivot_field_aggregation``,
-``set_pivot_field_properties``) by ``task_050``. It is deliberately **COM-free**:
+``set_pivot_field_properties``) by ``task_050``; and the filter tools
+(``get_pivot_field_filters``, ``apply_pivot_field_filter``,
+``clear_pivot_field_filters``) by ``task_051``. It is deliberately **COM-free**:
 every method resolves the ``workbook_id`` through the session bookkeeping and
 then submits a single STA-local callable to the dedicated single-STA
 :class:`~excel_vba_mcp.adapters.excel.com_worker.ExcelComWorker`. Only domain
 DTOs / plain containers cross the worker boundary (ARCH-009).
 
-Read-only path (task_048): no snapshot / approval guard chain is required (this
-task never mutates a PivotTable, PivotCache or PivotField). Every call is
-recorded in the append-only audit trail as ``read_only``.
+Read-only path (task_048, task_051 read): no snapshot / approval guard chain is
+required for ``get_pivot_field_filters`` (it never mutates a PivotTable,
+PivotCache or PivotField). Every call is recorded in the append-only audit trail
+as ``read_only``.
 
-Mutation path (task_049, task_050): ``refresh_pivot_table`` /
-``refresh_pivot_cache`` and the four ``set_pivot_field_*`` tools run the full
+Mutation path (task_049, task_050, task_051): ``refresh_pivot_table`` /
+``refresh_pivot_cache``, the four ``set_pivot_field_*`` tools,
+``apply_pivot_field_filter`` and ``clear_pivot_field_filters`` run the full
 guard chain — writable working copy, successful snapshot, deny-by-default
 approval — then a single mutating STA dispatch, recorded as ``mutating``. Only a
-worksheet/Table-backed (``database``) cache is refreshed or reconfigured;
-external / OLAP / Data Model sources are rejected with ``UNSUPPORTED_PIVOT_SOURCE``
-and never touched. ``Workbook.RefreshAll`` is never used.
+worksheet/Table-backed (``database``) cache is refreshed, reconfigured or
+filtered; external / OLAP / Data Model sources are rejected with
+``UNSUPPORTED_PIVOT_SOURCE`` and never touched. ``Workbook.RefreshAll`` is never
+used.
 
 Design (task_039 decision record, ``docs/research/pivot_tables_api.md``):
 
@@ -57,15 +62,20 @@ from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
 from excel_vba_mcp.adapters.excel.pivot_tables_adapter import (
     PivotTablesAdapter,
+    normalize_filter_scope,
+    normalize_filter_spec,
+    unsupported_filter_reason,
     validate_field_properties,
 )
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
-from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import AmbiguousFilterError, ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
     PivotCacheInfo,
+    PivotFieldFilters,
     PivotFieldInfo,
     PivotFieldProperties,
+    PivotFilterSpec,
     PivotInventory,
     PivotRefreshResult,
     PivotTableInfo,
@@ -88,6 +98,8 @@ _ACTION_SET_LAYOUT = "pivot_field_set_layout"
 _ACTION_SET_POSITION = "pivot_field_set_position"
 _ACTION_SET_AGGREGATION = "pivot_field_set_aggregation"
 _ACTION_SET_PROPERTIES = "pivot_field_set_properties"
+_ACTION_APPLY_FILTER = "pivot_field_apply_filter"
+_ACTION_CLEAR_FILTERS = "pivot_field_clear_filters"
 
 #: The orientation buckets a field's ``Orientation`` may be assigned to.
 _LAYOUT_ORIENTATIONS: frozenset[PivotFieldOrientation] = frozenset(
@@ -246,6 +258,40 @@ class PivotTablesService:
             {
                 "pivot_table": pivot_table,
                 "field_count": len(result),
+            },
+        )
+        return result
+
+    async def get_pivot_field_filters(
+        self, workbook_id: str, pivot_table: str, field: str
+    ) -> PivotFieldFilters:
+        """Read one field's filter state (manual visible/hidden items).
+
+        Read-only: the adapter reports ``AllItemsVisible``, the visible/hidden
+        ``PivotItems`` (the manual filter), the classified filter kind and any
+        detected ``PivotFilters`` entries. ``PivotFilters.Add`` is never called.
+        """
+
+        record = self._resolve_record(workbook_id)
+        result = await self._submit_read(
+            workbook_id,
+            "pivot_field_get_filters",
+            lambda wb: self._adapter.get_field_filters(wb, pivot_table, field),
+            record,
+        )
+        self._record_audit(
+            "pivot_field_get_filters",
+            "read_only",
+            record,
+            {"workbook_id": workbook_id, "pivot_table": pivot_table, "field": field},
+            {
+                "pivot_table": result.pivot_table,
+                "field": result.field,
+                "all_items_visible": result.all_items_visible,
+                "visible_count": len(result.visible_items),
+                "hidden_items": list(result.hidden_items),
+                "kind": result.filter.kind.value,
+                "unsupported": list(result.unsupported),
             },
         )
         return result
@@ -546,6 +592,157 @@ class PivotTablesService:
         return field_info
 
     # ------------------------------------------------------------------
+    # Public API — PivotField filters (guarded; task_051)
+    # ------------------------------------------------------------------
+    async def apply_pivot_field_filter(
+        self,
+        workbook_id: str,
+        pivot_table: str,
+        field: str,
+        spec: PivotFilterSpec,
+    ) -> PivotFieldFilters:
+        """Apply a supported manual filter to one field (guarded).
+
+        The request is validated before anything else (a non-PivotFilterSpec, an
+        unknown kind, a blank/duplicate/oversized item list or an empty manual
+        filter is rejected). A label / value / date / top-bottom request maps to
+        ``PivotFilters.Add``, which is unsupported on the target build: it returns
+        an explicit ``unsupported`` result with a reason and **never** touches
+        Excel or converts the request into a manual filter (task_039 §6).
+
+        A supported manual filter then runs the guard chain (writable working copy
+        → successful snapshot → approval) before the single STA dispatch. The
+        adapter re-reads the visible/hidden items as a postcondition; a mismatch
+        is a structured error, never a false success.
+        """
+
+        normalized = normalize_filter_spec(spec)
+        reason = unsupported_filter_reason(normalized)
+        record = self._resolve_record(workbook_id)
+        if reason is not None:
+            # Unsupported filter kind: no snapshot/approval needed because no
+            # mutation is attempted. Audited as a refused mutating request.
+            result = _unsupported_filter_dto(pivot_table, field, normalized, reason)
+            self._record_audit(
+                "pivot_field_apply_filter",
+                "mutating",
+                record,
+                {
+                    "workbook_id": workbook_id,
+                    "pivot_table": pivot_table,
+                    "field": field,
+                    "kind": normalized.kind.value,
+                    "visible_items": list(normalized.visible_items),
+                },
+                {
+                    "pivot_table": pivot_table,
+                    "field": field,
+                    "applied": False,
+                    "status": "unsupported",
+                    "reason": reason,
+                },
+            )
+            return result
+
+        record = self._require_writable(workbook_id)
+        self._require_snapshot(workbook_id)
+        self._require_approval(record, _ACTION_APPLY_FILTER)
+
+        outcome = await self._submit_mutation(
+            workbook_id,
+            "pivot_field_apply_filter",
+            lambda wb: self._adapter.apply_field_filter(wb, pivot_table, field, normalized),
+            record,
+        )
+        filters = cast("PivotFieldFilters", outcome["filters"])
+        self._record_audit(
+            "pivot_field_apply_filter",
+            "mutating",
+            record,
+            {
+                "workbook_id": workbook_id,
+                "pivot_table": pivot_table,
+                "field": field,
+                "kind": normalized.kind.value,
+                "visible_items": list(normalized.visible_items),
+            },
+            {
+                "pivot_table": filters.pivot_table,
+                "field": filters.field,
+                "applied": outcome["applied"],
+                "verified": outcome["verified"],
+                "kind": filters.filter.kind.value,
+                "visible_items": list(filters.visible_items),
+                "hidden_items": list(filters.hidden_items),
+                "before": _filters_audit_state(outcome["before"]),
+            },
+        )
+        return filters
+
+    async def clear_pivot_field_filters(
+        self,
+        workbook_id: str,
+        pivot_table: str,
+        field: str | None = None,
+        *,
+        scope: str = "field",
+    ) -> PivotFieldFilters:
+        """Clear filters for one field or the whole PivotTable (guarded).
+
+        ``scope="field"`` (the default) requires ``field`` and calls
+        ``PivotField.ClearAllFilters`` on that field; ``scope="table"`` calls
+        ``PivotTable.ClearAllFilters`` for the whole PivotTable. The scope and the
+        field requirement are validated before the guard chain, so an ambiguous
+        request never reaches Excel. The adapter re-reads the field state as a
+        postcondition; a mismatch is reported truthfully.
+        """
+
+        normalized_scope = normalize_filter_scope(scope)
+        if normalized_scope == "field" and (not isinstance(field, str) or not field.strip()):
+            raise AmbiguousFilterError(
+                "Argument 'field' is required when scope is 'field'.",
+                context={
+                    "pivot_table": pivot_table,
+                    "scope": normalized_scope,
+                    "reason": "field_required",
+                },
+            )
+
+        record = self._require_writable(workbook_id)
+        self._require_snapshot(workbook_id)
+        self._require_approval(record, _ACTION_CLEAR_FILTERS)
+
+        outcome = await self._submit_mutation(
+            workbook_id,
+            "pivot_field_clear_filters",
+            lambda wb: self._adapter.clear_field_filters(
+                wb, pivot_table, field, scope=normalized_scope
+            ),
+            record,
+        )
+        filters = cast("PivotFieldFilters", outcome["filters"])
+        self._record_audit(
+            "pivot_field_clear_filters",
+            "mutating",
+            record,
+            {
+                "workbook_id": workbook_id,
+                "pivot_table": pivot_table,
+                "field": field,
+                "scope": normalized_scope,
+            },
+            {
+                "pivot_table": filters.pivot_table,
+                "field": filters.field,
+                "scope": outcome["scope"],
+                "cleared_fields": list(outcome["cleared_fields"]),
+                "verified": outcome["verified"],
+                "before": _filter_states_audit(outcome["before"]),
+            },
+        )
+        return filters
+
+    # ------------------------------------------------------------------
     # Guards (non-COM)
     # ------------------------------------------------------------------
     def _require_writable(self, workbook_id: str) -> WorkbookInfo:
@@ -826,6 +1023,49 @@ def _field_state(info: PivotFieldInfo) -> dict[str, Any]:
         "number_format": info.number_format,
         "show_all_items": info.show_all_items,
     }
+
+
+def _unsupported_filter_dto(
+    pivot_table: str, field: str, spec: PivotFilterSpec, reason: str
+) -> PivotFieldFilters:
+    """Build the explicit unsupported result for a non-manual filter request."""
+
+    return PivotFieldFilters(
+        pivot_table=pivot_table,
+        field=field,
+        filter=PivotFilterSpec(
+            kind=spec.kind,
+            visible_items=[],
+            supported=False,
+            unsupported_reason=reason,
+        ),
+        unsupported=[spec.kind.value],
+    )
+
+
+def _filters_audit_state(filters: PivotFieldFilters | None) -> dict[str, Any] | None:
+    """Return the audit-friendly subset of one field's filter state."""
+
+    if filters is None:
+        return None
+    return {
+        "field": filters.field,
+        "all_items_visible": filters.all_items_visible,
+        "visible_items": list(filters.visible_items),
+        "hidden_items": list(filters.hidden_items),
+        "kind": filters.filter.kind.value,
+        "unsupported": list(filters.unsupported),
+    }
+
+
+def _filter_states_audit(states: Any) -> Any:
+    """Return an audit-friendly view of a before-state (DTO or name→DTO map)."""
+
+    if isinstance(states, PivotFieldFilters):
+        return _filters_audit_state(states)
+    if isinstance(states, dict):
+        return {name: _filters_audit_state(value) for name, value in states.items()}
+    return None
 
 
 def _find_open_workbook(app_adapter: ExcelAppAdapter, working_path: str) -> Any | None:
