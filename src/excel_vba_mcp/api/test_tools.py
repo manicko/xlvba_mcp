@@ -3,15 +3,21 @@
 Thin, async MCP tool handlers for immutable workbook snapshots
 (``snapshot_create``, ``snapshot_list``, ``snapshot_restore``, ``snapshot_diff``)
 and for the bounded declarative test runner (``test_run_suite``,
-``test_get_run``). They are deliberately **thin**: each validates its arguments,
-delegates to an application service and returns a domain DTO. They **never touch
-COM** (ARCH-009): no ``pythoncom`` / ``win32com`` import lives in this module.
+``test_get_run``, ``test_suite_run``). They are deliberately **thin**: each
+validates its arguments, delegates to an application service and returns a domain
+DTO. They **never touch COM** (ARCH-009): no ``pythoncom`` / ``win32com`` import
+lives in this module.
 
-``test_run_suite`` accepts the suite as a
+``test_run_suite`` / ``test_suite_run`` accept the suite as a
 :class:`~excel_vba_mcp.domain.test_spec.TestSuiteSpec`, so the closed action /
 assertion vocabularies are validated by Pydantic at the protocol boundary —
 before any Excel call. The runner then isolates every case on a disposable copy of
-one baseline snapshot.
+one baseline snapshot. ``test_suite_run`` is the explicit Phase 2 (task_053)
+entry point: it accepts the suite either as a
+:class:`~excel_vba_mcp.domain.test_spec.TestSuiteSpec` instance or as a plain
+JSON-style mapping (the shape an MCP caller sends) and validates it here, so an
+unknown Range/Pivot action or assertion is rejected **before** any Excel call.
+``test_run_suite`` stays the canonical runner entry point.
 
 The handlers need configured services. Like
 :mod:`excel_vba_mcp.api.workbook_tools`, the active services are published here via
@@ -21,9 +27,13 @@ read via ``get_snapshot_service`` / ``get_test_runner``.
 
 from __future__ import annotations
 
+from typing import Any
+
+from pydantic import ValidationError
+
 from excel_vba_mcp.application.snapshot_service import SnapshotDiff, SnapshotService
 from excel_vba_mcp.application.test_runner import TestRunner
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import TestRunResult, WorkbookInfo
 from excel_vba_mcp.domain.test_spec import TestSuiteSpec
 from excel_vba_mcp.storage.snapshot_store import SnapshotManifest
@@ -172,6 +182,53 @@ async def test_run_suite(suite: TestSuiteSpec) -> TestRunResult:
     return await runner.run_suite(suite)
 
 
+async def test_suite_run(suite: TestSuiteSpec | dict[str, Any]) -> TestRunResult:
+    """Validate and run a declarative suite (task_053 explicit entry point).
+
+    Accepts the suite either as a
+    :class:`~excel_vba_mcp.domain.test_spec.TestSuiteSpec` or as a plain
+    JSON-style mapping (the shape an MCP caller sends). The mapping is validated
+    here with ``extra="forbid"`` and the closed Range/Pivot action / assertion
+    vocabularies, so an unknown action or assertion — or an unsupported payload
+    such as arbitrary code, a shell command or an unbounded COM expression — is
+    rejected **before** any Excel call. The run then behaves exactly like
+    :func:`test_run_suite`: one immutable baseline snapshot, one disposable working
+    copy per case, steps dispatched to the existing application services, and
+    external macro side effects not rolled back.
+
+    Args:
+        suite: The declarative suite document (or an already-built
+            :class:`TestSuiteSpec`).
+
+    Returns:
+        A :class:`~excel_vba_mcp.domain.models.TestRunResult` with per-case and
+        per-step statuses. The run is persisted and can be read back with
+        :func:`test_get_run`.
+
+    Raises:
+        ExcelVbaMcpError: With ``code='INVALID_RANGE'`` when the document does
+            not satisfy the closed schema.
+    """
+
+    spec = suite if isinstance(suite, TestSuiteSpec) else _parse_suite(suite)
+    return await test_run_suite(spec)
+
+
+def _parse_suite(document: dict[str, Any]) -> TestSuiteSpec:
+    """Validate a plain suite mapping against the closed schema (pre-Excel)."""
+
+    try:
+        return TestSuiteSpec.model_validate(document)
+    except ValidationError as exc:
+        raise ExcelVbaMcpError(
+            "The test suite is not a valid bounded declarative suite; "
+            "unknown actions/assertions and non-scalar payloads are rejected "
+            "before any Excel call.",
+            code=ErrorCode.INVALID_RANGE,
+            context={"reason": "invalid_test_suite", "validation": exc.errors()},
+        ) from exc
+
+
 async def test_get_run(run_id: str) -> TestRunResult:
     """Return a previously persisted test run.
 
@@ -198,4 +255,5 @@ __all__ = [
     "snapshot_restore",
     "test_get_run",
     "test_run_suite",
+    "test_suite_run",
 ]

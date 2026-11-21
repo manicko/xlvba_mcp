@@ -129,6 +129,7 @@ from excel_vba_mcp.api.test_tools import (
     snapshot_restore,
     test_get_run,
     test_run_suite,
+    test_suite_run,
 )
 from excel_vba_mcp.api.vba_tools import (
     vba_export_project,
@@ -227,6 +228,15 @@ _DESC_TEST_RUN_SUITE = (
 _DESC_TEST_GET_RUN = (
     "Return a previously persisted test run by run_id (statuses, per-case steps, "
     "assertions, artifact references). Read-only: it never touches Excel."
+)
+_DESC_TEST_SUITE_RUN = (
+    "Validate and run a declarative test suite (task_053 explicit entry point). "
+    "Accepts the suite as an object or a plain JSON-style mapping; the closed "
+    "Range/Pivot action and assertion vocabularies are validated before any Excel "
+    "call, so an unknown action/assertion or an arbitrary-code/unbounded payload "
+    "is rejected up front. Behaves like test_run_suite: one immutable baseline "
+    "snapshot, one disposable working copy per case, Range/Pivot steps dispatched "
+    "to the existing services; external macro side effects are NOT rolled back."
 )
 _DESC_VBA_PROJECT_INFO = (
     "Return the VBA project summary: name, protection/lock state, component "
@@ -817,6 +827,8 @@ def _build_runtime() -> _Runtime:
         path_policy,
         audit,
         shapes_service=shapes,
+        ranges_service=ranges,
+        pivot_tables_service=pivots,
     )
     return _Runtime(
         worker=worker,
@@ -950,6 +962,7 @@ def _register_tools(server: MCPServer) -> None:
     server.add_tool(snapshot_restore, name="snapshot_restore", description=_DESC_SNAPSHOT_RESTORE)
     server.add_tool(snapshot_diff, name="snapshot_diff", description=_DESC_SNAPSHOT_DIFF)
     server.add_tool(test_run_suite, name="test_run_suite", description=_DESC_TEST_RUN_SUITE)
+    server.add_tool(test_suite_run, name="test_suite_run", description=_DESC_TEST_SUITE_RUN)
     server.add_tool(test_get_run, name="test_get_run", description=_DESC_TEST_GET_RUN)
     server.add_tool(vba_project_info, name="vba_project_info", description=_DESC_VBA_PROJECT_INFO)
     server.add_tool(
