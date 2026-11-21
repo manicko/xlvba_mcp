@@ -1127,7 +1127,7 @@ async def test_service_rejects_without_approval(tmp_path: Path) -> None:
             info.workbook_id, "ptA", "Region", PivotFieldOrientation.COLUMN
         )
 
-    assert exc_info.value.code is ErrorCode.COM_BUSY
+    assert exc_info.value.code is ErrorCode.APPROVAL_DENIED
 
 
 async def test_service_rejects_data_orientation_before_dispatch(tmp_path: Path) -> None:

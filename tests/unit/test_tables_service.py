@@ -44,7 +44,7 @@ from excel_vba_mcp.adapters.excel.tables_adapter import TableMutationResult, Tab
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
 from excel_vba_mcp.application.tables_service import TablesService
-from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ApprovalDeniedError, ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.statuses import (
     CellValueKind,
     OperationClass,
@@ -978,8 +978,9 @@ async def test_append_requires_approval(tmp_path: Path) -> None:
     _new_table(rig.workbook(), columns=["Name"], rows=[])
     rig.add_snapshot(info.workbook_id)
 
-    with pytest.raises(ExcelVbaMcpError):
+    with pytest.raises(ApprovalDeniedError) as exc_info:
         await rig.service.append_table_rows(info.workbook_id, "Tbl", [{"Name": "a"}])
+    assert exc_info.value.code is ErrorCode.APPROVAL_DENIED
     assert [s for s in rig.worker.submits if s["name"] == "table_append_rows"] == []
 
 

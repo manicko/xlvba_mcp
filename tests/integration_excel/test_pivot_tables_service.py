@@ -838,7 +838,7 @@ async def test_missing_snapshot_blocks_every_mutation(rig: Rig) -> None:
 
 @requires_excel
 async def test_missing_approval_blocks_every_mutation(rig: Rig) -> None:
-    """Writable + snapshotted but unapproved: every mutation is refused (COM_BUSY)."""
+    """Writable + snapshotted but unapproved: every mutation is refused (APPROVAL_DENIED)."""
 
     # Open writable without granting any pivot mutation action.
     rig.grant("excel_open")
@@ -850,15 +850,15 @@ async def test_missing_approval_blocks_every_mutation(rig: Rig) -> None:
 
     with pytest.raises(ExcelVbaMcpError) as layout_exc:
         await rig.pivots.set_pivot_field_layout(wid, "ptA", "Region", PivotFieldOrientation.COLUMN)
-    assert layout_exc.value.code is ErrorCode.COM_BUSY
+    assert layout_exc.value.code is ErrorCode.APPROVAL_DENIED
 
     with pytest.raises(ExcelVbaMcpError) as filter_exc:
         await rig.pivots.apply_pivot_field_filter(wid, "ptA", "Region", _manual("North"))
-    assert filter_exc.value.code is ErrorCode.COM_BUSY
+    assert filter_exc.value.code is ErrorCode.APPROVAL_DENIED
 
     with pytest.raises(ExcelVbaMcpError) as refresh_exc:
         await rig.pivots.refresh_pivot_table(wid, "ptA")
-    assert refresh_exc.value.code is ErrorCode.COM_BUSY
+    assert refresh_exc.value.code is ErrorCode.APPROVAL_DENIED
 
     await rig.session.close_workbook(wid)
 

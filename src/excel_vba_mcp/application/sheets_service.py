@@ -37,7 +37,7 @@ from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
 from excel_vba_mcp.adapters.excel.sheets_adapter import SheetsAdapter, visible_worksheet_count
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
-from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ApprovalDeniedError, ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import SheetInfo, WorkbookInfo
 from excel_vba_mcp.domain.statuses import OperationClass
 from excel_vba_mcp.security.approval import ApprovalKey, ApprovalPolicy
@@ -321,9 +321,8 @@ class SheetsService:
         )
         decision = self._approval.authorize_vba_write(key)
         if not decision.allowed:
-            raise ExcelVbaMcpError(
+            raise ApprovalDeniedError(
                 f"Sheet mutation {action!r} denied by approval policy: {decision.reason}",
-                code=ErrorCode.COM_BUSY,
                 context={
                     "action": action,
                     "workbook_id": record.workbook_id,

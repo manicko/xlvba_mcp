@@ -453,7 +453,7 @@ async def test_refresh_rejected_without_approval(rig: Rig) -> None:
     with pytest.raises(ExcelVbaMcpError) as exc_info:
         await rig.pivots.refresh_pivot_cache(info.workbook_id, 1)
 
-    assert exc_info.value.code is ErrorCode.COM_BUSY
+    assert exc_info.value.code is ErrorCode.APPROVAL_DENIED
 
     await rig.session.close_workbook(info.workbook_id)
 

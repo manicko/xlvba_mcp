@@ -40,7 +40,7 @@ from excel_vba_mcp.adapters.excel.names_adapter import NamesAdapter
 from excel_vba_mcp.application.names_service import NamesService
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
-from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ApprovalDeniedError, ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import DefinedNameInfo
 from excel_vba_mcp.domain.statuses import (
     NameScope,
@@ -716,8 +716,9 @@ async def test_create_requires_approval(tmp_path: Path) -> None:
     info = await rig.open()
     rig.add_snapshot(info.workbook_id)
 
-    with pytest.raises(ExcelVbaMcpError):
+    with pytest.raises(ApprovalDeniedError) as exc_info:
         await rig.service.create_name(info.workbook_id, "X", "=1", scope=NameScope.WORKBOOK)
+    assert exc_info.value.code is ErrorCode.APPROVAL_DENIED
     assert [s for s in rig.worker.submits if s["name"] == "name_create"] == []
 
 

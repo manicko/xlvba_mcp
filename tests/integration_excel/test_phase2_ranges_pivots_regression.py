@@ -1106,7 +1106,7 @@ async def test_every_range_mutation_requires_a_snapshot(rig: Rig) -> None:
 
 @requires_excel
 async def test_every_range_mutation_requires_approval(rig: Rig) -> None:
-    """Writable + snapshotted but unapproved: every range mutation -> COM_BUSY (deny)."""
+    """Writable + snapshotted but unapproved: every range mutation -> APPROVAL_DENIED."""
 
     fixture = _fixture_or_skip(_RANGES_PROJECT)
     original = rig.copy_fixture(fixture)
@@ -1118,7 +1118,7 @@ async def test_every_range_mutation_requires_approval(rig: Rig) -> None:
     for tool, call in _range_mutation_calls(rig, wid):
         with pytest.raises(ExcelVbaMcpError) as exc_info:
             await call()
-        assert exc_info.value.code is ErrorCode.COM_BUSY, tool
+        assert exc_info.value.code is ErrorCode.APPROVAL_DENIED, tool
         assert "approval" in exc_info.value.message.lower(), tool
 
     await rig.session.close_workbook(wid)

@@ -49,7 +49,7 @@ from excel_vba_mcp.adapters.excel.ranges_adapter import (
 )
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
-from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ApprovalDeniedError, ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
     ConditionalFormatMutationResult,
     ConditionalFormatRule,
@@ -825,9 +825,8 @@ class RangesService:
         )
         decision = self._approval.authorize_vba_write(key)
         if not decision.allowed:
-            raise ExcelVbaMcpError(
+            raise ApprovalDeniedError(
                 f"Range mutation {action!r} denied by approval policy: {decision.reason}",
-                code=ErrorCode.COM_BUSY,
                 context={
                     "action": action,
                     "workbook_id": record.workbook_id,

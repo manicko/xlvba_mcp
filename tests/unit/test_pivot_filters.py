@@ -1010,7 +1010,7 @@ async def test_service_apply_rejects_without_approval(tmp_path: Path) -> None:
             info.workbook_id, "ptA", "Region", _manual_spec("North")
         )
 
-    assert exc_info.value.code is ErrorCode.COM_BUSY
+    assert exc_info.value.code is ErrorCode.APPROVAL_DENIED
 
 
 async def test_service_clear_rejects_invalid_scope_before_dispatch(tmp_path: Path) -> None:

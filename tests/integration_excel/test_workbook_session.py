@@ -448,7 +448,7 @@ async def test_inspect_and_execute_modes(tmp_path: Path) -> None:
             await rig.service.open_workbook(
                 str(rig.original), mode=SessionMode.EXECUTE, read_only=False
             )
-        assert denied.type.__name__ == "MacroBlockedError", (
+        assert denied.type.__name__ == "ApprovalDeniedError", (
             f"execute without a grant must be denied by approval policy, got {denied.type.__name__}"
         )
         assert _sha256(rig.original) == original_hash, (

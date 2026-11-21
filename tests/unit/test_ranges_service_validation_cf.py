@@ -1446,7 +1446,7 @@ async def test_service_set_validation_requires_approval(tmp_path: Path) -> None:
             ValidationSpec(type=DataValidationType.LIST, formula1='"A,B"'),
         )
 
-    assert exc_info.value.code is ErrorCode.COM_BUSY
+    assert exc_info.value.code is ErrorCode.APPROVAL_DENIED
 
 
 async def test_service_set_validation_rejects_read_only_session(tmp_path: Path) -> None:

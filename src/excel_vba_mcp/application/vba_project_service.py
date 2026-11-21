@@ -46,7 +46,12 @@ from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
 from excel_vba_mcp.adapters.excel.vbide_adapter import VBIDEAdapter, hash_code
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
-from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError, PathNotAllowedError
+from excel_vba_mcp.domain.errors import (
+    ApprovalDeniedError,
+    ErrorCode,
+    ExcelVbaMcpError,
+    PathNotAllowedError,
+)
 from excel_vba_mcp.domain.models import (
     VbaComponentInfo,
     VbaComponentSource,
@@ -307,9 +312,8 @@ class VBAProjectService:
         assert self._approval is not None
         decision = self._approval.authorize_vba_write(key)
         if not decision.allowed:
-            raise ExcelVbaMcpError(
+            raise ApprovalDeniedError(
                 f"VBA write denied by approval policy: {decision.reason}",
-                code=ErrorCode.COM_BUSY,
                 context={
                     "action": key.action,
                     "component": component,
@@ -416,9 +420,8 @@ class VBAProjectService:
         assert self._approval is not None
         decision = self._approval.authorize_vba_write(key)
         if not decision.allowed:
-            raise ExcelVbaMcpError(
+            raise ApprovalDeniedError(
                 f"VBA write denied by approval policy: {decision.reason}",
-                code=ErrorCode.COM_BUSY,
                 context={
                     "action": key.action,
                     "component": component,
@@ -559,9 +562,8 @@ class VBAProjectService:
         """Ensure the approval policy is wired (required for mutations)."""
 
         if self._approval is None:
-            raise ExcelVbaMcpError(
+            raise ApprovalDeniedError(
                 "The approval policy is not configured; mutations require it.",
-                code=ErrorCode.COM_BUSY,
                 context={"tool": "vba_mutation", "reason": "approval_unavailable"},
             )
 

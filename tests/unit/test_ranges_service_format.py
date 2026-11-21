@@ -42,7 +42,7 @@ from excel_vba_mcp.adapters.excel.ranges_adapter import (
 from excel_vba_mcp.application.ranges_service import RangesService
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
-from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ApprovalDeniedError, ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import FormatInfo, RangeFormatPatch
 from excel_vba_mcp.domain.statuses import (
     OperationClass,
@@ -944,10 +944,11 @@ async def test_service_set_format_requires_approval(tmp_path: Path) -> None:
     rig.add_snapshot(info.workbook_id)
     # No grant.
 
-    with pytest.raises(ExcelVbaMcpError):
+    with pytest.raises(ApprovalDeniedError) as exc_info:
         await rig.service.set_format(
             info.workbook_id, "Data", "A1", RangeFormatPatch(font_bold=True)
         )
+    assert exc_info.value.code is ErrorCode.APPROVAL_DENIED
     assert [s for s in rig.worker.submits if s["name"] == "range_set_format"] == []
 
 

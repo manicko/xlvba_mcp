@@ -21,7 +21,7 @@ fixture. They assert:
 * **Rejections** — an invalid orientation / position / legacy aggregation code
   is rejected with a structured error;
 * **Guards** — read-only open → ``WORKBOOK_READ_ONLY``, no snapshot →
-  ``SNAPSHOT_FAILED``, no approval → ``COM_BUSY``;
+  ``SNAPSHOT_FAILED``, no approval → ``APPROVAL_DENIED``;
 * **BG03/BG04/BG05** — the automation Excel stays hidden and non-activating, the
   owned PID never holds foreground, no owned window is visible, and the owned PID
   is reaped after shutdown (no orphan);
@@ -650,7 +650,7 @@ async def test_config_rejected_without_approval(rig: Rig) -> None:
             info.workbook_id, "ptA", "Sales", PivotAggregation.MAX
         )
 
-    assert exc_info.value.code is ErrorCode.COM_BUSY
+    assert exc_info.value.code is ErrorCode.APPROVAL_DENIED
 
     await rig.session.close_workbook(info.workbook_id)
 

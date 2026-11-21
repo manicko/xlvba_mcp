@@ -271,6 +271,10 @@ class SnapshotService:
     ) -> WorkbookInfo:
         """Restore a working session from an immutable snapshot.
 
+        Restore has **no approval gate** (R-19): it only reverts the working copy
+        from an immutable snapshot baseline and never mutates the original, so it
+        is not classified as a mutating approval-gated operation.
+
         Closes the current working copy **without saving** (when ``workbook_id``
         is given and still open), then opens a fresh working copy from the
         snapshot baseline via the session service. The immutable snapshot file is

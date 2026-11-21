@@ -47,10 +47,10 @@ from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker, WorkerStatus
 from excel_vba_mcp.adapters.excel.workbook_adapter import WorkbookAdapter
 from excel_vba_mcp.domain.errors import (
+    ApprovalDeniedError,
     ErrorCode,
     ExcelHungError,
     ExcelVbaMcpError,
-    MacroBlockedError,
 )
 from excel_vba_mcp.domain.models import SessionStatus, WorkbookInfo
 from excel_vba_mcp.domain.statuses import (
@@ -189,7 +189,7 @@ class SessionService:
 
         Raises:
             PathNotAllowedError: If ``path`` is outside the allowlisted roots.
-            MacroBlockedError: If the approval gate denies the open.
+            ApprovalDeniedError: If the approval gate denies the open.
             ExcelVbaMcpError: If the workbook is already open on this path.
             ExcelHungError: If the STA open times out / needs recovery.
         """
@@ -351,7 +351,7 @@ class SessionService:
 
         Raises:
             ExcelVbaMcpError: If ``workbook_id`` is unknown.
-            MacroBlockedError: If a save-on-close is not approved.
+            ApprovalDeniedError: If a save-on-close is not approved.
         """
 
         record = self._require_record(workbook_id)
@@ -423,7 +423,7 @@ class SessionService:
 
         Raises:
             ExcelVbaMcpError: If ``workbook_id`` is unknown.
-            MacroBlockedError: If the save is not approved.
+            ApprovalDeniedError: If the save is not approved.
         """
 
         record = self._require_record(workbook_id)
@@ -811,9 +811,9 @@ class SessionService:
                     "source": decision.source.value if decision.source else None,
                     "reason": decision.reason,
                 },
-                result={"error_code": ErrorCode.MACRO_BLOCKED.value},
+                result={"error_code": ErrorCode.APPROVAL_DENIED.value},
             )
-            raise MacroBlockedError(
+            raise ApprovalDeniedError(
                 f"Operation {key.action!r} denied by approval policy: {decision.reason}",
                 context={
                     "action": key.action,

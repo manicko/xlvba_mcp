@@ -36,7 +36,7 @@ from excel_vba_mcp.adapters.excel.ranges_adapter import RangesAdapter
 from excel_vba_mcp.application.ranges_service import RangesService
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
-from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ApprovalDeniedError, ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
     CellValue,
     FormulaWriteRequest,
@@ -748,8 +748,9 @@ async def test_service_write_values_requires_approval(tmp_path: Path) -> None:
     rig.add_snapshot(info.workbook_id)
     payload = RangeWriteRequest(rows=1, cols=1, values=[[_cv(CellValueKind.NUMBER, 1.0)]])
 
-    with pytest.raises(ExcelVbaMcpError):
+    with pytest.raises(ApprovalDeniedError) as exc_info:
         await rig.service.write_values(info.workbook_id, "Data", "A1", payload)
+    assert exc_info.value.code is ErrorCode.APPROVAL_DENIED
     assert [s for s in rig.worker.submits if s["name"] == "range_write_values"] == []
 
 
@@ -787,6 +788,7 @@ async def test_service_write_formulas_requires_approval(tmp_path: Path) -> None:
     rig.add_snapshot(info.workbook_id)
     payload = FormulaWriteRequest(rows=1, cols=1, formulas=[["=1+2"]])
 
-    with pytest.raises(ExcelVbaMcpError):
+    with pytest.raises(ApprovalDeniedError) as exc_info:
         await rig.service.write_formulas(info.workbook_id, "Data", "A1", payload)
+    assert exc_info.value.code is ErrorCode.APPROVAL_DENIED
     assert [s for s in rig.worker.submits if s["name"] == "range_write_formulas"] == []

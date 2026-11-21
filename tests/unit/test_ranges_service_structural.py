@@ -40,7 +40,7 @@ from excel_vba_mcp.api import range_tools
 from excel_vba_mcp.application.ranges_service import RangesService
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
-from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ApprovalDeniedError, ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.statuses import (
     OperationClass,
     SessionMode,
@@ -1207,8 +1207,9 @@ async def test_service_copy_requires_approval(tmp_path: Path) -> None:
     rig.add_snapshot(wid)
     # No grant.
 
-    with pytest.raises(ExcelVbaMcpError):
+    with pytest.raises(ApprovalDeniedError) as exc_info:
         await rig.service.copy_range(wid, "Data", "A1:B2", "Data", "D1")
+    assert exc_info.value.code is ErrorCode.APPROVAL_DENIED
     assert [s for s in rig.worker.submits if s["name"] == "range_copy"] == []
 
 
@@ -1281,8 +1282,9 @@ async def test_service_merge_requires_approval(tmp_path: Path) -> None:
     wid = await _open_seeded(rig)
     rig.add_snapshot(wid)
 
-    with pytest.raises(ExcelVbaMcpError):
+    with pytest.raises(ApprovalDeniedError) as exc_info:
         await rig.service.merge_range(wid, "Data", "A1:B2", allow_data_loss=True)
+    assert exc_info.value.code is ErrorCode.APPROVAL_DENIED
     assert [s for s in rig.worker.submits if s["name"] == "range_merge"] == []
 
 

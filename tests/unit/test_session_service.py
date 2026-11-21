@@ -32,7 +32,7 @@ import pytest
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import WorkerStatus
 from excel_vba_mcp.application.session_service import SessionService
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError, MacroBlockedError
+from excel_vba_mcp.domain.errors import ApprovalDeniedError, ExcelVbaMcpError
 from excel_vba_mcp.domain.statuses import (
     AccessMode,
     OperationClass,
@@ -266,14 +266,14 @@ async def test_open_inspect_sets_force_disable_automation_security(tmp_path: Pat
 async def test_open_execute_denied_without_grant(tmp_path: Path) -> None:
     service, _app, _worker, original, _work_dir = _make_service(tmp_path)
 
-    with pytest.raises(MacroBlockedError):
+    with pytest.raises(ApprovalDeniedError):
         await service.open_workbook(str(original), mode=SessionMode.EXECUTE)
 
 
 async def test_open_writable_inspect_denied_without_grant(tmp_path: Path) -> None:
     service, _app, _worker, original, _work_dir = _make_service(tmp_path)
 
-    with pytest.raises(MacroBlockedError):
+    with pytest.raises(ApprovalDeniedError):
         await service.open_workbook(str(original), mode=SessionMode.INSPECT, read_only=False)
 
 
@@ -358,7 +358,7 @@ async def test_close_with_save_changes_requires_grant(tmp_path: Path) -> None:
     service, _app, _worker, original, _work_dir = _make_service(tmp_path)
     info = await service.open_workbook(str(original), mode=SessionMode.INSPECT, read_only=True)
 
-    with pytest.raises(MacroBlockedError):
+    with pytest.raises(ApprovalDeniedError):
         await service.close_workbook(info.workbook_id, save_changes=True)
 
 
@@ -519,11 +519,12 @@ async def test_get_status_reports_restricted_access_mode_by_default(tmp_path: Pa
     assert status.access_mode == AccessMode.RESTRICTED
 
 
-async def test_approval_denial_emits_macro_blocked_audit_event(tmp_path: Path) -> None:
-    # F-02: a denial emits exactly one audit event (MACRO_BLOCKED) before raising.
+async def test_approval_denial_emits_approval_denied_audit_event(tmp_path: Path) -> None:
+    # F-02 (task_b4): a denial emits exactly one audit event (APPROVAL_DENIED)
+    # before raising ApprovalDeniedError.
     service, _app, _worker, original, _work_dir = _make_service(tmp_path)
 
-    with pytest.raises(MacroBlockedError):
+    with pytest.raises(ApprovalDeniedError):
         await service.open_workbook(str(original), mode=SessionMode.EXECUTE)
 
     audit_path = tmp_path / "audit.jsonl"
@@ -536,7 +537,7 @@ async def test_approval_denial_emits_macro_blocked_audit_event(tmp_path: Path) -
         event
         for event in events
         if event.get("tool") == "excel_open"
-        and (event.get("result") or {}).get("error_code") == "MACRO_BLOCKED"
+        and (event.get("result") or {}).get("error_code") == "APPROVAL_DENIED"
     ]
     assert len(denials) == 1
     approval = denials[0]["approval"]

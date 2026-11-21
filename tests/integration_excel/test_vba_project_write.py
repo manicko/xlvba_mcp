@@ -679,7 +679,7 @@ async def test_mutation_blocked_without_approval(tmp_path: Path) -> None:
             )
 
         err = exc_info.value
-        assert err.code is ErrorCode.COM_BUSY
+        assert err.code is ErrorCode.APPROVAL_DENIED
         assert err.context.get("reason") == decision.reason
         assert err.to_dict()["context"]["reason"] == decision.reason
 

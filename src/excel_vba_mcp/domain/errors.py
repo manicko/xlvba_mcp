@@ -49,6 +49,7 @@ class ErrorCode(StrEnum):
     REFRESH_FAILED = "REFRESH_FAILED"
     MODAL_UI_BLOCKED = "MODAL_UI_BLOCKED"
     LISTOBJECT_INTERSECTION = "LISTOBJECT_INTERSECTION"
+    APPROVAL_DENIED = "APPROVAL_DENIED"
 
 
 # Well-known HRESULT values that map to domain codes (hex shown for readability).
@@ -190,6 +191,13 @@ class MacroBlockedError(ExcelVbaMcpError):
 
     default_code = ErrorCode.MACRO_BLOCKED
     default_message = "The macro is blocked by policy."
+
+
+class ApprovalDeniedError(ExcelVbaMcpError):
+    """The operation was denied by the approval policy."""
+
+    default_code = ErrorCode.APPROVAL_DENIED
+    default_message = "The operation was denied by the approval policy."
 
 
 class MacroNotFoundError(ExcelVbaMcpError):
@@ -371,4 +379,7 @@ _ERROR_BY_CODE: dict[ErrorCode, type[ExcelVbaMcpError]] = {
     ErrorCode.REFRESH_FAILED: RefreshFailedError,
     ErrorCode.MODAL_UI_BLOCKED: ModalUiBlockedError,
     ErrorCode.LISTOBJECT_INTERSECTION: ListObjectIntersectionError,
+    # Task_b4 (fix_004): approval denial is a typed domain error, distinct from
+    # COM contention. Inert for ``error_from_hresult`` (no HRESULT maps to it).
+    ErrorCode.APPROVAL_DENIED: ApprovalDeniedError,
 }

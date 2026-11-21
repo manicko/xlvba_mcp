@@ -1128,7 +1128,7 @@ async def test_every_mutation_requires_approval(rig: Rig) -> None:
     for tool, call in _mutation_calls(rig, wid):
         with pytest.raises(ExcelVbaMcpError) as exc_info:
             await call()
-        assert exc_info.value.code is ErrorCode.COM_BUSY, tool
+        assert exc_info.value.code is ErrorCode.APPROVAL_DENIED, tool
         assert "approval" in exc_info.value.message.lower(), tool
 
 

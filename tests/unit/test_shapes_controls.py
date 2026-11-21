@@ -44,7 +44,7 @@ from excel_vba_mcp.application.controls_service import ControlsService
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.shapes_service import ShapesService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
-from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ApprovalDeniedError, ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import ControlEntry, ShapeInfo
 from excel_vba_mcp.domain.statuses import (
     ControlFormType,
@@ -723,8 +723,9 @@ async def test_shape_set_on_action_requires_approval(tmp_path: Path) -> None:
     rig.add_snapshot(info.workbook_id)
     # No grant.
 
-    with pytest.raises(ExcelVbaMcpError):
+    with pytest.raises(ApprovalDeniedError) as exc_info:
         await rig.shapes.set_on_action(info.workbook_id, "Text 1", "X")
+    assert exc_info.value.code is ErrorCode.APPROVAL_DENIED
     assert [s for s in rig.worker.submits if s["name"] == "shape_set_on_action"] == []
 
 
@@ -757,8 +758,9 @@ async def test_control_set_on_action_requires_approval(tmp_path: Path) -> None:
     _seed_workbook(rig)
     rig.add_snapshot(info.workbook_id)
 
-    with pytest.raises(ExcelVbaMcpError):
+    with pytest.raises(ApprovalDeniedError) as exc_info:
         await rig.controls.set_on_action(info.workbook_id, "Button 1", "X")
+    assert exc_info.value.code is ErrorCode.APPROVAL_DENIED
 
 
 async def test_control_set_on_action_requires_writable(tmp_path: Path) -> None:

@@ -69,7 +69,12 @@ from excel_vba_mcp.adapters.excel.pivot_tables_adapter import (
 )
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
-from excel_vba_mcp.domain.errors import AmbiguousFilterError, ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import (
+    AmbiguousFilterError,
+    ApprovalDeniedError,
+    ErrorCode,
+    ExcelVbaMcpError,
+)
 from excel_vba_mcp.domain.models import (
     PivotCacheInfo,
     PivotFieldFilters,
@@ -775,9 +780,8 @@ class PivotTablesService:
         """Authorize a mutating pivot operation (deny-by-default)."""
 
         if self._approval is None:
-            raise ExcelVbaMcpError(
+            raise ApprovalDeniedError(
                 "The approval policy is not configured; a pivot mutation requires it.",
-                code=ErrorCode.COM_BUSY,
                 context={"tool": "pivot_mutation", "action": action},
             )
         key = ApprovalKey(
@@ -787,9 +791,8 @@ class PivotTablesService:
         )
         decision = self._approval.authorize_vba_write(key)
         if not decision.allowed:
-            raise ExcelVbaMcpError(
+            raise ApprovalDeniedError(
                 f"Pivot mutation {action!r} denied by approval policy: {decision.reason}",
-                code=ErrorCode.COM_BUSY,
                 context={
                     "action": action,
                     "workbook_id": record.workbook_id,

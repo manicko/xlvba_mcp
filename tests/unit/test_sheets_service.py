@@ -34,7 +34,7 @@ from excel_vba_mcp.adapters.excel.sheets_adapter import SheetsAdapter
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.sheets_service import SheetsService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
-from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ApprovalDeniedError, ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.statuses import (
     OperationClass,
     SessionMode,
@@ -510,8 +510,9 @@ async def test_add_sheet_requires_approval(tmp_path: Path) -> None:
     info = await rig.open()
     rig.add_snapshot(info.workbook_id)
 
-    with pytest.raises(ExcelVbaMcpError):
+    with pytest.raises(ApprovalDeniedError) as exc_info:
         await rig.service.add_sheet(info.workbook_id, "New")
+    assert exc_info.value.code is ErrorCode.APPROVAL_DENIED
     assert [s for s in rig.worker.submits if s["name"] == "sheet_add"] == []
 
 
@@ -587,8 +588,9 @@ async def test_delete_requires_approval(tmp_path: Path) -> None:
     info = await rig.open()
     rig.add_snapshot(info.workbook_id)
 
-    with pytest.raises(ExcelVbaMcpError):
+    with pytest.raises(ApprovalDeniedError) as exc_info:
         await rig.service.delete_sheet(info.workbook_id, "Sheet1")
+    assert exc_info.value.code is ErrorCode.APPROVAL_DENIED
     assert [s for s in rig.worker.submits if s["name"] == "sheet_delete"] == []
 
 
