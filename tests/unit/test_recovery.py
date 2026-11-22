@@ -25,7 +25,7 @@ import pytest
 
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import WorkerStatus
-from excel_vba_mcp.api import workbook_tools
+from excel_vba_mcp.api import health_tools, workbook_tools
 from excel_vba_mcp.api.health_tools import excel_health
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.domain.errors import ErrorCode, ExcelHungError
@@ -374,7 +374,14 @@ async def test_recover_after_close_reports_truthful_closed_state(rig: Rig) -> No
 # ---------------------------------------------------------------------------
 # excel_health (no forced re-run)
 # ---------------------------------------------------------------------------
-async def test_excel_health_is_truthful_without_forced_rerun(rig: Rig) -> None:
+async def test_excel_health_is_truthful_without_forced_rerun(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The fake worker owns pid 4242, which is not a real process; stub the
+    # FE-18 owned-pid liveness probe as "alive" so this test exercises only the
+    # state-based verdict, not the pid liveness branch (covered in
+    # test_health_tools.py).
+    monkeypatch.setattr(health_tools, "_owned_pid_alive", lambda _pid: True)
     workbook_tools.set_session_service(rig.session)
     try:
         before = len(rig.worker.submits)

@@ -660,6 +660,75 @@ async def test_owned_pid_reaped_on_shutdown_without_barrier(tmp_path: Path) -> N
 
 
 # ---------------------------------------------------------------------------
+# FE-18 (R-17): excel_health reports a dead owned Excel truthfully
+# ---------------------------------------------------------------------------
+def _terminate_owned_pid(pid: int) -> bool:
+    """Terminate ONLY ``pid`` via ``taskkill /F /PID`` (mirrors macro_service)."""
+
+    try:
+        completed = subprocess.run(
+            ["taskkill", "/F", "/PID", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return completed.returncode == 0
+    except Exception:  # noqa: BLE001 - defensive: a probe failure means "not killed"
+        return False
+
+
+@requires_excel
+async def test_health_reports_dead_owned_pid(tmp_path: Path) -> None:
+    """A killed owned Excel is reported as ``needs_recovery`` (FE-18 / R-17).
+
+    After ``excel_open`` the worker bookkeeping says ``running`` / ``accepting``.
+    Killing the *owned* hidden ``EXCEL.EXE`` (and only that pid) leaves the
+    worker bookkeeping unchanged, so without the FE-18 pid-liveness probe
+    ``excel_health`` would still report ``ok``. The probe must flip the verdict
+    to ``needs_recovery`` truthfully. Recovery is then driven by the server
+    lifespan shutdown (no ``excel_recover_session`` tool is exposed); after the
+    server exits the owned pid is gone and no orphaned Excel remains beyond the
+    pre-existing baseline.
+    """
+
+    baseline_pids = _excel_pids()
+    work_copy = _copy_fixture(tmp_path)
+
+    async with _running_server(tmp_path) as session:
+        owned_pid = _assert_healthy_and_live(await _wait_healthy(session))
+        assert owned_pid not in baseline_pids, (
+            f"owned PID {owned_pid} collided with a pre-existing user Excel PID"
+        )
+
+        await _call(session, "excel_open", {"path": str(work_copy)})
+        # Confirm still healthy before the kill (the owned pid is alive).
+        _assert_healthy_and_live(await _wait_healthy(session))
+
+        # Kill ONLY the owned hidden Excel pid (same pattern as macro_service).
+        assert _terminate_owned_pid(owned_pid), f"failed to terminate owned pid {owned_pid}"
+        assert _wait_pid_dead(owned_pid), f"owned pid {owned_pid} did not die after taskkill"
+
+        # The worker bookkeeping still says running/accepting; the read-only probe
+        # must report the stale worker truthfully.
+        health = structured(await _call(session, "excel_health"))
+        assert health.get("needs_recovery") is True, f"dead owned pid not reported: {health}"
+        assert health.get("status") == "needs_recovery", f"wrong status: {health}"
+        assert health.get("owned_pid") == owned_pid, f"owned_pid changed: {health}"
+        assert any("not alive" in note for note in health.get("notes", [])), (
+            f"missing dead-pid note: {health}"
+        )
+
+    # Server lifespan shutdown completed: the owned pid is gone (it was killed
+    # above and the worker's shutdown reap is a no-op on an already-dead pid).
+    assert not _pid_alive(owned_pid), (
+        f"owned PID {owned_pid} is unexpectedly alive after shutdown"
+    )
+    # No orphaned hidden Excel beyond the pre-existing baseline.
+    leaked = _excel_pids() - baseline_pids
+    assert not leaked, f"orphaned Excel process(es) after shutdown: {sorted(leaked)}"
+
+
+# ---------------------------------------------------------------------------
 # F1 persistence (recommended): snapshot -> close(save) -> restore -> verify
 # ---------------------------------------------------------------------------
 @requires_excel
