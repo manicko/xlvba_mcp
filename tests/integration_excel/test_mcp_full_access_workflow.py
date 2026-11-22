@@ -25,6 +25,14 @@ settings-update / macro-execution cycles on one ``workbook_id``**:
    is untouched, so the hash-bound classification stays valid across both cycles.
 7. ``excel_save`` -> ``excel_close(save_changes=False)``.
 
+The main two-cycle test additionally closes the Phase-4 coverage gaps flagged in
+``.ai/plans/full-edit-mode-orchestration-plan.md`` §7: it reads the settings table
+**explicitly** via ``table_read_rows`` before any mutation (step 4), reads the
+updated ``Sheet1!B2`` cell back after **each** ``table_update_rows`` (steps 6 and
+11), and performs a final **non-VBA** ``range_write_values`` of a sentinel into
+``Result!A3`` followed by a read-back (step 14) to prove a mutation surface other
+than ``table_update_rows`` lands on the live session.
+
 Background safety (PO-5) is verified per owned PID: a read-only Win32 window
 enumeration (``EnumWindows`` + ``GetWindowThreadProcessId``) proves the owned
 Excel instance has **no visible window** at stable points (so it cannot steal
@@ -335,6 +343,61 @@ async def _read_result_a1(session: ClientSession, workbook_id: str) -> Any:
     )
 
 
+async def _read_cell(
+    session: ClientSession, workbook_id: str, sheet: str, address: str
+) -> Any:
+    """Read a single cell's scalar value via ``range_read_values``."""
+
+    return _single_cell(
+        await _call(
+            session,
+            "range_read_values",
+            {"workbook_id": workbook_id, "sheet": sheet, "address": address},
+        )
+    )
+
+
+async def _write_cell(
+    session: ClientSession, workbook_id: str, sheet: str, address: str, value: Any
+) -> Any:
+    """Write a single scalar cell via ``range_write_values``; return the structured result."""
+
+    return structured(
+        await _call(
+            session,
+            "range_write_values",
+            {
+                "workbook_id": workbook_id,
+                "sheet": sheet,
+                "address": address,
+                "payload": _write_payload(value),
+            },
+        )
+    )
+
+
+async def _read_settings_rows(session: ClientSession, workbook_id: str) -> Any:
+    """Read every data row of ``tblSettings`` via ``table_read_rows`` (Phase-4 step 4)."""
+
+    return structured(
+        await _call(
+            session,
+            "table_read_rows",
+            {"workbook_id": workbook_id, "name": "tblSettings"},
+        )
+    )
+
+
+def _table_rows_as_dicts(table_rows: dict[str, Any]) -> list[dict[str, Any]]:
+    """Map ``TableRows.rows`` (positional per ``columns``) into ``{column: value}`` dicts."""
+
+    columns = table_rows["columns"]
+    return [
+        {column: cell["value"] for column, cell in zip(columns, row, strict=True)}
+        for row in table_rows["rows"]
+    ]
+
+
 async def _update_factor(session: ClientSession, workbook_id: str, value: int) -> None:
     """Set ``tblSettings`` row 1 ``SettingValue`` to ``value`` via ``table_update_rows``."""
 
@@ -485,8 +548,31 @@ async def test_full_access_workflow_e2e(tmp_path: Path) -> None:
         )
         assert classified["background_safe"] is True, classified
 
+        # --- Step 4: read the settings table EXPLICITLY (table_read_rows) and the
+        #     initial Result!A1 BEFORE any mutation (Phase-4 step 4). ---
+        settings = await _read_settings_rows(session, workbook_id)
+        assert settings["name"] == "tblSettings", f"unexpected table: {settings}"
+        assert settings["columns"] == ["SettingKey", "SettingValue"], (
+            f"unexpected columns: {settings['columns']}"
+        )
+        settings_rows = _table_rows_as_dicts(settings)
+        factor_rows = [r for r in settings_rows if r["SettingKey"] == "factor"]
+        assert factor_rows == [{"SettingKey": "factor", "SettingValue": 5}], (
+            f"initial factor row missing/incorrect: {settings_rows}"
+        )
+        assert {"SettingKey": "label", "SettingValue": "alpha"} in settings_rows, (
+            f"initial label row missing: {settings_rows}"
+        )
+        assert await _read_result_a1(session, workbook_id) == 0, (
+            "initial Result!A1 must be 0 before the first cycle"
+        )
+
         # --- CYCLE 1: SettingValue 5 -> 10; Recalculate -> Result!A1 == 20. ---
         await _update_factor(session, workbook_id, 10)
+        # Step 6: read the updated cell back and assert it equals the written value.
+        assert await _read_cell(session, workbook_id, "Sheet1", "B2") == 10, (
+            "cycle 1 Sheet1!B2 must read back the written value 10"
+        )
         run1 = await _run_recalculate(session, workbook_id)
         assert run1["status"] == "success", f"cycle 1 Recalculate did not succeed: {run1}"
         cycle1_output = await _read_result_a1(session, workbook_id)
@@ -496,6 +582,10 @@ async def test_full_access_workflow_e2e(tmp_path: Path) -> None:
         # --- CYCLE 2: SettingValue 10 -> 20; Recalculate -> Result!A1 == 40 (!= 20).
         #     NO excel_save / macro .Save between the classification and here. ---
         await _update_factor(session, workbook_id, 20)
+        # Step 11: read the updated cell back and assert it equals the written value.
+        assert await _read_cell(session, workbook_id, "Sheet1", "B2") == 20, (
+            "cycle 2 Sheet1!B2 must read back the written value 20"
+        )
         run2 = await _run_recalculate(session, workbook_id)
         assert run2["status"] == "success", f"cycle 2 Recalculate did not succeed: {run2}"
         cycle2_output = await _read_result_a1(session, workbook_id)
@@ -505,6 +595,18 @@ async def test_full_access_workflow_e2e(tmp_path: Path) -> None:
             f"table state, not a cached value): {cycle1_output!r} vs {cycle2_output!r}"
         )
         _assert_owned_hidden(owned_pid, "cycle 2 macro_run")
+
+        # --- Step 14: at least one NON-VBA mutation that is NOT table_update_rows.
+        #     Write a sentinel into Result!A3 via range_write_values and read it back,
+        #     proving a second mutation surface lands on the live session. ---
+        probe = "e2e-probe"
+        write_result = await _write_cell(session, workbook_id, "Result", "A3", probe)
+        assert write_result.get("verified") is True, (
+            f"range_write_values postcondition did not verify: {write_result}"
+        )
+        assert await _read_cell(session, workbook_id, "Result", "A3") == probe, (
+            "step 14 Result!A3 must read back the written sentinel value"
+        )
 
         # --- Save then close WITHOUT saving again (close must not re-persist). ---
         saved = structured(await _call(session, "excel_save", {"workbook_id": workbook_id}))
