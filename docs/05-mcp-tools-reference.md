@@ -75,6 +75,16 @@ default `full` access mode the approval gate authorizes them (a baseline snapsho
 before a mutation); only in `restricted` mode are they refused with `APPROVAL_DENIED`. The
 `background_safe` requirement on `macro_run` applies in both modes.
 
+**`vba_compile` is `read-only`, not `executing`.** `vba_compile` submits its STA diagnostic probe
+with `op_class=EXECUTING`, but that tag only governs **retry eligibility** (the probe is never
+blindly replayed after a busy/timeout) and the **audit `operation_class`** label — it does not drive
+the approval gate. `CompileService` is constructed without an `ApprovalPolicy` and never calls the
+approval gate, so `vba_compile` is **not** approval-gated: it runs in both `full` and `restricted`
+modes, is non-mutating/non-activating, and never changes the workbook or shows UI.
+`vba_get_compile_diagnostics` only reads the cached result. `vba_compile` is therefore counted as
+`read-only` and is **not** one of the three `executing` tools (`macro_run`, `test_run_suite`,
+`test_suite_run`), whose `EXECUTING` classification does gate approval and execute user code.
+
 ## Abbreviations
 
 | Abbreviation | Meaning |
@@ -96,7 +106,7 @@ before a mutation); only in `restricted` mode are they refused with `APPROVAL_DE
 | Snapshots | 4 | `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff` | read-only + 2 mutating |
 | Test runner | 3 | `test_run_suite`, `test_suite_run`, `test_get_run` | executing + read-only |
 | VBA | 9 | `vba_project_info`, `vba_list_components`, `vba_list_procedures`, `vba_read_component`, `vba_export_project`, `vba_get_references`, `vba_search_code`, `vba_replace_component_source`, `vba_insert_code` | read-only + 2 mutating |
-| Compile | 2 | `vba_compile`, `vba_get_compile_diagnostics` | read-only |
+| Compile | 2 | `vba_compile`, `vba_get_compile_diagnostics` | read-only (see access-class note) |
 | Macros | 4 | `macro_list`, `macro_run`, `macro_get_last_result`, `macro_classify_background` | read-only + 1 executing + 1 config (bookkeeping) |
 | Sheets | 7 | `sheets_list`, `sheet_get`, `sheet_add`, `sheet_rename`, `sheet_copy`, `sheet_delete`, `sheet_set_visibility` | read-only + 5 mutating |
 | Tables | 11 | `tables_list`, `table_get`, `table_read_rows`, `table_append_rows`, `table_insert_row`, `table_update_rows`, `table_delete_rows`, `table_add_column`, `table_delete_column`, `table_create`, `table_resize` | read-only + 8 mutating |
@@ -172,6 +182,9 @@ Document modules and UserForms are rejected with `COM_BUSY`
 |------|---------|------------|---------|--------------|--------|--------|
 | `vba_compile` | Fail-closed compile result; always `indeterminate` on the validated build. | `workbook_id:string` | `CompileResult` | — (does not launch UI) | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
 | `vba_get_compile_diagnostics` | Last diagnostics without re-running. | `workbook_id:string` | `CompileDiagnostics` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
+
+`vba_compile`'s worker probe is tagged `op_class=EXECUTING` for retry/audit only; the tool itself is
+`read-only` and not approval-gated (see the access-class note).
 
 ## Macros
 
@@ -760,7 +773,10 @@ Resources are read-only: they do not mutate the workbook and do not execute VBA.
 3. **No approval grant tool.** Approval/allowlist management cannot be granted through MCP. In the
    default `full` access mode mutations and execute mode are authorized without a grant; in
    `restricted` mode they are refused with `APPROVAL_DENIED`. `background_safe` classification is
-   available through `macro_classify_background`.
+   available through `macro_classify_background`. Consequently, in `restricted` mode there is no
+   in-band path to grant approvals or manage the allowlist, so the default execute `excel_open` is
+   denied and only `inspect`+`read_only` sessions are usable; the remedy is to run in `full` mode or
+   pre-authorize via the library.
 4. **No PivotTable/PivotCache creation or deletion.** Only existing objects can be managed;
    external/OLAP/Data-Model sources are rejected.
 5. **Range and ListObject intersection.** Structural range operations over tables are rejected

@@ -75,6 +75,16 @@ related:
 режиме `restricted` они отклоняются с `APPROVAL_DENIED`. Требование `background_safe` для
 `macro_run` действует в обоих режимах.
 
+**`vba_compile` — `read-only`, а не `executing`.** `vba_compile` отправляет свою STA-пробу с
+`op_class=EXECUTING`, но этот тег управляет только **правом на повтор** (проба никогда слепо не
+повторяется после busy/timeout) и **аудиторской меткой `operation_class`** — он не управляет
+approval-гейтом. `CompileService` создаётся без `ApprovalPolicy` и никогда не вызывает approval-гейт,
+поэтому `vba_compile` **не гейтится approval**: он работает в обоих режимах (`full` и `restricted`),
+не мутирует и не активирует UI, никогда не меняет книгу и не показывает окна.
+`vba_get_compile_diagnostics` только читает кэш. Поэтому `vba_compile` учитывается как `read-only`
+и **не** входит в три `executing`-инструмента (`macro_run`, `test_run_suite`, `test_suite_run`),
+у которых класс `EXECUTING` действительно гейтит approval и выполняет пользовательский код.
+
 ## Сокращения
 
 | Сокращение | Значение |
@@ -96,7 +106,7 @@ related:
 | Snapshots | 4 | `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff` | read-only + 2 mutating |
 | Test runner | 3 | `test_run_suite`, `test_suite_run`, `test_get_run` | executing + read-only |
 | VBA | 9 | `vba_project_info`, `vba_list_components`, `vba_list_procedures`, `vba_read_component`, `vba_export_project`, `vba_get_references`, `vba_search_code`, `vba_replace_component_source`, `vba_insert_code` | read-only + 2 mutating |
-| Compile | 2 | `vba_compile`, `vba_get_compile_diagnostics` | read-only |
+| Compile | 2 | `vba_compile`, `vba_get_compile_diagnostics` | read-only (см. примечание о классах доступа) |
 | Macros | 4 | `macro_list`, `macro_run`, `macro_get_last_result`, `macro_classify_background` | read-only + 1 executing + 1 config (bookkeeping) |
 | Sheets | 7 | `sheets_list`, `sheet_get`, `sheet_add`, `sheet_rename`, `sheet_copy`, `sheet_delete`, `sheet_set_visibility` | read-only + 5 mutating |
 | Tables | 11 | `tables_list`, `table_get`, `table_read_rows`, `table_append_rows`, `table_insert_row`, `table_update_rows`, `table_delete_rows`, `table_add_column`, `table_delete_column`, `table_create`, `table_resize` | read-only + 8 mutating |
@@ -172,6 +182,9 @@ related:
 |------------|------------|-----------|---------|------------------|--------|--------|
 | `vba_compile` | Fail-closed результат компиляции; на валидированной сборке всегда `indeterminate`. | `workbook_id:string` | `CompileResult` | — (не запускает UI) | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
 | `vba_get_compile_diagnostics` | Последние диагностические данные без повторного запуска. | `workbook_id:string` | `CompileDiagnostics` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
+
+STA-проба `vba_compile` помечается `op_class=EXECUTING` только для повтора/аудита; сам инструмент
+`read-only` и не гейтится approval (см. примечание о классах доступа).
 
 ## Macros
 
@@ -767,7 +780,10 @@ Fail-closed ответ:
 3. **Нет grant-инструмента для approval.** Управление approval/allowlist через MCP невозможно.
    В режиме `full` (по умолчанию) мутации и execute-режим авторизованы без гранта; в
    `restricted` они отклоняются с `APPROVAL_DENIED`. Классификация `background_safe` доступна
-   через `macro_classify_background`.
+   через `macro_classify_background`. Следовательно, в режиме `restricted` нет in-band пути для
+   выдачи approval или управления allowlist, поэтому execute-`excel_open` по умолчанию отклоняется
+   и пригодны только сессии `inspect`+`read_only`; решение — работать в режиме `full` или заранее
+   авторизовать через библиотеку.
 4. **Нет создания/удаления PivotTables и PivotCaches.** Только управление существующими
    объектами; внешние/OLAP/Data-Model источники отклоняются.
 5. **Пересечение диапазона с ListObject.** Структурные операции диапазонов над таблицами
