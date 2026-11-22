@@ -55,7 +55,7 @@ Coverage describes the **Excel object-model surface**. It does not mean the oper
 unconditionally permitted through MCP. In the default `full` access mode mutating and executing
 operations are authorized (a snapshot is still required before a mutation); in `restricted` mode
 they are denied by default. The Limitations column of each row says so explicitly. The security
-model is in [Security](08-security.md).
+model is in [Architecture](04-architecture.md).
 
 ### Operation kinds
 
@@ -344,6 +344,5 @@ veto.
 
 Related documents: [Overview](01-overview.md), [Configuration](03-configuration.md),
 [Architecture](04-architecture.md), [MCP tools reference](05-mcp-tools-reference.md),
-[Workflows and examples](07-workflows-and-examples.md), [Security](08-security.md),
-[Limitations and compatibility](09-limitations-and-compatibility.md),
+[Workflows and examples](07-workflows-and-examples.md),
 [Troubleshooting](10-troubleshooting.md) and the [root README](../README.md).

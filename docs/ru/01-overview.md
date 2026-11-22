@@ -88,7 +88,7 @@ related:
   как явный opt-in.
 
 Каждая группа описана подробнее в [Возможности Excel](06-excel-capabilities.md),
-угрозы и границы — в [Безопасность](08-security.md) и [Ограничения и совместимость](09-limitations-and-compatibility.md).
+угрозы и границы — в [Архитектура](04-architecture.md) и [Возможности Excel](06-excel-capabilities.md).
 
 ## Как ИИ-агент взаимодействует с Excel через xlvba
 
@@ -141,7 +141,7 @@ related:
 - Не поддерживает облачные сценарии и Office 365 (работа только с настольным Excel через COM).
 - Не поддерживает не-Windows платформы (COM и VBOM доступны только на Windows).
 
-Полный перечень ограничений — в [Ограничения и совместимость](09-limitations-and-compatibility.md).
+Полный перечень ограничений — в [Возможности Excel](06-excel-capabilities.md).
 
 ## Основные зависимости
 
@@ -168,8 +168,6 @@ related:
 - [Справочник инструментов MCP](05-mcp-tools-reference.md)
 - [Возможности Excel](06-excel-capabilities.md)
 - [Рабочие процессы и примеры](07-workflows-and-examples.md)
-- [Безопасность](08-security.md)
-- [Ограничения и совместимость](09-limitations-and-compatibility.md)
 - [Устранение неполадок](10-troubleshooting.md)
 - [Разработка и сопровождение](11-development-and-maintenance.md)
 - [Корневой README](../../README.md)

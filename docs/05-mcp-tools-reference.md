@@ -25,8 +25,8 @@ actual tool schemas obtained from a live `MCPServer` and on the source modules `
 
 This document does not restate the architecture — that is covered in
 [Architecture](04-architecture.md). Settings are in [Configuration](03-configuration.md),
-the security model is in [Security](08-security.md), and limits are in
-[Limitations and compatibility](09-limitations-and-compatibility.md).
+the security model is in [Architecture](04-architecture.md), and limits are in
+[Excel capabilities](06-excel-capabilities.md).
 
 ## How to read this reference
 

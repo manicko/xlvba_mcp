@@ -29,7 +29,7 @@ writing this document: they are recipes, not transcripts.
 The capabilities behind these workflows are classified in
 [Excel capabilities](06-excel-capabilities.md). Settings are in
 [Configuration](03-configuration.md); the security and approval model is in
-[Security](08-security.md).
+[Architecture](04-architecture.md).
 
 ## Conventions
 
@@ -38,7 +38,7 @@ The capabilities behind these workflows are classified in
 | `<workbook_id>` | Server-assigned identifier of an open working copy, returned by `excel_open`. It is **not** a file path. Replace it in every subsequent call. |
 | JSON blocks | Show the tool **arguments** object exactly as it is sent over MCP. A block is not the full JSON-RPC envelope. |
 | `xlvba_` prefix | Clients expose published names with a server prefix. In Kilo, for example, `excel_open` is called as `xlvba_excel_open`. This document uses the published names without the prefix; add your client's prefix. |
-| **Approval-gated (restricted mode)** | The call is a mutating or executing operation. In the default `full` access mode it is authorized (a baseline snapshot is still required before a mutation); in `restricted` mode it is refused with `APPROVAL_DENIED` unless an in-process allowlist entry or live grant matches. See [Security](08-security.md). |
+| **Approval-gated (restricted mode)** | The call is a mutating or executing operation. In the default `full` access mode it is authorized (a baseline snapshot is still required before a mutation); in `restricted` mode it is refused with `APPROVAL_DENIED` unless an in-process allowlist entry or live grant matches. See [Architecture](04-architecture.md). |
 | Read-only | No workbook change; auto-allowed by the approval policy. |
 
 Paths are Windows paths. A workbook path must be inside `EXCEL_VBA_MCP_ROOTS`
@@ -683,5 +683,5 @@ Additional codes declared by the server include `VBA_PROJECT_LOCKED`, `MISSING_R
 
 Related documents: [Overview](01-overview.md), [Excel capabilities](06-excel-capabilities.md),
 [MCP tools reference](05-mcp-tools-reference.md), [Configuration](03-configuration.md),
-[Security](08-security.md), [Troubleshooting](10-troubleshooting.md) and the
+[Architecture](04-architecture.md), [Troubleshooting](10-troubleshooting.md) and the
 [root README](../README.md).

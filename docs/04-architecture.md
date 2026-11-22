@@ -26,9 +26,9 @@ snapshots, error handling, the mutation guard chain and auditing behave.
 
 This document does not describe individual tools — the complete reference is in
 [MCP tools reference](05-mcp-tools-reference.md). Environment-variable settings are in
-[Configuration](03-configuration.md), the security model is in
-[Security](08-security.md), and limits and incompatibilities are in
-[Limitations and compatibility](09-limitations-and-compatibility.md).
+[Configuration](03-configuration.md), the security model is described in this document,
+and limits and incompatibilities are in
+[Excel capabilities](06-excel-capabilities.md).
 
 ## High-level architecture diagram
 
@@ -400,8 +400,8 @@ Example audit record (abridged):
   `MUTATING`/`EXECUTING` operations are authorized by default and `READ_ONLY` is auto-allowed; in
   `restricted` mode `MUTATING`/`EXECUTING` are refused with `APPROVAL_DENIED`.
 
-Threat model, trust boundaries and the full set of protections are in
-[Security](08-security.md).
+Threat model, trust boundaries and the full set of protections are described in this
+section above.
 
 ## Architecture limits
 
@@ -431,7 +431,7 @@ Threat model, trust boundaries and the full set of protections are in
   the action and assertion vocabularies are closed, so arbitrary code cannot be expressed.
 
 The complete list of limits and compatibility constraints is in
-[Limitations and compatibility](09-limitations-and-compatibility.md).
+[Excel capabilities](06-excel-capabilities.md).
 
 ## Source modules
 

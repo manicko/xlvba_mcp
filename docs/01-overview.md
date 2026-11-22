@@ -88,7 +88,8 @@ and of Excel capabilities in [Excel Capabilities](06-excel-capabilities.md).
   explicit opt-in.
 
 Each group is described in more detail in [Excel Capabilities](06-excel-capabilities.md);
-threats and boundaries are in [Security](08-security.md) and [Limitations and Compatibility](09-limitations-and-compatibility.md).
+threats and boundaries are in [Architecture](04-architecture.md) and
+[Excel capabilities](06-excel-capabilities.md).
 
 ## How an AI Agent Interacts with Excel via xlvba
 
@@ -141,7 +142,7 @@ Step-by-step examples with arguments are in [Workflows and Examples](07-workflow
 - It does not support cloud scenarios or Office 365 (it works only with desktop Excel via COM).
 - It does not support non-Windows platforms (COM and VBOM are available only on Windows).
 
-The full list of limitations is in [Limitations and Compatibility](09-limitations-and-compatibility.md).
+The full list of limitations is in [Excel capabilities](06-excel-capabilities.md).
 
 ## Core Dependencies
 
@@ -168,8 +169,6 @@ environment variables are in [Configuration](03-configuration.md).
 - [MCP Tools Reference](05-mcp-tools-reference.md)
 - [Excel Capabilities](06-excel-capabilities.md)
 - [Workflows and Examples](07-workflows-and-examples.md)
-- [Security](08-security.md)
-- [Limitations and Compatibility](09-limitations-and-compatibility.md)
 - [Troubleshooting](10-troubleshooting.md)
 - [Development and Maintenance](11-development-and-maintenance.md)
 - [Root README](../README.md)
