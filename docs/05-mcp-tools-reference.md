@@ -533,6 +533,11 @@ Restore:
 The current working copy is closed **without saving**, then a new copy is opened from the
 baseline; a `WorkbookInfo` is returned. External macro effects are not rolled back.
 
+Note that `snapshot_create` and `vba_export_project` write files: snapshots under the snapshot
+temp directory and exported components under the artifact/temp directory. These writes are by
+design; they do not require approval in `full` mode and are not gated in `restricted` mode
+either (R-19).
+
 ### vba_replace_component_source
 
 Before replacing, two calls are needed: `vba_list_components` (confirm the component is
@@ -766,3 +771,24 @@ Resources are read-only: they do not mutate the workbook and do not execute VBA.
    `range_copy` works only within one workbook and without the clipboard.
 10. **No list pagination.** `tables_list` and `pivot_tables_list` return the full bounded list
     without paging.
+11. **Stale worker / lost owned Excel is not auto-detected by `excel_health` (R-17).**
+    `excel_health` reports worker state from the in-process worker only; if the owned hidden
+    `EXCEL.EXE` process dies (for example, killed externally), health can still show
+    `ok`/`running` with a stale `owned_pid` until a call fails. There is no in-band PID liveness
+    probe and no MCP-callable recovery. Remedy: `excel_close` the affected `workbook_id` and
+    re-open, or restart the server process. This is a known limitation, not silent corruption.
+12. **`macro_run` has no snapshot precondition (spec deviation, tracked).**
+    Unlike content-mutating tools, `macro_run` does not require a prior `snapshot_create`; it runs
+    a classified, approved macro without one. The recommended workflow still snapshots first so a
+    macro's external side effects have a rollback baseline. This asymmetry is a documented
+    limitation, not a guarantee that macros are snapshot-gated.
+13. **Session recovery is close/reopen only; there is no `excel_recover_session` tool.**
+    `SessionService.recover_session`/`close_session` exist internally but are not exposed as MCP
+    tools. `excel_health` surfaces `needs_recovery`, but a client cannot trigger recovery in-band;
+    the supported remedy is to close and re-open the workbook (or restart the server).
+14. **`macro_policy.classify_operation` is non-authoritative (dead/illustrative table).**
+    The `classify_operation` function in `security/macro_policy.py` is retained for illustration
+    and is **not** wired into the runtime enforcement path; the live operation class of each tool
+    is defined per-service. Its table is stale (it predates the current 88-tool catalogue) and
+    must not be read as the authoritative tool classification — use this reference or the service
+    code for that.
