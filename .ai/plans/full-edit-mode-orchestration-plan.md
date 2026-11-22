@@ -203,6 +203,7 @@ Gate 0 (Auditor baseline + Tech Lead independent code verification) ACCEPTED. Li
 | FE-13 | **Done+commit** | `dece703` | Phase 4: 17/17 PASS, 6/6 also-verify, 5/5 live tests via real MCP; fixture byte-identical; report `.ai/audit/reports/xlvba-mcp-phase4-e2e-acceptance.md` |
 | FE-14 | **Done+commit** | `b9c13b0` | Phase 5: 9/10 PASS, 1 NOT VERIFIED (focus-theft — point-sampling only; zero forbidden-API call sites; owned Excel never visible/foreground; evidence needed = continuous foreground hook). Report `.ai/audit/reports/xlvba-mcp-phase5-hidden-execution.md` |
 | FE-15 | **Done+commit** | `b08d638`, `1633115` | Phase 6: final code audit found 1 BLOCKING (C-1: ValidationError ctx not JSON-serializable → unstructured error) → **fixed** + regression tests (872 unit, 5 e2e both orders, 0 orphans). A-2 (comtypes undeclared) + D-2 (stale veto docs) + T-3 (matrix gap) fixed. Capability verdict **PARTIALLY VERIFIED** (accepted; 2 non-blocking residuals: 4 shape/control MCP tools, focus-theft continuous obs). Reports: `-capability-audit.md`, `-capability-report.md` |
+| FE-17 | **Done+commit** | `9131f08` | Orphaned hidden Excel: `Quit()` is not a process terminator → adapter now captures owned pid before quit, polls liveness, `taskkill /F /PID` fallback, re-verifies; worker mirrors pid only after verified quit + shutdown last-resort reap. 878 unit, 6 e2e both orders, **0 orphans**, fixture byte-identical. Defect report `.ai/audit/problems/orphaned-excel-processes-2026-11-22.md` |
 
 ---
 
