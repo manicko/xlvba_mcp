@@ -47,10 +47,13 @@ Shared conventions:
    in-process allowlist entry or live grant matches. There is no MCP tool to grant approval or edit
    the allowlist, so a restricted server exposes only `read-only` work over MCP. Per the B4 error
    taxonomy: an approval refusal is `APPROVAL_DENIED`; `WORKBOOK_READ_ONLY` is raised only for a
-   read-only session; `COM_BUSY`/`RPC_E_CALL_REJECTED` only for genuine COM contention (and VBA
-   revision conflicts); `MACRO_BLOCKED` only for Office macro-security / non-execute contexts. In
-   the per-tool tables, `COM_BUSY` on a mutating row denotes genuine contention or a revision
-   conflict, not approval denial.
+   read-only session; an unknown or no-longer-open `workbook_id` is `WORKBOOK_NOT_FOUND` (a caller
+   error, not contention); a stale `expected_source_hash` is `REVISION_CONFLICT`; and
+   `COM_BUSY`/`RPC_E_CALL_REJECTED` are reserved for genuine COM contention only. `MACRO_BLOCKED`
+   is only for Office macro-security / non-execute contexts. A lost owned Excel instance is reported
+   as `WORKBOOK_NOT_FOUND` on the plain read/mutation paths and as `EXCEL_HUNG` (`needs_recovery`)
+   from `macro_run` / `vba_compile`, which require recovery. In the per-tool tables, `COM_BUSY` on a
+   mutating row denotes genuine contention, not approval denial, a bad id, or a revision conflict.
 2. **`excel_open` first.** Any tool that needs a `workbook_id` requires the workbook to be
    opened first. `workbook_id` is the identifier of the working copy issued by the server, not a
    file path.
@@ -169,12 +172,13 @@ authorized; in `restricted` mode every case gets `blocked` (`APPROVAL_DENIED`) a
 | `vba_export_project` | Exports every component and returns a manifest. | `workbook_id:string, out_dir:string?` | `VbaExportManifest` | `.bas`/`.cls`/`.frm`/`.frx` files; artifact root; audit | `ACCESS_VBOM_DISABLED`, `PATH_NOT_ALLOWED`, `SNAPSHOT_FAILED` | read-only |
 | `vba_get_references` | Project references with Name/GUID/version/path. | `workbook_id:string` | `list[VbaReferenceInfo]` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
 | `vba_search_code` | Searches all components' code (substring or regex). | `workbook_id:string, pattern:string, regex:boolean=false?` | `list[VbaSearchMatch]` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
-| `vba_replace_component_source` | Fully replaces a Standard/Class module. | `workbook_id:string, component:string, new_source:string, expected_source_hash:string` | `VbaMutationResult` | Changes the VBA project; before/after export; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `APPROVAL_DENIED` (restricted mode), `COM_BUSY` (revision conflict), `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | mutating |
+| `vba_replace_component_source` | Fully replaces a Standard/Class module. | `workbook_id:string, component:string, new_source:string, expected_source_hash:string` | `VbaMutationResult` | Changes the VBA project; before/after export; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `APPROVAL_DENIED` (restricted mode), `REVISION_CONFLICT` (revision conflict), `PROTECTED_TARGET` (non-replaceable component), `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | mutating |
 | `vba_insert_code` | Inserts code at a semantic position in a Standard/Class module. | `workbook_id:string, component:string, code:string, position:string, expected_source_hash:string` | `VbaMutationResult` | Changes the VBA project; audit | same; an invalid `position` — `COM_BUSY` | mutating |
 
 `vba_replace_component_source` and `vba_insert_code` work only with Standard/Class modules;
-Document modules and UserForms are rejected with `COM_BUSY`
-(`reason=non_replaceable_component`).
+Document modules and UserForms are rejected with `PROTECTED_TARGET`
+(`reason=non_replaceable_component`). A stale `expected_source_hash` is rejected with
+`REVISION_CONFLICT` (`reason=revision_conflict`).
 
 ## Compile
 

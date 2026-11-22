@@ -53,6 +53,7 @@ from excel_vba_mcp.domain.errors import (
     ExcelHungError,
     ExcelVbaMcpError,
     VbaProjectLockedError,
+    WorkbookNotFoundError,
 )
 from excel_vba_mcp.domain.models import (
     DomainModel,
@@ -245,7 +246,7 @@ class CompileService:
         for info in self._session.list_workbooks_sync():
             if info.workbook_id == workbook_id:
                 return info
-        raise ExcelVbaMcpError(
+        raise WorkbookNotFoundError(
             f"Unknown workbook_id {workbook_id!r} (not open).",
             context={"workbook_id": workbook_id},
         )

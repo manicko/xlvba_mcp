@@ -32,7 +32,12 @@ import pytest
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import WorkerStatus
 from excel_vba_mcp.application.session_service import SessionService
-from excel_vba_mcp.domain.errors import ApprovalDeniedError, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import (
+    ApprovalDeniedError,
+    ErrorCode,
+    ExcelVbaMcpError,
+    WorkbookNotFoundError,
+)
 from excel_vba_mcp.domain.statuses import (
     AccessMode,
     OperationClass,
@@ -464,10 +469,18 @@ async def test_open_restores_settings_on_exception(tmp_path: Path) -> None:
 async def test_unknown_workbook_id_raises(tmp_path: Path) -> None:
     service, _app, _worker, _original, _work_dir = _make_service(tmp_path)
 
-    with pytest.raises(ExcelVbaMcpError):
+    # An unknown workbook_id is a caller error (WORKBOOK_NOT_FOUND), not COM_BUSY.
+    with pytest.raises(WorkbookNotFoundError) as exc_info:
         await service.close_workbook("nope")
-    with pytest.raises(ExcelVbaMcpError):
+    assert exc_info.value.code is ErrorCode.WORKBOOK_NOT_FOUND
+    with pytest.raises(WorkbookNotFoundError) as exc_info:
         await service.save_workbook("nope")
+    assert exc_info.value.code is ErrorCode.WORKBOOK_NOT_FOUND
+    # The internal record resolver used across services reports the same code.
+    with pytest.raises(WorkbookNotFoundError) as exc_info:
+        service._require_record("nope")
+    assert exc_info.value.code is ErrorCode.WORKBOOK_NOT_FOUND
+    assert exc_info.value.code is not ErrorCode.COM_BUSY
 
 
 async def test_duplicate_open_same_path_errors(tmp_path: Path) -> None:

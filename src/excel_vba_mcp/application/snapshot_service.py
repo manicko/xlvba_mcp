@@ -47,6 +47,7 @@ from excel_vba_mcp.domain.errors import (
     ApprovalDeniedError,
     ExcelVbaMcpError,
     SnapshotFailedError,
+    WorkbookNotFoundError,
 )
 from excel_vba_mcp.domain.models import WorkbookInfo
 from excel_vba_mcp.domain.statuses import OperationClass, SessionMode
@@ -209,7 +210,7 @@ class SnapshotService:
             def save_copy_as_fn() -> list[dict[str, Any]] | None:
                 wb = _find_open_workbook(app_adapter, working_path)
                 if wb is None:
-                    raise ExcelVbaMcpError(
+                    raise WorkbookNotFoundError(
                         "The working copy is no longer open in the owned instance.",
                         context={"workbook_id": workbook_id, "working_path": working_path},
                     )
@@ -452,9 +453,7 @@ class SnapshotService:
     def _new_snapshot_id() -> str:
         return f"snap-{uuid4().hex}"
 
-    def _require_create_approval(
-        self, workbook_id: str, info: WorkbookInfo | None
-    ) -> None:
+    def _require_create_approval(self, workbook_id: str, info: WorkbookInfo | None) -> None:
         """Deny-by-default approval gate for the snapshot filesystem write (F-4).
 
         A snapshot create is a ``MUTATING`` operation for approval purposes: it

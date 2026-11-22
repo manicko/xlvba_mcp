@@ -55,6 +55,7 @@ from excel_vba_mcp.domain.errors import (
     AccessVbomDisabledError,
     ExcelVbaMcpError,
     VbaProjectLockedError,
+    WorkbookNotFoundError,
 )
 from excel_vba_mcp.domain.models import (
     DefinedNameInfo,
@@ -439,7 +440,7 @@ class WorkbookModelService:
         for info in self._session.list_workbooks_sync():
             if info.workbook_id == workbook_id:
                 return info
-        raise ExcelVbaMcpError(
+        raise WorkbookNotFoundError(
             f"Unknown workbook_id {workbook_id!r} (not open).",
             context={"workbook_id": workbook_id},
         )

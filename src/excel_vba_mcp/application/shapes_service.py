@@ -35,7 +35,12 @@ from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
 from excel_vba_mcp.adapters.excel.shapes_adapter import ShapesAdapter
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
-from excel_vba_mcp.domain.errors import ApprovalDeniedError, ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import (
+    ApprovalDeniedError,
+    ErrorCode,
+    ExcelVbaMcpError,
+    WorkbookNotFoundError,
+)
 from excel_vba_mcp.domain.models import ShapeInfo, WorkbookInfo
 from excel_vba_mcp.domain.statuses import OperationClass
 from excel_vba_mcp.security.approval import ApprovalKey, ApprovalPolicy
@@ -197,7 +202,7 @@ class ShapesService:
         for info in self._session.list_workbooks_sync():
             if info.workbook_id == workbook_id:
                 return info
-        raise ExcelVbaMcpError(
+        raise WorkbookNotFoundError(
             f"Unknown workbook_id {workbook_id!r} (not open).",
             context={"workbook_id": workbook_id},
         )
@@ -269,7 +274,7 @@ class ShapesService:
         def run() -> Any:
             wb = _find_open_workbook(app_adapter, working_path)
             if wb is None:
-                raise ExcelVbaMcpError(
+                raise WorkbookNotFoundError(
                     "The working copy is no longer open in the owned instance.",
                     context={"workbook_id": workbook_id, "working_path": working_path},
                 )

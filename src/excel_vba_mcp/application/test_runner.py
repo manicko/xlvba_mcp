@@ -84,7 +84,7 @@ from excel_vba_mcp.application.shapes_service import ShapesService
 from excel_vba_mcp.application.sheets_service import SheetsService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
 from excel_vba_mcp.application.tables_service import TablesService
-from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError, WorkbookNotFoundError
 from excel_vba_mcp.domain.models import (
     AssertionResult,
     MacroRunResult,
@@ -1448,7 +1448,7 @@ class TestRunner:
         def read_fn() -> Any:
             wb = _find_open_workbook(app_adapter, working_path)
             if wb is None:
-                raise ExcelVbaMcpError(
+                raise WorkbookNotFoundError(
                     "The working copy is no longer open in the owned instance.",
                     context={"workbook_id": workbook_id, "working_path": working_path},
                 )

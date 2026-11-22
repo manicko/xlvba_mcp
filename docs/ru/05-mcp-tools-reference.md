@@ -46,10 +46,15 @@ related:
    in-process записи allowlist или живого гранта. Grant-инструмента для approval или редактирования
    allowlist через MCP нет, поэтому сервер в режиме `restricted` через MCP предоставляет только
    работу для чтения. По таксономии ошибок B4: отказ approval — это `APPROVAL_DENIED`;
-   `WORKBOOK_READ_ONLY` поднимается только для read-only-сессии; `COM_BUSY`/`RPC_E_CALL_REJECTED` —
-   только при реальной конкуренции за COM (и конфликте ревизий VBA); `MACRO_BLOCKED` — только для
-   Office macro-security / не-execute контекстов. В таблицах инструментов `COM_BUSY` у mutating-
-   строки означает конкуренцию или конфликт ревизий, а не отказ approval.
+   `WORKBOOK_READ_ONLY` поднимается только для read-only-сессии; неизвестный или уже не
+   открытый `workbook_id` — это `WORKBOOK_NOT_FOUND` (ошибка вызывающей стороны, а не
+   конкуренция); устаревший `expected_source_hash` — это `REVISION_CONFLICT`; а
+   `COM_BUSY`/`RPC_E_CALL_REJECTED` зарезервированы только для реальной конкуренции за COM.
+   `MACRO_BLOCKED` — только для Office macro-security / не-execute контекстов. Потерянный
+   owned-экземпляр Excel на обычных путях чтения/мутации сообщается как `WORKBOOK_NOT_FOUND`, а в
+   `macro_run` / `vba_compile` — как `EXCEL_HUNG` (`needs_recovery`), где требуется восстановление.
+   В таблицах инструментов `COM_BUSY` у mutating-строки означает реальную конкуренцию, а не отказ
+   approval, плохой id или конфликт ревизий.
 2. **Сначала `excel_open`.** Любой инструмент, которому нужен `workbook_id`, требует
    предварительного открытия книги. `workbook_id` — это идентификатор рабочей копии,
    выданный сервером, а не путь к файлу.
@@ -169,12 +174,13 @@ approval-гейтом. `CompileService` создаётся без `ApprovalPolic
 | `vba_export_project` | Экспортирует все компоненты и возвращает манифест. | `workbook_id:string, out_dir:string?` | `VbaExportManifest` | Файлы `.bas`/`.cls`/`.frm`/`.frx`; артефакт-корень; аудит | `ACCESS_VBOM_DISABLED`, `PATH_NOT_ALLOWED`, `SNAPSHOT_FAILED` | read-only |
 | `vba_get_references` | Ссылки проекта с Name/GUID/version/path. | `workbook_id:string` | `list[VbaReferenceInfo]` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
 | `vba_search_code` | Поиск по коду всех компонентов (подстрока или regex). | `workbook_id:string, pattern:string, regex:boolean=false?` | `list[VbaSearchMatch]` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
-| `vba_replace_component_source` | Полностью заменяет модуль Standard/Class. | `workbook_id:string, component:string, new_source:string, expected_source_hash:string` | `VbaMutationResult` | Изменение проекта VBA; экспорт до/после; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `APPROVAL_DENIED` (restricted), `COM_BUSY` (конфликт ревизии), `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | mutating |
+| `vba_replace_component_source` | Полностью заменяет модуль Standard/Class. | `workbook_id:string, component:string, new_source:string, expected_source_hash:string` | `VbaMutationResult` | Изменение проекта VBA; экспорт до/после; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `APPROVAL_DENIED` (restricted), `REVISION_CONFLICT` (конфликт ревизии), `PROTECTED_TARGET` (незаменяемый компонент), `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | mutating |
 | `vba_insert_code` | Вставляет код в семантическую позицию Standard/Class модуля. | `workbook_id:string, component:string, code:string, position:string, expected_source_hash:string` | `VbaMutationResult` | Изменение проекта VBA; аудит | те же; неверная `position` — `COM_BUSY` | mutating |
 
-`vba_replace_component_source` и `vba_insert_code` работают только со Standard/Class
-модулями; Document-модули и UserForms отклоняются с `COM_BUSY`
-(`reason=non_replaceable_component`).
+`vba_replace_component_source` и `vba_insert_code` работают только с модулями Standard/Class;
+Document-модули и UserForms отклоняются с `PROTECTED_TARGET`
+(`reason=non_replaceable_component`). Устаревший `expected_source_hash` отклоняется с
+`REVISION_CONFLICT` (`reason=revision_conflict`).
 
 ## Compile
 

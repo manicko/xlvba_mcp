@@ -50,6 +50,7 @@ pytest.importorskip("win32com", reason="pywin32 required for the live Excel erro
 pytest.importorskip("pythoncom", reason="pywin32 required for the live Excel error-surfacing test")
 
 from mcp import ClientSession, StdioServerParameters, stdio_client  # noqa: E402
+from mcp.shared.exceptions import MCPError  # noqa: E402
 from mcp.types import CallToolResult  # noqa: E402
 
 _PYWIN32 = sys.platform == "win32"
@@ -544,8 +545,7 @@ async def test_error_surfacing_matrix(tmp_path: Path) -> None:
             oversized, "range_write_values", "model-validator"
         )
         assert oversized_payload["code"] == "INVALID_RANGE", (
-            "oversized grid must be a structured INVALID_RANGE, got "
-            f"{oversized_payload['code']!r}"
+            f"oversized grid must be a structured INVALID_RANGE, got {oversized_payload['code']!r}"
         )
         report.append(
             f"{'range_write_values':32s} validator code={oversized_payload['code']} "
@@ -554,6 +554,40 @@ async def test_error_surfacing_matrix(tmp_path: Path) -> None:
 
         await _call(session, "excel_close", {"workbook_id": write_wid, "save_changes": False})
         await _call(session, "excel_close", {"workbook_id": read_only_wid, "save_changes": False})
+
+        # (d) Unknown workbook_id is a caller error, not COM contention (FE-22 / F-5).
+        # Read-only tools that resolve the workbook record first must now report
+        # WORKBOOK_NOT_FOUND instead of the former generic COM_BUSY.
+        bogus = "__no_such_workbook__"
+        unknown_id_cases: dict[str, dict[str, Any]] = {
+            "vba_read_component": {"workbook_id": bogus, "component": "modWorkflow"},
+            "names_list": {"workbook_id": bogus},
+            "pivot_tables_list": {"workbook_id": bogus},
+            "sheet_get": {"workbook_id": bogus, "name": "Sheet1"},
+            "table_get": {"workbook_id": bogus, "name": "tblSettings"},
+        }
+        for tool, args in unknown_id_cases.items():
+            unknown = await _call(session, tool, args)
+            payload = assert_structured_error(unknown, tool, f"unknown-id[{bogus}]")
+            assert payload["code"] == "WORKBOOK_NOT_FOUND", (
+                f"[{tool}] unknown workbook_id must be WORKBOOK_NOT_FOUND, "
+                f"got {payload['code']} (payload={payload!r})"
+            )
+            report.append(
+                f"{tool:32s} unknown-id code={payload['code']} (expected WORKBOOK_NOT_FOUND)"
+            )
+
+        # (e) Resource errors are structured too (FE-22 / F-5 §6.4): reading a VBA
+        # component source for an unknown workbook surfaces the JSON payload
+        # (code + context) over the wire, not a plain-text message. The server
+        # wraps the ResourceError in a JSON-RPC MCPError whose message is that JSON.
+        with pytest.raises(MCPError) as res_exc:
+            await session.read_resource(f"excel://workbooks/{bogus}/vba/components/modWorkflow")
+        assert "WORKBOOK_NOT_FOUND" in str(res_exc.value), (
+            "resource error must carry the structured WORKBOOK_NOT_FOUND code, "
+            f"got {res_exc.value!r}"
+        )
+        report.append("resource(component)           unknown-id structured code=WORKBOOK_NOT_FOUND")
 
     # Originals never modified: repo fixture and temp copies byte-identical.
     assert _sha256(_WORKFLOW_FIXTURE) == repo_hash_before, "committed fixture must never change"

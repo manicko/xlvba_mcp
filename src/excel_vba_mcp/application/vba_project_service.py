@@ -55,6 +55,9 @@ from excel_vba_mcp.domain.errors import (
     ErrorCode,
     ExcelVbaMcpError,
     PathNotAllowedError,
+    ProtectedTargetError,
+    RevisionConflictError,
+    WorkbookNotFoundError,
 )
 from excel_vba_mcp.domain.models import (
     VbaComponentInfo,
@@ -489,7 +492,7 @@ class VBAProjectService:
         for info in self._session.list_workbooks_sync():
             if info.workbook_id == workbook_id:
                 return info
-        raise ExcelVbaMcpError(
+        raise WorkbookNotFoundError(
             f"Unknown workbook_id {workbook_id!r} (not open).",
             context={"workbook_id": workbook_id},
         )
@@ -600,11 +603,10 @@ class VBAProjectService:
         """Reject Document modules and UserForms with a clear error."""
 
         if source.component_type not in _REPLACEABLE_TYPES:
-            raise ExcelVbaMcpError(
+            raise ProtectedTargetError(
                 f"Component {source.component_name!r} is a "
                 f"{source.component_type.value}; only Standard/Class modules "
                 "may be replaced or mutated.",
-                code=ErrorCode.COM_BUSY,
                 context={
                     "component": source.component_name,
                     "component_type": source.component_type.value,
@@ -617,10 +619,9 @@ class VBAProjectService:
         """Reject a stale revision when the on-disk source has changed."""
 
         if current_hash != expected_hash:
-            raise ExcelVbaMcpError(
+            raise RevisionConflictError(
                 f"Revision conflict for component {component!r}: the source has "
                 "changed since it was read.",
-                code=ErrorCode.COM_BUSY,
                 context={
                     "component": component,
                     "expected_source_hash": expected_hash,
@@ -652,7 +653,7 @@ class VBAProjectService:
         def replace_fn() -> dict[str, Any]:
             wb = _find_open_workbook(app_adapter, record.path)
             if wb is None:
-                raise ExcelVbaMcpError(
+                raise WorkbookNotFoundError(
                     "The working copy is no longer open in the owned instance.",
                     context={"workbook_id": workbook_id, "working_path": record.path},
                 )
@@ -696,7 +697,7 @@ class VBAProjectService:
         def insert_fn() -> dict[str, Any]:
             wb = _find_open_workbook(app_adapter, record.path)
             if wb is None:
-                raise ExcelVbaMcpError(
+                raise WorkbookNotFoundError(
                     "The working copy is no longer open in the owned instance.",
                     context={"workbook_id": workbook_id, "working_path": record.path},
                 )
@@ -795,7 +796,7 @@ def _bind_workbook(
     def run() -> Any:
         wb = _find_open_workbook(app_adapter, working_path)
         if wb is None:
-            raise ExcelVbaMcpError(
+            raise WorkbookNotFoundError(
                 "The working copy is no longer open in the owned instance.",
                 context={"workbook_id": workbook_id, "working_path": working_path},
             )
@@ -913,10 +914,9 @@ def _do_replace(
     current_text = adapter._read_code_text(code_module)  # noqa: SLF001
     current_hash = hash_code(current_text)
     if current_hash != expected_source_hash:
-        raise ExcelVbaMcpError(
+        raise RevisionConflictError(
             f"Revision conflict for component {component!r}: the source changed "
             "between the pre-check and the mutation.",
-            code=ErrorCode.COM_BUSY,
             context={
                 "component": component,
                 "expected_source_hash": expected_source_hash,
@@ -983,10 +983,9 @@ def _do_insert(
     current_text = adapter._read_code_text(code_module)  # noqa: SLF001
     current_hash = hash_code(current_text)
     if current_hash != expected_source_hash:
-        raise ExcelVbaMcpError(
+        raise RevisionConflictError(
             f"Revision conflict for component {component!r}: the source changed "
             "between the pre-check and the mutation.",
-            code=ErrorCode.COM_BUSY,
             context={
                 "component": component,
                 "expected_source_hash": expected_source_hash,

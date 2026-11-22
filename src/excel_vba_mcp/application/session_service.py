@@ -51,6 +51,7 @@ from excel_vba_mcp.domain.errors import (
     ErrorCode,
     ExcelHungError,
     ExcelVbaMcpError,
+    WorkbookNotFoundError,
 )
 from excel_vba_mcp.domain.models import SessionStatus, WorkbookInfo
 from excel_vba_mcp.domain.statuses import (
@@ -439,7 +440,7 @@ class SessionService:
         def save_fn() -> WorkbookInfo:
             wb = _find_open_workbook(app_adapter, record.working_path)
             if wb is None:
-                raise ExcelVbaMcpError(
+                raise WorkbookNotFoundError(
                     "The workbook is no longer open in the owned instance.",
                     context={"workbook_id": workbook_id},
                 )
@@ -782,7 +783,7 @@ class SessionService:
     def _require_record(self, workbook_id: str) -> _SessionRecord:
         record = self._records.get(workbook_id)
         if record is None:
-            raise ExcelVbaMcpError(
+            raise WorkbookNotFoundError(
                 f"Unknown workbook_id {workbook_id!r} (not open).",
                 context={"workbook_id": workbook_id},
             )

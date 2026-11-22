@@ -83,6 +83,7 @@ from excel_vba_mcp.domain.errors import (
     ExcelHungError,
     ExcelVbaMcpError,
     StaleTargetError,
+    WorkbookNotFoundError,
 )
 from excel_vba_mcp.domain.models import DomainModel, MacroRunResult, WorkbookInfo
 from excel_vba_mcp.domain.statuses import (
@@ -958,7 +959,7 @@ class MacroService:
         for info in self._session.list_workbooks_sync():
             if info.workbook_id == workbook_id:
                 return info
-        raise ExcelVbaMcpError(
+        raise WorkbookNotFoundError(
             f"Unknown workbook_id {workbook_id!r} (not open).",
             context={"workbook_id": workbook_id},
         )
@@ -1060,7 +1061,7 @@ def _scan_project(
     app = app_adapter.app
     wb = _find_open_workbook(app_adapter, working_path)
     if app is None or wb is None:
-        raise ExcelVbaMcpError(
+        raise WorkbookNotFoundError(
             "The working copy is no longer open in the owned instance.",
             context={"working_path": working_path},
         )

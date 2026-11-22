@@ -54,6 +54,12 @@ class ErrorCode(StrEnum):
     # codes only — no exception classes, no ``_ERROR_BY_CODE`` entries).
     BACKGROUND_SAFETY_NOT_VERIFIED = "BACKGROUND_SAFETY_NOT_VERIFIED"
     INTERACTIVE_UI_NOT_SUPPORTED = "INTERACTIVE_UI_NOT_SUPPORTED"
+    # Task FE-22 (finding F-5): caller-error codes (additive). These distinguish a
+    # caller-supplied failure (unknown/lost ``workbook_id``) and an optimistic-
+    # concurrency failure (stale ``expected_source_hash``) from genuine COM
+    # contention, which the generic ``COM_BUSY`` fallback previously masked.
+    WORKBOOK_NOT_FOUND = "WORKBOOK_NOT_FOUND"
+    REVISION_CONFLICT = "REVISION_CONFLICT"
 
 
 # Well-known HRESULT values that map to domain codes (hex shown for readability).
@@ -338,6 +344,44 @@ class ListObjectIntersectionError(ExcelVbaMcpError):
     default_message = "The range intersects an Excel Table; use the table tools instead."
 
 
+# ---------------------------------------------------------------------------
+# Task FE-22 (finding F-5): caller-error typed errors (additive)
+#
+# These make a caller-supplied failure distinguishable from genuine COM
+# contention. ``ExcelVbaMcpError.default_code = COM_BUSY`` remains the generic
+# fallback for unclassified errors; these subclasses are raised only for the
+# specific conditions below.
+# ---------------------------------------------------------------------------
+
+
+class WorkbookNotFoundError(ExcelVbaMcpError):
+    """The ``workbook_id`` is unknown, not open, or its owned instance was lost.
+
+    Raised for an unknown ``workbook_id`` (a caller error) and for a read/mutation
+    path that discovers the working copy is no longer open in the owned instance
+    (the lost-instance case). It is deliberately distinct from ``COM_BUSY`` so a
+    client can tell "bad id / lost session" from "Excel is busy".
+
+    Note: ``macro_run`` / ``vba_compile`` still report the lost owned instance as
+    ``EXCEL_HUNG`` (``needs_recovery``) because macro execution requires recovery;
+    the plain read/mutation paths report ``WORKBOOK_NOT_FOUND``.
+    """
+
+    default_code = ErrorCode.WORKBOOK_NOT_FOUND
+    default_message = "The workbook is not open."
+
+
+class RevisionConflictError(ExcelVbaMcpError):
+    """The component source changed since it was read (stale ``expected_source_hash``).
+
+    An optimistic-concurrency failure on a VBA component mutation, not COM
+    contention.
+    """
+
+    default_code = ErrorCode.REVISION_CONFLICT
+    default_message = "The component source changed since it was read."
+
+
 def error_from_hresult(
     hresult: int,
     message: str,
@@ -386,4 +430,8 @@ _ERROR_BY_CODE: dict[ErrorCode, type[ExcelVbaMcpError]] = {
     # Task_b4 (fix_004): approval denial is a typed domain error, distinct from
     # COM contention. Inert for ``error_from_hresult`` (no HRESULT maps to it).
     ErrorCode.APPROVAL_DENIED: ApprovalDeniedError,
+    # Task FE-22 (finding F-5): caller-error codes, inert for
+    # ``error_from_hresult`` (no HRESULT maps to them).
+    ErrorCode.WORKBOOK_NOT_FOUND: WorkbookNotFoundError,
+    ErrorCode.REVISION_CONFLICT: RevisionConflictError,
 }

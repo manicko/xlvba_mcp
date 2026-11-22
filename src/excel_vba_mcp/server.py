@@ -1441,7 +1441,7 @@ async def workbook_vba_component_source_resource(workbook_id: str, component_nam
     try:
         source = await vba_service.read_component(workbook_id, component_name)
     except ExcelVbaMcpError as exc:
-        raise ResourceError(str(exc)) from exc
+        raise ResourceError(json.dumps(exc.to_dict())) from exc
     return source.source
 
 
@@ -1457,7 +1457,7 @@ async def test_run_resource(run_id: str) -> str:
     try:
         run = test_tools.get_test_runner().get_run(run_id)
     except ExcelVbaMcpError as exc:
-        raise ResourceError(str(exc)) from exc
+        raise ResourceError(json.dumps(exc.to_dict())) from exc
     return run.model_dump_json(indent=2)
 
 
