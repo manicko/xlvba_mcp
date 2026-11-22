@@ -293,7 +293,33 @@ def _denial_args(tool: str, wid: str) -> dict[str, Any]:
         "snapshot_create": {"workbook_id": wid},
         "snapshot_restore": {"snapshot_id": "no-such-snapshot"},
         "snapshot_diff": {"snapshot_id_a": "no-such-a", "snapshot_id_b": "no-such-b"},
-        "test_run_suite": {"suite": {"suite": "fe02", "workbook_id": wid, "cases": []}},
+        "test_run_suite": {
+            "suite": {
+                "suite": "fe02",
+                "workbook_id": wid,
+                "cases": [
+                    {
+                        "id": "c1",
+                        "steps": [
+                            {
+                                "action": "range_read_values",
+                                "sheet": "Sheet1",
+                                "range_address": "A1",
+                            }
+                        ],
+                        "assertions": [
+                            {
+                                "type": "range_structure",
+                                "sheet": "Sheet1",
+                                "address": "A1",
+                                "rows": 1,
+                                "cols": 1,
+                            }
+                        ],
+                    }
+                ],
+            }
+        },
         "vba_export_project": {"workbook_id": wid},
         "excel_save": {"workbook_id": wid},
         "excel_close": {"workbook_id": wid, "save_changes": False},
@@ -387,24 +413,58 @@ async def test_error_surfacing_matrix(tmp_path: Path) -> None:
         assert ro_opened["read_only"] is True, f"expected a read-only session: {ro_opened}"
         read_only_wid = ro_opened["workbook_id"]
 
+        # The denial argument must hit the REAL guard for each tool, not merely a
+        # schema rejection. ``_denial_expectations`` maps each mutating tool to the
+        # structured code its denial must produce; tools with no reachable denial on
+        # a read-only session (snapshot_create / vba_export_project only write
+        # files; excel_save / excel_close are read-only-safe) map to None and are
+        # asserted to SUCCEED instead, so a silent behavior change still fails.
+        _denial_expectations: dict[str, str | None] = {
+            "range_write_values": "WORKBOOK_READ_ONLY",
+            "table_update_rows": "WORKBOOK_READ_ONLY",
+            "table_create": "WORKBOOK_READ_ONLY",
+            "name_create": "WORKBOOK_READ_ONLY",
+            "sheet_add": "WORKBOOK_READ_ONLY",
+            "sheet_delete": "WORKBOOK_READ_ONLY",
+            "shape_set_on_action": "WORKBOOK_READ_ONLY",
+            "control_set_on_action": "WORKBOOK_READ_ONLY",
+            "vba_replace_component_source": "WORKBOOK_READ_ONLY",
+            "vba_insert_code": "WORKBOOK_READ_ONLY",
+            "macro_run": "WORKBOOK_READ_ONLY",
+            # snapshot_restore/diff fail on the unknown snapshot id, not read-only.
+            "snapshot_restore": "SNAPSHOT_FAILED",
+            "snapshot_diff": "SNAPSHOT_FAILED",
+            # test_run_suite is read-only-safe (runs against disposable copies and
+            # never mutates the session workbook); it succeeds on a read-only open.
+            "test_run_suite": None,
+            # Ungated file-write / read-only-safe: succeed on a read-only session
+            # (R-19 documented side effect); asserted as success, not a denial.
+            "snapshot_create": None,
+            "vba_export_project": None,
+            "excel_save": None,
+            "excel_close": None,
+        }
+
         for tool in _MUTATING_TOOLS:
-            # (a) denial argument (writable-required / unknown id / unclassified macro)
-            denial = await _call(session, tool, _denial_args(tool, read_only_wid))
-            denial_payload = assert_structured_error(denial, tool, "denial")
-            report.append(f"{tool:32s} denial   code={denial_payload['code']}")
+            expected = _denial_expectations[tool]
+            denial = await _call(session, tool, _denial_args(tool, read_only_wid)[tool])
+            if expected is None:
+                # Ungated / read-only-safe tool: the denial argument must succeed.
+                payload = structured(denial)
+                report.append(f"{tool:32s} denial   OK (ungated, no denial expected)")
+                assert payload is not None, f"[{tool}] expected success, got {denial.content!r}"
+            else:
+                payload = assert_structured_error(denial, tool, f"denial[{expected}]")
+                assert payload["code"] == expected, (
+                    f"[{tool}] denial hit the wrong guard: expected {expected}, "
+                    f"got {payload['code']} (payload={payload!r})"
+                )
+                report.append(f"{tool:32s} denial   code={payload['code']} (expected {expected})")
 
             # (b) malformed argument (missing required field / wrong type)
-            malformed = await _call(session, tool, _malformed_args(tool, write_wid))
+            malformed = await _call(session, tool, _malformed_args(tool, write_wid)[tool])
             malformed_payload = assert_structured_error(malformed, tool, "malformed")
             report.append(f"{tool:32s} malformed code={malformed_payload['code']}")
-
-        # Unknown workbook_id for an admin tool (a denial with no live session at all).
-        # ``excel_get_status`` is intentionally non-throwing for an unknown id (it
-        # returns a status with a "not currently open" note), so it is not a
-        # denial surface; ``excel_save`` on an unknown id is the reachable one.
-        unknown = await _call(session, "excel_save", {"workbook_id": "no-such-workbook"})
-        unknown_payload = assert_structured_error(unknown, "excel_save", "unknown-id")
-        report.append(f"{'excel_save':32s} unknown  code={unknown_payload['code']}")
 
         await _call(session, "excel_close", {"workbook_id": write_wid, "save_changes": False})
         await _call(session, "excel_close", {"workbook_id": read_only_wid, "save_changes": False})

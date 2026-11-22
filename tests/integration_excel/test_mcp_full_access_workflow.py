@@ -738,7 +738,12 @@ async def test_persistence_roundtrip(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 @requires_excel
 async def test_read_only_session_denies_mutation(tmp_path: Path) -> None:
-    """A read-only session rejects ``range_write_values`` with ``WORKBOOK_READ_ONLY``."""
+    """A read-only session rejects mutations with ``WORKBOOK_READ_ONLY``.
+
+    Covers ``range_write_values``, ``table_update_rows`` and ``macro_run`` (FE-05):
+    each is refused by the writable/execute guard before any snapshot or
+    background-safety precondition.
+    """
 
     work_copy = _copy_fixture(tmp_path)
 
@@ -762,6 +767,28 @@ async def test_read_only_session_denies_mutation(tmp_path: Path) -> None:
             },
         )
         assert error_code(denied) == "WORKBOOK_READ_ONLY"
+
+        # (2) table (ListObject) mutation — denied by the writable guard before the
+        # snapshot precondition (FE-05 regression coverage).
+        denied_table = await _call(
+            session,
+            "table_update_rows",
+            {
+                "workbook_id": workbook_id,
+                "name": "tblSettings",
+                "updates": [{"index": 1, "values": {"SettingValue": 1}}],
+            },
+        )
+        assert error_code(denied_table) == "WORKBOOK_READ_ONLY"
+
+        # (3) macro execution — denied by _require_execute_context before the
+        # background-safety classification (FE-05 regression coverage).
+        denied_macro = await _call(
+            session,
+            "macro_run",
+            {"workbook_id": workbook_id, "macro_name": "modWorkflow.Recalculate"},
+        )
+        assert error_code(denied_macro) == "WORKBOOK_READ_ONLY"
 
 
 # ---------------------------------------------------------------------------
