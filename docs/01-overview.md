@@ -154,7 +154,6 @@ The full list of limitations is in [Limitations and Compatibility](09-limitation
 | `mcp` | `>=1.0.0` (locked to 2.3.0) |
 | `pydantic` | `>=2.0.0` (locked to 2.14.4) |
 | `pywin32` | `>=306` (locked to 312) |
-| `pywinauto` | `>=0.6.8` (locked to 0.6.9) |
 | Excel setting | Trust Center: "Trust access to the VBA project object model" (VBOM), set manually on each machine |
 
 The installation and verification procedure is in [Installation and Setup](02-installation-and-setup.md),

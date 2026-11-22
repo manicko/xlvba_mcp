@@ -52,7 +52,6 @@ Runtime dependencies from `pyproject.toml` (locked versions in parentheses):
 | `mcp` | `>=1.0.0` | 2.3.0 | MCP server, STDIO transport, tool/resource registration |
 | `pydantic` | `>=2.0.0` | 2.14.4 | Typed configuration and DTOs |
 | `pywin32` | `>=306` | 312 | Excel COM automation |
-| `pywinauto` | `>=0.6.8` | 0.6.9 | Windows UI automation for VBE compile paths |
 
 > [!NOTE]
 > The code uses the MCP SDK v2 `MCPServer` API (`mcp.server.mcpserver`), which is why the lock resolves `mcp` to 2.3.0 despite the lower bound in `pyproject.toml`.

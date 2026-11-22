@@ -10,7 +10,6 @@ dependencies = [
   "mcp>=2.3,<3",
   "pydantic>=2.0.0",
   "pywin32>=306",
-  "pywinauto>=0.6.8",
 ]
 
 [dependency-groups]
