@@ -57,7 +57,12 @@ from excel_vba_mcp.api.control_tools import (
     controls_list,
 )
 from excel_vba_mcp.api.health_tools import excel_health
-from excel_vba_mcp.api.macro_tools import macro_get_last_result, macro_list, macro_run
+from excel_vba_mcp.api.macro_tools import (
+    macro_classify_background,
+    macro_get_last_result,
+    macro_list,
+    macro_run,
+)
 from excel_vba_mcp.api.name_tools import (
     name_create,
     name_delete,
@@ -308,6 +313,14 @@ _DESC_MACRO_RUN = (
 _DESC_MACRO_GET_LAST_RESULT = (
     "Return the cached last macro run result (status, duration, return value, "
     "structured error) without re-running the macro."
+)
+_DESC_MACRO_CLASSIFY_BACKGROUND = (
+    "Classify a procedure's background_safe for the current workbook + VBA source "
+    "revision. UNGATED bookkeeping (macro_run remains the security boundary): "
+    "review a procedure (vba_read_component / vba_list_procedures) then assert "
+    "background_safe here. The classification is bound to (workbook hash, source "
+    "hash, procedure) and is invalidated on VBA source change; a heuristic or "
+    "interactive-UI procedure cannot be classified background_safe (R13 veto)."
 )
 _DESC_SHEETS_LIST = (
     "List every sheet of an open workbook (all types: Worksheet / Chart / Macro "
@@ -1030,6 +1043,11 @@ def _register_tools(server: MCPServer) -> None:
     )
     server.add_tool(macro_list, name="macro_list", description=_DESC_MACRO_LIST)
     server.add_tool(macro_run, name="macro_run", description=_DESC_MACRO_RUN)
+    server.add_tool(
+        macro_classify_background,
+        name="macro_classify_background",
+        description=_DESC_MACRO_CLASSIFY_BACKGROUND,
+    )
     server.add_tool(
         macro_get_last_result,
         name="macro_get_last_result",

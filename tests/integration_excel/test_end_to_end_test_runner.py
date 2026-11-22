@@ -413,6 +413,7 @@ class _Rig:
         self.runner = self.make_runner(self.compile, self.macro)
         self._original: Path | None = None
         self._baseline: Any = None
+        self.workbook_id: str | None = None
 
     # -- construction helpers -------------------------------------------
     def make_runner(self, compile_service: Any, macro_service: Any) -> Any:
@@ -512,8 +513,32 @@ class _Rig:
             )
         )
 
-    def classify_safe(self, procedure: str) -> None:
-        self.background.classify(self.baseline.sha256, procedure, background_safe=True)
+    async def classify_safe(self, procedure: str) -> None:
+        """Classify bound to the live hash + VBA source revision.
+
+        §7.3 DEVIATION (B5 edits the B6-owned helper): pass the **live**
+        ``project_source_hash`` to :meth:`BackgroundSafetyRegistry.classify` (the
+        sanctioned 3-arg path) so the classification is keyed by
+        ``(workbook hash, project_source_hash, procedure)`` — the same source
+        revision the runner's ``run_macro`` recomputes on the (byte-identical) case
+        copy. No legacy 2-arg authorize path remains.
+        """
+
+        assert self.workbook_id is not None
+        record = next(
+            r for r in self.session.list_workbooks_sync() if r.workbook_id == self.workbook_id
+        )
+        _inventory, project_source_hash = await self.macro._collect_project_state(
+            self.workbook_id, record
+        )
+        # Key on the baseline hash (== the runner's case-copy file hash), NOT the
+        # original working-copy hash: the baseline is a re-saved snapshot, so its
+        # bytes (and the case copies derived from it) differ from the original file.
+        # The VBA source hash is stable across that re-save, so the live
+        # ``project_source_hash`` is the same the runner recomputes on the case copy.
+        self.background.classify(
+            self.baseline.sha256, project_source_hash, procedure, background_safe=True
+        )
 
     # -- lifecycle -------------------------------------------------------
     async def open(self) -> Any:
@@ -521,6 +546,7 @@ class _Rig:
         info = await self.session.open_workbook(
             str(self.original), mode=SessionMode.EXECUTE, read_only=False
         )
+        self.workbook_id = info.workbook_id
         # Pre-create the immutable baseline and approve opening it.
         self._baseline = await self.snapshot.create_snapshot(info.workbook_id)
         self.grant_open_baseline()
@@ -616,7 +642,7 @@ async def test_successful_suite_returns_passed_with_artifacts(tmp_path: Path) ->
         owned_pid = rig.worker.get_status().owned_pid
         assert owned_pid is not None
         rig.grant_macro_run(_ADD_NUMBERS)
-        rig.classify_safe(_ADD_NUMBERS)
+        await rig.classify_safe(_ADD_NUMBERS)
 
         suite = _suite(
             [
@@ -731,7 +757,7 @@ async def test_compile_error_blocks_macro_step(tmp_path: Path) -> None:
         # Approve + classify so the block is attributable to the compile gate
         # only, never to a missing macro approval.
         rig.grant_macro_run(_ADD_NUMBERS)
-        rig.classify_safe(_ADD_NUMBERS)
+        await rig.classify_safe(_ADD_NUMBERS)
 
         suite = _suite(
             [
@@ -802,7 +828,7 @@ async def test_runtime_error_represented_with_evidence(
         owned_pid = rig.worker.get_status().owned_pid
         assert owned_pid is not None
         rig.grant_macro_run(_RAISE_ERROR)
-        rig.classify_safe(_RAISE_ERROR)
+        await rig.classify_safe(_RAISE_ERROR)
 
         suite = _suite(
             [
@@ -971,7 +997,7 @@ async def test_original_fixtures_unchanged(tmp_path: Path) -> None:
         owned_pid = rig.worker.get_status().owned_pid
         assert owned_pid is not None
         rig.grant_macro_run(_ADD_NUMBERS)
-        rig.classify_safe(_ADD_NUMBERS)
+        await rig.classify_safe(_ADD_NUMBERS)
 
         # A passing macro suite exercises snapshot / copy / close on CleanProject.
         suite = _suite(
@@ -1028,7 +1054,7 @@ async def test_run_resource_retrieval(tmp_path: Path) -> None:
         owned_pid = rig.worker.get_status().owned_pid
         assert owned_pid is not None
         rig.grant_macro_run(_ADD_NUMBERS)
-        rig.classify_safe(_ADD_NUMBERS)
+        await rig.classify_safe(_ADD_NUMBERS)
 
         suite = _suite(
             [

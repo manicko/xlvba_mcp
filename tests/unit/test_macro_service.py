@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import json
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,16 +48,22 @@ from excel_vba_mcp.adapters.excel.macro_runner import (
 )
 from excel_vba_mcp.application import macro_service as macro_service_module
 from excel_vba_mcp.application.macro_service import (
+    _UNREADABLE_MODULE_SENTINEL,
     ERROR_BACKGROUND_SAFETY_NOT_VERIFIED,
     ERROR_INTERACTIVE_UI_NOT_SUPPORTED,
+    BackgroundSafetyClassification,
     BackgroundSafetyRegistry,
     MacroInfo,
     MacroService,
+    _compute_project_source_hash,
+    _find_interactive_tokens,
+    _hash_module_lines,
 )
 from excel_vba_mcp.application.session_service import SessionService
-from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError, StaleTargetError
 from excel_vba_mcp.domain.models import MacroRunResult
 from excel_vba_mcp.domain.statuses import (
+    AccessMode,
     MacroRunStatus,
     OperationClass,
     SessionMode,
@@ -160,12 +167,18 @@ def _parse_procedures(text: str) -> list[dict[str, Any]]:
 
 
 class FakeCodeModule:
-    """A ``CodeModule`` supporting the VBIDE procedure APIs the adapter uses."""
+    """A ``CodeModule`` supporting the VBIDE procedure APIs the adapter uses.
 
-    def __init__(self, text: str) -> None:
+    When ``heuristic=True`` the procedure-enumeration APIs raise, so ``VBIDEAdapter``
+    falls back to the textual scan and flags every procedure ``is_heuristic=True``
+    (used to prove the run/classify fail-closed behavior on heuristic procedures).
+    """
+
+    def __init__(self, text: str, *, heuristic: bool = False) -> None:
         self._lines = text.replace("\r\n", "\n").split("\n")
         self._procs = _parse_procedures(text)
         self._by_name = {p["name"].lower(): p for p in self._procs}
+        self._heuristic = heuristic
 
     @property
     def CountOfLines(self) -> int:  # noqa: N802 - COM casing
@@ -175,23 +188,29 @@ class FakeCodeModule:
         return "\n".join(self._lines[start - 1 : start - 1 + count])
 
     def ProcOfLine(self, line: int, _kind: int = 0) -> tuple[str, int]:  # noqa: N802 - COM casing
+        if self._heuristic:
+            raise KeyError(line)
         for proc in self._procs:
             if proc["start"] == line:
                 return (proc["name"], proc["kind"])
         raise KeyError(line)
 
     def ProcStartLine(self, name: str, _kind: int = 0) -> int:  # noqa: N802 - COM casing
+        if self._heuristic:
+            raise KeyError(name)
         return self._by_name[name.lower()]["start"]
 
     def ProcCountLines(self, name: str, _kind: int = 0) -> int:  # noqa: N802 - COM casing
+        if self._heuristic:
+            raise KeyError(name)
         return self._by_name[name.lower()]["count"]
 
 
 class FakeComponent:
-    def __init__(self, name: str, type_code: int, code: str) -> None:
+    def __init__(self, name: str, type_code: int, code: str, *, heuristic: bool = False) -> None:
         self.Name = name
         self.Type = type_code
-        self.CodeModule = FakeCodeModule(code)
+        self.CodeModule = FakeCodeModule(code, heuristic=heuristic)
         self.Designer = None
 
     def Export(self, path: str) -> None:  # noqa: N802 - COM casing
@@ -348,7 +367,13 @@ def _sha256(path: Path) -> str:
 
 
 class Rig:
-    def __init__(self, tmp_path: Path, *, project: FakeProject | None = None) -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        project: FakeProject | None = None,
+        mode: AccessMode = AccessMode.RESTRICTED,
+    ) -> None:
         self.tmp_path = tmp_path
         self.original = tmp_path / "Book.xlsm"
         self.original.write_bytes(b"ORIGINAL-BYTES")
@@ -356,7 +381,7 @@ class Rig:
         self.canonical = str(
             self.path_policy.validate_path(str(self.original), OperationClass.MUTATING)
         )
-        self.approval = ApprovalPolicy()
+        self.approval = ApprovalPolicy(mode=mode)
         self.background = BackgroundSafetyRegistry()
         self.app = FakeApp(project or _default_project())
         self.adapter = ExcelAppAdapter()
@@ -379,6 +404,38 @@ class Rig:
             self.audit,
         )
         self.workbook_hash = _sha256(self.original)
+
+    def _record(self, workbook_id: str) -> Any:
+        for info in self.session.list_workbooks_sync():
+            if info.workbook_id == workbook_id:
+                return info
+        raise AssertionError(f"unknown workbook_id {workbook_id!r}")
+
+    async def compute_project_source_hash(self, workbook_id: str) -> str:
+        """Compute the live ``project_source_hash`` via the service's single scan."""
+
+        record = self._record(workbook_id)
+        _inventory, project_source_hash = await self.service._collect_project_state(
+            workbook_id, record
+        )
+        return project_source_hash
+
+    async def classify_safe(
+        self, workbook_id: str, procedure: str, *, background_safe: bool = True
+    ) -> None:
+        """Classify via the raw registry, bound to the live hash + source revision.
+
+        Bypasses :meth:`MacroService.classify_background` on purpose: the R13
+        preflight tests must be able to (wrongly) mark an interactive procedure
+        ``background_safe`` to prove the deterministic veto still blocks it.
+        """
+
+        record = self._record(workbook_id)
+        workbook_hash = _sha256(Path(record.path))
+        project_source_hash = await self.compute_project_source_hash(workbook_id)
+        self.background.classify(
+            workbook_hash, project_source_hash, procedure, background_safe=background_safe
+        )
 
     def grant_open(self) -> None:
         self.approval.grant(
@@ -503,7 +560,7 @@ async def test_list_macros_enumerates_public_procedures(tmp_path: Path) -> None:
 async def test_list_macros_reflects_background_classification(tmp_path: Path) -> None:
     rig = Rig(tmp_path)
     info = await rig.open()
-    rig.background.classify(rig.workbook_hash, "modTest.AddNumbers", background_safe=True)
+    await rig.classify_safe(info.workbook_id, "modTest.AddNumbers")
 
     macros = await rig.service.list_macros(info.workbook_id)
 
@@ -513,20 +570,55 @@ async def test_list_macros_reflects_background_classification(tmp_path: Path) ->
 
 
 # ---------------------------------------------------------------------------
-# run_macro: deny-by-default approval
+# run_macro: deny-by-default approval (restricted mode)
 # ---------------------------------------------------------------------------
 async def test_run_macro_denied_without_approval(tmp_path: Path) -> None:
-    rig = Rig(tmp_path)
+    rig = Rig(tmp_path)  # default RESTRICTED
     info = await rig.open()
-    # No macro_run grant, no background classification.
-    rig.background.classify(rig.workbook_hash, "modTest.AddNumbers", background_safe=True)
+    # No macro_run grant, but classified background_safe so the approval gate is
+    # what denies the run.
+    await rig.classify_safe(info.workbook_id, "modTest.AddNumbers")
 
     result = await rig.service.run_macro(info.workbook_id, "modTest.AddNumbers", [2, 3])
 
     assert result.status is MacroRunStatus.BLOCKED
-    assert result.error_code == ErrorCode.MACRO_BLOCKED.value
+    assert result.error_code == ErrorCode.APPROVAL_DENIED.value
+    assert result.error_text is not None and "approval policy" in result.error_text
     # Never dispatched.
     assert [s for s in rig.worker.submits if s["section"] == "execute"] == []
+
+
+# ---------------------------------------------------------------------------
+# run_macro: full-access mode allows EXECUTING with no per-run grant
+# ---------------------------------------------------------------------------
+async def test_run_macro_full_mode_runs_without_grant(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, mode=AccessMode.FULL)
+    info = await rig.open()  # FULL mode: open allowed without a grant
+    # Classified background_safe, but NO macro_run grant.
+    await rig.classify_safe(info.workbook_id, "modTest.AddNumbers")
+
+    result = await rig.service.run_macro(info.workbook_id, "modTest.AddNumbers", [2, 3])
+
+    assert result.status is MacroRunStatus.SUCCESS
+    assert result.return_value == 5
+    execute = [s for s in rig.worker.submits if s["section"] == "execute"]
+    assert len(execute) == 1
+    assert execute[0]["op_class"] is OperationClass.EXECUTING
+
+
+# ---------------------------------------------------------------------------
+# run_macro: restricted mode runs with a matching grant
+# ---------------------------------------------------------------------------
+async def test_run_macro_restricted_with_grant_runs(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, mode=AccessMode.RESTRICTED)
+    info = await rig.open()
+    rig.grant_macro_run("modTest.AddNumbers")
+    await rig.classify_safe(info.workbook_id, "modTest.AddNumbers")
+
+    result = await rig.service.run_macro(info.workbook_id, "modTest.AddNumbers", [2, 3])
+
+    assert result.status is MacroRunStatus.SUCCESS
+    assert result.return_value == 5
 
 
 # ---------------------------------------------------------------------------
@@ -549,7 +641,7 @@ async def test_run_macro_classified_unsafe_is_blocked(tmp_path: Path) -> None:
     rig = Rig(tmp_path)
     info = await rig.open()
     rig.grant_macro_run("modTest.AddNumbers")
-    rig.background.classify(rig.workbook_hash, "modTest.AddNumbers", background_safe=False)
+    await rig.classify_safe(info.workbook_id, "modTest.AddNumbers", background_safe=False)
 
     result = await rig.service.run_macro(info.workbook_id, "modTest.AddNumbers", [2, 3])
 
@@ -567,7 +659,7 @@ async def test_run_macro_ui_preflight_blocks(tmp_path: Path, macro: str) -> None
     info = await rig.open()
     # Even if wrongly classified background_safe, the preflight must still block.
     rig.grant_macro_run(macro)
-    rig.background.classify(rig.workbook_hash, macro, background_safe=True)
+    await rig.classify_safe(info.workbook_id, macro)
 
     result = await rig.service.run_macro(info.workbook_id, macro)
 
@@ -583,7 +675,7 @@ async def test_run_macro_success_returns_serialized_value(tmp_path: Path) -> Non
     rig = Rig(tmp_path)
     info = await rig.open()
     rig.grant_macro_run("modTest.AddNumbers")
-    rig.background.classify(rig.workbook_hash, "modTest.AddNumbers", background_safe=True)
+    await rig.classify_safe(info.workbook_id, "modTest.AddNumbers")
 
     result = await rig.service.run_macro(info.workbook_id, "modTest.AddNumbers", [2, 3])
 
@@ -609,7 +701,7 @@ async def test_run_macro_runtime_error(tmp_path: Path) -> None:
     rig = Rig(tmp_path)
     info = await rig.open()
     rig.grant_macro_run("modTest.RaiseError")
-    rig.background.classify(rig.workbook_hash, "modTest.RaiseError", background_safe=True)
+    await rig.classify_safe(info.workbook_id, "modTest.RaiseError")
 
     result = await rig.service.run_macro(info.workbook_id, "modTest.RaiseError")
 
@@ -621,7 +713,7 @@ async def test_run_macro_unsupported_argument_is_blocked(tmp_path: Path) -> None
     rig = Rig(tmp_path)
     info = await rig.open()
     rig.grant_macro_run("modTest.Echo")
-    rig.background.classify(rig.workbook_hash, "modTest.Echo", background_safe=True)
+    await rig.classify_safe(info.workbook_id, "modTest.Echo")
 
     result = await rig.service.run_macro(info.workbook_id, "modTest.Echo", [object()])
 
@@ -636,7 +728,7 @@ async def test_run_macro_timeout_no_retry(tmp_path: Path, monkeypatch: pytest.Mo
     rig = Rig(tmp_path)
     info = await rig.open()
     rig.grant_macro_run("modTest.Echo")
-    rig.background.classify(rig.workbook_hash, "modTest.Echo", background_safe=True)
+    await rig.classify_safe(info.workbook_id, "modTest.Echo")
     rig.worker.hang_execute = True
 
     terminated: list[int] = []
@@ -661,7 +753,7 @@ async def test_run_macro_modal_hang_terminates_owned_pid(
     rig = Rig(tmp_path)
     info = await rig.open()
     rig.grant_macro_run("modTest.RaiseError")
-    rig.background.classify(rig.workbook_hash, "modTest.RaiseError", background_safe=True)
+    await rig.classify_safe(info.workbook_id, "modTest.RaiseError")
     rig.worker.hang_execute = True
 
     terminated: list[int] = []
@@ -700,7 +792,7 @@ async def test_get_last_result_uses_cache_without_rerun(tmp_path: Path) -> None:
     rig = Rig(tmp_path)
     info = await rig.open()
     rig.grant_macro_run("modTest.AddNumbers")
-    rig.background.classify(rig.workbook_hash, "modTest.AddNumbers", background_safe=True)
+    await rig.classify_safe(info.workbook_id, "modTest.AddNumbers")
 
     first = await rig.service.run_macro(info.workbook_id, "modTest.AddNumbers", [2, 3])
     execute_count = len([s for s in rig.worker.submits if s["section"] == "execute"])
@@ -727,3 +819,262 @@ async def test_unknown_workbook_raises(tmp_path: Path) -> None:
         await rig.service.run_macro("ghost", "modTest.AddNumbers")
     with pytest.raises(ExcelVbaMcpError):
         await rig.service.list_macros("ghost")
+
+
+# ---------------------------------------------------------------------------
+# ErrorCode surface (additive Phase-2 result codes) + literal aliases
+# ---------------------------------------------------------------------------
+def test_background_error_codes_exist() -> None:
+    assert ErrorCode.BACKGROUND_SAFETY_NOT_VERIFIED.value == "BACKGROUND_SAFETY_NOT_VERIFIED"
+    assert ErrorCode.INTERACTIVE_UI_NOT_SUPPORTED.value == "INTERACTIVE_UI_NOT_SUPPORTED"
+    # The macro_service aliases are the enum's single source of truth.
+    assert ErrorCode.BACKGROUND_SAFETY_NOT_VERIFIED.value == ERROR_BACKGROUND_SAFETY_NOT_VERIFIED
+    assert ErrorCode.INTERACTIVE_UI_NOT_SUPPORTED.value == ERROR_INTERACTIVE_UI_NOT_SUPPORTED
+
+
+# ---------------------------------------------------------------------------
+# _find_interactive_tokens: case-insensitive + expanded token set
+# ---------------------------------------------------------------------------
+def test_find_interactive_tokens_is_case_insensitive() -> None:
+    # Lowercased tokens (VBA is case-insensitive) must still be caught.
+    assert "MsgBox" in _find_interactive_tokens('x = msgbox("hi")')
+    assert ".Show" in _find_interactive_tokens("frmTest.show")
+    assert "Shell" in _find_interactive_tokens("shell \"calc\"")
+    assert _find_interactive_tokens("Public Sub AddNumbers()\nEnd Sub\n") == []
+
+
+def test_find_interactive_tokens_covers_expanded_set() -> None:
+    for token in ("SendKeys", "DoEvents", "CallByName", "ExecuteGlobal", "Eval", "OnTime"):
+        assert token in _find_interactive_tokens(f"Before\n    {token} something\nAfter")
+
+
+# ---------------------------------------------------------------------------
+# project_source_hash: empty vs unreadable sentinel + determinism
+# ---------------------------------------------------------------------------
+def test_hash_module_lines_empty_vs_unreadable_sentinel() -> None:
+    empty_hash = _hash_module_lines([])
+    unreadable_hash = _hash_module_lines(None)
+    # Empty (readable, zero lines) is a real hash; unreadable is a distinct sentinel.
+    assert empty_hash != _UNREADABLE_MODULE_SENTINEL
+    assert unreadable_hash == _UNREADABLE_MODULE_SENTINEL
+    assert empty_hash != unreadable_hash
+    # Deterministic for the same input.
+    assert _hash_module_lines(["a", "b"]) == _hash_module_lines(["a", "b"])
+
+
+def test_compute_project_source_hash_is_order_independent() -> None:
+    first = _compute_project_source_hash({"modA": "h1", "modB": "h2", "ThisWorkbook": "h3"})
+    second = _compute_project_source_hash({"ThisWorkbook": "h3", "modB": "h2", "modA": "h1"})
+    assert first == second
+    # A different per-component hash changes the digest.
+    changed = _compute_project_source_hash({"modA": "h1", "modB": "CHANGED", "ThisWorkbook": "h3"})
+    assert changed != first
+    # The unreadable sentinel participates (invalidates), never the empty hash.
+    unreadable = _compute_project_source_hash({"modA": _UNREADABLE_MODULE_SENTINEL})
+    empty = _compute_project_source_hash({"modA": _hash_module_lines([])})
+    assert unreadable != empty
+
+
+# ---------------------------------------------------------------------------
+# BackgroundSafetyRegistry: 3-tuple key lifecycle
+# ---------------------------------------------------------------------------
+def test_registry_classify_and_invalidate() -> None:
+    registry = BackgroundSafetyRegistry()
+    registry.classify("wbhash", "srchash", "modTest.AddNumbers", background_safe=True)
+    assert registry.is_safe("wbhash", "srchash", "modTest.AddNumbers") is True
+    # Case-insensitive procedure key.
+    assert registry.is_safe("wbhash", "srchash", "  modtest.addnumbers ") is True
+    # Source revision change -> unclassified (None).
+    assert registry.is_safe("wbhash", "OTHER_SRCHASH", "modTest.AddNumbers") is None
+    # Workbook hash change -> unclassified (None).
+    assert registry.is_safe("OTHER_WBHASH", "srchash", "modTest.AddNumbers") is None
+    # Explicit unsafe classification.
+    registry.classify("wbhash", "srchash", "modTest.ShowMsg", background_safe=False)
+    assert registry.is_safe("wbhash", "srchash", "modTest.ShowMsg") is False
+    registry.clear()
+    assert registry.is_safe("wbhash", "srchash", "modTest.AddNumbers") is None
+
+
+# ---------------------------------------------------------------------------
+# classify_background service method
+# ---------------------------------------------------------------------------
+def _audit_events(rig: Rig) -> list[dict[str, Any]]:
+    path = rig.tmp_path / "audit.jsonl"
+    if not path.is_file():
+        return []
+    events: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        events.append(json.loads(line))
+    return events
+
+
+async def test_classify_background_writes_and_is_idempotent(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, mode=AccessMode.FULL)
+    info = await rig.open()
+
+    dto = await rig.service.classify_background(info.workbook_id, "modTest.AddNumbers", True)
+    assert isinstance(dto, BackgroundSafetyClassification)
+    assert dto.background_safe is True
+    assert dto.procedure == "modTest.AddNumbers"
+    assert dto.project_source_hash == await rig.compute_project_source_hash(info.workbook_id)
+    assert dto.workbook_sha256
+
+    # Idempotent second write; the run now succeeds (no grant needed in FULL mode).
+    again = await rig.service.classify_background(info.workbook_id, "modTest.AddNumbers", True)
+    assert again.project_source_hash == dto.project_source_hash
+
+    result = await rig.service.run_macro(info.workbook_id, "modTest.AddNumbers", [2, 3])
+    assert result.status is MacroRunStatus.SUCCESS
+    assert result.return_value == 5
+
+    # Audit recorded a config/macro_classify_background event.
+    events = [e for e in _audit_events(rig) if e.get("tool") == "macro_classify_background"]
+    assert events and events[-1]["operation_class"] == "config"
+
+
+async def test_classify_background_unknown_is_macro_not_found(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, mode=AccessMode.FULL)
+    info = await rig.open()
+
+    with pytest.raises(ExcelVbaMcpError) as excinfo:
+        await rig.service.classify_background(info.workbook_id, "modTest.Nope", True)
+    assert excinfo.value.code is ErrorCode.MACRO_NOT_FOUND
+
+
+async def test_classify_background_stale_source_hash_no_write(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, mode=AccessMode.FULL)
+    info = await rig.open()
+
+    with pytest.raises(StaleTargetError) as excinfo:
+        await rig.service.classify_background(
+            info.workbook_id, "modTest.AddNumbers", True,
+            expected_project_source_hash="deadbeef",
+        )
+    assert excinfo.value.code is ErrorCode.STALE_TARGET
+    # No write occurred: a later run is still BACKGROUND_SAFETY_NOT_VERIFIED.
+    result = await rig.service.run_macro(info.workbook_id, "modTest.AddNumbers", [2, 3])
+    assert result.status is MacroRunStatus.BLOCKED
+    assert result.error_code == ERROR_BACKGROUND_SAFETY_NOT_VERIFIED
+
+
+async def test_classify_background_interactive_token_no_write(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, mode=AccessMode.FULL)
+    info = await rig.open()
+
+    with pytest.raises(ExcelVbaMcpError) as excinfo:
+        await rig.service.classify_background(info.workbook_id, "modTest.ShowMsg", True)
+    assert excinfo.value.code is ErrorCode.INTERACTIVE_UI_NOT_SUPPORTED
+
+    # No write: ShowMsg remains unclassified.
+    live_hash = await rig.compute_project_source_hash(info.workbook_id)
+    workbook_hash = _sha256(Path(rig._record(info.workbook_id).path))
+    assert rig.background.is_safe(workbook_hash, live_hash, "modTest.ShowMsg") is None
+
+
+async def test_classify_background_heuristic_fail_closed(tmp_path: Path) -> None:
+    project = FakeProject(
+        [
+            FakeComponent(
+                "modH",
+                1,
+                "Option Explicit\n\nPublic Sub RunIt()\n    x = 1\nEnd Sub\n",
+                heuristic=True,
+            ),
+            FakeComponent("ThisWorkbook", 100, "Option Explicit\n"),
+        ]
+    )
+    rig = Rig(tmp_path, mode=AccessMode.FULL, project=project)
+    info = await rig.open()
+
+    # A heuristic procedure cannot be classified background_safe.
+    with pytest.raises(ExcelVbaMcpError) as excinfo:
+        await rig.service.classify_background(info.workbook_id, "modH.RunIt", True)
+    assert excinfo.value.code is ErrorCode.INTERACTIVE_UI_NOT_SUPPORTED
+
+    # ... and even if the registry is (wrongly) set safe, run_macro vetoes it.
+    await rig.classify_safe(info.workbook_id, "modH.RunIt")
+    result = await rig.service.run_macro(info.workbook_id, "modH.RunIt")
+    assert result.status is MacroRunStatus.BLOCKED
+    assert result.error_code == ERROR_INTERACTIVE_UI_NOT_SUPPORTED
+
+
+# ---------------------------------------------------------------------------
+# list_macros reflects classification + project_source_hash annotation
+# ---------------------------------------------------------------------------
+async def test_list_macros_annotates_project_source_hash(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, mode=AccessMode.FULL)
+    info = await rig.open()
+    live_hash = await rig.compute_project_source_hash(info.workbook_id)
+
+    await rig.service.classify_background(info.workbook_id, "modTest.AddNumbers", True)
+
+    macros = await rig.service.list_macros(info.workbook_id)
+    add = next(m for m in macros if m.name == "modTest.AddNumbers")
+    assert add.background_safe is True
+    assert add.background_safe_classified is True
+    assert add.project_source_hash == live_hash
+    # An unclassified sibling is still deny-by-default but carries the same hash.
+    other = next(m for m in macros if m.name == "modTest.NoArgs")
+    assert other.background_safe is False
+    assert other.project_source_hash == live_hash
+
+
+# ---------------------------------------------------------------------------
+# single-source hash consistency + source-edit invalidation at run time
+# ---------------------------------------------------------------------------
+async def test_run_after_classify_same_source_succeeds(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, mode=AccessMode.FULL)
+    info = await rig.open()
+
+    await rig.service.classify_background(info.workbook_id, "modTest.AddNumbers", True)
+    # No edits between classify and run: the live project_source_hash is identical.
+    result = await rig.service.run_macro(info.workbook_id, "modTest.AddNumbers", [2, 3])
+    assert result.status is MacroRunStatus.SUCCESS
+
+
+def _mutate_module(rig: Rig, name: str, new_source: str) -> None:
+    components = rig.app.Workbooks._project.VBComponents  # noqa: SLF001 - test reach-in
+    for component in components:
+        if component.Name == name:
+            component.CodeModule = FakeCodeModule(new_source)
+            return
+    raise AssertionError(f"component {name!r} not found")
+
+
+async def test_unsaved_source_edit_invalidates_classification(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, mode=AccessMode.FULL)
+    info = await rig.open()
+
+    await rig.service.classify_background(info.workbook_id, "modTest.AddNumbers", True)
+    # Mutate the in-memory VBA source WITHOUT saving: the file hash is unchanged,
+    # but project_source_hash changes -> the classification no longer matches.
+    _mutate_module(rig, "modTest", MOD_TEST_SOURCE + "\n' edited in memory\n")
+
+    result = await rig.service.run_macro(info.workbook_id, "modTest.AddNumbers", [2, 3])
+    assert result.status is MacroRunStatus.BLOCKED
+    assert result.error_code == ERROR_BACKGROUND_SAFETY_NOT_VERIFIED
+
+
+# ---------------------------------------------------------------------------
+# R13 preflight still blocks a lowercased interactive token even if wrongly safe
+# ---------------------------------------------------------------------------
+async def test_run_macro_lowercase_msgbox_blocked(tmp_path: Path) -> None:
+    source = "Option Explicit\n\nPublic Sub Sneaky()\n    msgbox \"hi\"\nEnd Sub\n"
+    project = FakeProject(
+        [
+            FakeComponent("modLow", 1, source),
+            FakeComponent("ThisWorkbook", 100, "Option Explicit\n"),
+        ]
+    )
+    rig = Rig(tmp_path, mode=AccessMode.FULL, project=project)
+    info = await rig.open()
+
+    # Wrongly classify safe (raw registry), yet R13 must still veto the lowercase token.
+    await rig.classify_safe(info.workbook_id, "modLow.Sneaky")
+    result = await rig.service.run_macro(info.workbook_id, "modLow.Sneaky")
+    assert result.status is MacroRunStatus.BLOCKED
+    assert result.error_code == ERROR_INTERACTIVE_UI_NOT_SUPPORTED
+    assert [s for s in rig.worker.submits if s["section"] == "execute"] == []

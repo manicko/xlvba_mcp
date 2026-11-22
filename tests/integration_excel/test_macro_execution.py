@@ -57,11 +57,13 @@ import pytest
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
 from excel_vba_mcp.application.macro_service import (
+    BackgroundSafetyClassification,
     BackgroundSafetyRegistry,
     MacroService,
 )
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.domain.statuses import (
+    AccessMode,
     MacroRunStatus,
     OperationClass,
     SessionMode,
@@ -275,7 +277,7 @@ def anyio_backend() -> str:
 class _Rig:
     """A live worker + session + macro service + background registry + temp roots."""
 
-    def __init__(self, tmp_dir: Path) -> None:
+    def __init__(self, tmp_dir: Path, *, mode: AccessMode = AccessMode.RESTRICTED) -> None:
         self.tmp_dir = tmp_dir
         self.work_dir = tmp_dir / "work"
         self.projects_dir = tmp_dir / "projects"
@@ -283,7 +285,7 @@ class _Rig:
         self.path_policy = PathPolicy(
             {"work": str(self.work_dir), "projects": str(self.projects_dir)}
         )
-        self.approval = ApprovalPolicy()
+        self.approval = ApprovalPolicy(mode=mode)
         self.background = BackgroundSafetyRegistry()
         self.app_adapter = ExcelAppAdapter()
         self.worker = ExcelComWorker(self.app_adapter, orphan_timeout_s=_ORPHAN_POLL_TIMEOUT_S)
@@ -300,6 +302,7 @@ class _Rig:
             self.worker, self.session, self.approval, self.background, self.audit
         )
         self._original: Path | None = None
+        self.workbook_id: str | None = None
 
     def bind_original(self, original: Path) -> None:
         self._original = original
@@ -338,21 +341,43 @@ class _Rig:
             ),
         )
 
-    def classify_safe(self, procedure: str) -> None:
-        self.background.classify(self.workbook_hash, procedure, background_safe=True)
+    async def classify_safe(self, procedure: str) -> None:
+        """Classify ``procedure`` bound to the live hash + VBA source revision.
+
+        Computes the ``project_source_hash`` live (so it reflects an in-memory
+        ``_inject_hang`` edit made before the call) and classifies directly in the
+        registry. Direct (not via :meth:`MacroService.classify_background`) on
+        purpose: the R13 tests must be able to (wrongly) mark an interactive
+        procedure ``background_safe`` to prove the deterministic preflight veto
+        still blocks it. The success test exercises ``classify_background`` itself.
+        """
+
+        assert self.workbook_id is not None
+        record = next(
+            r for r in self.session.list_workbooks_sync() if r.workbook_id == self.workbook_id
+        )
+        _inventory, project_source_hash = await self.service._collect_project_state(
+            self.workbook_id, record
+        )
+        workbook_hash = _sha256(Path(record.path))
+        self.background.classify(
+            workbook_hash, project_source_hash, procedure, background_safe=True
+        )
 
     async def open(self) -> Any:
         self.grant_open()
         assert self._original is not None
-        return await self.session.open_workbook(
+        info = await self.session.open_workbook(
             str(self._original), mode=SessionMode.EXECUTE, read_only=False
         )
+        self.workbook_id = info.workbook_id
+        return info
 
 
-def _make_rig(tmp_path: Path, fixture: Path) -> _Rig:
+def _make_rig(tmp_path: Path, fixture: Path, *, mode: AccessMode = AccessMode.RESTRICTED) -> _Rig:
     """Copy the committed fixture into the temp projects root as the original."""
 
-    rig = _Rig(tmp_path)
+    rig = _Rig(tmp_path, mode=mode)
     original = rig.projects_dir / fixture.name
     shutil.copy2(fixture, original)
     rig.bind_original(original)
@@ -386,6 +411,37 @@ async def _inject_hang(rig: _Rig, working_path: str) -> None:
     inject.__name__ = "inject_hang"
     await rig.worker.submit(
         inject, timeout=30.0, section="diagnostic", op_class=OperationClass.EXECUTING
+    )
+
+
+async def _mutate_vba_source(rig: _Rig, working_path: str) -> None:
+    """Append a harmless comment line to ``modTest`` in the in-memory working copy.
+
+    The on-disk file is unchanged (the workbook hash holds), but the VBA source
+    revision changes, so a ``background_safe`` classification bound to the prior
+    source hash must no longer match (-> ``BACKGROUND_SAFETY_NOT_VERIFIED``). This
+    proves the source-revision binding invalidates on unsaved VBA edits.
+    """
+
+    app_adapter = rig.app_adapter
+
+    def mutate() -> bool:
+        app = app_adapter.app
+        target = working_path.lower()
+        wb = None
+        for candidate in app.Workbooks:
+            if str(candidate.FullName).lower() == target:
+                wb = candidate
+                break
+        if wb is None:
+            raise RuntimeError("working copy not open")
+        module = wb.VBProject.VBComponents("modTest").CodeModule
+        module.AddFromString("' b5 source-revision probe\r\n")
+        return True
+
+    mutate.__name__ = "mutate_vba_source"
+    await rig.worker.submit(
+        mutate, timeout=30.0, section="diagnostic", op_class=OperationClass.EXECUTING
     )
 
 
@@ -478,19 +534,19 @@ async def test_macro_execution_success_and_preflight(tmp_path: Path) -> None:
 
         # --- Success cases (approved + background_safe classified). ---
         rig.grant_macro_run("modTest.AddNumbers")
-        rig.classify_safe("modTest.AddNumbers")
+        await rig.classify_safe("modTest.AddNumbers")
         add = await rig.service.run_macro(info.workbook_id, "modTest.AddNumbers", [2, 3])
         assert add.status is MacroRunStatus.SUCCESS, f"AddNumbers failed: {add}"
         assert add.return_value == 5, f"AddNumbers(2,3) != 5: {add}"
 
         rig.grant_macro_run("modTest.NoArgs")
-        rig.classify_safe("modTest.NoArgs")
+        await rig.classify_safe("modTest.NoArgs")
         no_args = await rig.service.run_macro(info.workbook_id, "modTest.NoArgs")
         assert no_args.status is MacroRunStatus.SUCCESS
         assert no_args.return_value == "no-args"
 
         rig.grant_macro_run("modTest.MakeArray")
-        rig.classify_safe("modTest.MakeArray")
+        await rig.classify_safe("modTest.MakeArray")
         arr = await rig.service.run_macro(info.workbook_id, "modTest.MakeArray")
         assert arr.status is MacroRunStatus.SUCCESS
         assert arr.return_value == [1, 2, 3]
@@ -508,7 +564,7 @@ async def test_macro_execution_success_and_preflight(tmp_path: Path) -> None:
         # --- R13 preflight: ShowMsg / ShowForm blocked even if wrongly classified. ---
         for macro in ("modTest.ShowMsg", "modTest.ShowForm"):
             rig.grant_macro_run(macro)
-            rig.classify_safe(macro)
+            await rig.classify_safe(macro)
             blocked = await rig.service.run_macro(info.workbook_id, macro)
             assert blocked.status is MacroRunStatus.BLOCKED, f"{macro} was not blocked: {blocked}"
             assert blocked.error_code == "INTERACTIVE_UI_NOT_SUPPORTED"
@@ -561,7 +617,7 @@ async def test_macro_runtime_error_modal_owned_terminate(tmp_path: Path) -> None
         assert owned_pid is not None
 
         rig.grant_macro_run("modTest.RaiseError")
-        rig.classify_safe("modTest.RaiseError")
+        await rig.classify_safe("modTest.RaiseError")
 
         result = await rig.service.run_macro(
             info.workbook_id, "modTest.RaiseError", timeout_s=_MODAL_TIMEOUT_S
@@ -611,7 +667,7 @@ async def test_macro_timeout_needs_recovery(tmp_path: Path) -> None:
 
         await _inject_hang(rig, info.path)
         rig.grant_macro_run("modTest.HangForever")
-        rig.classify_safe("modTest.HangForever")
+        await rig.classify_safe("modTest.HangForever")
 
         result = await rig.service.run_macro(
             info.workbook_id, "modTest.HangForever", timeout_s=_HANG_TIMEOUT_S
@@ -674,14 +730,14 @@ async def test_successful_macro_returns_value_and_duration(tmp_path: Path) -> No
 
         with _count_execute_dispatches(rig) as counts:
             rig.grant_macro_run("modTest.AddNumbers")
-            rig.classify_safe("modTest.AddNumbers")
+            await rig.classify_safe("modTest.AddNumbers")
             add = await rig.service.run_macro(info.workbook_id, "modTest.AddNumbers", [2, 3])
             assert add.status is MacroRunStatus.SUCCESS, f"AddNumbers(2,3) failed: {add}"
             assert add.return_value == 5, f"AddNumbers(2,3) != 5: {add}"
             assert add.duration_ms > 0, f"duration not recorded: {add}"
 
             rig.grant_macro_run("modTest.MakeArray")
-            rig.classify_safe("modTest.MakeArray")
+            await rig.classify_safe("modTest.MakeArray")
             arr = await rig.service.run_macro(info.workbook_id, "modTest.MakeArray")
             assert arr.status is MacroRunStatus.SUCCESS, f"MakeArray failed: {arr}"
             assert arr.return_value == [1, 2, 3], f"MakeArray != [1,2,3]: {arr}"
@@ -754,7 +810,7 @@ async def test_blocked_macro_never_runs(tmp_path: Path) -> None:
             # approved and (wrongly) classified background_safe.
             for macro in ("modTest.ShowMsg", "modTest.ShowForm"):
                 rig.grant_macro_run(macro)
-                rig.classify_safe(macro)
+                await rig.classify_safe(macro)
                 blocked = await rig.service.run_macro(info.workbook_id, macro)
                 assert blocked.status is MacroRunStatus.BLOCKED, (
                     f"{macro} was not blocked: {blocked}"
@@ -881,7 +937,7 @@ async def test_runtime_error_classified_without_false_precision(tmp_path: Path) 
         assert old_pid is not None
 
         rig.grant_macro_run("modTest.RaiseError")
-        rig.classify_safe("modTest.RaiseError")
+        await rig.classify_safe("modTest.RaiseError")
 
         with _count_execute_dispatches(rig) as counts:
             result, owned_foreground = await _run_macro_sampling_foreground(
@@ -927,7 +983,7 @@ async def test_runtime_error_classified_without_false_precision(tmp_path: Path) 
         assert fresh_pid is not None and fresh_pid != old_pid
 
         rig.grant_macro_run("modTest.AddNumbers")
-        rig.classify_safe("modTest.AddNumbers")
+        await rig.classify_safe("modTest.AddNumbers")
         ok = await rig.service.run_macro(fresh.workbook_id, "modTest.AddNumbers", [2, 3])
         assert ok.status is MacroRunStatus.SUCCESS, f"fresh session unusable: {ok}"
         assert ok.return_value == 5, f"fresh-session AddNumbers(2,3) != 5: {ok}"
@@ -994,7 +1050,7 @@ async def test_timeout_not_retried(tmp_path: Path) -> None:
         # Inject a busy-loop macro into the in-memory working copy (file untouched).
         await _inject_hang(rig, info.path)
         rig.grant_macro_run("modTest.HangForever")
-        rig.classify_safe("modTest.HangForever")
+        await rig.classify_safe("modTest.HangForever")
 
         with _count_execute_dispatches(rig) as counts:
             result = await rig.service.run_macro(
@@ -1036,6 +1092,97 @@ async def test_timeout_not_retried(tmp_path: Path) -> None:
         # the busy loop. Terminate ONLY the owned PID to unblock app.Run, then stop.
         if owned_pid is not None and _pid_alive(owned_pid):
             _terminate_owned_pid(owned_pid)
+        await rig.stop()
+
+    assert owned_pid is not None
+    assert _wait_pid_gone(owned_pid), f"owned PID {owned_pid} still alive after shutdown"
+
+
+# ---------------------------------------------------------------------------
+# Test 9 (task_b5): classify a real procedure via the service => SUCCESS, and an
+# unsaved VBA source edit invalidates it (BACKGROUND_SAFETY_NOT_VERIFIED)
+# ---------------------------------------------------------------------------
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_service_classify_then_source_edit_invalidates(tmp_path: Path) -> None:
+    """``classify_background`` binds to the live source revision.
+
+    Classify ``modTest.AddNumbers`` via :meth:`MacroService.classify_background` (no
+    per-run grant in FULL mode) -> ``SUCCESS``. Then mutate the VBA source in memory
+    (no save): the workbook hash is unchanged but the ``project_source_hash`` changes,
+    so the re-run is ``BACKGROUND_SAFETY_NOT_VERIFIED`` (never a false success).
+    """
+
+    fixture = _fixture_or_skip(_CLEAN_PROJECT)
+    rig = _make_rig(tmp_path, fixture, mode=AccessMode.FULL)
+    await rig.start()
+    owned_pid: int | None = None
+    try:
+        committed_hash = _sha256(fixture)
+        original_hash = _sha256(rig._original)  # type: ignore[arg-type]
+
+        info = await rig.open()
+        owned_pid = rig.worker.get_status().owned_pid
+        assert owned_pid is not None
+
+        dto = await rig.service.classify_background(info.workbook_id, "modTest.AddNumbers", True)
+        assert isinstance(dto, BackgroundSafetyClassification)
+        assert dto.background_safe is True
+        assert dto.project_source_hash
+
+        ok = await rig.service.run_macro(info.workbook_id, "modTest.AddNumbers", [2, 3])
+        assert ok.status is MacroRunStatus.SUCCESS, f"classify+run failed: {ok}"
+        assert ok.return_value == 5
+
+        # Unsaved VBA edit -> new source revision -> classification invalidated.
+        await _mutate_vba_source(rig, info.path)
+        blocked = await rig.service.run_macro(info.workbook_id, "modTest.AddNumbers", [2, 3])
+        assert blocked.status is MacroRunStatus.BLOCKED
+        assert blocked.error_code == "BACKGROUND_SAFETY_NOT_VERIFIED"
+
+        # Disposable copies intact.
+        assert _sha256(rig._original) == original_hash, "original must be unchanged"
+        assert _sha256(fixture) == committed_hash, "committed fixture must never change"
+
+        print(
+            f"[b5-classify] status={ok.status.value} rv={ok.return_value} "
+            f"after_edit={blocked.error_code} owned_pid={owned_pid}"
+        )
+    finally:
+        await rig.stop()
+
+    assert owned_pid is not None
+    assert _wait_pid_gone(owned_pid), f"owned PID {owned_pid} still alive after shutdown"
+
+
+# ---------------------------------------------------------------------------
+# Test 10 (task_b5): FULL mode runs a macro with no per-run grant
+# ---------------------------------------------------------------------------
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_full_mode_macro_runs_without_grant(tmp_path: Path) -> None:
+    """In FULL access mode, a policy-approved + background_safe macro runs with no
+    ``macro_run`` grant (the empty-registry / per-run-approval dead end is gone)."""
+
+    fixture = _fixture_or_skip(_CLEAN_PROJECT)
+    rig = _make_rig(tmp_path, fixture, mode=AccessMode.FULL)
+    await rig.start()
+    owned_pid: int | None = None
+    try:
+        info = await rig.open()
+        owned_pid = rig.worker.get_status().owned_pid
+        assert owned_pid is not None
+
+        # No grant_macro_run: FULL mode authorizes EXECUTING by policy.
+        await rig.service.classify_background(info.workbook_id, "modTest.AddNumbers", True)
+        result = await rig.service.run_macro(info.workbook_id, "modTest.AddNumbers", [2, 3])
+        assert result.status is MacroRunStatus.SUCCESS, f"FULL-mode run failed: {result}"
+        assert result.return_value == 5
+
+        print(f"[b5-full-mode] status={result.status.value} rv={result.return_value}")
+    finally:
         await rig.stop()
 
     assert owned_pid is not None

@@ -12,6 +12,7 @@ from excel_vba_mcp.api.compile_tools import (
 )
 from excel_vba_mcp.api.health_tools import ExcelHealth, excel_health
 from excel_vba_mcp.api.macro_tools import (
+    macro_classify_background,
     macro_get_last_result,
     macro_list,
     macro_run,
@@ -47,6 +48,7 @@ __all__ = [
     "excel_open",
     "excel_save",
     "get_workbook_model_service",
+    "macro_classify_background",
     "macro_get_last_result",
     "macro_list",
     "macro_run",

@@ -50,6 +50,10 @@ class ErrorCode(StrEnum):
     MODAL_UI_BLOCKED = "MODAL_UI_BLOCKED"
     LISTOBJECT_INTERSECTION = "LISTOBJECT_INTERSECTION"
     APPROVAL_DENIED = "APPROVAL_DENIED"
+    # Task_b5 (fix_005): macro background-safety result codes (additive; result
+    # codes only — no exception classes, no ``_ERROR_BY_CODE`` entries).
+    BACKGROUND_SAFETY_NOT_VERIFIED = "BACKGROUND_SAFETY_NOT_VERIFIED"
+    INTERACTIVE_UI_NOT_SUPPORTED = "INTERACTIVE_UI_NOT_SUPPORTED"
 
 
 # Well-known HRESULT values that map to domain codes (hex shown for readability).

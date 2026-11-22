@@ -21,7 +21,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from excel_vba_mcp.application.macro_service import MacroInfo, MacroService
+from excel_vba_mcp.application.macro_service import (
+    BackgroundSafetyClassification,
+    MacroInfo,
+    MacroService,
+)
 from excel_vba_mcp.domain.errors import ExcelVbaMcpError
 from excel_vba_mcp.domain.models import MacroRunResult
 
@@ -107,6 +111,45 @@ async def macro_run(
     return await service.run_macro(workbook_id, macro_name, args)
 
 
+async def macro_classify_background(
+    workbook_id: str,
+    procedure: str,
+    background_safe: bool,
+    expected_project_source_hash: str | None = None,
+) -> BackgroundSafetyClassification:
+    """Classify a procedure's ``background_safe`` for the current source revision.
+
+    Thin, UNGATED bookkeeping handler (approach A): it validates its arguments and
+    delegates to :meth:`MacroService.classify_background`, returning the
+    :class:`BackgroundSafetyClassification` DTO. It never touches COM and is not the
+    security boundary — :func:`macro_run` keeps the deny-by-default approval gate and
+    the deterministic R13 veto. The classification is bound to the workbook hash and
+    the live VBA ``project_source_hash`` and is invalidated on source change.
+
+    Args:
+        workbook_id: The id returned by :func:`excel_open`.
+        procedure: The procedure to classify (``Module.Procedure`` or a bare unique
+            ``Procedure`` name).
+        background_safe: The classification to record.
+        expected_project_source_hash: Optional optimistic-concurrency guard; when it
+            no longer matches the live source hash the write is rejected
+            (``STALE_TARGET``).
+
+    Returns:
+        A :class:`BackgroundSafetyClassification` describing what was recorded.
+    """
+
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(procedure, "procedure")
+    service = get_macro_service()
+    return await service.classify_background(
+        workbook_id,
+        procedure,
+        background_safe,
+        expected_project_source_hash=expected_project_source_hash,
+    )
+
+
 async def macro_get_last_result(workbook_id: str) -> MacroRunResult | None:
     """Return the cached last macro run result without re-running the macro.
 
@@ -124,6 +167,7 @@ async def macro_get_last_result(workbook_id: str) -> MacroRunResult | None:
 
 __all__ = [
     "get_macro_service",
+    "macro_classify_background",
     "macro_get_last_result",
     "macro_list",
     "macro_run",
