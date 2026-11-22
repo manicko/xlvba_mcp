@@ -169,6 +169,4 @@ environment variables are in [Configuration](03-configuration.md).
 - [MCP Tools Reference](05-mcp-tools-reference.md)
 - [Excel Capabilities](06-excel-capabilities.md)
 - [Workflows and Examples](07-workflows-and-examples.md)
-- [Troubleshooting](10-troubleshooting.md)
-- [Development and Maintenance](11-development-and-maintenance.md)
 - [Root README](../README.md)

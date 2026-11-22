@@ -168,6 +168,4 @@ related:
 - [Справочник инструментов MCP](05-mcp-tools-reference.md)
 - [Возможности Excel](06-excel-capabilities.md)
 - [Рабочие процессы и примеры](07-workflows-and-examples.md)
-- [Устранение неполадок](10-troubleshooting.md)
-- [Разработка и сопровождение](11-development-and-maintenance.md)
 - [Корневой README](../../README.md)

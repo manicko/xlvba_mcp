@@ -333,7 +333,7 @@ Example of a serialized error:
 }
 ```
 
-Diagnostics for specific codes are in [Troubleshooting](10-troubleshooting.md).
+Diagnostics for specific codes are in [MCP tools reference](05-mcp-tools-reference.md).
 
 ## Mutations and the guard chain
 

@@ -344,5 +344,4 @@ veto.
 
 Related documents: [Overview](01-overview.md), [Configuration](03-configuration.md),
 [Architecture](04-architecture.md), [MCP tools reference](05-mcp-tools-reference.md),
-[Workflows and examples](07-workflows-and-examples.md),
-[Troubleshooting](10-troubleshooting.md) and the [root README](../README.md).
+[Workflows and examples](07-workflows-and-examples.md) and the [root README](../README.md).

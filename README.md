@@ -356,8 +356,6 @@ Documentation entry point: [docs/01-overview.md](docs/01-overview.md).
 - [MCP tools reference](docs/05-mcp-tools-reference.md) — all 88 tools and 4 resources
 - [Excel capabilities](docs/06-excel-capabilities.md) — sheets, tables, ranges, PivotTables, VBA, macros
 - [Workflows and examples](docs/07-workflows-and-examples.md) — practical read-only and mutating recipes
-- [Troubleshooting](docs/10-troubleshooting.md) — Excel unavailable, VBOM access, path policy, blocked macros
-- [Development and maintenance](docs/11-development-and-maintenance.md) — tests, fixtures, doc rules
 
 Russian version: [docs/ru/](docs/ru/) — same content in Russian.
 

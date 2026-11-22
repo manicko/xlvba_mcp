@@ -265,4 +265,4 @@ Source workbooks and user files are not affected when the server is removed.
 
 - [Configuration](03-configuration.md) — environment variables, paths, path policy, sessions.
 - [MCP Tools Reference](05-mcp-tools-reference.md) — the full list of tools.
-- [Troubleshooting](10-troubleshooting.md) — if Excel is unavailable or VBOM is blocked.
+- [Excel capabilities](06-excel-capabilities.md) — if Excel is unavailable or VBOM is blocked.

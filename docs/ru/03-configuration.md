@@ -198,4 +198,4 @@ uv run excel-vba-mcp
 возвращают `APPROVAL_DENIED`, сервер работает в режиме `restricted`
 (`EXCEL_VBA_MCP_ACCESS_MODE=restricted`); сбросьте переменную (или задайте `full`) для поведения
 полного доступа по умолчанию. Если VBA-функции недоступны, проверьте настройку VBOM в Trust
-Center. Подробнее — [Устранение неполадок](10-troubleshooting.md).
+Center. Подробнее — [Архитектура](04-architecture.md).

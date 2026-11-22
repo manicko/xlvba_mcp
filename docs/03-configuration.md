@@ -198,4 +198,4 @@ If tools return `PATH_NOT_ALLOWED`, check that the workbook path is inside
 `APPROVAL_DENIED`, the server is running in `restricted` mode
 (`EXCEL_VBA_MCP_ACCESS_MODE=restricted`); unset it (or set `full`) for the default full-access
 behavior. If VBA features are unavailable, check the VBOM setting in Trust Center. For details —
-[Troubleshooting](10-troubleshooting.md).
+[Excel capabilities](06-excel-capabilities.md).
