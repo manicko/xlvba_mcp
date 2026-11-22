@@ -336,3 +336,73 @@ fresh-server unclassified denial `BACKGROUND_SAFETY_NOT_VERIFIED`, read-only den
 restricted `APPROVAL_DENIED`, `excel_health` ok, 88 tools / 4 resource templates / 0 prompts); originals
 byte-identical; no production/test/doc changes. Verdict: **`PARTIALLY VERIFIED`** with two documented,
 non-blocking residuals (4 shape/control MCP tools; continuous focus-theft observation).
+---
+
+## 10. Tech Lead addendum — final acceptance decision (post-audit remediation)
+
+**Author:** Tech Lead (orchestrator) · **Date:** 2026-11-22 · **Supersedes:** the interim `PARTIALLY VERIFIED`
+above only insofar as the blocking audit finding is now closed (see §10.1); the two residuals in §1 remain and are
+unchanged.
+
+### 10.1 Blocking audit finding closed (C-1)
+
+The final independent code audit (`xlvba-mcp-full-edit-mode-capability-audit.md`, commit `0a07b39`) returned
+`CODE AUDIT: FAIL` on one HIGH finding, **C-1**: the FE-02 boundary translation embedded raw
+`ValidationError.errors()` in the error `context`; for argument models with a `model_validator` guard
+(`RangeWriteRequest` / `FormulaWriteRequest` over `MAX_RANGE_ROWS`), `errors()` carries a **live `ValueError`**
+(and a raw nested model in `input`), so `json.dumps` raised `TypeError` inside the handler and the client received
+an **unstructured** error — defeating the very contract FE-02 exists to guarantee.
+
+**Fix (commit `b08d638`):** `server.py` now sanitizes the payload through `_jsonable_validation_errors()`, which
+copies each entry and stringifies any non-primitive value at the top level and inside `ctx`, so the error
+`context` is always JSON-serializable while preserving the diagnostic detail. The previously failing class of input
+(over-limit `range_write_values` grid) now returns a structured `INVALID_RANGE`. Covered by:
+- `tests/unit/test_mcp_error_surfacing.py` — 2 new tests (end-to-end boundary + direct sanitizer), no Excel;
+- `tests/integration_excel/test_mcp_error_surfacing_matrix.py` — a new live "model-validator" case asserting the
+  oversized-grid error is structured `INVALID_RANGE` with a JSON-serializable `context`.
+
+The same commit fixed a **test-isolation defect** the audit surfaced while reproducing C-1: the error-matrix
+harness did not reap its owned hidden Excel before exit, so a lingering owned PID was misclassified as a
+pre-existing user Excel by `test_mcp_full_access_workflow.py`. `_running_server` now waits (bounded) for the
+owned PID to die, and both files pass in **both orders** with zero orphaned Excel.
+
+### 10.2 Non-blocking audit findings dispositioned
+
+| ID | Severity | Disposition |
+|---|---|---|
+| C-2 / C-3 | LOW (best-practice) | Accepted. `INVALID_RANGE` reuse for argument-schema failures is documented and consistent with the tool modules' own malformed-argument code. No dedicated code added to the closed spec §11 vocabulary. |
+| C-6 | LOW (best-practice) | Accepted, residual. Substring false-positive surface of the new tokens is inherent to a heuristic veto; the scan remains fail-closed and the `Recalculate` fixture is unaffected (verified). |
+| A-2 | LOW (best-practice) | **Fixed (commit `1633115`).** `comtypes` was an undeclared dependency (a `pywinauto` transitive) still imported by `vbe_compile_ui.DialogReader`. Declared `comtypes>=1.2.0` in `pyproject.toml`, refreshed `uv.lock` (comtypes 1.5.0), and updated the dependency tables (README, `01-overview` EN/RU). |
+| D-2 | MEDIUM (doc) | **Fixed (commit `1633115`).** The residual-token note had been updated in only one of six places; the EN+RU `04-architecture`, `05-mcp-tools-reference`, `06-excel-capabilities`, `07-workflows-and-examples` and README statements now correctly say the tokens **are** in the veto list while dynamic/transitive UI remains a residual. |
+| T-3 | LOW (test) | **Fixed (commit `b08d638`).** The matrix now exercises the `model_validator` input shape that C-1 escaped. |
+| R-3 | LOW (hygiene) | Noted. The 5 pre-existing `docs/` deletions predate this orchestration and were never staged; the working tree is otherwise clean of orchestration changes. |
+
+### 10.3 Final gate evidence (Tech Lead, HEAD after remediation)
+
+| Gate | Command | Result |
+|---|---|---|
+| Unit | `pytest tests/unit -o addopts="" -q` | **872 passed** (870 baseline + 2 C-1 tests) |
+| Integration (live Excel, serial) | `pytest test_mcp_full_access_workflow.py test_mcp_error_surfacing_matrix.py -o addopts="" -q -p no:xdist` | **5 passed**, both orders, **0** orphaned Excel |
+| Lint | `ruff check src tests` | clean |
+| Types | `mypy` on the 3 changed production modules | clean (the 2 full-package errors are pre-existing comtypes-stub issues in `vbe_compile_ui.py`, now moot since comtypes is declared) |
+| Fixtures | SHA-256 `FullAccessWorkflow.xlsm` | `6B905837…A19AC1D4D9` unchanged |
+
+### 10.4 Final verdict
+
+**`PARTIALLY VERIFIED` — accepted for release, no blocking defects.**
+
+The core Full-Edit mission is proven end-to-end through the real MCP STDIO boundary, and the one HIGH audit
+finding that could have made a class of tool failures unstructured is closed with regression coverage. The two
+remaining residuals are **non-blocking and explicitly documented**:
+
+1. `shape_get` / `shape_set_on_action` / `control_get` / `control_set_on_action` — 4 of 88 registered tools lack
+   MCP-observed evidence because no committed fixture carries a shape/Form Control; they are service-layer covered
+   by `test_shapes_controls.py` and are peripheral to the open→edit→macro→save mission.
+2. Focus-theft continuous observation — formally `NOT VERIFIED` (point-sampling only); structural risk is very low
+   (zero forbidden focus/input API call sites; owned Excel never visible or foreground).
+
+Neither residual affects the Full-Edit workflow (default writable/execute open → table edit → classified macro run →
+verify → second edit → second macro run with a different result → save/snapshot/restore with macros still runnable).
+The verdict would move to `FULL EDIT MODE VERIFIED` if the four shape/control tools were exercised through MCP
+(e.g. a fixture with a named shape + Form Control button) and a continuous foreground logger confirmed no
+focus change.

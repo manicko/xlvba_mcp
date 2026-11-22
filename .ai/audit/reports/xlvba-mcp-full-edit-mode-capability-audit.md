@@ -279,3 +279,32 @@ CODE AUDIT: FAIL
 - **C-1 (HIGH)** — `src/excel_vba_mcp/server.py`, `_validation_error_as_domain` (line 1264) + `ExcelVbaMcpServer.call_tool` (line 1309): a reachable `ValidationError` class (`model_validator` bounds guards in `domain/models.py:996`, `:1027`, `:920` and `domain/test_spec.py:297`) produces a non-JSON-serialisable context, so the boundary itself raises `TypeError` and the client receives an **unstructured** error — the FE-02 contract ("no unstructured tool failure") is not met.
 
 **Non-blocking follow-ups:** C-2, C-3, A-2, T-3, D-2 (six doc statements), R-3 (clean the working tree before tagging).
+---
+
+## 6. Post-audit remediation (Tech Lead, 2026-11-22)
+
+The blocking finding **C-1** is **CLOSED** by commit `b08d638`:
+
+- `server.py` adds `_jsonable_validation_errors()`, which stringifies every non-primitive value in
+  `ValidationError.errors()` (both the top-level `input` and `ctx['error']`), so the error `context` is always
+  JSON-serializable. The over-limit `range_write_values` path now returns a structured `INVALID_RANGE` instead of
+  a `TypeError` leak.
+- Regression coverage added: `tests/unit/test_mcp_error_surfacing.py` (2 tests) and a live "model-validator" case
+  in `tests/integration_excel/test_mcp_error_surfacing_matrix.py` (this also closes **T-3**).
+- The same commit fixes the test-isolation defect the audit observed: the matrix harness now reaps its owned hidden
+  Excel before exit, so both integration files pass in either order with zero orphans.
+
+Non-blocking findings dispositioned:
+
+- **A-2 → fixed** (`1633115`): `comtypes>=1.2.0` declared in `pyproject.toml`, `uv.lock` refreshed (comtypes 1.5.0),
+  dependency tables updated.
+- **D-2 → fixed** (`1633115`): the EN+RU `04-architecture`, `05-mcp-tools-reference`, `06-excel-capabilities`,
+  `07-workflows-and-examples` and README residual-token statements now correctly reflect that
+  `AppActivate` / `Application.Visible` / `.Activate` / `WindowState` are in the veto list.
+- **C-2 / C-3 / C-6 → accepted** as documented low-severity, best-practice residuals.
+- **R-3 → noted** (pre-existing doc deletions, never staged).
+
+Updated verdict: the blocking reason is resolved. Re-running the quality gates at HEAD gives **872 unit passed**,
+**5 integration passed** (both orders, zero orphaned Excel), ruff clean, mypy clean on the changed modules, and
+fixtures byte-identical. The audit's substantive findings are all closed or accepted; see the capability report
+§10 (Tech Lead addendum) for the consolidated acceptance.
