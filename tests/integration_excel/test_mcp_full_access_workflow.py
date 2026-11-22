@@ -577,6 +577,35 @@ async def test_persistence_roundtrip(tmp_path: Path) -> None:
         workbook_id2 = restored["workbook_id"]
         assert workbook_id2 and workbook_id2 != workbook_id, f"expected a fresh id: {restored}"
 
+        # FE-16: the restored session is execute-mode and writable, so macros keep
+        # working after a restore instead of failing with MACRO_BLOCKED.
+        restored_status = structured(
+            await _call(session, "excel_get_status", {"workbook_id": workbook_id2})
+        )
+        assert restored_status["mode"] == "execute", (
+            f"restored session must be execute: {restored_status}"
+        )
+        assert restored_status["read_only"] is False, (
+            f"restored session must be writable: {restored_status}"
+        )
+
+        # A classify + run cycle succeeds on the restored workbook (the registry is
+        # keyed to the new workbook identity/hash, so classify once on the new id).
+        classified2 = structured(
+            await _call(
+                session,
+                "macro_classify_background",
+                {
+                    "workbook_id": workbook_id2,
+                    "procedure": "modWorkflow.Recalculate",
+                    "background_safe": True,
+                },
+            )
+        )
+        assert classified2["background_safe"] is True, classified2
+        run2 = await _run_recalculate(session, workbook_id2)
+        assert run2["status"] == "success", f"post-restore Recalculate must succeed: {run2}"
+
         # Observable macro output persisted.
         assert await _read_result_a1(session, workbook_id2) == 40
         # Table cell persisted (SettingValue == 20 lives in Sheet1!B2).

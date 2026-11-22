@@ -277,9 +277,13 @@ class SnapshotService:
 
         Closes the current working copy **without saving** (when ``workbook_id``
         is given and still open), then opens a fresh working copy from the
-        snapshot baseline via the session service. The immutable snapshot file is
-        never modified (the session service copies it into ``work/`` before
-        opening).
+        snapshot baseline via the session service. The freshly opened restored
+        session is **execute mode** and **writable** (``read_only=False``),
+        matching the default ``excel_open``; this lets the Full-Edit workflow
+        continue editing and running macros after a restore (an inspect-mode
+        restore would disable macros and make ``macro_run`` fail with
+        ``MACRO_BLOCKED``). The immutable snapshot file is never modified (the
+        session service copies it into ``work/`` before opening).
 
         External macro side effects are **not** undone — only the workbook file is
         restored (spec §9.4).
@@ -290,7 +294,9 @@ class SnapshotService:
             timeout_s: Soft per-call ceiling for the STA open/close.
 
         Returns:
-            A :class:`WorkbookInfo` describing the freshly opened working copy.
+            A :class:`WorkbookInfo` describing the freshly opened working copy in
+            execute mode (``mode == SessionMode.EXECUTE``) and writable
+            (``read_only is False``).
 
         Raises:
             SnapshotFailedError: If the snapshot does not exist.
@@ -308,7 +314,7 @@ class SnapshotService:
 
         info = await self._session.open_workbook(
             str(snapshot_file),
-            mode=SessionMode.INSPECT,
+            mode=SessionMode.EXECUTE,
             read_only=False,
             timeout_s=timeout_s,
         )

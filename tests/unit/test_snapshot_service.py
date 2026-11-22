@@ -30,6 +30,7 @@ from excel_vba_mcp.adapters.excel.com_worker import WorkerStatus
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
 from excel_vba_mcp.domain.errors import ExcelVbaMcpError, SnapshotFailedError
+from excel_vba_mcp.domain.models import WorkbookInfo
 from excel_vba_mcp.domain.statuses import (
     OperationClass,
     SessionMode,
@@ -330,6 +331,13 @@ async def test_restore_closes_without_save_and_opens_baseline(tmp_path: Path) ->
     # The old working copy was closed WITHOUT saving.
     assert wb.closed is True
     assert wb.saved_on_close is False
+
+    # The restored session is execute-mode and writable (FE-16): this is what lets
+    # the Full-Edit workflow continue running macros after a restore instead of
+    # failing with MACRO_BLOCKED on an inspect-mode session.
+    assert isinstance(restored, WorkbookInfo)
+    assert restored.mode == SessionMode.EXECUTE
+    assert restored.read_only is False
 
     # A fresh working copy was opened from the snapshot baseline.
     assert restored.workbook_id != info.workbook_id
