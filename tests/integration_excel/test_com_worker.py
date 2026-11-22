@@ -15,6 +15,8 @@ Coverage (exact test names required by task_011):
 * ``test_owned_excel_instance_shutdown`` — ``shutdown()`` closes the owned
   workbook and reaps the owned ``EXCEL.exe`` while a *bystander* Excel instance
   (representing the user session) is left alive and untouched; no focus steal.
+  The owned pid is gone the moment ``shutdown()`` returns (FE-17: no poll
+  barrier).
 * ``test_com_busy_does_not_replay_mutation`` — ``RPC_E_CALL_REJECTED`` is never
   replayed for a ``MUTATING`` op (exactly one attempt) but is retried a bounded
   number of times for a ``READ_ONLY`` op; a timed-out call moves the worker to
@@ -461,6 +463,16 @@ async def test_owned_excel_instance_shutdown() -> None:
 
             # Shutdown must close the owned instance and leave the bystander alone.
             await worker.shutdown()
+
+            # FE-17: shutdown enforces the owned process death, so it is already
+            # gone when shutdown() returns (no poll barrier) and the worker's
+            # status - the snapshot ``excel_health`` reports - no longer holds it.
+            assert not _pid_alive(owned_pid), (
+                f"owned PID {owned_pid} survived worker.shutdown() (FE-17 regression)"
+            )
+            assert worker.get_status().owned_pid is None, (
+                "worker status must drop the owned pid once the process is reaped"
+            )
 
             # Owned workbook is gone with the owned process.
             assert _wait_pid_gone(owned_pid), f"owned PID {owned_pid} still alive after shutdown"

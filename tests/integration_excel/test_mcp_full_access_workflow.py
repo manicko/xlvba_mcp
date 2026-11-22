@@ -614,6 +614,12 @@ async def test_full_access_workflow_e2e(tmp_path: Path) -> None:
         await _call(session, "excel_close", {"workbook_id": workbook_id, "save_changes": False})
 
     # --- Server stopped: owned PID reaped, no user Excel PID touched (PO-5). ---
+    # FE-17: shutdown reaps the owned process itself, so the pid is already gone
+    # when the server process exits (checked immediately, no reap barrier).
+    assert not _pid_alive(owned_pid), (
+        f"owned PID {owned_pid} was still alive when the server exited: "
+        "shutdown must reap the owned Excel (FE-17)"
+    )
     assert _wait_pid_dead(owned_pid), f"owned PID {owned_pid} was not reaped after shutdown"
     assert owned_pid not in _excel_pids(), f"owned PID {owned_pid} still present after shutdown"
     surviving_user_pids = baseline_pids - _excel_pids()
@@ -624,6 +630,33 @@ async def test_full_access_workflow_e2e(tmp_path: Path) -> None:
     # --- Originals never modified: repo fixture and temp copy byte-identical (PO-6). ---
     assert _sha256(_WORKFLOW_FIXTURE) == repo_hash_before, "committed fixture must never change"
     assert _sha256(work_copy) == temp_hash_before, "temp copy must never change"
+
+
+# ---------------------------------------------------------------------------
+# FE-17: shutdown reaps the owned Excel with no test-level reap barrier
+# ---------------------------------------------------------------------------
+@requires_excel
+async def test_owned_pid_reaped_on_shutdown_without_barrier(tmp_path: Path) -> None:
+    """The owned hidden Excel is dead the moment the server exits (FE-17).
+
+    No reap barrier and no kill helper runs here: the only actor is the server's
+    own shutdown path (``ExcelComWorker.shutdown`` -> verified adapter quit ->
+    pid-scoped fallback). ``excel_health`` reports the owned pid while the
+    server runs; that exact process must be gone as soon as the STDIO server
+    subprocess has exited.
+    """
+
+    async with _running_server(tmp_path) as session:
+        owned_pid = _assert_healthy_and_live(await _wait_healthy(session))
+        _assert_owned_hidden(owned_pid, "server start")
+
+    # The server subprocess has exited, so its lifespan shutdown has completed.
+    assert not _pid_alive(owned_pid), (
+        f"owned PID {owned_pid} survived the server shutdown (FE-17 regression)"
+    )
+    assert owned_pid not in _excel_pids(), (
+        f"owned PID {owned_pid} is still running after shutdown (FE-17 regression)"
+    )
 
 
 # ---------------------------------------------------------------------------

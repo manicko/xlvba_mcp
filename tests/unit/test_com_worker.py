@@ -12,6 +12,8 @@ Covered:
 * Timeout -> ``NEEDS_RECOVERY`` + truthful ``EXCEL_HUNG``; second submit fails
   fast; a ``close``-section item is allowed through.
 * Shutdown ordering and idempotency (fake adapter records calls).
+* Shutdown reaps the owned pid only after the drain's verified quit (FE-17):
+  no fallback when the quit ended the process, a pid-scoped fallback otherwise.
 * Proxy-leak guard raises on a non-serializable return value.
 * READ_ONLY bounded retry (<=3) vs MUTATING no-retry for ``RPC_E_CALL_REJECTED``.
 * Settings context managers restore on exception (fake app object).
@@ -100,6 +102,40 @@ class FakeAdapter(ExcelAppAdapter):
         self._app = None
         self._owned_pid = None
         self._owned_caption = None
+
+
+class VerifyingAdapter(FakeAdapter):
+    """Fake adapter whose ``quit`` may leave the owned process resident (FE-17).
+
+    ``quit_ends_process`` models the two outcomes of a real ``Application.Quit``:
+    ``True`` (the process dies, the adapter clears its identity) and ``False``
+    (the worst case: the process survives, so ``reap_owned_pid`` must terminate
+    it). ``reap_owned_pid`` records the pid the worker still holds when it runs,
+    which proves teardown does not drop the identity before the verified
+    shutdown.
+    """
+
+    def __init__(self, *, quit_ends_process: bool = False) -> None:
+        super().__init__()
+        self.quit_ends_process = quit_ends_process
+        self.reap_calls: list[int] = []
+        self.worker_owned_pid_at_reap: list[int | None] = []
+        self.worker: ExcelComWorker | None = None
+
+    def quit(self) -> None:
+        self.quit_count += 1
+        self._app = None
+        if self.quit_ends_process:
+            self._owned_pid = None
+            self._owned_caption = None
+
+    def reap_owned_pid(self, pid: int) -> bool:
+        self.reap_calls.append(pid)
+        if self.worker is not None:
+            self.worker_owned_pid_at_reap.append(self.worker.get_status().owned_pid)
+        self._owned_pid = None
+        self._owned_caption = None
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +378,46 @@ async def test_shutdown_is_ordered_and_idempotent() -> None:
 
     status = worker.get_status()
     assert status.state in (WorkbookSessionState.CLOSED, WorkbookSessionState.ERROR)
+
+
+# ---------------------------------------------------------------------------
+# Shutdown reaps the owned pid (FE-17)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_shutdown_skips_the_fallback_when_the_drain_verified_the_quit() -> None:
+    """A drain whose quit ended the process leaves nothing to reap."""
+
+    adapter = VerifyingAdapter(quit_ends_process=True)
+    worker = ExcelComWorker(adapter, orphan_timeout_s=2.0)
+    adapter.worker = worker
+    await worker.start()
+    assert worker.get_status().owned_pid == 4242
+
+    await worker.shutdown()
+
+    assert adapter.reap_calls == [], "no fallback is needed once the drain verified the quit"
+    assert worker.get_status().owned_pid is None
+
+
+@pytest.mark.anyio
+async def test_shutdown_reaps_the_owned_pid_after_an_unverified_drain() -> None:
+    """If the STA drain left the process alive, shutdown reaps it on the caller thread."""
+
+    adapter = VerifyingAdapter(quit_ends_process=False)
+    worker = ExcelComWorker(adapter, orphan_timeout_s=2.0)
+    adapter.worker = worker
+    await worker.start()
+    assert worker.get_status().owned_pid == 4242
+
+    await worker.shutdown()
+
+    assert adapter.reap_calls == [4242], "shutdown must fall back to a pid-scoped reap"
+    assert adapter.worker_owned_pid_at_reap == [4242], (
+        "_owned_pid must not be cleared before the fallback ran"
+    )
+    assert worker.get_status().owned_pid is None, "the worker drops the pid after the reap"
 
 
 # ---------------------------------------------------------------------------

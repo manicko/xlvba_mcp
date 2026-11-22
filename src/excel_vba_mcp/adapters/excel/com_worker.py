@@ -430,9 +430,12 @@ class ExcelComWorker:
 
         Sequence (research §5): stop accepting → enqueue ``close`` drain +
         sentinel → complete queued futures with ``WorkerUnavailableError`` →
-        close owned workbooks (alerts suppressed) → ``Quit`` → release refs →
-        ``CoUninitialize`` → bounded ``thread.join(orphan_timeout)``. The
-        ``close`` section is allowed even in ``NEEDS_RECOVERY``.
+        close owned workbooks (alerts suppressed) → ``Quit`` (which verifies the
+        owned process death, with a pid-scoped fallback) → release refs →
+        ``CoUninitialize`` → bounded ``thread.join(orphan_timeout)`` → a final
+        pid-scoped reap on the calling thread if the daemon STA thread never
+        finished the drain. The ``close`` section is allowed even in
+        ``NEEDS_RECOVERY``.
         """
 
         if self._shutdown_started:
@@ -462,6 +465,19 @@ class ExcelComWorker:
         # 3. Complete any futures still pending (defensive; the run loop should
         #    already have drained the queue).
         self._fail_pending_futures()
+
+        # 4. Enforce the owned-instance invariant as the last resort (FE-17).
+        #    ``_drain_close`` normally reaps the owned process through the
+        #    adapter's verified quit; if the daemon STA thread is still alive
+        #    after the bounded join it may never have run, so reap the owned pid
+        #    here. The pid is the authoritative identity: killing the process
+        #    does not need the (possibly dead) STA thread, and only the
+        #    adapter's own pid is ever passed.
+        pid = self._owned_pid
+        if pid is not None:
+            reaped = await asyncio.to_thread(self._adapter.reap_owned_pid, pid)
+            if not reaped:
+                self._note(f"owned pid {pid} still alive after the shutdown fallback")
 
         self._started = False
         self._owned_pid = None
@@ -713,7 +729,9 @@ class ExcelComWorker:
         """Close owned workbooks, Quit, release refs, drop pid (STA thread).
 
         Idempotent: a second call (e.g. from :meth:`_cleanup_com`) is a no-op so
-        ``Quit`` runs at most once.
+        ``Quit`` runs at most once. The worker keeps the owned pid until the
+        adapter's quit has *verified* the process death (poll + pid-scoped
+        fallback), so teardown never drops the identity of a surviving process.
         """
 
         if self._drained:
@@ -732,13 +750,17 @@ class ExcelComWorker:
                     with contextlib.suppress(Exception):
                         target = workbooks(name)
                         adapter.close_workbook(target, save_changes=False)
-        # Quit + release.
+        # Quit (enforces the owned process death) + release. Mirror the adapter
+        # identity only after the verified quit: a still-surviving pid is kept
+        # so :meth:`shutdown` can retry the pid-scoped fallback.
         with contextlib.suppress(Exception):
             adapter.quit()
+        self._owned_pid = adapter.owned_pid
+        self._owned_caption = adapter.owned_caption
+        if self._owned_pid is not None:
+            self._note(f"owned pid {self._owned_pid} not verified dead by adapter quit")
         with contextlib.suppress(Exception):
             adapter.release()
-        self._owned_pid = None
-        self._owned_caption = None
         self._note("drain_close complete")
         return True
 

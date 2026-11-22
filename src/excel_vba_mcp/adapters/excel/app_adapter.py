@@ -17,6 +17,10 @@ Design invariants (ARCH-013 as amended by the background-execution addendum):
 * ``DisplayAlerts`` / ``ScreenUpdating`` / ``AutomationSecurity`` are changed
   only inside narrowly scoped context managers that restore the prior value in
   ``finally``.
+* Teardown is an **enforced** invariant, not a best-effort side effect:
+  :meth:`ExcelAppAdapter.quit` verifies that the owned process is dead and, if
+  ``Application.Quit`` left it resident, terminates exactly that pid (never a
+  wildcard image kill, never a user instance).
 
 ``DisplayAlerts = False`` is **not** a universal dialog blocker: it does not
 suppress ``MsgBox``, ``UserForm.Show``, ``FileDialog``, add-in UI, or arbitrary
@@ -31,6 +35,8 @@ stays safe on non-Windows unit-test environments.
 from __future__ import annotations
 
 import contextlib
+import subprocess
+import time
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -42,6 +48,25 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime COM import
 # Sentinel used by ``automation_security`` to restore a property whose prior
 # read failed (e.g. a partially initialized app object).
 _UNSET: Any = object()
+
+# Grace period (seconds) given to ``Application.Quit`` to end the owned process
+# before the pid-scoped fallback runs, and the poll interval used while waiting
+# for that death. ``Quit`` is best-effort: it can raise and it can return while
+# ``EXCEL.EXE`` is still resident (measured on the target build: ``Quit()``
+# returns in ~0.2 s and the process survives indefinitely), so teardown verifies
+# the death explicitly.
+#
+# The budget is deliberately short and bounded: an MCP STDIO server is only
+# allowed ~2 s to shut down gracefully once its stdin closes, so the whole reap
+# (grace + kill + verification) must fit inside that window for the guarantee to
+# hold on the server shutdown path. A still-alive process after this short grace
+# is terminated immediately; that is safe because owned workbooks are already
+# closed without saving before ``quit`` runs.
+_REAP_TIMEOUT_S = 0.5
+_REAP_INTERVAL_S = 0.05
+
+# Bounded re-verification window (seconds) after the pid-scoped fallback kill.
+_REAP_VERIFY_TIMEOUT_S = 0.5
 
 
 class ExcelAppAdapter:
@@ -121,26 +146,72 @@ class ExcelAppAdapter:
         self._owned_pid = self._pid_from_hwnd(self._read_hwnd(app))
 
     def quit(self) -> None:
-        """Quit the owned instance and drop the proxy reference.
+        """Quit the owned instance and enforce the death of its process.
 
-        Best-effort: a ``com_error`` during ``Quit`` is swallowed (the instance
-        may already be gone). The proxy reference is always cleared so no stale
-        COM object is retained.
+        ``Application.Quit`` is best-effort: a ``com_error`` is swallowed (the
+        instance may already be gone), and a successful return does **not** mean
+        the process died (an open workbook, a pending macro, a modal dialog or a
+        live COM reference keeps ``EXCEL.EXE`` resident). The owned pid is
+        therefore captured *before* quitting and its death is enforced by
+        :meth:`reap_owned_pid`; the pid / caption are cleared only after that
+        verification (or after the fallback attempt).
+
+        Never raises: teardown must not mask the failure that triggered it.
         """
 
         app = self._app
         self._app = None
-        if app is None:
-            return
-        try:
-            with self.alerts_suppressed(app):
-                app.Quit()
-        except Exception:
-            # The instance may already be gone; nothing actionable remains.
-            pass
-        finally:
-            self._owned_pid = None
-            self._owned_caption = None
+        owned_pid = self._owned_pid
+        if app is not None:
+            try:
+                with self.alerts_suppressed(app):
+                    app.Quit()
+            except Exception:
+                # The instance may already be gone; the pid check below is the
+                # authoritative teardown signal.
+                pass
+        if owned_pid is not None:
+            self.reap_owned_pid(owned_pid)
+        self._owned_pid = None
+        self._owned_caption = None
+
+    def reap_owned_pid(self, pid: int) -> bool:
+        """Ensure the owned ``pid`` is dead; return whether it is verified gone.
+
+        Called by :meth:`quit` (on the STA worker thread) and by the worker's
+        ``shutdown`` last resort (when the daemon STA thread may never have run
+        the drain). ``Application.Quit`` gets a bounded grace period
+        (:data:`_REAP_TIMEOUT_S`); a process still alive afterwards is
+        terminated with ``taskkill /F /PID <pid>`` and re-verified.
+
+        Only the adapter's own pid is ever passed here, so the blast radius is
+        exactly one process: no user instance is touched and no wildcard image
+        kill is ever used.
+
+        Best-effort: an unavailable Win32 / ``taskkill`` layer degrades to "not
+        verified" (``False``) and never raises.
+        """
+
+        if not self._pid_alive(pid):
+            return True
+
+        deadline = time.monotonic() + _REAP_TIMEOUT_S
+        while True:
+            time.sleep(_REAP_INTERVAL_S)
+            if not self._pid_alive(pid):
+                return True
+            if time.monotonic() >= deadline:
+                break
+
+        # Grace period expired: terminate only this pid, then re-verify.
+        self._terminate_pid(pid)
+        deadline = time.monotonic() + _REAP_VERIFY_TIMEOUT_S
+        while True:
+            if not self._pid_alive(pid):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_REAP_INTERVAL_S)
 
     def release(self) -> None:
         """Drop all references to the owned proxy without quitting.
@@ -359,6 +430,65 @@ class ExcelAppAdapter:
         except Exception:  # pragma: no cover - platform specific
             return None
         return int(pid.value) or None
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        """Best-effort: is ``pid`` currently a live process? Never raises.
+
+        Uses ``OpenProcess`` + ``GetExitCodeProcess`` (no window and no COM, so
+        it works for a hidden instance). A defunct pid, an inaccessible handle
+        or an unavailable Win32 layer reports ``False`` ("dead"): the caller then
+        has nothing to terminate and never escalates to a kill.
+        """
+
+        if pid <= 0:
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:  # pragma: no cover - non-Windows fallback
+            return False
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        try:
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(process_query_limited_information, False, int(pid))
+            if not handle:
+                return False
+            try:
+                exit_code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                return exit_code.value == still_active
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # pragma: no cover - platform specific
+            return False
+
+    @staticmethod
+    def _terminate_pid(pid: int) -> bool:
+        """Terminate ONLY ``pid`` via ``taskkill /F /PID``; return success.
+
+        Last resort once the grace period expired: the pid is the adapter's own
+        ``DispatchEx`` instance, so the blast radius is exactly one process. The
+        invocation mirrors ``macro_service._terminate_owned_pid``. Best-effort:
+        never raises and never falls back to a wildcard image kill.
+        """
+
+        if pid <= 0:
+            return False
+        try:
+            completed = subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            return False
+        return completed.returncode == 0
 
     @staticmethod
     def _read_with_default(app: Any, name: str, *, default: Any) -> Any:
