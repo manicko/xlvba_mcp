@@ -1239,6 +1239,37 @@ def _find_domain_cause(exc: BaseException) -> ExcelVbaMcpError | None:
     return None
 
 
+def _jsonable_validation_errors(error: ValidationError) -> list[dict[str, Any]]:
+    """Return ``error.errors()`` as a JSON-serializable list (audit finding C-1).
+
+    ``ValidationError.errors()`` can embed non-JSON-serializable objects:
+
+    * ``ctx['error']`` holds the raw exception for errors raised by a
+      ``model_validator`` (for example the range-size guards in
+      ``RangeWriteRequest`` / ``FormulaWriteRequest``), and
+    * ``input`` holds the raw input value, which for nested models is the
+      instantiated model object (for example a ``CellValue``).
+
+    Embedding either verbatim in the error ``context`` made ``json.dumps`` raise
+    ``TypeError`` at the MCP boundary, so the client received an unstructured
+    error and the structured-error contract was broken. Every entry is copied and
+    any non-primitive value (at the top level and inside ``ctx``) is replaced by
+    its ``str()`` form, so the payload is always serializable while keeping the
+    diagnostic detail.
+    """
+
+    def _jsonable(value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool, type(None))):
+            return value
+        if isinstance(value, dict):
+            return {str(key): _jsonable(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_jsonable(item) for item in value]
+        return str(value)
+
+    return [_jsonable(dict(entry)) for entry in error.errors()]
+
+
 def _validation_error_as_domain(exc: BaseException) -> ExcelVbaMcpError | None:
     """Translate a pydantic ``ValidationError`` in ``exc``'s cause chain.
 
@@ -1261,7 +1292,10 @@ def _validation_error_as_domain(exc: BaseException) -> ExcelVbaMcpError | None:
             return ExcelVbaMcpError(
                 "The tool arguments do not match the input schema.",
                 code=ErrorCode.INVALID_RANGE,
-                context={"reason": "invalid_arguments", "validation": current.errors()},
+                context={
+                    "reason": "invalid_arguments",
+                    "validation": _jsonable_validation_errors(current),
+                },
             )
         seen.add(id(current))
         current = current.__cause__

@@ -34,6 +34,23 @@ async def _raise_runtime_error() -> None:
     raise RuntimeError("boom")
 
 
+async def _raise_model_validator_error() -> None:
+    """Trigger a ``model_validator`` ``ValueError`` (audit finding C-1).
+
+    ``RangeWriteRequest`` raises a plain ``ValueError`` from its ``model_validator``
+    when the grid exceeds ``MAX_RANGE_ROWS``; pydantic then embeds that live
+    exception in ``errors()[i]['ctx']['error']``, which is not JSON-serializable.
+    """
+
+    from excel_vba_mcp.domain.models import CellValue, RangeWriteRequest
+
+    RangeWriteRequest(
+        rows=100_001,
+        cols=1,
+        values=[[CellValue(kind="number", value=1)]],  # type: ignore[list-item]
+    )
+
+
 def _make_server() -> ExcelVbaMcpServer:
     return ExcelVbaMcpServer("test-excel-vba-mcp", version="0.0.0")
 
@@ -68,3 +85,57 @@ async def test_unknown_tool_raises_tool_error() -> None:
 
     with pytest.raises(ToolError):
         await server.call_tool("does_not_exist", {})
+
+
+async def test_model_validator_error_surfaced_structured() -> None:
+    """A ``model_validator`` ``ValueError`` still yields a structured code (C-1).
+
+    Regression: ``ValidationError.errors()`` embeds the live ``ValueError`` in
+    ``ctx['error']``; embedding it verbatim made ``json.dumps`` raise
+    ``TypeError`` inside the handler, so the client received an unstructured
+    error instead of ``INVALID_RANGE``.
+    """
+
+    server = _make_server()
+    server.add_tool(_raise_model_validator_error, name="raise_model_validator")
+
+    with pytest.raises(ToolError) as exc_info:
+        await server.call_tool("raise_model_validator", {})
+
+    # Must be the structured boundary translation, not the generic SDK wrapper.
+    message = str(exc_info.value)
+    assert "Error executing tool" not in message
+    # The payload must be valid JSON (no TypeError leak) with a stable code.
+    payload = json.loads(message)
+    assert payload["code"] == "INVALID_RANGE"
+    assert payload["context"]["reason"] == "invalid_arguments"
+    # The non-serializable exception must have been stringified, not dropped.
+    ctx_errors = payload["context"]["validation"]
+    assert ctx_errors, "validation details must be preserved"
+    assert all(isinstance(entry.get("ctx", {}).get("error", ""), str) for entry in ctx_errors)
+
+
+def test_jsonable_validation_errors_stringifies_live_exception() -> None:
+    """``_jsonable_validation_errors`` makes ``errors()`` JSON-serializable (C-1)."""
+
+    from pydantic import ValidationError
+
+    from excel_vba_mcp.domain.models import CellValue, RangeWriteRequest
+    from excel_vba_mcp.server import _jsonable_validation_errors
+
+    try:
+        RangeWriteRequest(
+            rows=100_001,
+            cols=1,
+            values=[[CellValue(kind="number", value=1)]],  # type: ignore[list-item]
+        )
+    except ValidationError as exc:
+        sanitized = _jsonable_validation_errors(exc)
+    else:  # pragma: no cover - the guard must fire
+        pytest.fail("expected a ValidationError for an oversized grid")
+
+    # Must not raise, and must be JSON-serializable.
+    json.dumps(sanitized)
+    error_entries = [entry for entry in sanitized if entry.get("ctx", {}).get("error")]
+    assert error_entries, "the ValueError ctx entry must be preserved as a string"
+    assert isinstance(error_entries[0]["ctx"]["error"], str)

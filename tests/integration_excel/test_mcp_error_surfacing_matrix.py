@@ -96,6 +96,43 @@ def _sha256(path: Path) -> str:
 # ---------------------------------------------------------------------------
 # Server harness (mirrors test_mcp_full_access_workflow.py)
 # ---------------------------------------------------------------------------
+# Bounded poll for the owned Excel PID to be reaped after server shutdown.
+_REAP_POLL_TIMEOUT_S = 30.0
+_REAP_POLL_INTERVAL_S = 0.5
+
+
+def _excel_pids() -> set[int]:
+    """Return the PIDs of currently running ``EXCEL.EXE`` processes."""
+
+    if not _PYWIN32:
+        return set()
+    import subprocess
+
+    completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        ["tasklist", "/FI", "IMAGENAME eq EXCEL.EXE", "/FO", "CSV", "/NH"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    pids: set[int] = set()
+    for line in completed.stdout.splitlines():
+        parts = [part.strip('"') for part in line.split('","')]
+        if len(parts) >= 2 and parts[0].upper() == "EXCEL.EXE" and parts[1].isdigit():
+            pids.add(int(parts[1]))
+    return pids
+
+
+def _wait_pid_dead(pid: int, *, timeout_s: float = _REAP_POLL_TIMEOUT_S) -> bool:
+    """Poll until ``pid`` is gone (bounded); return whether it was reaped."""
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if pid not in _excel_pids():
+            return True
+        time.sleep(_REAP_POLL_INTERVAL_S)
+    return pid not in _excel_pids()
+
+
 def server_env(base: Path, *, access_mode: str | None = None) -> dict[str, str]:
     """Environment for a fresh MCP server subprocess, scoped to ``base``."""
 
@@ -115,7 +152,15 @@ def server_env(base: Path, *, access_mode: str | None = None) -> dict[str, str]:
 
 @asynccontextmanager
 async def _running_server(base: Path) -> AsyncIterator[ClientSession]:
-    """Start a fresh ``excel_vba_mcp`` STDIO server and yield an MCP session."""
+    """Start a fresh ``excel_vba_mcp`` STDIO server and yield an MCP session.
+
+    On exit, after the server subprocess stops, wait (bounded) for the owned
+    hidden Excel PID to be reaped. Without this barrier the worker's Excel can
+    outlive the server briefly, and a later test that asserts "pre-existing user
+    Excel PIDs survive" would misclassify that lingering owned PID as a user
+    instance (test-isolation defect observed when this file runs before
+    ``test_mcp_full_access_workflow.py``).
+    """
 
     params = StdioServerParameters(
         command=sys.executable,
@@ -123,12 +168,17 @@ async def _running_server(base: Path) -> AsyncIterator[ClientSession]:
         cwd=str(base),
         env=server_env(base),
     )
+    baseline_pids = _excel_pids()
     async with (
         stdio_client(params, errlog=sys.stderr) as (read_stream, write_stream),
         ClientSession(read_stream, write_stream, read_timeout_seconds=_CALL_TIMEOUT_S) as session,
     ):
         await session.initialize()
         yield session
+    # Server stopped: reap any Excel this test's worker owned, and do not touch
+    # PIDs that pre-existed this test (those belong to the user / other tests).
+    for pid in _excel_pids() - baseline_pids:
+        _wait_pid_dead(pid)
 
 
 async def _call(
@@ -465,6 +515,38 @@ async def test_error_surfacing_matrix(tmp_path: Path) -> None:
             malformed = await _call(session, tool, _malformed_args(tool, write_wid)[tool])
             malformed_payload = assert_structured_error(malformed, tool, "malformed")
             report.append(f"{tool:32s} malformed code={malformed_payload['code']}")
+
+        # (c) model_validator-guarded argument (audit finding C-1 regression).
+        # ``RangeWriteRequest`` raises a plain ``ValueError`` from its
+        # ``model_validator`` when the grid exceeds ``MAX_RANGE_ROWS``. pydantic
+        # embeds that live exception in ``errors()[i]['ctx']['error']``, which is
+        # NOT JSON-serializable; the boundary must sanitize it so the client still
+        # receives a structured ``code`` instead of a ``TypeError`` leak.
+        oversized = await _call(
+            session,
+            "range_write_values",
+            {
+                "workbook_id": write_wid,
+                "sheet": "Sheet1",
+                "address": "A1",
+                "payload": {
+                    "rows": 100_001,
+                    "cols": 1,
+                    "values": [[{"kind": "number", "value": 1}]],
+                },
+            },
+        )
+        oversized_payload = assert_structured_error(
+            oversized, "range_write_values", "model-validator"
+        )
+        assert oversized_payload["code"] == "INVALID_RANGE", (
+            "oversized grid must be a structured INVALID_RANGE, got "
+            f"{oversized_payload['code']!r}"
+        )
+        report.append(
+            f"{'range_write_values':32s} validator code={oversized_payload['code']} "
+            "(json-serializable ctx)"
+        )
 
         await _call(session, "excel_close", {"workbook_id": write_wid, "save_changes": False})
         await _call(session, "excel_close", {"workbook_id": read_only_wid, "save_changes": False})
