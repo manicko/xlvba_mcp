@@ -1,13 +1,15 @@
 """Macro trust and operation-classification policy (spec §7.1-§7.3, §8, §10, §11).
 
-This module is the single source of truth for two pure decisions:
+This module groups two decision areas (plus small pure diagnostics):
 
-1. **Operation classification** (:func:`classify_operation`) — maps a canonical
-   tool name (plus its parameters) to an :class:`OperationClass`. The class drives
-   both the approval gate (this package) and the COM retry policy (the worker):
-   only ``READ_ONLY`` operations may be safely replayed after a busy/rejected
-   result, while ``MUTATING``/``EXECUTING`` operations must never be blindly
-   retried.
+1. **Operation classification** (:func:`classify_operation`) — an **illustrative,
+   non-authoritative** table that maps a canonical tool name (plus its parameters)
+   to an :class:`OperationClass`. It is **not** wired into the runtime enforcement
+   path: each service sets its own operation class when it submits work to the
+   worker, so the live classification is defined per-service (see
+   `docs/05-mcp-tools-reference.md` and the service code), not by this function.
+   The table is retained for documentation/teaching only and is **stale** — it
+   predates the current tool catalogue. Do not rely on it for enforcement.
 2. **Macro trust diagnostics** (:class:`MacroPolicy`) — decides the automation
    security mode for a session (inspect vs execute) and turns raw COM/state
    signals (VBOM availability, project protection, ``Application.Run`` HRESULT)
@@ -24,15 +26,15 @@ Design constraints (spec §7.2, §10, §10.1):
 * Diagnostics are pure functions returning typed errors or ``None`` so they can
   be unit-tested without Excel.
 
-Unknown-tool policy
--------------------
+Unknown-tool policy (illustrative table only)
+---------------------------------------------
 :func:`classify_operation` **fails closed**: an unrecognized tool name is
 classified as :attr:`OperationClass.EXECUTING` (the most restrictive class). This
-means an unknown or misspelled tool can never be treated as ``READ_ONLY`` and
-slip past the approval gate — it always requires approval, and the deny-by-default
-approval policy rejects it unless an explicit grant/allowlist entry exists. This
-is a deliberate security choice; a caller that wants to catch programming errors
-should validate tool names against the API schema before dispatch.
+mirrors the deny-by-default stance of the real approval gate, but — because
+``classify_operation`` is **not called at runtime** — it does not itself enforce
+anything; each service sets its own operation class. A caller that wants to catch
+programming errors should validate tool names against the API schema before
+dispatch.
 """
 
 from __future__ import annotations
@@ -180,6 +182,13 @@ def classify_operation(
     params: Mapping[str, Any] | None = None,
 ) -> OperationClass:
     """Classify a tool invocation as ``READ_ONLY``, ``MUTATING`` or ``EXECUTING``.
+
+    **Non-authoritative / illustrative only.** This function is **not** called at
+    runtime and is **not** wired into enforcement; the live operation class of each
+    tool is defined per-service (each service passes its own ``OperationClass`` to
+    the worker). The table is also stale — it predates the current tool catalogue.
+    Do not rely on it for enforcement; use ``docs/05-mcp-tools-reference.md`` or the
+    service code for the authoritative classification.
 
     Args:
         tool_name: Canonical tool/action name (e.g. ``"vba_write"``).
