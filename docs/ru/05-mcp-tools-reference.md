@@ -69,12 +69,15 @@ related:
 
 | Класс | Кол-во | Поведение |
 |-------|--------|-----------|
-| `read-only` | 43 | Разрешён автоматически; не меняет книгу. Может писать файлы снапшотов, экспорта, артефактов и in-memory состояние классификации. |
-| `mutating` | 40 | Guarded: writable-сессия → снапшот → approval → проверки → postcondition + аудит. |
+| `read-only` | 41 | Разрешён автоматически; не меняет книгу. Может писать файлы снапшотов, экспорта, артефактов и in-memory состояние классификации. |
+| `mutating` | 41 | Guarded: writable-сессия → снапшот → approval → проверки → postcondition + аудит. |
+| `executing` | 3 | Запускает код (`macro_run`, `test_run_suite`, `test_suite_run`); дополнительно gated approval (в режиме `restricted`) и `background_safe`. |
+| `mixed` | 2 | `excel_open` и `excel_close`: класс зависит от параметров (`read_only`, `mode`, `save_changes`). |
+| `config` (bookkeeping) | 1 | `macro_classify_background`: меняет только in-memory состояние классификации (без изменения книги); ungated bookkeeping, границей безопасности остаётся `macro_run`. |
 | `executing` | 3 | Выполняет код (`macro_run`, `test_run_suite`, `test_suite_run`); дополнительно гейтится approval (в режиме `restricted`) и `background_safe`. |
 | `mixed` | 2 | `excel_open` и `excel_close`: класс зависит от параметров (`read_only`, `mode`, `save_changes`). |
 
-Важно различать «инструмент реализован» и «инструмент доступен через MCP». Все 40
+Важно различать «инструмент реализован» и «инструмент доступен через MCP». Все 41
 `mutating` и 3 `executing` инструмента существуют и описаны в справочнике. В режиме `full`
 (по умолчанию) approval-гейт их авторизует (снапшот перед мутацией всё равно требуется); только в
 режиме `restricted` они отклоняются с `APPROVAL_DENIED`. Требование `background_safe` для
@@ -99,7 +102,7 @@ approval-гейтом. `CompileService` создаётся без `ApprovalPolic
 | `VBOM` | VBA project object model — объектная модель проекта VBA (требует доверия в Trust Center). |
 | `ListObject` | Excel Table — структурированная таблица листа. |
 | `BG06` | Правило классификации `background_safe` для фонового выполнения макросов. |
-| `R13` | Preflight интерактивного UI (без учёта регистра): `MsgBox`, `InputBox`, `.Show`, `FileDialog`, `Shell`, `CreateObject`, `FollowHyperlink`, `SendKeys`, `DoEvents`, `GetOpenFilename`, `GetSaveAsFilename`, `CallByName`, `ExecuteGlobal`, `Execute`, `Eval`, `OnTime`, `DisplayAlerts`, `.Run`, `CommandBars`. |
+| `R13` | Preflight интерактивного UI (без учёта регистра): `MsgBox`, `InputBox`, `.Show`, `FileDialog`, `Shell`, `CreateObject`, `FollowHyperlink`, `SendKeys`, `DoEvents`, `GetOpenFilename`, `GetSaveAsFilename`, `CallByName`, `ExecuteGlobal`, `Execute`, `Eval`, `OnTime`, `DisplayAlerts`, `.Run`, `CommandBars`, `AppActivate`, `Application.Visible`, `.Activate`, `WindowState`. |
 | `VBE` | VBA Editor — среда разработки VBA. |
 | `UIA` | UI Automation — доступ к дереву элементов Windows (только чтение, без активации). |
 
@@ -122,7 +125,7 @@ approval-гейтом. `CompileService` создаётся без `ApprovalPolic
 | Controls | 3 | `controls_list`, `control_get`, `control_set_on_action` | read-only + 1 mutating |
 | Workbook model | 1 | `workbook_get_model` | read-only |
 | Health | 1 | `server_health` | read-only |
-| **Итого** | **88** | — | 43 read-only, 40 mutating, 3 executing, 2 mixed |
+| **Итого** | **88** | — | 41 read-only, 41 mutating, 3 executing, 2 mixed, 1 config (bookkeeping) |
 
 Сумма по группам: 6 + 4 + 3 + 9 + 2 + 4 + 7 + 11 + 13 + 16 + 5 + 3 + 3 + 1 + 1 = **88**.
 
@@ -273,12 +276,12 @@ STA-проба `vba_compile` помечается `op_class=EXECUTING` толь�
 | `range_write_values` | Запись типизированных значений в ограниченный диапазон. | `workbook_id:string, sheet:string, address:string, payload:RangeWriteRequest` | `RangeMutationResult` | Значения ячеек; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `LISTOBJECT_INTERSECTION` | mutating |
 | `range_write_formulas` | Запись формул в ограниченный диапазон. | `workbook_id:string, sheet:string, address:string, payload:FormulaWriteRequest` | `RangeMutationResult` | Формулы ячеек; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `LISTOBJECT_INTERSECTION` | mutating |
 | `range_get_format` | Три-state форматирование диапазона. | `workbook_id:string, sheet:string, address:string` | `FormatInfo` | — | `INVALID_RANGE` | read-only |
-| `range_set_format` | Частичное обновление форматирования. | `workbook_id:string, sheet:string, address:string, patch:RangeFormatPatch` | `FormatMutationResult` | Форматирование; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `PROTECTED_TARGET` | mutating |
+| `range_set_format` | Частичное обновление форматирования. | `workbook_id:string, sheet:string, address:string, patch:RangeFormatPatch` | `FormatMutationResult` | Форматирование; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
 | `range_copy` | Копирование диапазона в другой лист/адрес (без буфера). | `workbook_id:string, sheet:string, source:string, destination_sheet:string, destination:string` | `StructuralMutationResult` | Данные получателя; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `LISTOBJECT_INTERSECTION` | mutating |
 | `range_insert` | Вставка ячеек со сдвигом `right`/`down`. | `workbook_id:string, sheet:string, address:string, shift:string, allow_merged:boolean=false?` | `StructuralMutationResult` | Сдвиг ячеек; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `LISTOBJECT_INTERSECTION`, `PROTECTED_TARGET` | mutating |
 | `range_delete` | Удаление ячеек со сдвигом `left`/`up`. | `workbook_id:string, sheet:string, address:string, shift:string, allow_merged:boolean=false?` | `StructuralMutationResult` | Удаление ячеек; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `LISTOBJECT_INTERSECTION`, `PROTECTED_TARGET` | mutating |
-| `range_merge` | Объединение диапазона в одну ячейку. | `workbook_id:string, sheet:string, address:string, across:boolean=false?, allow_data_loss:boolean=false?` | `StructuralMutationResult` | Объединение; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `LISTOBJECT_INTERSECTION` | mutating |
-| `range_unmerge` | Снимает объединение всех пересечённых областей. | `workbook_id:string, sheet:string, address:string` | `StructuralMutationResult` | Разъединение; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `LISTOBJECT_INTERSECTION` | mutating |
+| `range_merge` | Объединение диапазона в одну ячейку. | `workbook_id:string, sheet:string, address:string, across:boolean=false?, allow_data_loss:boolean=false?` | `StructuralMutationResult` | Объединение; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `LISTOBJECT_INTERSECTION`, `PROTECTED_TARGET` | mutating |
+| `range_unmerge` | Снимает объединение всех пересечённых областей. | `workbook_id:string, sheet:string, address:string` | `StructuralMutationResult` | Разъединение; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `LISTOBJECT_INTERSECTION`, `PROTECTED_TARGET` | mutating |
 | `range_get_validation` | Правило проверки данных диапазона. | `workbook_id:string, sheet:string, address:string` | `ValidationRule` | — | `INVALID_RANGE` | read-only |
 | `range_set_validation` | Добавляет или изменяет правило проверки данных. | `workbook_id:string, sheet:string, address:string, spec:ValidationSpec` | `ValidationRule` | Правило; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `PROTECTED_TARGET` | mutating |
 | `range_get_conditional_formatting` | Правила условного форматирования по приоритету. | `workbook_id:string, sheet:string, address:string` | `list[ConditionalFormatRule]` | — | `INVALID_RANGE` | read-only |
@@ -509,7 +512,9 @@ approval-гейт авторизует её в режиме `full` (по умо�
 
 Если `where` не разрешается в ровно одну строку, инструмент возвращает `COM_BUSY` с
 сообщением о неоднозначности и предпросмотром найденных строк — автоматического
-«угадывания» нет.
+«угадывания» нет. (Неоднозначность таблицы намеренно использует базовый код `COM_BUSY` с
+`context.reason="ambiguous"`; это отличается от кода `AMBIGUOUS_FILTER`, применяемого
+инструментами сводных таблиц.)
 Ответ — `TableMutationResult` с `before`/`after` (`TableInfo`) и `affected_rows`.
 
 Удаление строк:
@@ -575,7 +580,7 @@ Standard/Class) и `vba_read_component` (получить `source_hash`). Зат
 ```
 
 `expected_source_hash` — защита от устаревшей ревизии: сервер сравнивает его с текущим
-нормализованным хэшем до и **внутри** STA-воркера. Несовпадение — `COM_BUSY` с
+нормализованным хэшем до и **внутри** STA-воркера. Несовпадение — `REVISION_CONFLICT` с
 `context.reason="revision_conflict"`; мутация не выполняется. Ответ — `VbaMutationResult`
 с `before_hash`, `after_hash` и путями экспорта. Document-модули и UserForms
 отклоняются.
@@ -596,7 +601,8 @@ Standard/Class) и `vba_read_component` (получить `source_hash`). Зат
 5. preflight интерактивного UI (R13): `MsgBox`, `InputBox`, `.Show`, `FileDialog`, `Shell`,
    `CreateObject`, `FollowHyperlink`, `SendKeys`, `DoEvents`, `GetOpenFilename`,
    `GetSaveAsFilename`, `CallByName`, `ExecuteGlobal`, `Execute`, `Eval`, `OnTime`,
-   `DisplayAlerts`, `.Run`, `CommandBars` (без учёта регистра);
+   `DisplayAlerts`, `.Run`, `CommandBars`, `AppActivate`, `Application.Visible`, `.Activate`,
+   `WindowState` (без учёта регистра);
 6. один `Application.Run` на STA-воркере.
 
 Возможные статусы `MacroRunResult`: `success`, `not_found`, `runtime_error`, `blocked`,

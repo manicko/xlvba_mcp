@@ -683,5 +683,6 @@ Additional codes declared by the server include `VBA_PROJECT_LOCKED`, `MISSING_R
 
 Related documents: [Overview](01-overview.md), [Excel capabilities](06-excel-capabilities.md),
 [MCP tools reference](05-mcp-tools-reference.md), [Configuration](03-configuration.md),
-[Architecture](04-architecture.md) and the
+[Architecture](04-architecture.md), [Security](08-security.md),
+[Troubleshooting](10-troubleshooting.md) and the
 [root README](../README.md).

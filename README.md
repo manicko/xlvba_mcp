@@ -49,7 +49,7 @@ Runtime dependencies from `pyproject.toml` (locked versions in parentheses):
 
 | Package | Constraint | Locked | Purpose |
 |---------|------------|--------|---------|
-| `mcp` | `>=1.0.0` | 2.3.0 | MCP server, STDIO transport, tool/resource registration |
+| `mcp` | `>=2.3,<3` | 2.3.0 | MCP server, STDIO transport, tool/resource registration |
 | `pydantic` | `>=2.0.0` | 2.14.4 | Typed configuration and DTOs |
 | `pywin32` | `>=306` | 312 | Excel COM automation |
 | `comtypes` | `>=1.2.0` | 1.5.0 | UI Automation (read-only VBE compile diagnostics) |
@@ -356,6 +356,12 @@ Documentation entry point: [docs/01-overview.md](docs/01-overview.md).
 - [MCP tools reference](docs/05-mcp-tools-reference.md) — all 88 tools and 4 resources
 - [Excel capabilities](docs/06-excel-capabilities.md) — sheets, tables, ranges, PivotTables, VBA, macros
 - [Workflows and examples](docs/07-workflows-and-examples.md) — practical read-only and mutating recipes
+- [Security](docs/08-security.md) — trust boundaries, access model, risk table
+- [Limitations and compatibility](docs/09-limitations-and-compatibility.md) — validated platform and known limits
+- [Troubleshooting](docs/10-troubleshooting.md) — error codes, diagnostics, recovery
+- [Development and maintenance](docs/11-development-and-maintenance.md) — contributor and maintainer guide
+
+Diagrams are maintained as Mermaid sources in [docs/assets/](docs/assets/).
 
 Russian version: [docs/ru/](docs/ru/) — same content in Russian.
 

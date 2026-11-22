@@ -1,0 +1,29 @@
+sequenceDiagram
+    participant CL as MCP client
+    participant SRV as MCPServer
+    participant API as api/workbook_tools
+    participant SES as SessionService
+    participant PP as PathPolicy
+    participant AP as ApprovalPolicy
+    participant WK as ExcelComWorker STA
+    participant AD as ExcelAppAdapter
+    participant XL as Excel hidden
+
+    CL->>SRV: tools/call excel_open(path, mode, read_only)
+    SRV->>API: excel_open(...)
+    API->>API: validation (Pydantic + non-empty)
+    API->>SES: open_workbook(...)
+    SES->>PP: validate_path(path, MUTATING)
+    PP-->>SES: canonical path / PATH_NOT_ALLOWED
+    SES->>AP: check(ApprovalKey, operation_class)
+    AP-->>SES: allowed | APPROVAL_DENIED
+    SES->>SES: shutil.copy2 -> work/<workbook_id>.<ext>
+    SES->>WK: submit(open_fn, section="open", op_class=MUTATING)
+    WK->>AD: automation_security(...) + alerts_suppressed()
+    AD->>XL: Workbooks.Open(working_copy)
+    XL-->>AD: Workbook proxy (STA-local)
+    AD-->>WK: WorkbookInfo (DTO)
+    WK-->>SES: WorkbookInfo
+    SES-->>API: WorkbookInfo
+    API-->>SRV: DTO
+    SRV-->>CL: JSON-RPC result

@@ -152,7 +152,7 @@ The full list of limitations is in [Excel capabilities](06-excel-capabilities.md
 | Excel | Desktop Microsoft Excel with COM/VBE (validated on 16.0.14332 x64) |
 | Python | `>=3.11,<3.15` (validated on 3.14 x64) |
 | Package manager | [uv](https://docs.astral.sh/uv/) |
-| `mcp` | `>=1.0.0` (locked to 2.3.0) |
+| `mcp` | `>=2.3,<3` (locked to 2.3.0) |
 | `pydantic` | `>=2.0.0` (locked to 2.14.4) |
 | `pywin32` | `>=306` (locked to 312) |
 | `comtypes` | `>=1.2.0` (locked to 1.5.0) |
@@ -169,4 +169,8 @@ environment variables are in [Configuration](03-configuration.md).
 - [MCP Tools Reference](05-mcp-tools-reference.md)
 - [Excel Capabilities](06-excel-capabilities.md)
 - [Workflows and Examples](07-workflows-and-examples.md)
+- [Security](08-security.md) — trust boundaries, access model and risk table
+- [Limitations and compatibility](09-limitations-and-compatibility.md) — validated platform and known limits
+- [Troubleshooting](10-troubleshooting.md) — error codes, diagnostics and recovery
+- [Development and maintenance](11-development-and-maintenance.md) — contributor and maintainer guide
 - [Root README](../README.md)

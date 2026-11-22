@@ -67,13 +67,14 @@ Shared conventions:
 
 | Class | Count | Behavior |
 |-------|-------|----------|
-| `read-only` | 43 | Allowed automatically; does not change the workbook. May write snapshot, export, artifact and in-memory classification state. |
-| `mutating` | 40 | Guarded: writable session → snapshot → approval → checks → postcondition + audit. |
+| `read-only` | 41 | Allowed automatically; does not change the workbook. May write snapshot, export, artifact and in-memory classification state. |
+| `mutating` | 41 | Guarded: writable session → snapshot → approval → checks → postcondition + audit. |
 | `executing` | 3 | Runs code (`macro_run`, `test_run_suite`, `test_suite_run`); additionally gated by approval (in `restricted` mode) and `background_safe`. |
 | `mixed` | 2 | `excel_open` and `excel_close`: the class depends on parameters (`read_only`, `mode`, `save_changes`). |
+| `config` (bookkeeping) | 1 | `macro_classify_background`: changes in-memory classification state only (no workbook mutation); ungated bookkeeping, `macro_run` remains the security boundary. |
 
 It is important to distinguish "the tool is implemented" from "the tool is available through
-MCP". All 40 `mutating` and 3 `executing` tools exist and are described in this reference. In the
+MCP". All 41 `mutating` and 3 `executing` tools exist and are described in this reference. In the
 default `full` access mode the approval gate authorizes them (a baseline snapshot is still required
 before a mutation); only in `restricted` mode are they refused with `APPROVAL_DENIED`. The
 `background_safe` requirement on `macro_run` applies in both modes.
@@ -97,7 +98,7 @@ modes, is non-mutating/non-activating, and never changes the workbook or shows U
 | `VBOM` | VBA project object model — the VBA project object model (requires trust in Trust Center). |
 | `ListObject` | Excel Table — a structured worksheet table. |
 | `BG06` | The `background_safe` classification rule for background macro execution. |
-| `R13` | Interactive-UI preflight (case-insensitive): `MsgBox`, `InputBox`, `.Show`, `FileDialog`, `Shell`, `CreateObject`, `FollowHyperlink`, `SendKeys`, `DoEvents`, `GetOpenFilename`, `GetSaveAsFilename`, `CallByName`, `ExecuteGlobal`, `Execute`, `Eval`, `OnTime`, `DisplayAlerts`, `.Run`, `CommandBars`. |
+| `R13` | Interactive-UI preflight (case-insensitive): `MsgBox`, `InputBox`, `.Show`, `FileDialog`, `Shell`, `CreateObject`, `FollowHyperlink`, `SendKeys`, `DoEvents`, `GetOpenFilename`, `GetSaveAsFilename`, `CallByName`, `ExecuteGlobal`, `Execute`, `Eval`, `OnTime`, `DisplayAlerts`, `.Run`, `CommandBars`, `AppActivate`, `Application.Visible`, `.Activate`, `WindowState`. |
 | `VBE` | VBA Editor — the VBA development environment. |
 | `UIA` | UI Automation — read-only access to the Windows element tree (no activation). |
 
@@ -120,7 +121,7 @@ modes, is non-mutating/non-activating, and never changes the workbook or shows U
 | Controls | 3 | `controls_list`, `control_get`, `control_set_on_action` | read-only + 1 mutating |
 | Workbook model | 1 | `workbook_get_model` | read-only |
 | Health | 1 | `server_health` | read-only |
-| **Total** | **88** | — | 43 read-only, 40 mutating, 3 executing, 2 mixed |
+| **Total** | **88** | — | 41 read-only, 41 mutating, 3 executing, 2 mixed, 1 config (bookkeeping) |
 
 Sum across groups: 6 + 4 + 3 + 9 + 2 + 4 + 7 + 11 + 13 + 16 + 5 + 3 + 3 + 1 + 1 = **88**.
 
@@ -271,12 +272,12 @@ to a manual filter.
 | `range_write_values` | Writes typed values to a bounded range. | `workbook_id:string, sheet:string, address:string, payload:RangeWriteRequest` | `RangeMutationResult` | Cell values; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION` | mutating |
 | `range_write_formulas` | Writes formulas to a bounded range. | `workbook_id:string, sheet:string, address:string, payload:FormulaWriteRequest` | `RangeMutationResult` | Cell formulas; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION` | mutating |
 | `range_get_format` | Tri-state formatting of a range. | `workbook_id:string, sheet:string, address:string` | `FormatInfo` | — | `INVALID_RANGE` | read-only |
-| `range_set_format` | Partial formatting update. | `workbook_id:string, sheet:string, address:string, patch:RangeFormatPatch` | `FormatMutationResult` | Formatting; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `PROTECTED_TARGET` | mutating |
+| `range_set_format` | Partial formatting update. | `workbook_id:string, sheet:string, address:string, patch:RangeFormatPatch` | `FormatMutationResult` | Formatting; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE` | mutating |
 | `range_copy` | Copies a range to another sheet/address (no clipboard). | `workbook_id:string, sheet:string, source:string, destination_sheet:string, destination:string` | `StructuralMutationResult` | Destination data; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION` | mutating |
 | `range_insert` | Inserts cells with a `right`/`down` shift. | `workbook_id:string, sheet:string, address:string, shift:string, allow_merged:boolean=false?` | `StructuralMutationResult` | Cell shift; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION`, `PROTECTED_TARGET` | mutating |
 | `range_delete` | Deletes cells with a `left`/`up` shift. | `workbook_id:string, sheet:string, address:string, shift:string, allow_merged:boolean=false?` | `StructuralMutationResult` | Cell deletion; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION`, `PROTECTED_TARGET` | mutating |
-| `range_merge` | Merges a range into a single cell. | `workbook_id:string, sheet:string, address:string, across:boolean=false?, allow_data_loss:boolean=false?` | `StructuralMutationResult` | Merge; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION` | mutating |
-| `range_unmerge` | Unmerges every merged area intersecting the target. | `workbook_id:string, sheet:string, address:string` | `StructuralMutationResult` | Unmerge; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION` | mutating |
+| `range_merge` | Merges a range into a single cell. | `workbook_id:string, sheet:string, address:string, across:boolean=false?, allow_data_loss:boolean=false?` | `StructuralMutationResult` | Merge; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION`, `PROTECTED_TARGET` | mutating |
+| `range_unmerge` | Unmerges every merged area intersecting the target. | `workbook_id:string, sheet:string, address:string` | `StructuralMutationResult` | Unmerge; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION`, `PROTECTED_TARGET` | mutating |
 | `range_get_validation` | Data-validation rule of a range. | `workbook_id:string, sheet:string, address:string` | `ValidationRule` | — | `INVALID_RANGE` | read-only |
 | `range_set_validation` | Adds or changes a data-validation rule. | `workbook_id:string, sheet:string, address:string, spec:ValidationSpec` | `ValidationRule` | Validation rule; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `PROTECTED_TARGET` | mutating |
 | `range_get_conditional_formatting` | Conditional-formatting rules by priority. | `workbook_id:string, sheet:string, address:string` | `list[ConditionalFormatRule]` | — | `INVALID_RANGE` | read-only |
@@ -506,7 +507,9 @@ An update accepts either an **explicit index** or an **unambiguous `where`**:
 ```
 
 If `where` does not resolve to exactly one row, the tool returns `COM_BUSY` with a message about
-the ambiguity and a preview of the matched rows — there is no automatic "guessing". The response
+the ambiguity and a preview of the matched rows — there is no automatic "guessing". (Table
+ambiguity deliberately reuses the base `COM_BUSY` code with `context.reason="ambiguous"`; it is
+distinct from the PivotTable `AMBIGUOUS_FILTER` code used by the pivot tools.) The response
 is a `TableMutationResult` with `before`/`after` (`TableInfo`) and `affected_rows`.
 
 Deleting rows:
@@ -571,7 +574,7 @@ Standard/Class) and `vba_read_component` (obtain `source_hash`). Then:
 ```
 
 `expected_source_hash` is the stale-revision guard: the server compares it with the current
-normalized hash before and **inside** the STA worker. A mismatch raises `COM_BUSY` with
+normalized hash before and **inside** the STA worker. A mismatch raises `REVISION_CONFLICT` with
 `context.reason="revision_conflict"` and the mutation is not performed. The response is a
 `VbaMutationResult` with `before_hash`, `after_hash` and export paths. Document modules and
 UserForms are rejected.
@@ -592,7 +595,8 @@ Gate order:
 5. interactive-UI preflight (R13): `MsgBox`, `InputBox`, `.Show`, `FileDialog`, `Shell`,
    `CreateObject`, `FollowHyperlink`, `SendKeys`, `DoEvents`, `GetOpenFilename`,
    `GetSaveAsFilename`, `CallByName`, `ExecuteGlobal`, `Execute`, `Eval`, `OnTime`,
-   `DisplayAlerts`, `.Run`, `CommandBars` (case-insensitive);
+   `DisplayAlerts`, `.Run`, `CommandBars`, `AppActivate`, `Application.Visible`, `.Activate`,
+   `WindowState` (case-insensitive);
 6. one `Application.Run` on the STA worker.
 
 Possible `MacroRunResult` statuses: `success`, `not_found`, `runtime_error`, `blocked`,
@@ -794,12 +798,13 @@ Resources are read-only: they do not mutate the workbook and do not execute VBA.
    `range_copy` works only within one workbook and without the clipboard.
 10. **No list pagination.** `tables_list` and `pivot_tables_list` return the full bounded list
     without paging.
-11. **Stale worker / lost owned Excel is not auto-detected by `excel_health` (R-17).**
-    `excel_health` reports worker state from the in-process worker only; if the owned hidden
-    `EXCEL.EXE` process dies (for example, killed externally), health can still show
-    `ok`/`running` with a stale `owned_pid` until a call fails. There is no in-band PID liveness
-    probe and no MCP-callable recovery. Remedy: `excel_close` the affected `workbook_id` and
-    re-open, or restart the server process. This is a known limitation, not silent corruption.
+11. **Dead owned Excel is detected as `needs_recovery`, but recovery is close/reopen only.**
+    `excel_health` reads worker/session bookkeeping without touching COM and additionally runs a
+    read-only owned-pid liveness probe (`OpenProcess` + `GetExitCodeProcess`, no COM, no kill): if
+    the hidden `EXCEL.EXE` the worker owns has died while the bookkeeping still says
+    `running`/`accepting`, `excel_health` reports `needs_recovery` instead of a false `ok`. There
+    is still no MCP-callable recovery tool. Remedy: `excel_close` the affected `workbook_id` and
+    re-open, or restart the server process.
 12. **`macro_run` has no snapshot precondition (spec deviation, tracked).**
     Unlike content-mutating tools, `macro_run` does not require a prior `snapshot_create`; it runs
     a classified, approved macro without one. The recommended workflow still snapshots first so a

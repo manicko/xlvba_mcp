@@ -151,7 +151,7 @@ related:
 | Excel | Настольный Microsoft Excel с COM/VBE (валидировано на 16.0.14332 x64) |
 | Python | `>=3.11,<3.15` (валидировано на 3.14 x64) |
 | Менеджер пакетов | [uv](https://docs.astral.sh/uv/) |
-| `mcp` | `>=1.0.0` (зафиксировано 2.3.0) |
+| `mcp` | `>=2.3,<3` (зафиксировано 2.3.0) |
 | `pydantic` | `>=2.0.0` (зафиксировано 2.14.4) |
 | `pywin32` | `>=306` (зафиксировано 312) |
 | `comtypes` | `>=1.2.0` (зафиксировано 1.5.0) |
@@ -168,4 +168,8 @@ related:
 - [Справочник инструментов MCP](05-mcp-tools-reference.md)
 - [Возможности Excel](06-excel-capabilities.md)
 - [Рабочие процессы и примеры](07-workflows-and-examples.md)
+- [Безопасность](08-security.md)
+- [Ограничения и совместимость](09-limitations-and-compatibility.md)
+- [Устранение неполадок](10-troubleshooting.md)
+- [Разработка и поддержка](11-development-and-maintenance.md)
 - [Корневой README](../../README.md)

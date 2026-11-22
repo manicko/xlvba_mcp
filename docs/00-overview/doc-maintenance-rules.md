@@ -1,12 +1,14 @@
 ---
 id: doc-maintenance-rules
-domain: overview
+domain: 00-overview
 tags:
   - documentation
   - governance
   - rules
 related:
-  - vkdownloader-overview
+  - xlvba-overview
+  - xlvba-architecture
+  - xlvba-mcp-tools-reference
 ---
 
 ## Purpose
@@ -77,7 +79,7 @@ Required fields: `id`, `domain`, `tags`, `related`.
 ## Cross-Linking Strategy
 
 - Reference SSOT (single source of truth) documents.
-- Use relative paths: `[Text](../01-auth/auth-api.md)`.
+- Use relative paths, for example `[Architecture](../04-architecture.md)`.
 - Include summary + cross-link rather than full copy.
 - Verify all links are valid before commit.
 
@@ -95,13 +97,6 @@ Required fields: `id`, `domain`, `tags`, `related`.
 - No separate translation pass; translate during edits.
 - Do not commit non-English content.
 - Temporary uncertain content goes to `docs/.tmp/`.
-
-## Output Guidelines
-
-- Use `logger = get_logger(__name__)` for all service layer output in `src/vkdownloader/services/`
-- Use `console.print()` (Rich) for CLI user-facing output in `cli.py`
-- Use `RichProgressReporter` from `services/progress_display.py` for terminal progress bars — never use `print()` with `\r` manipulation
-- Progress bars and user interaction belong to the CLI layer, not business logic
 
 ## Agent Enforcement
 

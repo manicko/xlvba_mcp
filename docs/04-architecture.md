@@ -63,7 +63,7 @@ STA thread of `ExcelComWorker`. Every other layer works with typed DTOs and the 
 | Adapters | `adapters/excel/*`, `adapters/windows_ui/*` | `ExcelComWorker` (single STA thread, queue, recovery), `ExcelAppAdapter` (hidden `Application`), sheet/table/range/pivot/VBIDE/shape/control adapters, `macro_runner`; `VBECompileUI` — read-only VBE command discovery and dialog observation. | COM proxies never leave the STA thread; adapters never change `Visible` and never call `.Activate`/`.Select`/`SendKeys`. |
 | Domain | `domain/*` | Models (`models.py`), statuses and enums (`statuses.py`), stable error codes (`errors.py`), declarative test schema (`test_spec.py`). | Does not import `pywin32` and contains no COM; an HRESULT is only an integer. |
 | Security | `security/*` | `PathPolicy` (allowlist + canonicalisation), `ApprovalPolicy` (access-mode policy: `full` by default, `restricted` deny-by-default), `AuditLogger` (append-only JSONL, redaction), `macro_policy` (`AutomationSecurity` modes, operation class). | Never bypasses policy: every path goes through `validate_path`, every mutation through an approval gate; audit never writes to `stdout`. |
-| Storage | `storage/*` | `SnapshotStore` (immutable snapshots, `manifest.json`, SHA-256), `ArtifactStore` (artifacts and evidence), `RunRepository` (persisted declarative runs). | Filesystem only; no COM and no writes outside the allowed roots. |
+| Storage | `storage/*` | `SnapshotStore` (immutable snapshots, `manifest.json`, SHA-256), `ArtifactStore` (artifacts and evidence), `RunRepository` (persisted declarative runs). | Filesystem only; no COM. `ArtifactStore` validates its root via `PathPolicy`; `SnapshotStore` and `RunRepository` write only to server-configured runtime directories (paths are server-internal, not caller-supplied). |
 
 Additionally, the `adapters/windows_ui` layer matters for diagnostics: `VBECompileUI.discover_command`
 only enumerates `VBE.CommandBars` and performs a read-only `FindControl` probe; it never calls
@@ -297,6 +297,7 @@ The base type is `ExcelVbaMcpError` (`domain/errors.py`). It carries:
 | Compile | `COMPILE_ERROR`, `COMPILE_INDETERMINATE` |
 | Macros | `MACRO_BLOCKED`, `MACRO_NOT_FOUND`, `MACRO_RUNTIME_ERROR`, `MACRO_TIMEOUT`, `BACKGROUND_SAFETY_NOT_VERIFIED`, `INTERACTIVE_UI_NOT_SUPPORTED` |
 | COM / worker | `COM_BUSY`, `RPC_E_CALL_REJECTED`, `EXCEL_HUNG`, `MODAL_UI_BLOCKED` |
+| Caller / concurrency | `WORKBOOK_NOT_FOUND`, `REVISION_CONFLICT` |
 | Snapshots | `SNAPSHOT_FAILED` |
 | Phase 2: ranges and pivots | `INVALID_RANGE`, `PROTECTED_TARGET`, `UNSUPPORTED_PIVOT_SOURCE`, `STALE_TARGET`, `AMBIGUOUS_FILTER`, `REFRESH_FAILED`, `LISTOBJECT_INTERSECTION` |
 
@@ -333,7 +334,8 @@ Example of a serialized error:
 }
 ```
 
-Diagnostics for specific codes are in [MCP tools reference](05-mcp-tools-reference.md).
+Diagnostics for specific codes are in [MCP tools reference](05-mcp-tools-reference.md);
+a symptom-to-fix table is in [Troubleshooting](10-troubleshooting.md).
 
 ## Mutations and the guard chain
 
@@ -401,7 +403,9 @@ Example audit record (abridged):
   `restricted` mode `MUTATING`/`EXECUTING` are refused with `APPROVAL_DENIED`.
 
 Threat model, trust boundaries and the full set of protections are described in this
-section above.
+section above. The complete security and permission model, including the risk table
+and the split between implemented controls and operator responsibilities, is in
+[Security](08-security.md).
 
 ## Architecture limits
 
@@ -431,7 +435,8 @@ section above.
   the action and assertion vocabularies are closed, so arbitrary code cannot be expressed.
 
 The complete list of limits and compatibility constraints is in
-[Excel capabilities](06-excel-capabilities.md).
+[Excel capabilities](06-excel-capabilities.md) and
+[Limitations and compatibility](09-limitations-and-compatibility.md).
 
 ## Source modules
 

@@ -1,0 +1,15 @@
+flowchart TD
+    C[MCP client<br/>Kilo / Claude Desktop] -->|MCP over STDIO| T[MCPServer<br/>server.py + __main__.py]
+    T --> H[API tool handlers<br/>api/*.py]
+    H --> S[Application services<br/>application/*.py]
+    S --> W[ExcelComWorker<br/>single STA thread]
+    W --> A[ExcelAppAdapter<br/>hidden non-activating Excel]
+    A --> X[(Excel COM<br/>EXCEL.exe, Visible=False)]
+    S --> P[PathPolicy<br/>security/path_policy.py]
+    S --> G[ApprovalPolicy<br/>security/approval.py]
+    S --> U[AuditLogger<br/>security/audit.py]
+    S --> SN[SnapshotStore<br/>storage/snapshot_store.py]
+    S --> AR[ArtifactStore<br/>storage/artifact_store.py]
+    S --> RP[RunRepository<br/>storage/run_repository.py]
+    S --> D[Domain models<br/>models / statuses / errors]
+    W --> D
