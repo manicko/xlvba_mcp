@@ -24,7 +24,20 @@ turned into service calls, and it is deliberately narrow:
   contains no COM logic for them.
 * **Compile gates macros.** A failed ``vba_compile`` step blocks every later
   ``macro_run`` step of the same case (``skipped`` + ``details["blocked"]``; the
-  macro is **not** dispatched).
+  macro is **not** dispatched). Compile-before-macro is **explicit**: a suite that
+  gates macros must list a ``vba_compile`` step first; the runner never
+  auto-compiles.
+* **Background-safe declaration.** A ``macro_run`` step may carry the data-only
+  ``background_safe`` flag: the suite author's declaration that the procedure is
+  reviewed non-interactive for the current VBA source revision. When true, the
+  runner records it through the guarded
+  :meth:`~excel_vba_mcp.application.macro_service.MacroService.classify_background`
+  **before** dispatch, so the classify-time heuristic/UI veto and the run-time
+  R13 veto still apply; the runner never writes the classification registry
+  directly. The declaration is a claim, not proof: the residual boundary R-15
+  (dynamic/indirect or transitive UI is not fully covered) still applies, and a
+  false declaration is caught only by the deterministic veto or runtime
+  containment.
 * **Honest statuses.** ``passed`` / ``failed`` / ``blocked`` / ``skipped`` /
   ``indeterminate`` are reused from :mod:`excel_vba_mcp.domain.statuses`. A case
   whose compile outcome is ``indeterminate`` (the non-activating build) is **not**
@@ -504,17 +517,32 @@ class TestRunner:
         try:
             if await self._open_case_copy(run_context, run):
                 await self._snapshot_case(run)
+                recovery_required = False
                 for step in case.steps:
                     step_result = await self.execute_step(step)
+                    run.step_results.append(step_result)
                     if step_result.details.get("blocked"):
                         # A blocked step (failed compile, refused mutation) means
                         # the case cannot continue truthfully: record a note and
                         # stop issuing further steps.
                         run.note(f"case stopped after a blocked {step_result.action} step")
-                        run.step_results.append(step_result)
                         break
-                    run.step_results.append(step_result)
-                assertions = [await self.evaluate_assertion(item) for item in case.assertions]
+                    if step_result.action == TestAction.MACRO_RUN.value and _needs_recovery(run):
+                        # B6-004: a NEEDS_RECOVERY macro means the owned worker is
+                        # no longer trustworthy. Stop dispatching further steps and
+                        # skip assertions rather than failing them against a dead
+                        # worker; the failed macro step already makes the case fail.
+                        recovery_required = True
+                        run.note(
+                            "case stopped after a NEEDS_RECOVERY macro step: the worker "
+                            "requires recovery, so no later step or assertion was dispatched"
+                        )
+                        break
+                assertions = (
+                    []
+                    if recovery_required
+                    else [await self.evaluate_assertion(item) for item in case.assertions]
+                )
             else:
                 assertions = []
         finally:
@@ -684,9 +712,11 @@ class TestRunner:
             )
         except ExcelVbaMcpError as exc:
             reason = f"could not open a disposable copy: {exc.code.value}: {exc.message}"
-            if exc.code is ErrorCode.MACRO_BLOCKED:
+            if exc.code in (ErrorCode.MACRO_BLOCKED, ErrorCode.APPROVAL_DENIED):
                 # Deny-by-default: the baseline path is server-generated, so make
-                # the required grant explicit and actionable instead of opaque.
+                # the required grant explicit and actionable instead of opaque. After
+                # B4 the common restricted-mode denial is APPROVAL_DENIED; accept both
+                # codes so the hint is never silently dropped (B6-003).
                 reason += (
                     " (grant action='excel_open' for canonical_path="
                     f"{run_context.baseline_path!r}, or pre-create the baseline with "
@@ -787,6 +817,19 @@ class TestRunner:
         macro = _require_str(step.macro)
         if macro is None:
             return _failed_step(step, ERROR_INVALID_STEP, "macro_run requires 'macro'")
+
+        # B6 (task_b6): a suite author may declare a macro background-safe. Record
+        # that declaration through the GUARDED MacroService.classify_background so
+        # the classify-time heuristic/UI veto and the run-time R13 veto still apply.
+        # Never write the BackgroundSafetyRegistry directly here: that would drop the
+        # classify-time guard and become a false-safe path. A refusal (interactive UI,
+        # heuristic, unknown procedure) blocks the step and the macro is never
+        # dispatched.
+        if getattr(step, "background_safe", None) is True:
+            try:
+                await self._macro.classify_background(workbook_id, macro, True)
+            except ExcelVbaMcpError as exc:
+                return _blocked_step(step, exc.code.value, f"{macro}: {exc.message}")
 
         result = await self._macro.run_macro(
             workbook_id, macro, list(step.args), timeout_s=_MACRO_TIMEOUT_S
@@ -1045,7 +1088,9 @@ class TestRunner:
             outcome = await self._call_ranges(step, action, workbook_id, sheet)
         except ExcelVbaMcpError as exc:
             return _blocked_or_failed_service_step(
-                step, exc, blocked_codes=frozenset({ErrorCode.COM_BUSY})
+                step,
+                exc,
+                blocked_codes=frozenset({ErrorCode.COM_BUSY, ErrorCode.APPROVAL_DENIED}),
             )
         return _passed_step(step, _range_step_details(outcome))
 
@@ -1175,7 +1220,9 @@ class TestRunner:
             outcome = await self._call_pivots(step, action, workbook_id, pivot_table)
         except ExcelVbaMcpError as exc:
             return _blocked_or_failed_service_step(
-                step, exc, blocked_codes=frozenset({ErrorCode.COM_BUSY})
+                step,
+                exc,
+                blocked_codes=frozenset({ErrorCode.COM_BUSY, ErrorCode.APPROVAL_DENIED}),
             )
         self._pivot_outcomes.append((TestAction(action).value, _jsonable(outcome)))
         return _pivot_step_result(step, action, outcome)
@@ -2443,6 +2490,12 @@ def _artifact_assertion(assertion: Assertion, store: ArtifactStore) -> Assertion
 # ---------------------------------------------------------------------------
 # Status mapping
 # ---------------------------------------------------------------------------
+def _needs_recovery(run: CaseRun) -> bool:
+    """Whether the case's last macro result requires worker recovery (B6-004)."""
+
+    return run.macro_result is not None and run.macro_result.status is MacroRunStatus.NEEDS_RECOVERY
+
+
 def _case_status(run: CaseRun, assertions: list[AssertionResult]) -> CaseStatus:
     """Map one case's steps + assertions onto :class:`CaseStatus`.
 

@@ -147,6 +147,13 @@ class TestStep(BoundedModel):
     step. Phase 2 (task_053) adds the Range/Pivot selectors and the bounded typed
     payloads (``values`` / ``formulas`` / ``format`` / ``orientation`` /
     ``function`` / ``filter``), never an arbitrary COM object.
+
+    ``background_safe`` (task_b6) is a **data-only declaration** by the suite
+    author that a ``macro_run`` procedure is reviewed non-interactive for the
+    current VBA source revision. It is not an executable payload and not a
+    ``TestAction`` member: the runner records it through the guarded
+    ``MacroService.classify_background`` before dispatch, so the classify-time
+    heuristic/UI veto and the run-time R13 veto still apply.
     """
 
     model_config = ConfigDict(extra="forbid", use_enum_values=False)
@@ -201,6 +208,16 @@ class TestStep(BoundedModel):
     )
     macro: str | None = None
     args: list[Any] = Field(default_factory=list, max_length=MAX_MACRO_ARGS)
+    background_safe: bool | None = Field(
+        default=None,
+        description=(
+            "Suite author's declaration that this macro is background-safe (reviewed, "
+            "non-interactive) for the current VBA source revision. When true, the runner "
+            "records it via MacroService.classify_background before dispatch; the "
+            "classify-time heuristic/UI veto and the run-time R13 veto still apply. "
+            "This is a declaration, not an executable payload."
+        ),
+    )
     # Phase 2 — Range/Cells (task_053). All bounded scalars or typed DTOs.
     source_range: str | None = Field(
         default=None,

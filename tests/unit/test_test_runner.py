@@ -311,13 +311,31 @@ class _CompileStub:
 class _MacroStub:
     """Macro service stub returning a canned result and recording every call."""
 
-    def __init__(self, status: MacroRunStatus = MacroRunStatus.SUCCESS) -> None:
+    def __init__(
+        self,
+        status: MacroRunStatus = MacroRunStatus.SUCCESS,
+        *,
+        classify_error: ExcelVbaMcpError | None = None,
+    ) -> None:
         self.status = status
+        self.classify_error = classify_error
         self.calls: list[tuple[str, str, list[Any]]] = []
+        self.classify_calls: list[tuple[str, str, bool]] = []
+        #: Ordered event log so a test can prove classify happens before run.
+        self.events: list[str] = []
+
+    async def classify_background(
+        self, workbook_id: str, procedure: str, background_safe: bool, **_kwargs: Any
+    ) -> None:
+        self.events.append("classify")
+        self.classify_calls.append((workbook_id, procedure, background_safe))
+        if self.classify_error is not None:
+            raise self.classify_error
 
     async def run_macro(
         self, workbook_id: str, macro_name: str, args: list[Any] | None = None, **_kwargs: Any
     ) -> MacroRunResult:
+        self.events.append("run")
         self.calls.append((workbook_id, macro_name, list(args or [])))
         now = datetime.now(UTC)
         return MacroRunResult(
@@ -982,6 +1000,184 @@ async def test_policy_blocked_macro_blocks_the_case(rig_tmp: tuple[Rig, Path]) -
     assert case.steps[0].details["blocked"] is True
     assert case.status is CaseStatus.BLOCKED
     assert result.status is RunStatus.BLOCKED
+
+
+# ---------------------------------------------------------------------------
+# B6: background_safe declaration + NEEDS_RECOVERY abort
+# ---------------------------------------------------------------------------
+async def test_background_safe_classifies_before_macro_run(rig_tmp: tuple[Rig, Path]) -> None:
+    """background_safe=True records one classification before run_macro (B6)."""
+
+    rig, _tmp = rig_tmp
+    info = await rig.open_original()
+    await rig.create_baseline(info.workbook_id)
+
+    suite = _suite(
+        [
+            {
+                "id": "declared-safe",
+                "steps": [
+                    {
+                        "action": "macro_run",
+                        "macro": "modTest.AddNumbers",
+                        "args": [2, 3],
+                        "background_safe": True,
+                    }
+                ],
+                "assertions": [{"type": "macro_status", "expected": "success"}],
+            }
+        ],
+        baseline="use_existing",
+    )
+    suite.workbook_id = info.workbook_id
+
+    result = await rig.runner.run_suite(suite)
+    case = result.cases[0]
+
+    assert len(rig.macro.classify_calls) == 1
+    workbook_id, procedure, flag = rig.macro.classify_calls[0]
+    assert workbook_id  # the case copy, not the original
+    assert procedure == "modTest.AddNumbers"
+    assert flag is True
+    # Exactly one classify before the single dispatch.
+    assert rig.macro.events == ["classify", "run"]
+    assert len(rig.macro.calls) == 1
+    assert case.status is CaseStatus.PASSED
+
+
+async def test_background_safe_refusal_blocks_without_dispatch(
+    rig_tmp: tuple[Rig, Path],
+) -> None:
+    """A classify refusal (interactive UI) blocks the step; run_macro is not called."""
+
+    rig, _tmp = rig_tmp
+    info = await rig.open_original()
+    await rig.create_baseline(info.workbook_id)
+    rig.macro = _MacroStub(
+        classify_error=ExcelVbaMcpError(
+            "interactive UI", code=ErrorCode.INTERACTIVE_UI_NOT_SUPPORTED
+        )
+    )
+    rig.runner = _rebuild_runner(rig)
+
+    suite = _suite(
+        [
+            {
+                "id": "declared-ui",
+                "steps": [
+                    {
+                        "action": "macro_run",
+                        "macro": "modTest.ShowMsg",
+                        "background_safe": True,
+                    }
+                ],
+                "assertions": [{"type": "macro_status", "expected": "success"}],
+            }
+        ],
+        baseline="use_existing",
+    )
+    suite.workbook_id = info.workbook_id
+
+    result = await rig.runner.run_suite(suite)
+    case = result.cases[0]
+    step = case.steps[0]
+
+    assert step.status is StepStatus.SKIPPED
+    assert step.details["blocked"] is True
+    assert step.error_code == ErrorCode.INTERACTIVE_UI_NOT_SUPPORTED.value
+    # The macro was never dispatched and no run details were produced.
+    assert rig.macro.calls == []
+    assert rig.macro.events == ["classify"]
+    assert "macro_status" not in step.details
+    assert case.status is CaseStatus.BLOCKED
+
+
+async def test_macro_without_background_safe_does_not_classify(
+    rig_tmp: tuple[Rig, Path],
+) -> None:
+    """Omitting the field keeps today's behavior: no classify call (B6)."""
+
+    rig, _tmp = rig_tmp
+    info = await rig.open_original()
+    await rig.create_baseline(info.workbook_id)
+
+    suite = _suite(
+        [
+            {
+                "id": "undeclared",
+                "steps": [{"action": "macro_run", "macro": "modTest.AddNumbers", "args": [1, 2]}],
+                "assertions": [{"type": "macro_status", "expected": "success"}],
+            }
+        ],
+        baseline="use_existing",
+    )
+    suite.workbook_id = info.workbook_id
+
+    result = await rig.runner.run_suite(suite)
+
+    assert rig.macro.classify_calls == []
+    assert rig.macro.events == ["run"]
+    assert result.cases[0].status is CaseStatus.PASSED
+
+
+async def test_open_denial_grant_hint_includes_approval_denied(
+    rig_tmp: tuple[Rig, Path],
+) -> None:
+    """B6-003: the open-denial hint is emitted for APPROVAL_DENIED too."""
+
+    rig, _tmp = rig_tmp
+    info = await rig.open_original()
+    await rig.snapshot_service.create_snapshot(info.workbook_id)
+    # Deliberately no grant for the baseline path: the restricted-mode open is
+    # denied with APPROVAL_DENIED after B4.
+
+    suite = _suite([{"id": "no-approval", "steps": [], "assertions": []}])
+    suite.workbook_id = info.workbook_id
+
+    result = await rig.runner.run_suite(suite)
+    case = result.cases[0]
+    notes = " ".join(case.notes)
+
+    assert case.status is CaseStatus.BLOCKED
+    assert ErrorCode.APPROVAL_DENIED.value in notes
+    assert "grant action='excel_open'" in notes
+
+
+async def test_needs_recovery_macro_aborts_the_case(rig_tmp: tuple[Rig, Path]) -> None:
+    """B6-004: a NEEDS_RECOVERY macro stops the case before later steps."""
+
+    rig, _tmp = rig_tmp
+    info = await rig.open_original()
+    await rig.create_baseline(info.workbook_id)
+    rig.macro = _MacroStub(MacroRunStatus.NEEDS_RECOVERY)
+    rig.runner = _rebuild_runner(rig)
+
+    suite = _suite(
+        [
+            {
+                "id": "recover",
+                "steps": [
+                    {"action": "macro_run", "macro": "modTest.Broken"},
+                    {"action": "sheet_add", "sheet": "Never"},
+                ],
+                "assertions": [{"type": "sheet_exists", "name": "Never"}],
+            }
+        ],
+        baseline="use_existing",
+    )
+    suite.workbook_id = info.workbook_id
+
+    result = await rig.runner.run_suite(suite)
+    case = result.cases[0]
+
+    # Only the macro step ran; the later mutation and the assertion were not
+    # dispatched against the dead worker.
+    assert len(case.steps) == 1
+    assert case.steps[0].status is StepStatus.FAILED
+    assert rig.sheets.calls == []
+    assert case.assertions == []
+    assert case.status is CaseStatus.FAILED
+    assert "NEEDS_RECOVERY" in " ".join(case.notes)
 
 
 # ---------------------------------------------------------------------------

@@ -374,6 +374,24 @@ class _Rig:
             )
         )
 
+    def grant_macro_run_unbound(self, procedure: str) -> None:
+        """Approve one macro for any file hash under the baseline identity.
+
+        A sequential mutation -> macro workflow changes the case copy's bytes (and
+        therefore its hash) before the macro runs. The hash-bound grant above would
+        then deny the macro; this unbound grant keeps the approval canonical-path
+        scoped while the ``background_safe`` declaration is re-recorded by the
+        runner against the live case-copy hash (B6 option d).
+        """
+
+        self._grant(
+            ApprovalKey(
+                canonical_path=self.baseline_canonical,
+                action="macro_run",
+                procedure=procedure,
+            )
+        )
+
     async def classify_safe(self, procedure: str) -> None:
         """Classify bound to the live hash + VBA source revision.
 
@@ -742,6 +760,264 @@ async def test_case_mutation_does_not_leak_into_the_next(tmp_path: Path) -> None
         # sheet_exists assertion list the extra sheet. Re-verify from disk.
         baseline_file = Path(rig.baseline.stored_path)
         assert _sha256(baseline_file) == baseline_sha, "baseline must stay immutable"
+    finally:
+        await rig.stop()
+
+
+# ---------------------------------------------------------------------------
+# B6: sequential mutation -> macro -> mutation -> macro (option d)
+# ---------------------------------------------------------------------------
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_sequential_mutation_macro_mutation_macro_passes(tmp_path: Path) -> None:
+    """Alternating edits and macros run on ONE case copy (B6 option d).
+
+    Each ``macro_run`` declares ``background_safe=True`` so the runner records the
+    declaration against the live case-copy hash; the mutation between the macros
+    changes that hash, which a pre-classified baseline-hash entry could not follow.
+    The original and committed fixtures stay byte-identical.
+    """
+
+    fixture = _fixture_or_skip(_CLEAN_PROJECT)
+    rig = _make_rig(tmp_path, fixture)
+    await rig.start()
+    owned_pid: int | None = None
+    try:
+        committed_hash = _sha256(fixture)
+        original_hash = _sha256(rig.original)
+
+        info = await rig.open()
+        owned_pid = rig.worker.get_status().owned_pid
+        assert owned_pid is not None
+        rig.grant_mutation("sheet_add")
+        rig.grant_macro_run_unbound("modTest.AddNumbers")
+
+        suite = _suite(
+            [
+                {
+                    "id": "alternate",
+                    "steps": [
+                        {"action": "sheet_add", "sheet": "AfterFirstEdit"},
+                        {
+                            "action": "macro_run",
+                            "macro": "modTest.AddNumbers",
+                            "args": [2, 3],
+                            "background_safe": True,
+                        },
+                        {"action": "sheet_add", "sheet": "AfterSecondEdit"},
+                        {
+                            "action": "macro_run",
+                            "macro": "modTest.AddNumbers",
+                            "args": [4, 5],
+                            "background_safe": True,
+                        },
+                    ],
+                    "assertions": [
+                        {"type": "sheet_exists", "name": "AfterFirstEdit"},
+                        {"type": "sheet_exists", "name": "AfterSecondEdit"},
+                        {"type": "macro_status", "expected": "success"},
+                        {"type": "macro_return_value", "expected": 9},
+                    ],
+                }
+            ],
+            info.workbook_id,
+        )
+
+        result = await rig.runner.run_suite(suite)
+
+        assert result.status is RunStatus.PASSED, f"run failed: {result}"
+        case = result.cases[0]
+        assert case.status is CaseStatus.PASSED
+        assert [step.status for step in case.steps] == [StepStatus.PASSED] * 4
+        assert all(assertion.passed for assertion in case.assertions), case.assertions
+        # One case copy / one baseline snapshot for the whole alternating workflow.
+        assert f"working_copy_sha256={rig.baseline.sha256}" in " ".join(case.notes)
+
+        _assert_owned_never_foreground(owned_pid, "runner-alternating")
+        _assert_no_visible_owned_windows(owned_pid, "runner-alternating")
+
+        assert _sha256(rig.original) == original_hash, "original must be unchanged"
+        assert _sha256(fixture) == committed_hash, "committed fixture must never change"
+        assert _sha256(Path(rig.baseline.stored_path)) == rig.baseline.sha256
+    finally:
+        await rig.stop()
+
+
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_background_safe_declaration_runs_real_macro(tmp_path: Path) -> None:
+    """background_safe=True on a real macro succeeds without a helper pre-classify."""
+
+    fixture = _fixture_or_skip(_CLEAN_PROJECT)
+    rig = _make_rig(tmp_path, fixture)
+    await rig.start()
+    try:
+        info = await rig.open()
+        original_hash = _sha256(rig.original)
+        rig.grant_macro_run("modTest.AddNumbers")
+
+        suite = _suite(
+            [
+                {
+                    "id": "declared",
+                    "steps": [
+                        {
+                            "action": "macro_run",
+                            "macro": "modTest.AddNumbers",
+                            "args": [2, 3],
+                            "background_safe": True,
+                        }
+                    ],
+                    "assertions": [
+                        {"type": "macro_status", "expected": "success"},
+                        {"type": "macro_return_value", "expected": 5},
+                    ],
+                }
+            ],
+            info.workbook_id,
+        )
+
+        result = await rig.runner.run_suite(suite)
+
+        assert result.status is RunStatus.PASSED, f"run failed: {result}"
+        step = result.cases[0].steps[0]
+        assert step.status is StepStatus.PASSED
+        assert step.details["return_value"] == 5
+        assert _sha256(rig.original) == original_hash, "original must be unchanged"
+    finally:
+        await rig.stop()
+
+
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_macro_without_declaration_is_blocked_not_verified(tmp_path: Path) -> None:
+    """No background_safe field + unclassified -> BACKGROUND_SAFETY_NOT_VERIFIED."""
+
+    fixture = _fixture_or_skip(_CLEAN_PROJECT)
+    rig = _make_rig(tmp_path, fixture)
+    await rig.start()
+    try:
+        info = await rig.open()
+        # Approved, but never classified and no declaration on the step.
+        rig.grant_macro_run("modTest.AddNumbers")
+
+        suite = _suite(
+            [
+                {
+                    "id": "undeclared",
+                    "steps": [
+                        {"action": "macro_run", "macro": "modTest.AddNumbers", "args": [1, 1]}
+                    ],
+                    "assertions": [{"type": "macro_status", "expected": "success"}],
+                }
+            ],
+            info.workbook_id,
+        )
+
+        result = await rig.runner.run_suite(suite)
+
+        step = result.cases[0].steps[0]
+        assert step.status is StepStatus.SKIPPED
+        assert step.details["blocked"] is True
+        assert step.error_code == "BACKGROUND_SAFETY_NOT_VERIFIED"
+        # run_macro did run and truthfully reported the background-safety block.
+        assert step.details["macro_status"] == "blocked"
+        assert result.cases[0].status is CaseStatus.BLOCKED
+        assert result.status is RunStatus.BLOCKED
+    finally:
+        await rig.stop()
+
+
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_ui_macro_declaration_is_blocked_before_dispatch(tmp_path: Path) -> None:
+    """background_safe=True on an interactive-UI macro is refused pre-dispatch."""
+
+    fixture = _fixture_or_skip(_CLEAN_PROJECT)
+    rig = _make_rig(tmp_path, fixture)
+    await rig.start()
+    owned_pid: int | None = None
+    try:
+        info = await rig.open()
+        owned_pid = rig.worker.get_status().owned_pid
+        rig.grant_macro_run("modTest.ShowMsg")
+
+        suite = _suite(
+            [
+                {
+                    "id": "declared-ui",
+                    "steps": [
+                        {
+                            "action": "macro_run",
+                            "macro": "modTest.ShowMsg",
+                            "background_safe": True,
+                        }
+                    ],
+                    "assertions": [{"type": "macro_status", "expected": "success"}],
+                }
+            ],
+            info.workbook_id,
+        )
+
+        result = await rig.runner.run_suite(suite)
+
+        step = result.cases[0].steps[0]
+        assert step.status is StepStatus.SKIPPED
+        assert step.details["blocked"] is True
+        assert step.error_code == "INTERACTIVE_UI_NOT_SUPPORTED"
+        # The macro service never ran it, so there are no run details and no modal.
+        assert "macro_status" not in step.details
+        assert result.cases[0].status is CaseStatus.BLOCKED
+        _assert_no_visible_owned_windows(owned_pid or 0, "runner-ui-declared")
+    finally:
+        await rig.stop()
+
+
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_restricted_mode_macro_denial_is_blocked(tmp_path: Path) -> None:
+    """Restricted mode denies the macro with APPROVAL_DENIED -> blocked step."""
+
+    fixture = _fixture_or_skip(_CLEAN_PROJECT)
+    rig = _make_rig(tmp_path, fixture)
+    await rig.start()
+    try:
+        info = await rig.open()
+        # No macro_run grant: the default restricted policy denies execution.
+
+        suite = _suite(
+            [
+                {
+                    "id": "denied",
+                    "steps": [
+                        {
+                            "action": "macro_run",
+                            "macro": "modTest.AddNumbers",
+                            "args": [1, 1],
+                            "background_safe": True,
+                        }
+                    ],
+                    "assertions": [{"type": "macro_status", "expected": "success"}],
+                }
+            ],
+            info.workbook_id,
+        )
+
+        result = await rig.runner.run_suite(suite)
+
+        step = result.cases[0].steps[0]
+        assert step.status is StepStatus.SKIPPED
+        assert step.details["blocked"] is True
+        assert step.error_code == "APPROVAL_DENIED"
+        # run_macro ran and truthfully reported the approval denial.
+        assert step.details["macro_status"] == "blocked"
+        assert result.cases[0].status is CaseStatus.BLOCKED
+        assert result.status is RunStatus.BLOCKED
     finally:
         await rig.stop()
 

@@ -513,6 +513,22 @@ class _Rig:
             )
         )
 
+    def grant_macro_run_unbound(self, procedure: str) -> None:
+        """Approve one macro for any file hash under the baseline identity.
+
+        A mutation before the macro changes the case copy's hash, so the
+        hash-bound grant would deny it; the B6 ``background_safe`` declaration is
+        re-recorded by the runner against the live case-copy hash instead.
+        """
+
+        self._grant(
+            ApprovalKey(
+                canonical_path=self.baseline_canonical,
+                action="macro_run",
+                procedure=procedure,
+            )
+        )
+
     async def classify_safe(self, procedure: str) -> None:
         """Classify bound to the live hash + VBA source revision.
 
@@ -704,6 +720,93 @@ async def test_successful_suite_returns_passed_with_artifacts(tmp_path: Path) ->
         await rig.shutdown_and_reap(owned_pid)
 
     # BG05: no pre-existing user Excel process was terminated.
+    missing_user_pids = baseline_pids - _excel_pids()
+    assert not missing_user_pids, f"user-owned Excel PIDs disappeared: {missing_user_pids}"
+
+
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_sequential_mutation_macro_workflow_uses_background_safe(
+    tmp_path: Path,
+) -> None:
+    """End to end: edit -> macro -> edit -> macro via the background_safe field.
+
+    The declarative ``background_safe`` declaration lets the runner classify each
+    macro against the live case-copy hash, so the workflow survives the file hash
+    change caused by the mutation between macros. The original stays byte-identical.
+    """
+
+    fixture = _fixture_or_skip(_CLEAN_PROJECT)
+    rig = _make_rig(tmp_path, fixture)
+    baseline_pids = _excel_pids()
+    await rig.start()
+    owned_pid: int | None = None
+    try:
+        committed_hash = _sha256(fixture)
+        original_hash = _sha256(rig.original)
+
+        info = await rig.open()
+        owned_pid = rig.worker.get_status().owned_pid
+        assert owned_pid is not None
+        rig.grant_mutation("sheet_add")
+        rig.grant_macro_run_unbound(_ADD_NUMBERS)
+
+        suite = _suite(
+            [
+                {
+                    "id": "edit-macro-edit-macro",
+                    "steps": [
+                        {"action": "sheet_add", "sheet": "B6First"},
+                        {
+                            "action": "macro_run",
+                            "macro": _ADD_NUMBERS,
+                            "args": [2, 3],
+                            "background_safe": True,
+                        },
+                        {"action": "sheet_add", "sheet": "B6Second"},
+                        {
+                            "action": "macro_run",
+                            "macro": _ADD_NUMBERS,
+                            "args": [4, 5],
+                            "background_safe": True,
+                        },
+                    ],
+                    "assertions": [
+                        {"type": "sheet_exists", "name": "B6First"},
+                        {"type": "sheet_exists", "name": "B6Second"},
+                        {"type": "macro_status", "expected": "success"},
+                        {"type": "macro_return_value", "expected": 9},
+                    ],
+                }
+            ],
+            info.workbook_id,
+            name="e2e-background-safe",
+        )
+
+        result, owned_samples = await _run_suite_sampling_foreground(rig, suite, owned_pid)
+
+        assert result.status is RunStatus.PASSED, f"run failed: {result}"
+        case = result.cases[0]
+        assert case.status is CaseStatus.PASSED
+        assert [step.status for step in case.steps] == [StepStatus.PASSED] * 4
+        assert all(assertion.passed for assertion in case.assertions), case.assertions
+        assert not owned_samples, f"owned automation held foreground: {owned_samples}"
+
+        # Evidence persisted and readable; the original + baseline are untouched.
+        assert len(result.artifact_paths) >= 2
+        for path in result.artifact_paths:
+            assert Path(path).is_file(), path
+        assert rig.runner.get_run(result.test_run_id).status is RunStatus.PASSED
+        assert _sha256(rig.original) == original_hash, "original must be unchanged"
+        assert _sha256(fixture) == committed_hash, "committed fixture must never change"
+        assert _sha256(Path(rig.baseline.stored_path)) == rig.baseline.sha256
+
+        _assert_owned_never_foreground(owned_pid, "e2e-background-safe")
+        _assert_no_visible_owned_windows(owned_pid, "e2e-background-safe")
+    finally:
+        await rig.shutdown_and_reap(owned_pid)
+
     missing_user_pids = baseline_pids - _excel_pids()
     assert not missing_user_pids, f"user-owned Excel PIDs disappeared: {missing_user_pids}"
 
