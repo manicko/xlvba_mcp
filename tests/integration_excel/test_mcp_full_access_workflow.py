@@ -902,6 +902,11 @@ async def test_restricted_mode_denies_execute_open(tmp_path: Path) -> None:
 
     Restricted mode exposes no grant tool over MCP, so the deny-by-default approval
     gate on ``excel_open`` (EXECUTING) is the reachable ``APPROVAL_DENIED`` surface.
+
+    F-4: the filesystem-write tools ``snapshot_create`` and ``vba_export_project``
+    are approval-gated too. A read-only inspect open is the only session restricted
+    mode admits, and both tools must return ``APPROVAL_DENIED`` on it (previously
+    they succeeded ungated).
     """
 
     work_copy = _copy_fixture(tmp_path)
@@ -911,3 +916,24 @@ async def test_restricted_mode_denies_execute_open(tmp_path: Path) -> None:
 
         denied = await _call(session, "excel_open", {"path": str(work_copy)})
         assert error_code(denied) == "APPROVAL_DENIED"
+
+        # The only session restricted mode admits: inspect + read-only.
+        opened = structured(
+            await _call(
+                session,
+                "excel_open",
+                {"path": str(work_copy), "mode": "inspect", "read_only": True},
+            )
+        )
+        assert opened["read_only"] is True, f"expected a read-only session: {opened}"
+        workbook_id = opened["workbook_id"]
+
+        denied_snapshot = await _call(
+            session, "snapshot_create", {"workbook_id": workbook_id}
+        )
+        assert error_code(denied_snapshot) == "APPROVAL_DENIED"
+
+        denied_export = await _call(
+            session, "vba_export_project", {"workbook_id": workbook_id}
+        )
+        assert error_code(denied_export) == "APPROVAL_DENIED"

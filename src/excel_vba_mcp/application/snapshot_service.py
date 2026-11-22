@@ -43,9 +43,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
 from excel_vba_mcp.application.session_service import SessionService
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError, SnapshotFailedError
+from excel_vba_mcp.domain.errors import (
+    ApprovalDeniedError,
+    ExcelVbaMcpError,
+    SnapshotFailedError,
+)
 from excel_vba_mcp.domain.models import WorkbookInfo
 from excel_vba_mcp.domain.statuses import OperationClass, SessionMode
+from excel_vba_mcp.security.approval import ApprovalKey, ApprovalPolicy
 from excel_vba_mcp.security.audit import AuditLogger
 from excel_vba_mcp.security.path_policy import PathPolicy
 from excel_vba_mcp.storage.snapshot_store import SnapshotManifest, SnapshotStore
@@ -89,6 +94,10 @@ class SnapshotService:
         worker: The single-STA COM worker (all Excel runs there).
         path_policy: Allowlist / canonicalisation gate for source paths.
         audit: Append-only JSONL audit trail.
+        approval: Deny-by-default approval gate for the snapshot-creation
+            filesystem write. When ``None`` (legacy/test construction only) the
+            approval gate is a no-op; the production server always injects one
+            (``server._build_runtime``).
     """
 
     def __init__(
@@ -98,12 +107,14 @@ class SnapshotService:
         worker: ExcelComWorker,
         path_policy: PathPolicy,
         audit: AuditLogger,
+        approval: ApprovalPolicy | None = None,
     ) -> None:
         self._store = store
         self._session = session_service
         self._worker = worker
         self._path_policy = path_policy
         self._audit = audit
+        self._approval = approval
         # The most recent successful snapshot per workbook id (pre-mutation gate).
         self._latest_snapshot: dict[str, SnapshotManifest] = {}
         # Last-known canonical source path per workbook id (closed-branch lookup).
@@ -140,11 +151,18 @@ class SnapshotService:
             The written :class:`SnapshotManifest`.
 
         Raises:
+            ApprovalDeniedError: If the approval gate denies the snapshot write
+                (deny-by-default in ``restricted`` mode).
             ExcelVbaMcpError: If the workbook id is unknown.
             SnapshotFailedError: If the snapshot could not be produced.
         """
 
         info = await self._find_open(workbook_id)
+        # F-4: a snapshot is a filesystem write (SaveCopyAs / file copy). Gate it
+        # with the same deny-by-default approval policy the other mutating tools
+        # use. A snapshot create cannot require a pre-existing snapshot, so only
+        # the approval gate applies (no ``require_snapshot``).
+        self._require_create_approval(workbook_id, info)
         snapshot_id = self._new_snapshot_id()
 
         if info is not None:
@@ -158,7 +176,7 @@ class SnapshotService:
         self._known_sources[workbook_id] = manifest.source_path
         self._record_audit(
             tool="snapshot_create",
-            operation_class="read_only",
+            operation_class="mutating",
             params={"workbook_id": workbook_id, "snapshot_id": snapshot_id},
             workbook={"canonical_path": manifest.source_path},
             snapshot_id=snapshot_id,
@@ -271,9 +289,11 @@ class SnapshotService:
     ) -> WorkbookInfo:
         """Restore a working session from an immutable snapshot.
 
-        Restore has **no approval gate** (R-19): it only reverts the working copy
-        from an immutable snapshot baseline and never mutates the original, so it
-        is not classified as a mutating approval-gated operation.
+        Restore adds **no second approval gate**: its approval point is inherited
+        from the writable ``open_workbook`` call below (``SessionMode.EXECUTE`` →
+        ``EXECUTING``), which is deny-by-default in ``restricted`` mode and
+        auto-allowed in ``full`` mode. The snapshot baseline itself is only read,
+        so no additional gate is needed.
 
         Closes the current working copy **without saving** (when ``workbook_id``
         is given and still open), then opens a fresh working copy from the
@@ -299,6 +319,8 @@ class SnapshotService:
             (``read_only is False``).
 
         Raises:
+            ApprovalDeniedError: If the inherited ``excel_open`` approval gate
+                denies the writable open (restricted mode).
             SnapshotFailedError: If the snapshot does not exist.
         """
 
@@ -429,6 +451,40 @@ class SnapshotService:
     @staticmethod
     def _new_snapshot_id() -> str:
         return f"snap-{uuid4().hex}"
+
+    def _require_create_approval(
+        self, workbook_id: str, info: WorkbookInfo | None
+    ) -> None:
+        """Deny-by-default approval gate for the snapshot filesystem write (F-4).
+
+        A snapshot create is a ``MUTATING`` operation for approval purposes: it
+        writes a snapshot file (and optional VBA exports). In ``restricted`` mode
+        with no allowlist entry / live grant it raises ``APPROVAL_DENIED``; in the
+        default ``full`` mode the policy auto-allows. When no policy is wired
+        (legacy/test construction) the gate is a no-op.
+        """
+
+        if self._approval is None:
+            return
+        if info is not None:
+            canonical = info.source_path or info.path
+        else:
+            canonical = self._known_sources.get(workbook_id, "")
+        key = ApprovalKey(canonical_path=canonical, action="snapshot_create")
+        decision = self._approval.check(
+            key,
+            session_id=getattr(self._session, "session_id", None),
+            operation_class=OperationClass.MUTATING,
+        )
+        if not decision.allowed:
+            raise ApprovalDeniedError(
+                f"snapshot_create denied by approval policy: {decision.reason}",
+                context={
+                    "action": key.action,
+                    "canonical_path": canonical,
+                    "reason": decision.reason,
+                },
+            )
 
     def _record_audit(
         self,

@@ -804,6 +804,7 @@ def _build_runtime(config: Config) -> _Runtime:
         worker,
         path_policy,
         audit,
+        approval=approval,
     )
     vba = VBAProjectService(
         worker,

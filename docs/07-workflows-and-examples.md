@@ -332,7 +332,7 @@ returns `APPROVAL_DENIED`.
 { "workbook_id": "<workbook_id>" }
 ```
 
-Call `snapshot_create`. This is read-only and allowed once a writable session exists.
+Call `snapshot_create`. This is an approval-gated filesystem write: auto-allowed in the default `full` mode, refused with `APPROVAL_DENIED` in `restricted` mode.
 
 **Step 3 — write values.**
 

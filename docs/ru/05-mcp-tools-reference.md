@@ -93,11 +93,11 @@ related:
 | Группа | Кол-во | Инструменты | Класс доступа |
 |--------|--------|-------------|----------------|
 | Workbook/session | 6 | `excel_open`, `excel_close`, `excel_save`, `excel_get_status`, `excel_list_workbooks`, `excel_health` | mixed / mutating / read-only |
-| Snapshots | 4 | `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff` | read-only + 1 mutating |
+| Snapshots | 4 | `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff` | read-only + 2 mutating |
 | Test runner | 3 | `test_run_suite`, `test_suite_run`, `test_get_run` | executing + read-only |
 | VBA | 9 | `vba_project_info`, `vba_list_components`, `vba_list_procedures`, `vba_read_component`, `vba_export_project`, `vba_get_references`, `vba_search_code`, `vba_replace_component_source`, `vba_insert_code` | read-only + 2 mutating |
 | Compile | 2 | `vba_compile`, `vba_get_compile_diagnostics` | read-only |
-| Macros | 4 | `macro_list`, `macro_run`, `macro_get_last_result`, `macro_classify_background` | read-only + 1 executing |
+| Macros | 4 | `macro_list`, `macro_run`, `macro_get_last_result`, `macro_classify_background` | read-only + 1 executing + 1 config (bookkeeping) |
 | Sheets | 7 | `sheets_list`, `sheet_get`, `sheet_add`, `sheet_rename`, `sheet_copy`, `sheet_delete`, `sheet_set_visibility` | read-only + 5 mutating |
 | Tables | 11 | `tables_list`, `table_get`, `table_read_rows`, `table_append_rows`, `table_insert_row`, `table_update_rows`, `table_delete_rows`, `table_add_column`, `table_delete_column`, `table_create`, `table_resize` | read-only + 8 mutating |
 | PivotTables | 13 | `pivot_tables_list`, `pivot_table_get`, `pivot_cache_get`, `pivot_fields_list`, `pivot_table_refresh`, `pivot_cache_refresh`, `pivot_field_set_layout`, `pivot_field_set_position`, `pivot_field_set_aggregation`, `pivot_field_set_properties`, `pivot_field_get_filters`, `pivot_field_apply_filter`, `pivot_field_clear_filters` | read-only + 8 mutating |
@@ -130,7 +130,7 @@ related:
 
 | Инструмент | Назначение | Параметры | Возврат | Побочные эффекты | Ошибки | Доступ |
 |------------|------------|-----------|---------|------------------|--------|--------|
-| `snapshot_create` | Создаёт иммутабельный снапшот открытой или известной книги. | `workbook_id:string` | `SnapshotManifest` | Файлы снапшота + `manifest.json`; запись в аудит | `SNAPSHOT_FAILED`, `EXCEL_HUNG` | read-only |
+| `snapshot_create` | Создаёт иммутабельный снапшот открытой или известной книги. | `workbook_id:string` | `SnapshotManifest` | Файлы снапшота + `manifest.json`; запись в аудит | `SNAPSHOT_FAILED`, `APPROVAL_DENIED` (restricted), `EXCEL_HUNG` | mutating (approval-гейт) |
 | `snapshot_list` | Список снапшотов и их метаданных. | — | `list[SnapshotManifest]` | — | `SNAPSHOT_FAILED` | read-only |
 | `snapshot_restore` | Восстанавливает рабочую сессию из снапшота. | `snapshot_id:string, workbook_id:string?` | `WorkbookInfo` | Закрытие текущей копии без сохранения; новая рабочая копия; аудит | `SNAPSHOT_FAILED`, `APPROVAL_DENIED` (restricted), `EXCEL_HUNG` | mutating |
 | `snapshot_diff` | Сравнивает два снапшота по метаданным и хэшу. | `snapshot_id_a:string, snapshot_id_b:string` | `SnapshotDiff` | — | `SNAPSHOT_FAILED` | read-only |
@@ -179,7 +179,7 @@ related:
 |------------|------------|-----------|---------|------------------|--------|--------|
 | `macro_list` | Список вызываемых макросов с классификацией `background_safe`. | `workbook_id:string` | `list[MacroInfo]` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED`, `EXCEL_HUNG` | read-only |
 | `macro_run` | Запускает один одобренный `background_safe` макрос. | `workbook_id:string, macro_name:string, args:array?` | `MacroRunResult` | Исполнение VBA; возможные внешние эффекты; аудит | `APPROVAL_DENIED` (restricted), `MACRO_BLOCKED` (Office macro-security), `MACRO_NOT_FOUND`, `MACRO_RUNTIME_ERROR`, `MACRO_TIMEOUT`, `BACKGROUND_SAFETY_NOT_VERIFIED`, `INTERACTIVE_UI_NOT_SUPPORTED` | executing |
-| `macro_classify_background` | Записывает `background_safe` процедуры для текущего хэша книги и ревизии исходников VBA (ungated bookkeeping). | `workbook_id:string, procedure:string, background_safe:boolean, expected_project_source_hash:string?` | `BackgroundSafetyClassification` | Запись в in-memory реестре; аудит | `MACRO_NOT_FOUND`, `STALE_TARGET` (несовпадение хэша исходников), `INTERACTIVE_UI_NOT_SUPPORTED` (интерактивная/эвристическая + `background_safe=true`), `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED`, `EXCEL_HUNG` | read-only |
+| `macro_classify_background` | Записывает `background_safe` процедуры для текущего хэша книги и ревизии исходников VBA (ungated bookkeeping). | `workbook_id:string, procedure:string, background_safe:boolean, expected_project_source_hash:string?` | `BackgroundSafetyClassification` | Изменяет in-memory состояние классификации (bookkeeping); аудит | `MACRO_NOT_FOUND`, `STALE_TARGET` (несовпадение хэша исходников), `INTERACTIVE_UI_NOT_SUPPORTED` (интерактивная/эвристическая + `background_safe=true`), `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED`, `EXCEL_HUNG` | config (bookkeeping, ungated) |
 | `macro_get_last_result` | Возвращает кэш последнего запуска без повторного выполнения. | `workbook_id:string` | `MacroRunResult` | — | — | read-only |
 
 `macro_classify_background` **не гейтится**: он только записывает состояние классификации и не
@@ -535,9 +535,11 @@ approval-гейт авторизует её в режиме `full` (по умо�
 baseline; возвращается `WorkbookInfo`. Внешние эффекты макросов не откатываются.
 
 Обратите внимание, что `snapshot_create` и `vba_export_project` записывают файлы: снапшоты — в
-temp-каталог снапшотов, экспортируемые компоненты — в артефакт-/temp-каталог. Эти записи
-выполнены намеренно; они не требуют approval в режиме `full` и не гейтятся в режиме
-`restricted` (R-19).
+temp-каталог снапшотов, экспортируемые компоненты — в артефакт-/temp-каталог. Оба
+**гейтятся approval** (F-4): в режиме `full` (по умолчанию) они авторизованы без гранта, а в
+`restricted` отклоняются с `APPROVAL_DENIED`. `snapshot_restore` не добавляет второй гейт — его
+точка approval унаследована от writable-`excel_open` (EXECUTING), который он выполняет над
+baseline снапшота.
 
 ### vba_replace_component_source
 

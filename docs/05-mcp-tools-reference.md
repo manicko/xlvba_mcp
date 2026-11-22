@@ -93,11 +93,11 @@ before a mutation); only in `restricted` mode are they refused with `APPROVAL_DE
 | Group | Count | Tools | Access class |
 |-------|-------|-------|--------------|
 | Workbook/session | 6 | `excel_open`, `excel_close`, `excel_save`, `excel_get_status`, `excel_list_workbooks`, `excel_health` | mixed / mutating / read-only |
-| Snapshots | 4 | `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff` | read-only + 1 mutating |
+| Snapshots | 4 | `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff` | read-only + 2 mutating |
 | Test runner | 3 | `test_run_suite`, `test_suite_run`, `test_get_run` | executing + read-only |
 | VBA | 9 | `vba_project_info`, `vba_list_components`, `vba_list_procedures`, `vba_read_component`, `vba_export_project`, `vba_get_references`, `vba_search_code`, `vba_replace_component_source`, `vba_insert_code` | read-only + 2 mutating |
 | Compile | 2 | `vba_compile`, `vba_get_compile_diagnostics` | read-only |
-| Macros | 4 | `macro_list`, `macro_run`, `macro_get_last_result`, `macro_classify_background` | read-only + 1 executing |
+| Macros | 4 | `macro_list`, `macro_run`, `macro_get_last_result`, `macro_classify_background` | read-only + 1 executing + 1 config (bookkeeping) |
 | Sheets | 7 | `sheets_list`, `sheet_get`, `sheet_add`, `sheet_rename`, `sheet_copy`, `sheet_delete`, `sheet_set_visibility` | read-only + 5 mutating |
 | Tables | 11 | `tables_list`, `table_get`, `table_read_rows`, `table_append_rows`, `table_insert_row`, `table_update_rows`, `table_delete_rows`, `table_add_column`, `table_delete_column`, `table_create`, `table_resize` | read-only + 8 mutating |
 | PivotTables | 13 | `pivot_tables_list`, `pivot_table_get`, `pivot_cache_get`, `pivot_fields_list`, `pivot_table_refresh`, `pivot_cache_refresh`, `pivot_field_set_layout`, `pivot_field_set_position`, `pivot_field_set_aggregation`, `pivot_field_set_properties`, `pivot_field_get_filters`, `pivot_field_apply_filter`, `pivot_field_clear_filters` | read-only + 8 mutating |
@@ -130,7 +130,7 @@ Sum across groups: 6 + 4 + 3 + 9 + 2 + 4 + 7 + 11 + 13 + 16 + 5 + 3 + 3 + 1 + 1 
 
 | Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
 |------|---------|------------|---------|--------------|--------|--------|
-| `snapshot_create` | Creates an immutable snapshot of an open or known workbook. | `workbook_id:string` | `SnapshotManifest` | Snapshot files + `manifest.json`; audit record | `SNAPSHOT_FAILED`, `EXCEL_HUNG` | read-only |
+| `snapshot_create` | Creates an immutable snapshot of an open or known workbook. | `workbook_id:string` | `SnapshotManifest` | Snapshot files + `manifest.json`; audit record | `SNAPSHOT_FAILED`, `APPROVAL_DENIED` (restricted mode), `EXCEL_HUNG` | mutating (approval-gated) |
 | `snapshot_list` | Lists snapshots and their metadata. | — | `list[SnapshotManifest]` | — | `SNAPSHOT_FAILED` | read-only |
 | `snapshot_restore` | Restores a working session from a snapshot. | `snapshot_id:string, workbook_id:string?` | `WorkbookInfo` | Closes the current copy without saving; opens a new working copy; audit | `SNAPSHOT_FAILED`, `APPROVAL_DENIED` (restricted mode), `EXCEL_HUNG` | mutating |
 | `snapshot_diff` | Compares two snapshots by metadata and hash. | `snapshot_id_a:string, snapshot_id_b:string` | `SnapshotDiff` | — | `SNAPSHOT_FAILED` | read-only |
@@ -179,7 +179,7 @@ Document modules and UserForms are rejected with `COM_BUSY`
 |------|---------|------------|---------|--------------|--------|--------|
 | `macro_list` | Lists callable macros with their `background_safe` classification. | `workbook_id:string` | `list[MacroInfo]` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED`, `EXCEL_HUNG` | read-only |
 | `macro_run` | Runs one approved `background_safe` macro. | `workbook_id:string, macro_name:string, args:array?` | `MacroRunResult` | VBA execution; possible external effects; audit | `APPROVAL_DENIED` (restricted mode), `MACRO_BLOCKED` (Office macro-security), `MACRO_NOT_FOUND`, `MACRO_RUNTIME_ERROR`, `MACRO_TIMEOUT`, `BACKGROUND_SAFETY_NOT_VERIFIED`, `INTERACTIVE_UI_NOT_SUPPORTED` | executing |
-| `macro_classify_background` | Records a procedure's `background_safe` for the current workbook hash and VBA source revision (ungated bookkeeping). | `workbook_id:string, procedure:string, background_safe:boolean, expected_project_source_hash:string?` | `BackgroundSafetyClassification` | In-memory registry entry; audit | `MACRO_NOT_FOUND`, `STALE_TARGET` (source hash mismatch), `INTERACTIVE_UI_NOT_SUPPORTED` (interactive/heuristic + `background_safe=true`), `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED`, `EXCEL_HUNG` | read-only |
+| `macro_classify_background` | Records a procedure's `background_safe` for the current workbook hash and VBA source revision (ungated bookkeeping). | `workbook_id:string, procedure:string, background_safe:boolean, expected_project_source_hash:string?` | `BackgroundSafetyClassification` | Mutates in-memory classification state (bookkeeping); audit | `MACRO_NOT_FOUND`, `STALE_TARGET` (source hash mismatch), `INTERACTIVE_UI_NOT_SUPPORTED` (interactive/heuristic + `background_safe=true`), `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED`, `EXCEL_HUNG` | config (bookkeeping, ungated) |
 | `macro_get_last_result` | Returns the cached last run without re-executing. | `workbook_id:string` | `MacroRunResult` | — | — | read-only |
 
 `macro_classify_background` is **ungated**: it only records classification state and is not the
@@ -534,9 +534,10 @@ The current working copy is closed **without saving**, then a new copy is opened
 baseline; a `WorkbookInfo` is returned. External macro effects are not rolled back.
 
 Note that `snapshot_create` and `vba_export_project` write files: snapshots under the snapshot
-temp directory and exported components under the artifact/temp directory. These writes are by
-design; they do not require approval in `full` mode and are not gated in `restricted` mode
-either (R-19).
+temp directory and exported components under the artifact/temp directory. Both are
+**approval-gated** (F-4): they are auto-allowed in the default `full` mode and refused with
+`APPROVAL_DENIED` in `restricted` mode. `snapshot_restore` adds no second gate — its approval
+point is the inherited writable `excel_open` (EXECUTING) it performs on the snapshot baseline.
 
 ### vba_replace_component_source
 

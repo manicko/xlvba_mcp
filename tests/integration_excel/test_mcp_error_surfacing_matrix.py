@@ -466,9 +466,12 @@ async def test_error_surfacing_matrix(tmp_path: Path) -> None:
         # The denial argument must hit the REAL guard for each tool, not merely a
         # schema rejection. ``_denial_expectations`` maps each mutating tool to the
         # structured code its denial must produce; tools with no reachable denial on
-        # a read-only session (snapshot_create / vba_export_project only write
-        # files; excel_save / excel_close are read-only-safe) map to None and are
-        # asserted to SUCCEED instead, so a silent behavior change still fails.
+        # a read-only session (excel_save / excel_close are read-only-safe) map to
+        # None and are asserted to SUCCEED instead, so a silent behavior change
+        # still fails. ``snapshot_create`` / ``vba_export_project`` are approval-
+        # gated filesystem writes (F-4) but auto-allowed in this full-mode server,
+        # so they still succeed here; their restricted-mode denial is covered by
+        # ``test_restricted_mode_denies_execute_open``.
         _denial_expectations: dict[str, str | None] = {
             "range_write_values": "WORKBOOK_READ_ONLY",
             "table_update_rows": "WORKBOOK_READ_ONLY",
@@ -487,8 +490,9 @@ async def test_error_surfacing_matrix(tmp_path: Path) -> None:
             # test_run_suite is read-only-safe (runs against disposable copies and
             # never mutates the session workbook); it succeeds on a read-only open.
             "test_run_suite": None,
-            # Ungated file-write / read-only-safe: succeed on a read-only session
-            # (R-19 documented side effect); asserted as success, not a denial.
+            # Approval-gated filesystem writes (F-4): auto-allowed in full mode, so
+            # they succeed on a read-only session here (restricted-mode denial is
+            # asserted elsewhere).
             "snapshot_create": None,
             "vba_export_project": None,
             "excel_save": None,

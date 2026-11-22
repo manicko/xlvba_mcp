@@ -18,6 +18,7 @@ Covered:
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -29,9 +30,14 @@ from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import WorkerStatus
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError, SnapshotFailedError
+from excel_vba_mcp.domain.errors import (
+    ApprovalDeniedError,
+    ExcelVbaMcpError,
+    SnapshotFailedError,
+)
 from excel_vba_mcp.domain.models import WorkbookInfo
 from excel_vba_mcp.domain.statuses import (
+    AccessMode,
     OperationClass,
     SessionMode,
     WorkbookSessionState,
@@ -202,7 +208,7 @@ class Rig:
         self.canonical = str(
             self.path_policy.validate_path(str(self.original), OperationClass.MUTATING)
         )
-        self.approval = ApprovalPolicy()
+        self.approval = ApprovalPolicy(mode=AccessMode.FULL)
         self.app = FakeApp()
         self.adapter = ExcelAppAdapter()
         self.adapter._app = self.app  # inject without DispatchEx
@@ -223,6 +229,7 @@ class Rig:
             self.worker,  # type: ignore[arg-type]
             self.path_policy,
             self.audit,
+            approval=self.approval,
         )
 
     def grant(self, action: str, canonical: str | None = None) -> None:
@@ -414,3 +421,58 @@ def test_require_snapshot_returns_latest(tmp_path: Path) -> None:
     rig.service._latest_snapshot["wb"] = rig.store.load("s1")
     rig.service._latest_snapshot["wb"] = rig.store.load("s2")
     assert rig.service.require_snapshot("wb").snapshot_id == "s2"
+
+
+# ---------------------------------------------------------------------------
+# F-4 / F-9: approval gate + audit classification
+# ---------------------------------------------------------------------------
+async def test_create_restricted_mode_requires_approval(tmp_path: Path) -> None:
+    """In restricted mode a snapshot create is denied by default (F-4)."""
+
+    rig = Rig(tmp_path)
+    restricted = ApprovalPolicy(mode=AccessMode.RESTRICTED)
+    service = SnapshotService(
+        rig.store,
+        rig.session,
+        rig.worker,  # type: ignore[arg-type]
+        rig.path_policy,
+        rig.audit,
+        approval=restricted,
+    )
+    # A read-only inspect open is the only session restricted mode admits; a
+    # snapshot create on it must still be denied (no grant over MCP).
+    info = await rig.open(read_only=True)
+
+    with pytest.raises(ApprovalDeniedError) as exc_info:
+        await service.create_snapshot(info.workbook_id)
+    assert exc_info.value.code.value == "APPROVAL_DENIED"
+
+
+async def test_create_full_mode_succeeds_without_grant(tmp_path: Path) -> None:
+    """In full mode a snapshot create is auto-allowed (no behavior change)."""
+
+    rig = Rig(tmp_path)
+    info = await rig.open(read_only=False)
+
+    manifest = await rig.service.create_snapshot(info.workbook_id)
+
+    assert manifest.snapshot_id.startswith("snap-")
+
+
+async def test_create_audit_records_mutating(tmp_path: Path) -> None:
+    """The snapshot_create audit entry is classified ``mutating`` (F-9)."""
+
+    rig = Rig(tmp_path)
+    info = await rig.open(read_only=False)
+
+    await rig.service.create_snapshot(info.workbook_id)
+    rig.audit.flush()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    create_events = [record for record in records if record["tool"] == "snapshot_create"]
+    assert create_events, "snapshot_create must be audited"
+    assert create_events[-1]["operation_class"] == "mutating"

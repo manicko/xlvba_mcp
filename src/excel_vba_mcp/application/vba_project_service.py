@@ -17,6 +17,10 @@ instance and returns serializable DTOs. Nothing here touches COM (ARCH-009).
 Safety contract (spec §7.2, §10; addendum BG03/BG04/BG05):
 
 * **Read-only tools.** No VBA mutation in the read-only methods.
+* **Approval-gated export.** ``export_project`` only reads the VBA project but
+  writes ``.bas`` / ``.cls`` / ``.frm`` / ``.frx`` files, so it is approval-gated
+  (deny-by-default in ``restricted`` mode, auto-allowed in ``full`` mode) in
+  addition to the ``PathPolicy`` export-directory check (F-4).
 * **Guarded mutations.** ``replace_component_source`` / ``insert_code`` enforce
   (in order): writable session → snapshot → revision check → approval → STA
   mutation with before/after export + hash. Document modules and UserForms are
@@ -191,7 +195,31 @@ class VBAProjectService:
         caller-supplied ``out_dir`` is validated by :class:`PathPolicy` against
         the configured artifact roots, so an export can never escape the
         allowlist.
+
+        F-4: the export writes ``.bas`` / ``.cls`` / ``.frm`` / ``.frx`` files, so
+        it is approval-gated (deny-by-default in ``restricted`` mode; auto-allowed
+        in ``full`` mode). A read-only session is still allowed — the export only
+        reads the VBA project — so no writable-session check is applied.
+
+        Raises:
+            ApprovalDeniedError: If the approval gate denies the export
+                (restricted mode).
+            ExcelVbaMcpError: If ``out_dir`` escapes the allowlist.
         """
+
+        record = self._resolve_record(workbook_id)
+        self._require_approval_service()
+        assert self._approval is not None
+        key = ApprovalKey(
+            canonical_path=record.source_path or record.path,
+            action="vba_export_project",
+        )
+        decision = self._approval.authorize_vba_write(key)
+        if not decision.allowed:
+            raise ApprovalDeniedError(
+                f"VBA export denied by approval policy: {decision.reason}",
+                context={"action": key.action, "reason": decision.reason},
+            )
 
         if out_dir is None:
             target = Path(tempfile.mkdtemp(prefix="excel_vba_mcp_vba_export_"))

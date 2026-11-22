@@ -34,11 +34,13 @@ from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.vba_project_service import VBAProjectService
 from excel_vba_mcp.domain.errors import (
     AccessVbomDisabledError,
+    ApprovalDeniedError,
     ErrorCode,
     ExcelVbaMcpError,
     VbaProjectLockedError,
 )
 from excel_vba_mcp.domain.statuses import (
+    AccessMode,
     OperationClass,
     ProcedureType,
     ReferenceStatus,
@@ -419,7 +421,7 @@ class Rig:
         self.canonical = str(
             self.path_policy.validate_path(str(self.original), OperationClass.MUTATING)
         )
-        self.approval = ApprovalPolicy()
+        self.approval = ApprovalPolicy(mode=AccessMode.FULL)
         self.app = FakeApp()
         self.app.Workbooks.items.clear()
         self.adapter = ExcelAppAdapter()
@@ -439,6 +441,7 @@ class Rig:
             self.session,
             self.path_policy,
             self.audit,
+            approval=self.approval,
         )
         self._project = project
 
@@ -690,3 +693,38 @@ async def test_service_references_and_search(tmp_path: Path) -> None:
 
     regex_hits = await rig.service.search_code(info.workbook_id, r"^Public Function", regex=True)
     assert any(hit.component_name == "modTest" for hit in regex_hits)
+
+
+# ---------------------------------------------------------------------------
+# F-4: export_project is approval-gated (filesystem write)
+# ---------------------------------------------------------------------------
+async def test_service_export_project_restricted_requires_approval(tmp_path: Path) -> None:
+    """In restricted mode an export is denied by default (F-4)."""
+
+    rig = Rig(tmp_path)
+    info = await rig.open()
+
+    restricted = ApprovalPolicy(mode=AccessMode.RESTRICTED)
+    service = VBAProjectService(
+        rig.worker,  # type: ignore[arg-type]
+        rig.session,
+        rig.path_policy,
+        rig.audit,
+        approval=restricted,
+    )
+
+    with pytest.raises(ApprovalDeniedError) as exc_info:
+        await service.export_project(info.workbook_id)
+    assert exc_info.value.code.value == "APPROVAL_DENIED"
+
+
+async def test_service_export_project_full_mode_succeeds(tmp_path: Path) -> None:
+    """In full mode an export is auto-allowed (no behavior change)."""
+
+    rig = Rig(tmp_path)
+    info = await rig.open()
+
+    manifest = await rig.service.export_project(info.workbook_id)
+
+    assert Path(manifest.out_dir).is_dir()
+    assert {entry.component_name for entry in manifest.components} >= {"modTest", "frmTest"}
