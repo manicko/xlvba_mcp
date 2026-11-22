@@ -175,6 +175,7 @@ from excel_vba_mcp.application.workbook_model_service import WorkbookModelServic
 from excel_vba_mcp.config import Config, load_config
 from excel_vba_mcp.domain.errors import (
     AccessVbomDisabledError,
+    ErrorCode,
     ExcelVbaMcpError,
     VbaProjectLockedError,
 )
@@ -1238,17 +1239,53 @@ def _find_domain_cause(exc: BaseException) -> ExcelVbaMcpError | None:
     return None
 
 
+def _validation_error_as_domain(exc: BaseException) -> ExcelVbaMcpError | None:
+    """Translate a pydantic ``ValidationError`` in ``exc``'s cause chain.
+
+    The MCP SDK reports an input-schema mismatch as a bare
+    ``ToolError("Error executing tool <name>: ...")`` whose ``__cause__`` is the
+    ``ValidationError``; without this translation the client sees an unstructured
+    error with no ``code`` (audit finding G-9 / F-5). When a ``ValidationError``
+    is present it is wrapped into an :class:`ExcelVbaMcpError` so every tool
+    failure is structured. The closed spec §11 vocabulary has no dedicated
+    argument-validation code, so this reuses ``INVALID_RANGE`` — the same code the
+    tool modules already use for malformed arguments (``_require_bool`` /
+    ``_require_range_text`` / ``_require_shift`` / ``_parse_suite``) — rather than
+    inventing a new one.
+    """
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, ValidationError):
+            return ExcelVbaMcpError(
+                "The tool arguments do not match the input schema.",
+                code=ErrorCode.INVALID_RANGE,
+                context={"reason": "invalid_arguments", "validation": current.errors()},
+            )
+        seen.add(id(current))
+        current = current.__cause__
+    return None
+
+
 class ExcelVbaMcpServer(MCPServer[_Runtime]):
     """MCPServer that surfaces domain errors as structured ``ToolError`` payloads.
 
     The MCP SDK wraps any non-``ToolError`` exception raised by a tool into
     ``UnexpectedToolError("Error executing tool <name>")``, discarding the
-    :class:`ExcelVbaMcpError` ``code`` and ``context``. This subclass catches that
-    wrapper, locates the underlying domain error in the ``__cause__`` chain and
-    re-raises a ``ToolError`` whose message is the JSON of ``to_dict()`` so real
-    MCP clients can observe the stable ``code`` and structured ``context``. Any
-    other exception is re-raised unchanged (the SDK still reports it as an
-    unexpected tool failure).
+    :class:`ExcelVbaMcpError` ``code`` and ``context``. Argument-schema failures
+    (``pydantic.ValidationError``) are likewise turned into a bare
+    ``ToolError("Error executing tool <name>: ...")`` with no ``code``. This
+    subclass catches that wrapper, locates the underlying domain error in the
+    ``__cause__`` chain and re-raises a ``ToolError`` whose message is the JSON of
+    ``to_dict()`` so real MCP clients can observe the stable ``code`` and
+    structured ``context``. When the cause is a pydantic ``ValidationError`` (the
+    caller's arguments do not match the input schema) it is translated into an
+    ``ExcelVbaMcpError`` (code ``INVALID_RANGE``, matching the tool modules'
+    malformed-argument code) so **every** tool failure reaches the client
+    structured (audit finding G-9 / F-5: no unstructured ``UnexpectedToolError``
+    leak). Any other exception is re-raised unchanged (the SDK still reports it as
+    an unexpected tool failure).
     """
 
     async def call_tool(
@@ -1262,7 +1299,13 @@ class ExcelVbaMcpServer(MCPServer[_Runtime]):
         except ToolError as exc:
             cause = _find_domain_cause(exc)
             if cause is None:
-                raise
+                # No domain error in the chain: a pydantic ValidationError (argument
+                # schema mismatch) is the one unanticipated-but-caller-facing failure
+                # the SDK emits without a code; translate it so the client always
+                # receives a structured payload.
+                cause = _validation_error_as_domain(exc)
+                if cause is None:
+                    raise
             raise ToolError(json.dumps(cause.to_dict(), ensure_ascii=False)) from cause
 
 
