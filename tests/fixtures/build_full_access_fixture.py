@@ -6,24 +6,34 @@ builds one macro-enabled workbook through a **hidden, non-activating**
 standard module through VBIDE:
 
 * ``FullAccessWorkflow.xlsm``
-  ``Sheet1`` with a known value in ``E1`` and a workbook-scoped defined name
-  ``SettingsKey`` that refers to ``Sheet1!$E$1``. A standard module ``modWorkflow``
-  carries three public procedures used by the real MCP-protocol e2e test
-  (``tests/integration_excel/test_mcp_full_access_workflow.py``):
 
-  - ``WriteCell``  — sets ``Sheet1!A1 = 42`` (background-safe).
-  - ``WriteCell2`` — sets ``Sheet1!A2 = 7``  (background-safe).
-  - ``ShowMessage``— shows a ``MsgBox`` (interactive; the R13 preflight must
-    veto it, never run it).
+  - ``Sheet1`` carries a real Excel Table (ListObject) ``tblSettings`` over
+    ``A1:B3`` — headers ``SettingKey`` | ``SettingValue`` and two data rows
+    ``factor`` | ``5`` and ``label`` | ``alpha`` — plus ``Sheet1!E1`` with a known
+    value (``configured``) and a workbook-scoped defined name ``SettingsKey`` that
+    refers to ``Sheet1!$E$1``.
+  - ``Result`` is a second worksheet initialised to ``A1 = 0`` and ``A2 = ""``.
 
-  ``WriteCell`` / ``WriteCell2`` deliberately avoid every interactive-UI token in
-  ``security/macro_policy`` / ``MacroService.INTERACTIVE_TOKENS`` (no
-  ``MsgBox`` / ``.Show`` / ``.Run`` / ``DoEvents`` / ``DisplayAlerts`` / …), so
-  they can be legitimately classified ``background_safe``.
+  A standard module ``modWorkflow`` carries two public procedures used by the real
+  MCP-protocol e2e test (``tests/integration_excel/test_mcp_full_access_workflow.py``):
+
+  - ``Recalculate`` — reads the ``factor`` value from ``tblSettings`` and writes an
+    observable result (``Result!A1 = factor * 2`` and ``Result!A2 = "factor=<n>"``).
+    This is the **table-driven** background-safe macro: two consecutive
+    ``table_update_rows`` + ``macro_run`` cycles must produce different
+    ``Result!A1`` values, proving the macro reads the live table state.
+  - ``ShowMessage`` — shows a ``MsgBox`` (interactive; the R13 preflight must veto
+    it, never run it).
+
+  ``Recalculate`` deliberately avoids every interactive-UI token in
+  ``security/macro_policy`` / ``MacroService.INTERACTIVE_TOKENS`` (no ``MsgBox`` /
+  ``.Show`` / ``.Run`` / ``DoEvents`` / ``DisplayAlerts`` / ``Shell`` / …) and
+  never calls ``.Save``, so it is eligible for ``background_safe`` classification
+  and safe to run repeatedly in the background.
 
 The generator is idempotent: it rebuilds the fixture from scratch inside a
-temporary directory, reopens it read-only to verify the sheet, defined name,
-``E1`` value and component inventory, and only then copies it into
+temporary directory, reopens it read-only to verify the table, ``Result`` sheet,
+defined name, ``E1`` value and component inventory, and only then copies it into
 ``tests/fixtures`` — so an interrupted or mismatched run never corrupts an
 existing fixture and never leaves temp files behind.
 
@@ -60,21 +70,44 @@ XLSM_FILE_FORMAT = 52
 #: VBIDE ``VBComponents.Add`` type code for a standard module.
 VB_COMPONENT_STANDARD = 1
 
+#: Excel ``ListObjects.Add`` ``SourceType`` code for a range source.
+XL_SRC_RANGE = 1
+
+#: Excel ``ListObjects.Add`` ``XlListObjectHasHeaders`` code (``xlYes``).
+XL_LIST_OBJECT_HAS_HEADERS = 1
+
+#: The name of the ListObject the ``Recalculate`` macro reads.
+SETTINGS_TABLE_NAME = "tblSettings"
+
+#: The table headers (``SettingKey`` | ``SettingValue``).
+SETTINGS_KEY_HEADER = "SettingKey"
+SETTINGS_VALUE_HEADER = "SettingValue"
+
+#: The initial ``factor`` / ``label`` data rows of ``tblSettings``.
+SETTINGS_TABLE_ROWS: tuple[tuple[str, object], ...] = (("factor", 5), ("label", "alpha"))
+
 #: The known value written to ``Sheet1!E1`` (the target of ``SettingsKey``).
 SETTINGS_KEY_VALUE = "configured"
 
-#: VBA source for ``modWorkflow``. The two writer subs avoid every interactive-UI
-#: token so they are eligible for ``background_safe`` classification; the message
-#: sub intentionally triggers the R13 interactive-UI veto.
+#: Name of the observable output worksheet written by ``Recalculate``.
+RESULT_SHEET_NAME = "Result"
+
+#: VBA source for ``modWorkflow``. ``Recalculate`` reads the live ``factor`` value
+#: from ``tblSettings`` and writes an observable result; it avoids every
+#: interactive-UI token so it is eligible for ``background_safe`` classification.
+#: ``ShowMessage`` intentionally triggers the R13 interactive-UI veto.
 MOD_WORKFLOW_SOURCE = """\
 Option Explicit
 
-Public Sub WriteCell()
-    ThisWorkbook.Worksheets("Sheet1").Range("A1").Value = 42
-End Sub
-
-Public Sub WriteCell2()
-    ThisWorkbook.Worksheets("Sheet1").Range("A2").Value = 7
+Public Sub Recalculate()
+    Dim ws As Worksheet, tbl As ListObject, out As Worksheet
+    Dim factor As Double
+    Set ws = ThisWorkbook.Worksheets("Sheet1")
+    Set tbl = ws.ListObjects("tblSettings")
+    factor = CDbl(tbl.DataBodyRange.Cells(1, 2).Value)
+    Set out = ThisWorkbook.Worksheets("Result")
+    out.Range("A1").Value = factor * 2
+    out.Range("A2").Value = "factor=" & CStr(factor)
 End Sub
 
 Public Sub ShowMessage()
@@ -106,9 +139,27 @@ def _build_workflow_fixture(app: object, target: Path) -> None:
     try:
         _normalize_single_sheet(excel, wb)
         sheet = wb.Worksheets("Sheet1")
-        sheet.Range("E1").Value = SETTINGS_KEY_VALUE
 
-        # Workbook-scoped defined name -> Sheet1!$E$1.
+        # Real Excel Table (ListObject) ``tblSettings`` over A1:B3. Write the
+        # header + data block first, then create the ListObject with a header row.
+        sheet.Range("A1").Value = SETTINGS_KEY_HEADER
+        sheet.Range("B1").Value = SETTINGS_VALUE_HEADER
+        for offset, (key, value) in enumerate(SETTINGS_TABLE_ROWS, start=2):
+            sheet.Range(f"A{offset}").Value = key
+            sheet.Range(f"B{offset}").Value = value
+        table = sheet.ListObjects.Add(
+            XL_SRC_RANGE, sheet.Range("A1:B3"), False, XL_LIST_OBJECT_HAS_HEADERS
+        )
+        table.Name = SETTINGS_TABLE_NAME
+
+        # Observable output sheet written by ``Recalculate``.
+        result_sheet = wb.Worksheets.Add()
+        result_sheet.Name = RESULT_SHEET_NAME
+        result_sheet.Range("A1").Value = 0
+        result_sheet.Range("A2").Value = ""
+
+        # Known value in E1 plus the workbook-scoped defined name -> Sheet1!$E$1.
+        sheet.Range("E1").Value = SETTINGS_KEY_VALUE
         wb.Names.Add("SettingsKey", "=Sheet1!$E$1")
 
         proj = wb.VBProject
@@ -147,6 +198,33 @@ def _verify(app: object, path: Path) -> dict[str, object]:
             if total > 0:
                 module_source = str(code_module.Lines(1, total))
         e1_value = wb.Worksheets("Sheet1").Range("E1").Value
+
+        # Table (ListObject) structure on Sheet1.
+        table_info: dict[str, object] = {}
+        sheet1 = wb.Worksheets("Sheet1")
+        if int(sheet1.ListObjects.Count) > 0:
+            table = sheet1.ListObjects(SETTINGS_TABLE_NAME)
+            headers = [
+                str(table.HeaderRowRange.Cells(1, col).Value2)
+                for col in range(1, int(table.ListColumns.Count) + 1)
+            ]
+            body = table.DataBodyRange
+            table_info = {
+                "name": str(table.Name),
+                "headers": headers,
+                "row_count": int(body.Rows.Count),
+                "first_row": [body.Cells(1, 1).Value, body.Cells(1, 2).Value],
+            }
+
+        # Result sheet initial state.
+        result_a1: object = None
+        result_a2: object = None
+        has_result = RESULT_SHEET_NAME in sheet_names
+        if has_result:
+            result_sheet = wb.Worksheets(RESULT_SHEET_NAME)
+            result_a1 = result_sheet.Range("A1").Value
+            result_a2 = result_sheet.Range("A2").Value
+
         return {
             "path": str(path),
             "protection": int(proj.Protection),
@@ -154,9 +232,12 @@ def _verify(app: object, path: Path) -> dict[str, object]:
             "sheet_names": sheet_names,
             "defined_names": defined_names,
             "e1_value": e1_value,
+            "table": table_info,
+            "has_result_sheet": has_result,
+            "result_a1": result_a1,
+            "result_a2": result_a2,
             "has_modWorkflow": "modWorkflow" in names,
-            "has_write_cell": "WriteCell" in module_source,
-            "has_write_cell2": "WriteCell2" in module_source,
+            "has_recalculate": "Recalculate" in module_source,
             "has_show_message": "ShowMessage" in module_source,
         }
     finally:
@@ -169,18 +250,37 @@ def _verify_ok(info: dict[str, object]) -> list[str]:
     problems: list[str] = []
     if not info.get("has_modWorkflow"):
         problems.append("missing modWorkflow component")
-    if not info.get("has_write_cell"):
-        problems.append("modWorkflow missing WriteCell")
-    if not info.get("has_write_cell2"):
-        problems.append("modWorkflow missing WriteCell2")
+    if not info.get("has_recalculate"):
+        problems.append("modWorkflow missing Recalculate")
     if not info.get("has_show_message"):
         problems.append("modWorkflow missing ShowMessage")
     if "Sheet1" not in (info.get("sheet_names") or []):
         problems.append("missing Sheet1 worksheet")
+    if not info.get("has_result_sheet"):
+        problems.append("missing Result worksheet")
+    if info.get("result_a1") != 0:
+        problems.append(f"Result!A1 initial value {info.get('result_a1')!r} != 0")
     if "SettingsKey" not in (info.get("defined_names") or []):
         problems.append("missing SettingsKey defined name")
     if info.get("e1_value") != SETTINGS_KEY_VALUE:
         problems.append(f"E1 value {info.get('e1_value')!r} != {SETTINGS_KEY_VALUE!r}")
+
+    table = info.get("table") or {}
+    if not table:
+        problems.append("missing tblSettings ListObject")
+    else:
+        expected_headers = [SETTINGS_KEY_HEADER, SETTINGS_VALUE_HEADER]
+        if table.get("headers") != expected_headers:
+            problems.append(f"table headers {table.get('headers')!r} != {expected_headers!r}")
+        if table.get("row_count") != len(SETTINGS_TABLE_ROWS):
+            problems.append(
+                f"table row count {table.get('row_count')!r} != {len(SETTINGS_TABLE_ROWS)}"
+            )
+        first_key, first_value = SETTINGS_TABLE_ROWS[0]
+        if list(table.get("first_row") or []) != [first_key, first_value]:
+            problems.append(
+                f"table first data row {table.get('first_row')!r} != {[first_key, first_value]!r}"
+            )
     return problems
 
 

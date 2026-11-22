@@ -1,44 +1,47 @@
-"""Real MCP-protocol end-to-end workflow over STDIO (task_b7, fix_007).
+"""Real MCP-protocol end-to-end workflow over STDIO (task_b7, fix_007; PO-1..PO-6).
 
 This is the first test that drives the built server **through the actual Model
 Context Protocol boundary**: it launches ``python -m excel_vba_mcp`` as a child
 process, speaks JSON-RPC to it with the official ``mcp`` stdio client
 (``stdio_client`` + ``ClientSession``), and asserts the full default-access user
-workflow end to end against a live Excel instance:
+workflow end to end against a live Excel instance.
 
-open a working copy -> mutate settings -> run a macro -> mutate -> run a macro ->
-save -> snapshot -> close -> restore -> verify persisted cells / macros / names.
+The workflow is **table-driven** and runs **two consecutive
+settings-update / macro-execution cycles on one ``workbook_id``**:
 
-It exercises the production server, services and adapters exactly as a real MCP
-client would; nothing is called in-process. The original fixture is never opened:
-each test copies ``FullAccessWorkflow.xlsm`` into a temp root and points
-``EXCEL_VBA_MCP_ROOTS`` (and work/snapshot/artifact/run/audit) at that root, then
-asserts both the repo fixture and the temp copy stay byte-identical.
+1. ``excel_open`` (default => writable execute session);
+2. ``snapshot_create`` first (PO-3: the pre-mutation snapshot precondition, also
+   required by ``table_update_rows``);
+3. ``macro_classify_background`` vetoes the interactive ``ShowMessage``
+   (``INTERACTIVE_UI_NOT_SUPPORTED``); an unclassified ``Recalculate`` is blocked
+   (``BACKGROUND_SAFETY_NOT_VERIFIED``);
+4. ``macro_classify_background`` classifies ``modWorkflow.Recalculate`` safe ONCE;
+5. **cycle 1** — ``table_update_rows`` sets ``SettingValue = 10`` on ``tblSettings``
+   -> ``macro_run Recalculate`` -> ``Result!A1 == 20``;
+6. **cycle 2** — ``table_update_rows`` sets ``SettingValue = 20`` -> ``macro_run``
+   -> ``Result!A1 == 40`` (and ``!= 20``), proving the macro reads the LIVE table
+   state on the same session. No ``excel_save`` / macro ``.Save`` happens between
+   the classification and cycle 2 (the B7-F3 invariant): the on-disk working copy
+   is untouched, so the hash-bound classification stays valid across both cycles.
+7. ``excel_save`` -> ``excel_close(save_changes=False)``.
 
-Coverage:
+Background safety (PO-5) is verified per owned PID: a read-only Win32 window
+enumeration (``EnumWindows`` + ``GetWindowThreadProcessId``) proves the owned
+Excel instance has **no visible window** at stable points (so it cannot steal
+focus; the server never calls ``SetForegroundWindow`` / ``ShowWindow`` /
+``SendKeys``), and the owned PID is reaped after the server stops while every
+pre-existing user Excel PID stays alive. There is no VM / container / isolated
+session — this runs in the host's interactive Windows session.
 
-* **Default full-access workflow** (access mode unset => ``full``): ``excel_open``
-  defaults to a writable execute session; ``macro_classify_background`` +
-  ``macro_run`` write ``A1``/``A2``; ``range_write_values`` writes cells; the
-  interactive ``ShowMessage`` is vetoed (``INTERACTIVE_UI_NOT_SUPPORTED``); an
-  unclassified macro is blocked (``BACKGROUND_SAFETY_NOT_VERIFIED``).
-* **Persistence (F1 round-trip):** the plan's literal "close(save) then reopen the
-  copy" is impossible (``close_workbook`` always removes the working copy and
-  ``excel_open`` always re-copies the untouched original), so persistence is proved
-  the MCP-native way: ``snapshot_create`` -> ``excel_close(save_changes=True)`` ->
-  ``snapshot_restore`` -> a fresh ``workbook_id`` whose cells / components /
-  macros / names reflect the edits.
-* **Structured denials:** a read-only session rejects a mutation
-  (``WORKBOOK_READ_ONLY``); a restricted-mode server rejects the default execute
-  open (``APPROVAL_DENIED`` — restricted exposes no grant tool, so ``excel_open``
-  is the reachable ``APPROVAL_DENIED`` surface).
-* **Tool catalog:** ``list_tools`` advertises the full catalog (>= 87 tools,
-  including ``macro_classify_background``).
+The original fixture is never opened: each test copies ``FullAccessWorkflow.xlsm``
+into a temp root and points ``EXCEL_VBA_MCP_ROOTS`` (and work / snapshot /
+artifact / run / audit) at that root, then asserts both the repo fixture and the
+temp copy stay byte-identical (PO-6).
 
 A **fresh server subprocess** is started per test (never a reused worker), which
-avoids the stale-worker / dead-owned-Excel condition (R-17): every test gets a new
-owned Excel instance. The server is always torn down through the ``stdio_client``
-context manager (stdin close -> bounded wait -> job-object kill).
+avoids the stale-worker / dead-owned-Excel condition (R-17). ``USERPROFILE`` /
+``HOMEDRIVE`` / ``HOMEPATH`` / ``LOCALAPPDATA`` / ``APPDATA`` are intentionally
+NOT overridden (VBOM trust is per profile).
 
 Run serially (no xdist), against a host with Excel + VBOM trust::
 
@@ -48,6 +51,7 @@ Run serially (no xdist), against a host with Excel + VBOM trust::
 from __future__ import annotations
 
 import asyncio
+import csv
 import hashlib
 import json
 import subprocess
@@ -62,9 +66,13 @@ import pytest
 
 pytest.importorskip("win32com", reason="pywin32 required for the live Excel e2e test")
 pytest.importorskip("pythoncom", reason="pywin32 required for the live Excel e2e test")
+pytest.importorskip("win32gui", reason="pywin32 required for the window-enumeration probe")
+pytest.importorskip("win32process", reason="pywin32 required for the window-enumeration probe")
 
-from mcp import ClientSession, StdioServerParameters, stdio_client
-from mcp.types import CallToolResult
+import win32gui  # noqa: E402
+import win32process  # noqa: E402
+from mcp import ClientSession, StdioServerParameters, stdio_client  # noqa: E402
+from mcp.types import CallToolResult  # noqa: E402
 
 _PYWIN32 = sys.platform == "win32"
 
@@ -85,6 +93,10 @@ _CALL_TIMEOUT_S = 180.0
 # Bounded poll for the owned Excel PID to come up after server start.
 _HEALTH_POLL_TIMEOUT_S = 30.0
 _HEALTH_POLL_INTERVAL_S = 0.5
+
+# Bounded poll for the owned Excel PID to be reaped after server shutdown.
+_REAP_POLL_TIMEOUT_S = 30.0
+_REAP_POLL_INTERVAL_S = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +120,31 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _excel_pids() -> set[int]:
+    """Return the PIDs of every running ``EXCEL.EXE`` (read-only ``tasklist``)."""
+
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq EXCEL.EXE", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception:  # noqa: BLE001 - defensive: a probe failure means "unknown"
+        return set()
+    pids: set[int] = set()
+    for row in csv.reader(out.stdout.splitlines()):
+        if len(row) >= 2 and row[0].strip().upper() == "EXCEL.EXE":
+            try:
+                pids.add(int(row[1]))
+            except ValueError:
+                continue
+    return pids
+
+
 def _pid_alive(pid: int) -> bool:
+    """Return whether ``pid`` is currently alive (generic ``tasklist`` probe)."""
+
     try:
         out = subprocess.run(
             ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
@@ -121,6 +157,54 @@ def _pid_alive(pid: int) -> bool:
     return str(pid) in out.stdout
 
 
+def _wait_pid_dead(pid: int, *, timeout_s: float = _REAP_POLL_TIMEOUT_S) -> bool:
+    """Poll until ``pid`` is gone (bounded); return whether it was reaped."""
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if pid not in _excel_pids():
+            return True
+        time.sleep(_REAP_POLL_INTERVAL_S)
+    return pid not in _excel_pids()
+
+
+def _visible_windows_for_pid(pid: int) -> list[int]:
+    """Return the visible top-level window handles owned by ``pid`` (READ-ONLY).
+
+    Enumerates top-level windows with ``EnumWindows`` and filters by process id +
+    visibility. It never activates, focuses, moves, shows or dismisses anything:
+    an owned Excel that stays ``Visible = False`` must report no visible window
+    (so it cannot steal focus).
+    """
+
+    handles: list[int] = []
+
+    def _callback(hwnd: int, _ctx: Any) -> bool:
+        try:
+            _, wpid = win32process.GetWindowThreadProcessId(hwnd)
+        except Exception:  # noqa: BLE001 - defensive per-window probe
+            return True
+        if wpid == pid and win32gui.IsWindowVisible(hwnd):
+            handles.append(hwnd)
+        return True
+
+    win32gui.EnumWindows(_callback, None)
+    return handles
+
+
+def _assert_owned_hidden(pid: int, context: str) -> None:
+    """Assert the owned Excel PID has no visible window (no focus-steal surface)."""
+
+    windows = _visible_windows_for_pid(pid)
+    assert windows == [], (
+        f"owned Excel PID {pid} has visible window(s) {windows} after {context}; "
+        "a visible owned window could steal focus (BG03/BG04/BG05)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Server harness
+# ---------------------------------------------------------------------------
 def server_env(base: Path, *, access_mode: str | None) -> dict[str, str]:
     """Environment for a fresh MCP server subprocess.
 
@@ -239,6 +323,46 @@ def _write_payload(value: Any) -> dict[str, Any]:
     return {"rows": 1, "cols": 1, "values": [[{"kind": kind, "value": value}]]}
 
 
+async def _read_result_a1(session: ClientSession, workbook_id: str) -> Any:
+    """Read ``Result!A1`` (the observable output of ``Recalculate``)."""
+
+    return _single_cell(
+        await _call(
+            session,
+            "range_read_values",
+            {"workbook_id": workbook_id, "sheet": "Result", "address": "A1"},
+        )
+    )
+
+
+async def _update_factor(session: ClientSession, workbook_id: str, value: int) -> None:
+    """Set ``tblSettings`` row 1 ``SettingValue`` to ``value`` via ``table_update_rows``."""
+
+    structured(
+        await _call(
+            session,
+            "table_update_rows",
+            {
+                "workbook_id": workbook_id,
+                "name": "tblSettings",
+                "updates": [{"index": 1, "values": {"SettingValue": value}}],
+            },
+        )
+    )
+
+
+async def _run_recalculate(session: ClientSession, workbook_id: str) -> dict[str, Any]:
+    """Run ``modWorkflow.Recalculate`` and return its ``MacroRunResult`` payload."""
+
+    return macro_result(
+        await _call(
+            session,
+            "macro_run",
+            {"workbook_id": workbook_id, "macro_name": "modWorkflow.Recalculate"},
+        )
+    )
+
+
 async def _wait_healthy(
     session: ClientSession, *, timeout_s: float = _HEALTH_POLL_TIMEOUT_S
 ) -> dict[str, Any]:
@@ -283,13 +407,15 @@ def _copy_fixture(base: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Happy path: full default-access workflow end to end
+# Happy path: two-cycle table-driven workflow end to end (PO-1..PO-6)
 # ---------------------------------------------------------------------------
 @requires_excel
 async def test_full_access_workflow_e2e(tmp_path: Path) -> None:
-    """Drive the full default-access workflow through the real MCP boundary."""
+    """Drive the two-cycle, table-driven full-access workflow via the MCP boundary."""
 
     repo_hash_before = _sha256(_fixture_or_skip(_WORKFLOW_FIXTURE))
+    # PID baseline BEFORE the server starts: every pre-existing user Excel PID.
+    baseline_pids = _excel_pids()
     work_copy = _copy_fixture(tmp_path)
     temp_hash_before = _sha256(work_copy)
 
@@ -301,7 +427,11 @@ async def test_full_access_workflow_e2e(tmp_path: Path) -> None:
         assert "macro_classify_background" in tool_names
 
         # --- Fresh worker: healthy, running, live owned PID. ---
-        _assert_healthy_and_live(await _wait_healthy(session))
+        owned_pid = _assert_healthy_and_live(await _wait_healthy(session))
+        assert owned_pid not in baseline_pids, (
+            f"owned PID {owned_pid} collided with a pre-existing user Excel PID"
+        )
+        _assert_owned_hidden(owned_pid, "server start")
 
         # --- Open default (no mode/read_only args): writable execute session. ---
         opened = structured(await _call(session, "excel_open", {"path": str(work_copy)}))
@@ -313,134 +443,128 @@ async def test_full_access_workflow_e2e(tmp_path: Path) -> None:
         status = structured(await _call(session, "excel_get_status", {"workbook_id": workbook_id}))
         assert status["mode"] == "execute", f"session mode: {status}"
         assert status["read_only"] is False, f"session read_only: {status}"
+        _assert_owned_hidden(owned_pid, "excel_open")
 
-        # --- VBA is readable through the protocol. ---
-        components = _as_list(
-            await _call(session, "vba_list_components", {"workbook_id": workbook_id})
-        )
-        component_names = {c["component_name"] for c in components}
-        assert "modWorkflow" in component_names, f"modWorkflow missing: {component_names}"
+        # --- PO-3: snapshot FIRST, before any content-modifying operation. ---
+        # table_update_rows requires a snapshot; macro_run does not (CT-B7-macronapshot-
+        # precondition is a SEPARATE task), so the e2e snapshots up front regardless.
+        snap = structured(await _call(session, "snapshot_create", {"workbook_id": workbook_id}))
+        assert snap.get("snapshot_id"), f"snapshot_create returned no id: {snap}"
 
-        source = structured(
-            await _call(
-                session,
-                "vba_read_component",
-                {"workbook_id": workbook_id, "component": "modWorkflow"},
-            )
-        )
-        assert "WriteCell" in source["source"], "modWorkflow source missing WriteCell"
-        assert "ShowMessage" in source["source"], "modWorkflow source missing ShowMessage"
-
-        # --- Interactive procedure cannot be classified background_safe (R13 veto). ---
+        # --- The interactive procedure cannot be classified background_safe (R13 veto). ---
         vetoed = await _call(
             session,
             "macro_classify_background",
-            {"workbook_id": workbook_id, "procedure": "ShowMessage", "background_safe": True},
+            {
+                "workbook_id": workbook_id,
+                "procedure": "modWorkflow.ShowMessage",
+                "background_safe": True,
+            },
         )
         assert error_code(vetoed) == "INTERACTIVE_UI_NOT_SUPPORTED"
 
-        # --- Unclassified macro is blocked, never run (BG06 deny-by-default). ---
-        unclassified = macro_result(
-            await _call(
-                session,
-                "macro_run",
-                {"workbook_id": workbook_id, "macro_name": "WriteCell"},
-            )
-        )
+        # --- An unclassified macro is blocked, never run (BG06 deny-by-default). ---
+        unclassified = await _run_recalculate(session, workbook_id)
         assert unclassified["status"] == "blocked", f"unclassified macro must block: {unclassified}"
         assert unclassified["error_code"] == "BACKGROUND_SAFETY_NOT_VERIFIED", unclassified
+        _assert_owned_hidden(owned_pid, "unclassified macro_run")
 
-        # --- Classify WriteCell, then run it -> A1 == 42. ---
+        # --- Classify Recalculate ONCE; the hash-bound classification then covers
+        #     both cycles (no save between here and cycle 2 -> the on-disk hash is
+        #     unchanged -> the classification stays valid: B7-F3 invariant). ---
         classified = structured(
             await _call(
                 session,
                 "macro_classify_background",
-                {"workbook_id": workbook_id, "procedure": "WriteCell", "background_safe": True},
+                {
+                    "workbook_id": workbook_id,
+                    "procedure": "modWorkflow.Recalculate",
+                    "background_safe": True,
+                },
             )
         )
         assert classified["background_safe"] is True, classified
-        run1 = macro_result(
-            await _call(
-                session,
-                "macro_run",
-                {"workbook_id": workbook_id, "macro_name": "WriteCell"},
-            )
-        )
-        assert run1["status"] == "success", f"WriteCell did not succeed: {run1}"
-        assert _single_cell(
-            await _call(
-                session,
-                "range_read_values",
-                {"workbook_id": workbook_id, "sheet": "Sheet1", "address": "A1"},
-            )
-        ) == 42
 
-        # --- Tool write B1 (guarded mutation: needs a snapshot first). ---
-        structured(await _call(session, "snapshot_create", {"workbook_id": workbook_id}))
-        write1 = structured(
-            await _call(
-                session,
-                "range_write_values",
-                {
-                    "workbook_id": workbook_id,
-                    "sheet": "Sheet1",
-                    "address": "B1",
-                    "payload": _write_payload("tool-write"),
-                },
-            )
-        )
-        assert write1["verified"] is True, f"range_write_values not verified: {write1}"
-        assert _single_cell(
-            await _call(
-                session,
-                "range_read_values",
-                {"workbook_id": workbook_id, "sheet": "Sheet1", "address": "B1"},
-            )
-        ) == "tool-write"
+        # --- CYCLE 1: SettingValue 5 -> 10; Recalculate -> Result!A1 == 20. ---
+        await _update_factor(session, workbook_id, 10)
+        run1 = await _run_recalculate(session, workbook_id)
+        assert run1["status"] == "success", f"cycle 1 Recalculate did not succeed: {run1}"
+        cycle1_output = await _read_result_a1(session, workbook_id)
+        assert cycle1_output == 20, f"cycle 1 expected Result!A1 == 20, got {cycle1_output!r}"
+        _assert_owned_hidden(owned_pid, "cycle 1 macro_run")
 
-        # --- Classify + run WriteCell2 -> A2 == 7. ---
-        classified2 = structured(
+        # --- CYCLE 2: SettingValue 10 -> 20; Recalculate -> Result!A1 == 40 (!= 20).
+        #     NO excel_save / macro .Save between the classification and here. ---
+        await _update_factor(session, workbook_id, 20)
+        run2 = await _run_recalculate(session, workbook_id)
+        assert run2["status"] == "success", f"cycle 2 Recalculate did not succeed: {run2}"
+        cycle2_output = await _read_result_a1(session, workbook_id)
+        assert cycle2_output == 40, f"cycle 2 expected Result!A1 == 40, got {cycle2_output!r}"
+        assert cycle2_output != cycle1_output, (
+            "cycle 2 output must differ from cycle 1 (proves the macro read the LIVE "
+            f"table state, not a cached value): {cycle1_output!r} vs {cycle2_output!r}"
+        )
+        _assert_owned_hidden(owned_pid, "cycle 2 macro_run")
+
+        # --- Save then close WITHOUT saving again (close must not re-persist). ---
+        saved = structured(await _call(session, "excel_save", {"workbook_id": workbook_id}))
+        assert saved["workbook_id"] == workbook_id
+        await _call(session, "excel_close", {"workbook_id": workbook_id, "save_changes": False})
+
+    # --- Server stopped: owned PID reaped, no user Excel PID touched (PO-5). ---
+    assert _wait_pid_dead(owned_pid), f"owned PID {owned_pid} was not reaped after shutdown"
+    assert owned_pid not in _excel_pids(), f"owned PID {owned_pid} still present after shutdown"
+    surviving_user_pids = baseline_pids - _excel_pids()
+    assert not surviving_user_pids, (
+        f"pre-existing user Excel PID(s) {sorted(surviving_user_pids)} were terminated by the test"
+    )
+
+    # --- Originals never modified: repo fixture and temp copy byte-identical (PO-6). ---
+    assert _sha256(_WORKFLOW_FIXTURE) == repo_hash_before, "committed fixture must never change"
+    assert _sha256(work_copy) == temp_hash_before, "temp copy must never change"
+
+
+# ---------------------------------------------------------------------------
+# F1 persistence (recommended): snapshot -> close(save) -> restore -> verify
+# ---------------------------------------------------------------------------
+@requires_excel
+async def test_persistence_roundtrip(tmp_path: Path) -> None:
+    """Prove edits persist the MCP-native way: snapshot -> close(save) -> restore.
+
+    The plan's literal "close(save) then reopen the copy" is impossible
+    (``close_workbook`` always removes the working copy and ``excel_open`` always
+    re-copies the untouched original), so persistence is proved through
+    ``snapshot_create`` -> ``excel_close(save_changes=True)`` -> ``snapshot_restore``
+    -> a fresh ``workbook_id`` whose ``Result!A1`` and table value reflect the edit.
+    """
+
+    work_copy = _copy_fixture(tmp_path)
+
+    async with _running_server(tmp_path) as session:
+        await _wait_healthy(session)
+
+        opened = structured(await _call(session, "excel_open", {"path": str(work_copy)}))
+        workbook_id = opened["workbook_id"]
+
+        await _call(session, "snapshot_create", {"workbook_id": workbook_id})
+        classified = structured(
             await _call(
                 session,
                 "macro_classify_background",
-                {"workbook_id": workbook_id, "procedure": "WriteCell2", "background_safe": True},
-            )
-        )
-        assert classified2["background_safe"] is True, classified2
-        run2 = macro_result(
-            await _call(
-                session,
-                "macro_run",
-                {"workbook_id": workbook_id, "macro_name": "WriteCell2"},
-            )
-        )
-        assert run2["status"] == "success", f"WriteCell2 did not succeed: {run2}"
-        assert _single_cell(
-            await _call(
-                session,
-                "range_read_values",
-                {"workbook_id": workbook_id, "sheet": "Sheet1", "address": "A2"},
-            )
-        ) == 7
-
-        # --- Another guarded tool write (C1) then explicit save. ---
-        write2 = structured(
-            await _call(
-                session,
-                "range_write_values",
                 {
                     "workbook_id": workbook_id,
-                    "sheet": "Sheet1",
-                    "address": "C1",
-                    "payload": _write_payload("c-value"),
+                    "procedure": "modWorkflow.Recalculate",
+                    "background_safe": True,
                 },
             )
         )
-        assert write2["verified"] is True, f"C1 write not verified: {write2}"
-        saved = structured(await _call(session, "excel_save", {"workbook_id": workbook_id}))
-        assert saved["workbook_id"] == workbook_id
+        assert classified["background_safe"] is True, classified
 
-        # --- Persistence via the F1 round-trip: snapshot -> close -> restore. ---
+        await _update_factor(session, workbook_id, 20)
+        run = await _run_recalculate(session, workbook_id)
+        assert run["status"] == "success", f"Recalculate did not succeed: {run}"
+        assert await _read_result_a1(session, workbook_id) == 40
+
         edited_snapshot = structured(
             await _call(session, "snapshot_create", {"workbook_id": workbook_id})
         )
@@ -453,48 +577,29 @@ async def test_full_access_workflow_e2e(tmp_path: Path) -> None:
         workbook_id2 = restored["workbook_id"]
         assert workbook_id2 and workbook_id2 != workbook_id, f"expected a fresh id: {restored}"
 
-        # Cells persisted.
+        # Observable macro output persisted.
+        assert await _read_result_a1(session, workbook_id2) == 40
+        # Table cell persisted (SettingValue == 20 lives in Sheet1!B2).
         assert _single_cell(
             await _call(
                 session,
                 "range_read_values",
-                {"workbook_id": workbook_id2, "sheet": "Sheet1", "address": "A1"},
+                {"workbook_id": workbook_id2, "sheet": "Sheet1", "address": "B2"},
             )
-        ) == 42
-        assert _single_cell(
-            await _call(
-                session,
-                "range_read_values",
-                {"workbook_id": workbook_id2, "sheet": "Sheet1", "address": "B1"},
-            )
-        ) == "tool-write"
-        assert _single_cell(
-            await _call(
-                session,
-                "range_read_values",
-                {"workbook_id": workbook_id2, "sheet": "Sheet1", "address": "A2"},
-            )
-        ) == 7
-
+        ) == 20
         # Macros / components / names persisted.
         components2 = _as_list(
             await _call(session, "vba_list_components", {"workbook_id": workbook_id2})
         )
         assert "modWorkflow" in {c["component_name"] for c in components2}
-
         macros = _as_list(await _call(session, "macro_list", {"workbook_id": workbook_id2}))
         macro_names = {m["name"] for m in macros}
-        assert "modWorkflow.WriteCell" in macro_names, f"WriteCell missing: {macro_names}"
-        assert "modWorkflow.WriteCell2" in macro_names, f"WriteCell2 missing: {macro_names}"
-
+        assert "modWorkflow.Recalculate" in macro_names, f"Recalculate missing: {macro_names}"
+        assert "modWorkflow.ShowMessage" in macro_names, f"ShowMessage missing: {macro_names}"
         names = _as_list(await _call(session, "names_list", {"workbook_id": workbook_id2}))
         assert "SettingsKey" in {n["name"] for n in names}, f"SettingsKey missing: {names}"
 
         await _call(session, "excel_close", {"workbook_id": workbook_id2, "save_changes": False})
-
-    # --- Originals never modified: repo fixture and temp copy byte-identical. ---
-    assert _sha256(_WORKFLOW_FIXTURE) == repo_hash_before, "committed fixture must never change"
-    assert _sha256(work_copy) == temp_hash_before, "temp copy must never change"
 
 
 # ---------------------------------------------------------------------------
