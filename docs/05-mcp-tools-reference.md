@@ -587,9 +587,11 @@ owned PID yields `MACRO_RUNTIME_ERROR` and `dismissed=false`; without a modal wi
 
 **Residual false-safe boundary.** The R13 token scan is a heuristic veto, not static proof.
 Dynamic/indirect UI (`CallByName` / `ExecuteGlobal` / `Eval` indirection) and UI reached
-transitively through other procedures the scan does not see are not fully covered; tokens such as
-`AppActivate` or `Application.Visible = True` are not in the veto list. A `background_safe`
-classification is a human review outcome, and the deterministic layer can only veto, never certify.
+transitively through other procedures the scan does not see are not fully covered. The veto list
+now also covers window/focus and visibility tokens (`AppActivate`, `Application.Visible`,
+`.Activate`, `WindowState`), but a procedure that reaches the UI only indirectly can still evade a
+substring scan. A `background_safe` classification is a human review outcome, and the deterministic
+layer can only veto, never certify.
 
 ### macro_classify_background
 
