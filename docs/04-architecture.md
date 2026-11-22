@@ -423,9 +423,10 @@ Threat model, trust boundaries and the full set of protections are in
   procedure returns `BACKGROUND_SAFETY_NOT_VERIFIED`; a procedure classified unsafe, or one whose
   source hits an interactive token, returns `INTERACTIVE_UI_NOT_SUPPORTED`). In the default `full`
   access mode no per-run approval grant is needed. The R13 token scan is a heuristic veto, never a
-  certificate: dynamic `CallByName`/`ExecuteGlobal`/`Eval` indirection, transitive UI, and tokens
-  such as `AppActivate` or `Application.Visible = True` are **not** fully covered (residual
-  false-safe boundary).
+  certificate: dynamic `CallByName`/`ExecuteGlobal`/`Eval` indirection and transitive UI are **not**
+  fully covered (residual false-safe boundary). The veto list does include window/focus and
+  visibility tokens (`AppActivate`, `Application.Visible`, `.Activate`, `WindowState`), so a direct
+  use of those is caught — but UI reached only indirectly can still evade a substring scan.
 - **Declarative tests are not a sandbox.** A snapshot restores the file, not external effects;
   the action and assertion vocabularies are closed, so arbitrary code cannot be expressed.
 

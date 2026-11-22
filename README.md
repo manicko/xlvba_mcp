@@ -52,6 +52,7 @@ Runtime dependencies from `pyproject.toml` (locked versions in parentheses):
 | `mcp` | `>=1.0.0` | 2.3.0 | MCP server, STDIO transport, tool/resource registration |
 | `pydantic` | `>=2.0.0` | 2.14.4 | Typed configuration and DTOs |
 | `pywin32` | `>=306` | 312 | Excel COM automation |
+| `comtypes` | `>=1.2.0` | 1.5.0 | UI Automation (read-only VBE compile diagnostics) |
 
 > [!NOTE]
 > The code uses the MCP SDK v2 `MCPServer` API (`mcp.server.mcpserver`), which is why the lock resolves `mcp` to 2.3.0 despite the lower bound in `pyproject.toml`.
@@ -336,7 +337,7 @@ uv run python tests/fixtures/build_phase2_fixtures.py
 
 - **Compile is fail-closed.** On the validated build (Excel 16.0.14332), `vba_compile` returns `status: "indeterminate"` with `reason: "NON_ACTIVATING_COMPILE_UNAVAILABLE"`; it never reports a false success. Partial diagnostics (broken references, protection, inventory, VBOM status) are still returned.
 - **Access mode defaults to full.** In the default `full` mode mutations and macro execution are authorized without per-action grants; set `EXCEL_VBA_MCP_ACCESS_MODE=restricted` for deny-by-default (`APPROVAL_DENIED`). See [Approval and access model](#approval-and-access-model).
-- **Macros require background-safety classification.** `macro_run` runs only a procedure classified `background_safe` for the current workbook hash and VBA source revision (via `macro_classify_background`); an unclassified procedure returns `BACKGROUND_SAFETY_NOT_VERIFIED`. Interactive macros are blocked by the preflight (`INTERACTIVE_UI_NOT_SUPPORTED`). The preflight token scan is a heuristic veto, not static proof: dynamic `CallByName`/`ExecuteGlobal`/`Eval` indirection, transitive UI, and tokens such as `AppActivate` or `Application.Visible = True` are not fully covered.
+- **Macros require background-safety classification.** `macro_run` runs only a procedure classified `background_safe` for the current workbook hash and VBA source revision (via `macro_classify_background`); an unclassified procedure returns `BACKGROUND_SAFETY_NOT_VERIFIED`. Interactive macros are blocked by the preflight (`INTERACTIVE_UI_NOT_SUPPORTED`). The preflight token scan is a heuristic veto, not static proof: dynamic `CallByName`/`ExecuteGlobal`/`Eval` indirection and transitive UI are not fully covered (the veto list does include `AppActivate`, `Application.Visible`, `.Activate`, `WindowState`, so direct use is caught).
 - **Macro runtime errors can show a modal.** The server terminates only its owned Excel PID and reports `MACRO_RUNTIME_ERROR` (`dismissed=false`); it never dismisses dialogs.
 - **ActiveX event mapping is inferred** from `<sheet_code_name>_<control>_<Event>` naming; it is not click-tested.
 - **PivotTables:** management of existing PivotTables only; creating or deleting PivotTables or PivotCaches is out of scope. External/OLAP/Data-Model sources are rejected. `PivotFilters.Add` is unsupported on the validated build; filters are limited to manual visible-items filters and clear-all.

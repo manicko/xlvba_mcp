@@ -460,8 +460,9 @@ each edit returns a verified postcondition.
 - If the VBA source changes between classification and run, the classification is invalidated and
   the macro is `blocked` with `BACKGROUND_SAFETY_NOT_VERIFIED`; re-classify after re-reading.
 - The R13 token scan is a heuristic veto, not static proof: dynamic `CallByName`/`ExecuteGlobal`/
-  `Eval` indirection and transitive UI are not fully covered; `AppActivate` and
-  `Application.Visible = True` are not in the veto list.
+  `Eval` indirection and transitive UI are not fully covered. The veto list does include
+  `AppActivate`, `Application.Visible`, `.Activate` and `WindowState`, so direct use is caught;
+  UI reached only indirectly can still evade the substring scan.
 - External macro side effects are never rolled back by a snapshot.
 
 ## Workflow 8: Declarative test suite
