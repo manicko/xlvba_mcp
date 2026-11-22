@@ -114,7 +114,10 @@ ERROR_INTERACTIVE_UI_NOT_SUPPORTED = ErrorCode.INTERACTIVE_UI_NOT_SUPPORTED.valu
 # (addendum §2.4 / BG06 / R13). This is a heuristic risk filter, not static proof.
 # Matching is case-insensitive (``_find_interactive_tokens``). The list keeps the
 # original seven tokens and adds dynamic/indirect-UI and automation tokens so the
-# deterministic R13 veto under-approximates UI risk less (R-15).
+# deterministic R13 veto under-approximates UI risk less (R-15). It also adds
+# window/focus and visibility tokens (``AppActivate`` / ``Application.Visible`` /
+# ``.Activate`` / ``WindowState``) that a bare ``MsgBox``/``.Show`` scan misses; the
+# scan stays a veto, not a certificate of non-interactivity.
 INTERACTIVE_TOKENS: tuple[str, ...] = (
     "MsgBox",
     "InputBox",
@@ -135,6 +138,10 @@ INTERACTIVE_TOKENS: tuple[str, ...] = (
     "DisplayAlerts",
     ".Run",
     "CommandBars",
+    "AppActivate",
+    "Application.Visible",
+    ".Activate",
+    "WindowState",
 )
 
 # Distinct per-component source-hash sentinel for a module whose code could not be

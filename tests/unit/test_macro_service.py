@@ -848,6 +848,42 @@ def test_find_interactive_tokens_covers_expanded_set() -> None:
         assert token in _find_interactive_tokens(f"Before\n    {token} something\nAfter")
 
 
+def test_find_interactive_tokens_covers_window_visibility_set() -> None:
+    # Focus / visibility tokens (FE-04, D-3) that a MsgBox/.Show-only scan misses.
+    assert "AppActivate" in _find_interactive_tokens("AppActivate \"Book1\"")
+    assert "Application.Visible" in _find_interactive_tokens("Application.Visible = True")
+    assert ".Activate" in _find_interactive_tokens("Sheet1.Activate")
+    assert "WindowState" in _find_interactive_tokens("ActiveWindow.WindowState = xlMaximized")
+
+
+def test_find_interactive_tokens_new_tokens_case_insensitive() -> None:
+    # VBA is case-insensitive: a lowercased focus/visibility token is still caught.
+    assert "AppActivate" in _find_interactive_tokens('x = appactivate "w"')
+    assert "Application.Visible" in _find_interactive_tokens("application.visible = true")
+    assert ".Activate" in _find_interactive_tokens("sheet1.activate")
+    assert "WindowState" in _find_interactive_tokens("activewindow.windowstate = xlminimized")
+
+
+def test_find_interactive_tokens_clean_deterministic_macro_not_flagged() -> None:
+    # The Recalculate-style body (reads a table cell, writes a result) must not be
+    # flagged by any token, including the four new focus/visibility tokens.
+    source = (
+        "Option Explicit\n"
+        "\n"
+        "Public Sub Recalculate()\n"
+        "    Dim ws As Worksheet, tbl As ListObject, out As Worksheet\n"
+        "    Dim factor As Double\n"
+        '    Set ws = ThisWorkbook.Worksheets("Sheet1")\n'
+        '    Set tbl = ws.ListObjects("tblSettings")\n'
+        "    factor = CDbl(tbl.DataBodyRange.Cells(1, 2).Value)\n"
+        '    Set out = ThisWorkbook.Worksheets("Result")\n'
+        '    out.Range("A1").Value = factor * 2\n'
+        '    out.Range("A2").Value = "factor=" & CStr(factor)\n'
+        "End Sub\n"
+    )
+    assert _find_interactive_tokens(source) == []
+
+
 # ---------------------------------------------------------------------------
 # project_source_hash: empty vs unreadable sentinel + determinism
 # ---------------------------------------------------------------------------
