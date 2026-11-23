@@ -26,14 +26,20 @@ logging and audit.
 There is no configuration file. All settings are defined **exclusively through environment
 variables**, which are read when the server starts. The configuration model is typed with Pydantic
 (`src/excel_vba_mcp/config.py`) and is now wired into the server: `config.load_config()` is called
-in `server.lifespan` at startup, so `EXCEL_VBA_MCP_ACCESS_MODE` and `EXCEL_VBA_MCP_LOG_LEVEL` are
-validated together and an invalid value for either fails startup with a `ValidationError`.
+in `server.lifespan` at startup, so `EXCEL_VBA_MCP_ACCESS_MODE`, `EXCEL_VBA_MCP_LOG_LEVEL` and
+`EXCEL_VBA_MCP_MACRO_TIMEOUT_S` are validated together and an invalid value for any of them fails
+startup with a `ValidationError`.
+
+The remaining variables (`EXCEL_VBA_MCP_ROOTS` and the runtime-directory variables) are read
+separately by `server._configured_roots()` / `server._resolve_runtime_path()`, not by
+`config.load_config()`; they are still read only at startup.
 
 ## Environment Variables
 
 | Variable | Purpose | Default | Allowed Values | Effect |
 |----------|---------|---------|----------------|--------|
 | `EXCEL_VBA_MCP_ACCESS_MODE` | Server access policy (approval behavior) | `full` | `full`, `restricted` | `full` authorizes `MUTATING`/`EXECUTING` operations without a per-action grant; `restricted` keeps deny-by-default approval. Any other value fails startup fast (Pydantic `ValidationError`). |
+| `EXCEL_VBA_MCP_MACRO_TIMEOUT_S` | Macro dispatch deadline (seconds) | `90` | Positive number | Soft per-call ceiling for the `Application.Run` dispatch inside `macro_run` (F2b). Exceeding it classifies the run `MACRO_TIMEOUT` (or `MACRO_RUNTIME_ERROR` when the owned PID shows a modal), terminates only the owned Excel PID and recovers the session in-process. A non-positive value fails startup fast (Pydantic `ValidationError`). |
 | `EXCEL_VBA_MCP_ROOTS` | Allowlist of root directories for workbook paths | CWD + system temp | A path string separated by `os.pathsep` (on Windows `;`) | Paths outside the roots are rejected with `PATH_NOT_ALLOWED`. Empty/missing value → default. |
 | `EXCEL_VBA_MCP_WORK_DIR` | Working-copy directory | `<temp>/excel_vba_mcp/work` | Absolute path | Where working copies of opened workbooks are created. |
 | `EXCEL_VBA_MCP_SNAPSHOT_DIR` | Snapshot store | `<temp>/excel_vba_mcp/snapshots` | Absolute path | Snapshot directory with manifest and SHA-256. |
@@ -134,8 +140,9 @@ They are given as reference, not as settings:
 
 - **Worker soft timeouts.** For most operations `_DEFAULT_TIMEOUT_S = 60.0` seconds
   (session, snapshot, sheets, tables, ranges, names, shapes, controls, pivots, vba_project,
-  compile). For `macro_service` `_DEFAULT_TIMEOUT_S = 120.0`; in `test_runner`,
-  `_CALL_TIMEOUT_S = 60.0` and `_MACRO_TIMEOUT_S = 120.0` are used.
+  compile). In `macro_service` the dispatch deadline is `macro_timeout_s`, default `90.0`
+  seconds and configurable via `EXCEL_VBA_MCP_MACRO_TIMEOUT_S` (F2b); in
+  `test_runner`, `_CALL_TIMEOUT_S = 60.0` and `_MACRO_TIMEOUT_S = 120.0` are used.
 - **`orphan_timeout_s`.** The timeout for an "orphaned" worker/thread is set when
   `ExcelComWorker` is constructed (default `10.0` seconds) and is not surfaced in configuration.
 - **Path policy `allow_unc`.** Always `False`.

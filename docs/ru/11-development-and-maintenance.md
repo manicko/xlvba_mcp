@@ -62,7 +62,7 @@ related:
 | Модуль | Ответственность |
 |--------|-----------------|
 | `server.py` | Собирает `MCPServer`, владеет рантаймом через `lifespan`, регистрирует 88 инструментов и 4 ресурса, повторно поднимает структурированные `ToolError`, настраивает логирование в `stderr` |
-| `config.py` | Загружает `EXCEL_VBA_MCP_LOG_LEVEL` и `EXCEL_VBA_MCP_ACCESS_MODE` в Pydantic `Config`; валидирует их совместно |
+| `config.py` | Загружает `EXCEL_VBA_MCP_LOG_LEVEL`, `EXCEL_VBA_MCP_ACCESS_MODE` и `EXCEL_VBA_MCP_MACRO_TIMEOUT_S` в Pydantic `Config`; валидирует их совместно |
 | `api/*_tools.py` | Один модуль на группу инструментов; каждый обработчик тонкий: валидирует аргументы, делегирует сервису, возвращает DTO |
 | `application/session_service.py` | Открытие/закрытие/сохранение рабочих копий, блокировка на путь, статус сессии, восстановление |
 | `application/snapshot_service.py` | Иммутабельные снапшоты и восстановление |

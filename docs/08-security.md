@@ -306,12 +306,12 @@ These are **not enforced** by the application; they are operator choices:
 | Path escape | A path outside the allowlist (traversal, symlink, UNC, device) | Read/write outside intended roots | `PathPolicy.validate_path`, canonicalisation, `allow_unc=False`, extension allowlist | Set `EXCEL_VBA_MCP_ROOTS` to a dedicated root; keep `allow_unc` off |
 | Data exfiltration via working copies | `work/` copies and snapshots/artifacts may contain sensitive data | Sensitive data left on disk under `%TEMP%` | Originals are never modified; runtime dirs are operator-controlled | Use a dedicated runtime dir; restrict ACLs; clean up after use |
 | Credential leakage in arguments | Secrets passed as tool arguments | Secrets in client logs, process memory, or audit context | Audit redaction of secret-looking keys; basename-only paths | Never pass secrets as tool arguments; use an external secret store |
-| Macro dialog hang | A macro shows `MsgBox`/`UserForm`/`FileDialog` and blocks COM | Worker `NEEDS_RECOVERY`, hung server, possible orphaned Excel | R13 preflight veto; soft timeout; only the owned PID is terminated (`dismissed=false`) | Keep macros background-safe; monitor `excel_health`; close/reopen or restart |
+| Macro dialog hang | A macro shows `MsgBox`/`UserForm`/`FileDialog` and blocks COM | Worker `NEEDS_RECOVERY`, hung server, possible orphaned Excel | R13 preflight veto; 90 s soft deadline; the dispatch runs with `Interactive=False`/`DisplayAlerts=False` restored in `finally` (defense-in-depth, F2a); only the owned PID is terminated (`dismissed=false`) and the session is then recovered in-process (F2b) | Keep macros background-safe; monitor `excel_health`; after a macro hang re-open the workbook (auto-recovered) instead of restarting the server |
 | Untrusted workbook | Opening a workbook from an untrusted source | Macro/Protected View exploitation, external links | `inspect` disables macros; `execute` honors Office policy; no GUI | Open untrusted files with `inspect` + `read_only`; keep Office patched |
 | Dependency compromise | A compromised `mcp`/`pywin32`/`comtypes` release | Arbitrary code in the server process | Pinned versions in `uv.lock` | Pin and review updates; rebuild the venv from the lock |
 | Log tampering | Someone edits or truncates `audit.jsonl` | Loss of accountability | Append-only writes; serialized with a lock | Protect with filesystem ACLs; ship logs off-host; do not rely on it as tamper-evident |
 | Restricted-mode misconfiguration | Expecting deny-by-default while running `full` (default) | Mutations/macros run without per-action approval | Startup validation of `EXCEL_VBA_MCP_ACCESS_MODE` | Set `EXCEL_VBA_MCP_ACCESS_MODE=restricted` explicitly for untrusted callers |
-| Stale worker / lost Excel | The hidden `EXCEL.EXE` dies or hangs | Calls fail or hang; `needs_recovery` | Soft timeouts; `excel_health` owned-pid liveness probe; truthful `EXCEL_HUNG` | Monitor `excel_health`; close/reopen or restart the server (no in-band recovery tool) |
+| Stale worker / lost Excel | The hidden `EXCEL.EXE` dies or hangs | Calls fail or hang; `needs_recovery` | Soft timeouts; `excel_health` owned-pid liveness probe; truthful `EXCEL_HUNG`; the macro path auto-recovers in-process (F2b) | Monitor `excel_health`; a macro hang self-recovers (re-open the workbook); otherwise close/reopen or restart the server (no in-band recovery tool) |
 | Over-broad roots | Default roots are CWD + temp | Any workbook under CWD/temp is reachable | Path policy still canonicalises and checks roots | Always set an explicit, dedicated `EXCEL_VBA_MCP_ROOTS` |
 
 ## Control categories
@@ -372,8 +372,15 @@ These are **not enforced** by the application; they are operator choices:
   does not require a prior `snapshot_create`; this is a documented spec
   deviation.
 - **Session recovery is not exposed over MCP.** `excel_health` reports
-  `needs_recovery`, but a client cannot trigger recovery in-band; the remedy is
+  `needs_recovery`, but a client cannot trigger recovery in-band. The one exception
+  is a `macro_run` hang/timeout, which rebuilds the owned instance automatically
+  (F2b) and reports it in `MacroRunResult.session_recovery`; every other case is
   close/reopen or restarting the server.
+- **The macro dialog guard is defense-in-depth, not a sandbox.** F2a sets
+  `Application.Interactive=False` / `DisplayAlerts=False` around the single
+  `Application.Run` dispatch and restores them in `finally`; this suppresses only
+  Excel's own built-in alerts. `MsgBox`, `UserForm.Show`, `FileDialog`, add-in UI
+  and Win32 dialogs still require the BG06/R13 veto plus owned-PID termination.
 - **`macro_policy.classify_operation` is non-authoritative.** The function is
   retained for illustration, is not wired into enforcement, and its table is
   stale. Use the service code or [MCP tools reference](05-mcp-tools-reference.md)

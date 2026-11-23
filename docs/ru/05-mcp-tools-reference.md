@@ -48,11 +48,13 @@ related:
    работу для чтения. По таксономии ошибок B4: отказ approval — это `APPROVAL_DENIED`;
    `WORKBOOK_READ_ONLY` поднимается только для read-only-сессии; неизвестный или уже не
    открытый `workbook_id` — это `WORKBOOK_NOT_FOUND` (ошибка вызывающей стороны, а не
-   конкуренция); устаревший `expected_source_hash` — это `REVISION_CONFLICT`; а
+   конкуренция); устаревший `expected_source_hash` — это `REVISION_CONFLICT`; отсутствующая
+   фигура/элемент по имени — `NOT_FOUND` (F6); а
    `COM_BUSY`/`RPC_E_CALL_REJECTED` зарезервированы только для реальной конкуренции за COM.
    `MACRO_BLOCKED` — только для Office macro-security / не-execute контекстов. Потерянный
    owned-экземпляр Excel на обычных путях чтения/мутации сообщается как `WORKBOOK_NOT_FOUND`, а в
-   `macro_run` / `vba_compile` — как `EXCEL_HUNG` (`needs_recovery`), где требуется восстановление.
+   `macro_run` / `vba_compile` — как `EXCEL_HUNG` (`needs_recovery`), где требуется восстановление —
+   кроме `macro_run`, который при зависании/таймауте восстанавливает сессию сам (F2b).
    В таблицах инструментов `COM_BUSY` у mutating-строки означает реальную конкуренцию, а не отказ
    approval, плохой id или конфликт ревизий.
 2. **Сначала `excel_open`.** Любой инструмент, которому нужен `workbook_id`, требует
@@ -269,15 +271,33 @@ STA-проба `vba_compile` помечается `op_class=EXECUTING` толь�
 | `pivot_field_clear_filters` | Очищает фильтры поля или всей таблицы. | `workbook_id:string, pivot_table:string, field:string?, scope:string=field?` | `PivotFieldFilters` | Фильтры; аудит | `UNSUPPORTED_PIVOT_SOURCE`, `AMBIGUOUS_FILTER`, `INVALID_RANGE`, `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
 
 Создание и удаление PivotTables/PivotCaches не поддерживается. `PivotFilters.Add`
-(label/value/date/top-bottom) на валидированной сборке не работает: возвращается явный
-`unsupported` результат с `filter.supported=false` и причиной, а не «тихая» конвертация в
+(метка/значение/дата/топ-низ) на валидированной сборке не работает: возвращается явный
+`unsupported`-результат с `filter.supported=false` и причиной, а не «тихая» конвертация в
 ручной фильтр.
+
+**Поля страницы (report-filter) (F3).** Поле страницы не хранит свой выбор в
+`PivotItem.Visible` (на целевой сборке каждый элемент читается как `Visible=False`), поэтому его
+состояние классифицируется по `CurrentPage` / `AllItemsVisible`. Нетронутое поле страницы
+сообщает `kind:"none"` и `hidden_items:[]`, что в точности совпадает с `filter_state`,
+который возвращают `pivot_table_get` / `pivot_fields_list` — оба читателя используют один
+классификатор. Следствия:
+
+- `pivot_field_clear_filters` с `scope:"field"` или `scope:"table"` больше не поднимает ложный
+  `AMBIGUOUS_FILTER` для нетронутого поля страницы;
+- `pivot_field_apply_filter` для поля страницы **отклоняется** до любой мутации COM: результат
+  несёт `filters.filter.supported=false` и `unsupported_reason`, а мутация reported как
+  `applied=false`, `verified=false`. Ручной фильтр по видимым элементам там неприменим, и
+  результат никогда не «понижается» молча. Выбирайте страницу через выпадающий список страниц /
+  `CurrentPage`.
+
+Для полей row/column/data сохраняется существующая семантика ручного фильтра
+`PivotItems[i].Visible`.
 
 ## Ranges
 
 | Инструмент | Назначение | Параметры | Возврат | Побочные эффекты | Ошибки | Доступ |
 |------------|------------|-----------|---------|------------------|--------|--------|
-| `range_get` | Метаданные A1-диапазона (адрес, размеры, форма). | `workbook_id:string, sheet:string, address:string` | `RangeAddress` | — | `INVALID_RANGE` | read-only |
+| `range_get` | Метаданные A1-диапазона (адрес, размеры, форма, объединение). | `workbook_id:string, sheet:string, address:string` | `RangeAddress` | — | `INVALID_RANGE` | read-only |
 | `range_read_values` | Типизированные значения ограниченного окна. | `workbook_id:string, sheet:string, address:string, offset:integer=0?, limit:integer?` | `RangeValues` | — | `INVALID_RANGE` | read-only |
 | `range_read_formulas` | Типизированные формулы ограниченного окна. | `workbook_id:string, sheet:string, address:string, offset:integer=0?, limit:integer?` | `RangeFormulas` | — | `INVALID_RANGE` | read-only |
 | `range_write_values` | Запись типизированных значений в ограниченный диапазон. | `workbook_id:string, sheet:string, address:string, payload:RangeWriteRequest` | `RangeMutationResult` | Значения ячеек; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `LISTOBJECT_INTERSECTION` | mutating |
@@ -298,6 +318,13 @@ STA-проба `vba_compile` помечается `op_class=EXECUTING` толь�
 пересекающие Excel Table (ListObject), отклоняются с `LISTOBJECT_INTERSECTION` и должны
 выполняться через инструменты Tables.
 
+`RangeAddress` сообщает геометрию объединённых ячеек: `is_merged` равен `true` только когда все
+ячейки цели принадлежат **одному** объединённому блоку (цель, смешивающая объединённые и
+необъединённые ячейки, не считается единым блоком), а `merged_area` — это `$`-абсолютный адрес
+якорной области (`$A$1:$B$2`) либо `null`. Внутренние ячейки и поддиапазоны объединённого блока
+разрешаются в эту anchor-область, а после `range_unmerge` `is_merged` снова равен `false` (F1).
+Декларативная проверка `range_structure` сверяет `rows` / `cols` / `merged` с этим же дескриптором.
+
 ## Names
 
 | Инструмент | Назначение | Параметры | Возврат | Побочные эффекты | Ошибки | Доступ |
@@ -313,8 +340,8 @@ STA-проба `vba_compile` помечается `op_class=EXECUTING` толь�
 | Инструмент | Назначение | Параметры | Возврат | Побочные эффекты | Ошибки | Доступ |
 |------------|------------|-----------|---------|------------------|--------|--------|
 | `shapes_list` | Все фигуры книги с типом, `on_action`, позицией и текстом. | `workbook_id:string` | `list[ShapeInfo]` | — | — | read-only |
-| `shape_get` | Одна фигура по имени (регистронезависимо). | `workbook_id:string, name:string` | `ShapeInfo` | — | `COM_BUSY` | read-only |
-| `shape_set_on_action` | Назначает макрос фигуре (макрос не выполняется). | `workbook_id:string, name:string, macro_name:string` | `ShapeInfo` | `OnAction`; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
+| `shape_get` | Одна фигура по имени (регистронезависимо). | `workbook_id:string, name:string` | `ShapeInfo` | — | `NOT_FOUND` (фигуры нет) | read-only |
+| `shape_set_on_action` | Назначает макрос фигуре (макрос не выполняется). | `workbook_id:string, name:string, macro_name:string` | `ShapeInfo` | `OnAction`; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `NOT_FOUND` (фигуры нет) | mutating |
 
 Пустой `macro_name` снимает назначение.
 
@@ -323,8 +350,13 @@ STA-проба `vba_compile` помечается `op_class=EXECUTING` толь�
 | Инструмент | Назначение | Параметры | Возврат | Побочные эффекты | Ошибки | Доступ |
 |------------|------------|-----------|---------|------------------|--------|--------|
 | `controls_list` | Все Form Control и ActiveX-элементы книги. | `workbook_id:string` | `list[ControlEntry]` | — | — | read-only |
-| `control_get` | Один элемент по имени (регистронезависимо). | `workbook_id:string, name:string` | `ControlEntry` | — | `COM_BUSY` | read-only |
-| `control_set_on_action` | Назначает макрос Form Control (не ActiveX). | `workbook_id:string, name:string, macro_name:string` | `ControlEntry` | `OnAction`; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
+| `control_get` | Один элемент по имени (регистронезависимо). | `workbook_id:string, name:string` | `ControlEntry` | — | `NOT_FOUND` (элемента нет) | read-only |
+| `control_set_on_action` | Назначает макрос Form Control (не ActiveX). | `workbook_id:string, name:string, macro_name:string` | `ControlEntry` | `OnAction`; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `NOT_FOUND` (элемента нет) | mutating |
+
+Отсутствующая фигура или элемент возвращают `NOT_FOUND` (F6) — это ошибка вызывающей стороны, её
+не нужно повторять; реальная конкуренция за COM по-прежнему сообщается как `COM_BUSY`. Неоднозначное
+(повторяющееся) имя — обычный `ExcelVbaMcpError` с семантикой `COM_BUSY` и
+`context.reason="ambiguous"`.
 
 ActiveX-элементы отклоняются: у них нет `OnAction`-семантики Form Control.
 
@@ -637,9 +669,28 @@ Document-модули и UserForms отклоняются.
 `APPROVAL_DENIED` (approval в restricted), `BACKGROUND_SAFETY_NOT_VERIFIED` (не
 классифицирована для текущего хэша книги и ревизии исходников) или
 `INTERACTIVE_UI_NOT_SUPPORTED` (опасный токен, классификация «небезопасен» или эвристическая
-процедура). Таймаут с модальным окном, принадлежащим owned PID, даёт `MACRO_RUNTIME_ERROR` и
-`dismissed=false`; без модального окна — `MACRO_TIMEOUT`/`needs_recovery`. Повторного
-«слепого» запуска нет.
+процедура).
+
+**Дедлайн, диалоги и автовосстановление (F2a/F2b).** У диспетчеризации есть мягкий дедлайн
+(`macro_timeout_s`, по умолчанию **90 с**, `EXCEL_VBA_MCP_MACRO_TIMEOUT_S`). Она выполняется
+внутри defense-in-depth-обёртки, которая выставляет `Application.Interactive=False` и
+`DisplayAlerts=False` и восстанавливает прежние значения в `finally`; это подавляет только
+встроенные предупреждения Excel и **не** блокирует `MsgBox`, `UserForm.Show`, `FileDialog`,
+UI надстроек или Win32-диалоги — реальными защитами остаются вето BG06/R13 и завершение
+owned-PID. При превышении дедлайна owned PID проверяется только для чтения на наличие видимого
+модального окна:
+
+- модальное окно есть → `MACRO_RUNTIME_ERROR`, `dismissed=false`;
+- модального окна нет → `MACRO_TIMEOUT`.
+
+В **обеих** ветках завершается только принадлежащий автоматизации процесс Excel (никогда —
+пользовательский), после чего сессия восстанавливается **в процессе** — без перезапуска сервера
+и без нового инструмента. `MacroRunResult.session_recovery` сообщает результат: `"recovered"`,
+когда пересозданный скрытый экземпляр снова в состоянии `RUNNING`, `"needs_recovery"` — когда
+нет, и `null`, если восстановление не выполнялось (пути success / blocked / not_found).
+Восстановление **отбрасывает открытые книги**: прежний `workbook_id` вызывающей стороны после
+этого недействителен (это также указано в `error_text`), макрос никогда не переигрывается
+автоматически, а книгу нужно заново открыть через `excel_open`.
 
 **Остаточная граница ложно-безопасного.** Токен-скан R13 — эвристический запрет, а не
 статическое доказательство. Динамическая/косвенная UI (`CallByName`/`ExecuteGlobal`/`Eval`) и
@@ -838,24 +889,28 @@ Fail-closed ответ:
    предоставляется; `range_copy` работает только внутри одной книги и без буфера обмена.
 10. **Нет пагинации списков.** `tables_list` и `pivot_tables_list` возвращают полный
     ограниченный список без постраничного вывода.
-11. **Устаревший воркер / потеря owned-Excel не детектируются автоматически через `excel_health` (R-17).**
-    `excel_health` сообщает состояние воркера только из внутрипроцессного воркера; если
-    принадлежащий скрытый процесс `EXCEL.EXE` умирает (например, убит извне), health может
-    по-прежнему показывать `ok`/`running` с устаревшим `owned_pid`, пока вызов не завершится
-    ошибкой. Нет in-band проверки живости PID и нет MCP-восстановления. Решение: `excel_close`
-    для затронутого `workbook_id` и повторное открытие, либо перезапуск серверного процесса.
-    Это известное ограничение, а не тихая порча данных.
+11. **Потерянный owned-Excel обнаруживается как `needs_recovery`; автовосстановление есть только на пути макроса.**
+    `excel_health` читает bookkeeping воркера/сессии без обращения к COM и дополнительно
+    выполняет read-only liveness-пробу owned-pid (`OpenProcess` + `GetExitCodeProcess`, без COM
+    и без kill): если принадлежащий скрытый `EXCEL.EXE` умер, а bookkeeping всё ещё говорит
+    `running`/`accepting`, `excel_health` сообщает `needs_recovery` вместо ложного `ok`.
+    Зависание/таймаут `macro_run` — единственный путь, который пересоздаёт экземпляр
+    автоматически (F2b, см. раздел `macro_run`); для любого другого состояния `needs_recovery`
+    MCP-инструмента восстановления нет. Решение там: повторно открыть книгу или перезапустить
+    серверный процесс.
 12. **У `macro_run` нет предусловия снапшота (задокументированное отклонение от спеки).**
     В отличие от контент-мутирующих инструментов, `macro_run` не требует предварительного
     `snapshot_create`; он запускает классифицированный, одобренный макрос без него.
     Рекомендованный процесс всё равно делает снапшот первым, чтобы внешние эффекты макроса имели
     baseline для отката. Эта асимметрия — известное, задокументированное ограничение, а не
     гарантия того, что макросы защищены снапшотом.
-13. **Восстановление сессии — только close/reopen; инструмента `excel_recover_session` нет.**
+13. **Инструмента `excel_recover_session` нет.**
     `SessionService.recover_session`/`close_session` существуют внутри, но не выставлены как
-    MCP-инструменты. `excel_health` показывает `needs_recovery`, но клиент не может запустить
-    восстановление in-band; поддерживаемое решение — закрыть и повторно открыть книгу (или
-    перезапустить сервер).
+    MCP-инструменты. Клиент не может запустить восстановление in-band; единственное
+    автоматическое восстановление — путь зависания макроса (F2b), который сам вызывает
+    `recover_session` и сообщает об этом в `MacroRunResult.session_recovery`. В остальных
+    случаях поддерживаемое решение — закрыть и повторно открыть книгу (или перезапустить
+    сервер).
 14. **`macro_policy.classify_operation` неавторитетен (мёртвая/иллюстративная таблица).**
     Функция `classify_operation` в `security/macro_policy.py` сохранена для иллюстрации и **не**
     подключена к пути рантайм-энфорсмента; живой класс операции каждого инструмента определён

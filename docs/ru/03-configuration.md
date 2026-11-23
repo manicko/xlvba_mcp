@@ -26,15 +26,20 @@ related:
 Конфигурации в виде файла нет. Все настройки задаются **исключительно переменными окружения**,
 которые читаются при старте сервера. Модель конфигурации типизирована через Pydantic
 (`src/excel_vba_mcp/config.py`) и теперь подключена к серверу: `config.load_config()` вызывается
-в `server.lifespan` при старте, поэтому `EXCEL_VBA_MCP_ACCESS_MODE` и `EXCEL_VBA_MCP_LOG_LEVEL`
-валидируются вместе, и неверное значение любой из них приводит к быстрому сбою старта
-(`ValidationError`).
+в `server.lifespan` при старте, поэтому `EXCEL_VBA_MCP_ACCESS_MODE`, `EXCEL_VBA_MCP_LOG_LEVEL` и
+`EXCEL_VBA_MCP_MACRO_TIMEOUT_S` валидируются вместе, и неверное значение любой из них приводит к
+быстрому сбою старта (`ValidationError`).
+
+Остальные переменные (`EXCEL_VBA_MCP_ROOTS` и переменные runtime-каталогов) читаются отдельно —
+`server._configured_roots()` / `server._resolve_runtime_path()`, а не `config.load_config()`;
+они тоже читаются только при старте.
 
 ## Переменные окружения
 
 | Переменная | Назначение | По умолчанию | Допустимые значения | Эффект |
 |------------|------------|--------------|---------------------|--------|
 | `EXCEL_VBA_MCP_ACCESS_MODE` | Политика доступа сервера (поведение approval) | `full` | `full`, `restricted` | `full` авторизует `MUTATING`/`EXECUTING` без гранта на действие; `restricted` сохраняет deny-by-default approval. Любое другое значение вызывает быстрый сбой старта (`ValidationError`). |
+| `EXCEL_VBA_MCP_MACRO_TIMEOUT_S` | Дедлайн диспетчеризации макроса (секунды) | `90` | Положительное число | Мягкий per-call потолок для диспетчеризации `Application.Run` внутри `macro_run` (F2b). Превышение классифицирует прогон как `MACRO_TIMEOUT` (или `MACRO_RUNTIME_ERROR`, если у owned PID есть модальное окно), завершает только принадлежащий Excel PID и восстанавливает сессию в процессе. Неположительное значение вызывает быстрый сбой старта (`ValidationError`). |
 | `EXCEL_VBA_MCP_ROOTS` | Allowlist корневых каталогов для путей книг | CWD + системный temp | Строка путей, разделённых `os.pathsep` (на Windows `;`) | Пути вне корней отклоняются с `PATH_NOT_ALLOWED`. Пустое/отсутствующее значение → значение по умолчанию. |
 | `EXCEL_VBA_MCP_WORK_DIR` | Каталог рабочих копий | `<temp>/excel_vba_mcp/work` | Абсолютный путь | Где создаются рабочие копии открываемых книг. |
 | `EXCEL_VBA_MCP_SNAPSHOT_DIR` | Хранилище снапшотов | `<temp>/excel_vba_mcp/snapshots` | Абсолютный путь | Каталог снапшотов с манифестом и SHA-256. |
@@ -137,8 +142,9 @@ lifespan. Переменная принимается (и валидируетс
 
 - **Мягкие таймауты воркера.** Для большинства операций `_DEFAULT_TIMEOUT_S = 60.0` секунд
   (session, snapshot, sheets, tables, ranges, names, shapes, controls, pivots, vba_project,
-  compile). Для `macro_service` `_DEFAULT_TIMEOUT_S = 120.0`; в `test_runner` используются
-  `_CALL_TIMEOUT_S = 60.0` и `_MACRO_TIMEOUT_S = 120.0`.
+  compile). В `macro_service` дедлайн диспетчеризации — это `macro_timeout_s` (по умолчанию
+  `90.0` секунд, настраивается через `EXCEL_VBA_MCP_MACRO_TIMEOUT_S`, F2b); в `test_runner`
+  используются `_CALL_TIMEOUT_S = 60.0` и `_MACRO_TIMEOUT_S = 120.0`.
 - **`orphan_timeout_s`.** Таймаут "осиротевшего" воркера/потока задаётся при построении
   `ExcelComWorker` (значение по умолчанию — `10.0` секунды) и не вынесен в конфигурацию.
 - **Path policy `allow_unc`.** Всегда `False`.

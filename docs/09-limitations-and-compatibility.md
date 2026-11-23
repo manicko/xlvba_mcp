@@ -87,12 +87,13 @@ behavior as unproven until tested on a copy.
 | Macros require `background_safe` classification | `macro_run` runs only a procedure classified `background_safe` for the current workbook hash and VBA source revision. An unclassified procedure returns `BACKGROUND_SAFETY_NOT_VERIFIED`; an interactive one returns `INTERACTIVE_UI_NOT_SUPPORTED`. | Verified |
 | `EXCEL_VBA_MCP_LOG_LEVEL` is parsed but not applied | Logging is configured at import time with a fixed `INFO` level on `stderr`; the variable has no effect in this revision. | Verified |
 | ActiveX event mapping is inferred | The probable event procedure is inferred from `<sheet_code_name>_<control>_<Event>` naming. It is never click-tested and may be absent or wrong. | Suspected / not verified |
-| Session recovery is not exposed as an MCP tool | `SessionService.recover_session` exists internally, but no MCP tool triggers it. `excel_health` surfaces `needs_recovery`; the remedy is close/reopen or restarting the server. | Verified |
+| Session recovery is not exposed as an MCP tool | `SessionService.recover_session` exists internally, but no MCP tool triggers it. The single exception is a `macro_run` hang/timeout, which terminates the owned PID and rebuilds the instance in-process (F2b), reporting `session_recovery` and discarding open workbooks; `excel_health` surfaces `needs_recovery` for every other case, where the remedy is close/reopen or restarting the server. | Verified |
 | `pywinauto` is not a dependency | `pywinauto` was removed from `pyproject.toml` and `uv.lock`; VBE compile UI diagnostics use `comtypes` `IUIAutomation` (read-only). Do not expect a `pywinauto` API. | Verified |
 | Missing manual fixtures | `LockedProject.xlsm` and `TableNamesProject.xlsm` are not committed; the related tests skip with explicit reasons. | Verified |
 | Non-`.xlsm` formats are allowed but not validated | The path allowlist accepts the extensions above, but only `.xlsm` is validated on the target build. | Suspected / not verified |
 | `macro_run` has no snapshot precondition | Unlike content-mutating tools, `macro_run` does not require a prior `snapshot_create` (documented spec deviation). | Verified |
 | R13 preflight is heuristic | The token scan is a veto, not static proof; dynamic `CallByName`/`ExecuteGlobal`/`Eval` indirection and transitive UI are not fully covered. | Verified |
+| The macro dialog guard is defense-in-depth, not a dialog blocker | F2a sets `Application.Interactive=False` / `DisplayAlerts=False` around the single `Application.Run` dispatch and restores them in `finally`; it suppresses only Excel's built-in alerts, not `MsgBox`/`UserForm.Show`/`FileDialog`/add-in UI/Win32 dialogs. | Verified |
 | `excel_health` can lag a dead worker when the Win32 layer is unavailable | The owned-pid liveness probe requires the Win32 layer; where it is unavailable the check degrades to state-based reporting. | Verified |
 
 ## Why these limits exist
@@ -133,8 +134,9 @@ behavior as unproven until tested on a copy.
 - **Per-path lock.** An `asyncio.Lock` is held for the life of an open workbook,
   so reopening the same canonical path is serialized.
 - **Soft timeouts.** Most operations use a 60-second default
-  (`_DEFAULT_TIMEOUT_S = 60.0`). Macro execution uses 120 seconds
-  (`macro_service._DEFAULT_TIMEOUT_S = 120.0`); the test runner uses
+  (`_DEFAULT_TIMEOUT_S = 60.0`). The `macro_run` dispatch uses a 90-second
+  default (`macro_timeout_s`, configurable via `EXCEL_VBA_MCP_MACRO_TIMEOUT_S`,
+  F2b); the test runner uses
   `_CALL_TIMEOUT_S = 60.0` and `_MACRO_TIMEOUT_S = 120.0`. The worker's
   `orphan_timeout_s` defaults to 10 seconds.
 - **No blind retry of mutations.** `READ_ONLY` calls may be retried at most 3
@@ -164,8 +166,10 @@ behavior as unproven until tested on a copy.
   [MCP tools reference](05-mcp-tools-reference.md).
 - **`MODAL_UI_BLOCKED` is declared but unused.** It is part of the stable
   `ErrorCode` vocabulary but is not emitted by the current adapters.
-- **No in-band recovery.** The server does not expose recovery as a tool; the
-  remedy is close/reopen or restarting the process.
+- **No general in-band recovery.** The server exposes no recovery tool; the single
+  automatic path is a `macro_run` hang/timeout, which rebuilds the owned instance
+  in-process (F2b). In every other case the remedy is close/reopen or restarting
+  the process.
 - **R13 preflight is a heuristic.** See [Security](08-security.md) for the
   residual false-safe boundary.
 

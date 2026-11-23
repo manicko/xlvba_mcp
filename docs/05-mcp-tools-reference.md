@@ -48,11 +48,13 @@ Shared conventions:
    the allowlist, so a restricted server exposes only `read-only` work over MCP. Per the B4 error
    taxonomy: an approval refusal is `APPROVAL_DENIED`; `WORKBOOK_READ_ONLY` is raised only for a
    read-only session; an unknown or no-longer-open `workbook_id` is `WORKBOOK_NOT_FOUND` (a caller
-   error, not contention); a stale `expected_source_hash` is `REVISION_CONFLICT`; and
+   error, not contention); a stale `expected_source_hash` is `REVISION_CONFLICT`; a missing
+   shape/control addressed by name is `NOT_FOUND` (F6); and
    `COM_BUSY`/`RPC_E_CALL_REJECTED` are reserved for genuine COM contention only. `MACRO_BLOCKED`
    is only for Office macro-security / non-execute contexts. A lost owned Excel instance is reported
    as `WORKBOOK_NOT_FOUND` on the plain read/mutation paths and as `EXCEL_HUNG` (`needs_recovery`)
-   from `macro_run` / `vba_compile`, which require recovery. In the per-tool tables, `COM_BUSY` on a
+   from `macro_run` / `vba_compile`, which require recovery — except that `macro_run` recovers the
+   session itself on a hang/timeout (F2b). In the per-tool tables, `COM_BUSY` on a
    mutating row denotes genuine contention, not approval denial, a bad id, or a revision conflict.
 2. **`excel_open` first.** Any tool that needs a `workbook_id` requires the workbook to be
    opened first. `workbook_id` is the identifier of the working copy issued by the server, not a
@@ -269,11 +271,27 @@ Creating and deleting PivotTables/PivotCaches is not supported. `PivotFilters.Ad
 `unsupported` result with `filter.supported=false` and a reason, rather than silently converting
 to a manual filter.
 
+**Page (report-filter) fields (F3).** A page field does not store its selection in
+`PivotItem.Visible` (every item reads `Visible=False` on the target build), so its state is
+classified from `CurrentPage` / `AllItemsVisible`. An untouched page field reports `kind:"none"`
+with `hidden_items:[]`, exactly matching the `filter_state` reported by `pivot_table_get` /
+`pivot_fields_list` — the two readers share one classifier. Consequences:
+
+- `pivot_field_clear_filters` with `scope:"field"` or `scope:"table"` no longer raises a false
+  `AMBIGUOUS_FILTER` for an untouched page field;
+- `pivot_field_apply_filter` on a page field is **rejected** before any COM mutation: the result
+  carries `filters.filter.supported=false` plus `unsupported_reason`, and the mutation is reported
+  as `applied=false`, `verified=false`. A manual visible-item filter is not applicable there and
+  the result is never silently downgraded. Select a page through the page
+  dropdown / `CurrentPage` instead.
+
+Row/column/data fields keep the existing `PivotItems[i].Visible` manual-filter semantics.
+
 ## Ranges
 
 | Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
 |------|---------|------------|---------|--------------|--------|--------|
-| `range_get` | Metadata for an A1 range (address, size, shape). | `workbook_id:string, sheet:string, address:string` | `RangeAddress` | — | `INVALID_RANGE` | read-only |
+| `range_get` | Metadata for an A1 range (address, size, shape, merged state). | `workbook_id:string, sheet:string, address:string` | `RangeAddress` | — | `INVALID_RANGE` | read-only |
 | `range_read_values` | Typed values of a bounded window. | `workbook_id:string, sheet:string, address:string, offset:integer=0?, limit:integer?` | `RangeValues` | — | `INVALID_RANGE` | read-only |
 | `range_read_formulas` | Typed formulas of a bounded window. | `workbook_id:string, sheet:string, address:string, offset:integer=0?, limit:integer?` | `RangeFormulas` | — | `INVALID_RANGE` | read-only |
 | `range_write_values` | Writes typed values to a bounded range. | `workbook_id:string, sheet:string, address:string, payload:RangeWriteRequest` | `RangeMutationResult` | Cell values; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION` | mutating |
@@ -294,6 +312,13 @@ Structural operations (`range_insert`, `range_delete`, `range_copy`, `range_merg
 intersect an Excel Table (ListObject) are rejected with `LISTOBJECT_INTERSECTION` and must be
 performed through the Tables tools.
 
+`RangeAddress` reports merged-cell geometry: `is_merged` is `true` only when every cell of the
+target belongs to the **same** merged block (a target mixing merged and unmerged cells is not a
+single merged block), and `merged_area` is the `$`-absolute anchor area (`$A$1:$B$2`) or `null`.
+Interior/sub-range addresses of a merged block resolve to that anchor area, and `is_merged` is
+`false` again after `range_unmerge` (F1). The declarative `range_structure` assertion checks
+`rows` / `cols` / `merged` against this same descriptor.
+
 ## Names
 
 | Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
@@ -309,8 +334,8 @@ performed through the Tables tools.
 | Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
 |------|---------|------------|---------|--------------|--------|--------|
 | `shapes_list` | All shapes with type, `on_action`, position and text. | `workbook_id:string` | `list[ShapeInfo]` | — | — | read-only |
-| `shape_get` | One shape by name (case-insensitive). | `workbook_id:string, name:string` | `ShapeInfo` | — | `COM_BUSY` | read-only |
-| `shape_set_on_action` | Assigns a macro to a shape (the macro is not executed). | `workbook_id:string, name:string, macro_name:string` | `ShapeInfo` | `OnAction`; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
+| `shape_get` | One shape by name (case-insensitive). | `workbook_id:string, name:string` | `ShapeInfo` | — | `NOT_FOUND` (no such shape) | read-only |
+| `shape_set_on_action` | Assigns a macro to a shape (the macro is not executed). | `workbook_id:string, name:string, macro_name:string` | `ShapeInfo` | `OnAction`; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `NOT_FOUND` (no such shape) | mutating |
 
 An empty `macro_name` clears the assignment.
 
@@ -319,8 +344,12 @@ An empty `macro_name` clears the assignment.
 | Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
 |------|---------|------------|---------|--------------|--------|--------|
 | `controls_list` | All Form Controls and ActiveX controls in the workbook. | `workbook_id:string` | `list[ControlEntry]` | — | — | read-only |
-| `control_get` | One control by name (case-insensitive). | `workbook_id:string, name:string` | `ControlEntry` | — | `COM_BUSY` | read-only |
-| `control_set_on_action` | Assigns a macro to a Form Control (not ActiveX). | `workbook_id:string, name:string, macro_name:string` | `ControlEntry` | `OnAction`; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
+| `control_get` | One control by name (case-insensitive). | `workbook_id:string, name:string` | `ControlEntry` | — | `NOT_FOUND` (no such control) | read-only |
+| `control_set_on_action` | Assigns a macro to a Form Control (not ActiveX). | `workbook_id:string, name:string, macro_name:string` | `ControlEntry` | `OnAction`; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `NOT_FOUND` (no such control) | mutating |
+
+A missing shape or control returns `NOT_FOUND` (F6), a caller error that must not be retried;
+genuine COM contention still reports `COM_BUSY`. An ambiguous (duplicate) name is a plain
+`ExcelVbaMcpError` with `COM_BUSY` semantics and `context.reason="ambiguous"`.
 
 ActiveX controls are rejected: they do not have Form Control `OnAction` semantics.
 
@@ -630,9 +659,26 @@ Possible `MacroRunResult` statuses: `success`, `not_found`, `runtime_error`, `bl
 `timeout`, `needs_recovery`. When blocked the macro **is not started**: `blocked` with
 `APPROVAL_DENIED` (restricted-mode approval), `BACKGROUND_SAFETY_NOT_VERIFIED` (unclassified for
 the current workbook hash and source revision) or `INTERACTIVE_UI_NOT_SUPPORTED` (dangerous token,
-an "unsafe" classification, or a heuristic procedure). A timeout with a modal window owned by the
-owned PID yields `MACRO_RUNTIME_ERROR` and `dismissed=false`; without a modal window —
-`MACRO_TIMEOUT`/`needs_recovery`. There is no blind re-run.
+an "unsafe" classification, or a heuristic procedure).
+
+**Deadline, dialogs and auto-recovery (F2a/F2b).** The dispatch has a soft deadline
+(`macro_timeout_s`, default **90 s**, `EXCEL_VBA_MCP_MACRO_TIMEOUT_S`). It runs inside a
+defense-in-depth guard that sets `Application.Interactive=False` and `DisplayAlerts=False` and
+restores the prior values in `finally`; this suppresses only Excel's own built-in alerts and does
+**not** block `MsgBox`, `UserForm.Show`, `FileDialog`, add-in UI or Win32 dialogs — the BG06/R13
+veto and owned-PID termination remain the real protections. When the deadline is exceeded the
+owned PID is inspected read-only for a visible modal:
+
+- modal present → `MACRO_RUNTIME_ERROR`, `dismissed=false`;
+- no modal → `MACRO_TIMEOUT`.
+
+In **both** branches only the automation-owned Excel PID is terminated (never a user-owned
+process), and the session is then recovered **in-process** — no server restart and no new tool.
+`MacroRunResult.session_recovery` reports the outcome: `"recovered"` when the rebuilt hidden
+instance is `RUNNING` again, `"needs_recovery"` when it is not, and `null` when no recovery was
+attempted (the success / blocked / not-found paths). Recovery **discards open workbooks**: the
+caller's prior `workbook_id` is invalid afterwards (also stated in `error_text`), the macro is
+never auto-replayed, and the workbook must be re-opened with `excel_open`.
 
 **Residual false-safe boundary.** The R13 token scan is a heuristic veto, not static proof.
 Dynamic/indirect UI (`CallByName` / `ExecuteGlobal` / `Eval` indirection) and UI reached
@@ -825,22 +871,25 @@ Resources are read-only: they do not mutate the workbook and do not execute VBA.
    `range_copy` works only within one workbook and without the clipboard.
 10. **No list pagination.** `tables_list` and `pivot_tables_list` return the full bounded list
     without paging.
-11. **Dead owned Excel is detected as `needs_recovery`, but recovery is close/reopen only.**
+11. **A dead owned Excel is detected as `needs_recovery`; only the macro path auto-recovers.**
     `excel_health` reads worker/session bookkeeping without touching COM and additionally runs a
     read-only owned-pid liveness probe (`OpenProcess` + `GetExitCodeProcess`, no COM, no kill): if
     the hidden `EXCEL.EXE` the worker owns has died while the bookkeeping still says
-    `running`/`accepting`, `excel_health` reports `needs_recovery` instead of a false `ok`. There
-    is still no MCP-callable recovery tool. Remedy: `excel_close` the affected `workbook_id` and
-    re-open, or restart the server process.
+    `running`/`accepting`, `excel_health` reports `needs_recovery` instead of a false `ok`. A
+    `macro_run` hang/timeout is the one path that rebuilds the instance automatically (F2b, see
+    the `macro_run` section); any other `needs_recovery` state has no MCP-callable recovery tool.
+    Remedy there: re-open the workbook, or restart the server process.
 12. **`macro_run` has no snapshot precondition (spec deviation, tracked).**
     Unlike content-mutating tools, `macro_run` does not require a prior `snapshot_create`; it runs
     a classified, approved macro without one. The recommended workflow still snapshots first so a
     macro's external side effects have a rollback baseline. This asymmetry is a documented
     limitation, not a guarantee that macros are snapshot-gated.
-13. **Session recovery is close/reopen only; there is no `excel_recover_session` tool.**
+13. **There is no `excel_recover_session` tool.**
     `SessionService.recover_session`/`close_session` exist internally but are not exposed as MCP
-    tools. `excel_health` surfaces `needs_recovery`, but a client cannot trigger recovery in-band;
-    the supported remedy is to close and re-open the workbook (or restart the server).
+    tools. A client cannot trigger recovery in-band; the only automatic recovery is the F2b
+    macro-hang path, which runs `recover_session` itself and reports it in
+    `MacroRunResult.session_recovery`. In every other case the supported remedy is to close and
+    re-open the workbook (or restart the server).
 14. **`macro_policy.classify_operation` is non-authoritative (dead/illustrative table).**
     The `classify_operation` function in `security/macro_policy.py` is retained for illustration
     and is **not** wired into the runtime enforcement path; the live operation class of each tool

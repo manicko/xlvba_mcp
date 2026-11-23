@@ -220,6 +220,16 @@ sequenceDiagram
   `SessionService.recover_session()` дополнительно сбрасывает bookkeeping открытых книг и
   per-path блокировки; если восстановление не удалось, состояние остаётся
   `needs_recovery`, и новая работа отклоняется.
+- **Автовосстановление макроса (F2b).** `macro_run` — единственный путь, который сам вызывает
+  `recover_session`. Когда диспетчеризация `Application.Run` превышает мягкий дедлайн
+  (`macro_timeout_s`, по умолчанию 90 с, `EXCEL_VBA_MCP_MACRO_TIMEOUT_S`), сервис завершает
+  только принадлежащий PID и пересоздаёт скрытый экземпляр в процессе (никогда — перезапуск
+  сервера), записывает `MacroRunResult.session_recovery` (`"recovered"` / `"needs_recovery"`;
+  `null`, если восстановление не выполнялось) и отбрасывает открытые книги — прежний
+  `workbook_id` вызывающей стороны становится недействительным, а макрос никогда не
+  переигрывается автоматически. Сама диспетчеризация выполняется с
+  `Application.Interactive=False` / `DisplayAlerts=False`, восстанавливаемыми в `finally`
+  (F2a, только defense-in-depth; это не универсальный блокиратор диалогов).
 
 ## Модель сессии книги
 
@@ -305,14 +315,18 @@ sequenceDiagram
 | Компиляция | `COMPILE_ERROR`, `COMPILE_INDETERMINATE` |
 | Макросы | `MACRO_BLOCKED`, `MACRO_NOT_FOUND`, `MACRO_RUNTIME_ERROR`, `MACRO_TIMEOUT`, `BACKGROUND_SAFETY_NOT_VERIFIED`, `INTERACTIVE_UI_NOT_SUPPORTED` |
 | COM / worker | `COM_BUSY`, `RPC_E_CALL_REJECTED`, `EXCEL_HUNG`, `MODAL_UI_BLOCKED` |
+| Вызывающая сторона / конкуренция | `WORKBOOK_NOT_FOUND`, `REVISION_CONFLICT`, `NOT_FOUND` |
 | Снапшоты | `SNAPSHOT_FAILED` |
 | Phase 2: диапазоны и сводные | `INVALID_RANGE`, `PROTECTED_TARGET`, `UNSUPPORTED_PIVOT_SOURCE`, `STALE_TARGET`, `AMBIGUOUS_FILTER`, `REFRESH_FAILED`, `LISTOBJECT_INTERSECTION` |
 
 Перечисление `ErrorCode` — это стабильный контракт кодов; не каждый код обязан
 подниматься текущими адаптерами (например, `MODAL_UI_BLOCKED` объявлен, но в текущей
 сборке не используется). `STALE_TARGET` поднимается `macro_classify_background`, когда
-`expected_project_source_hash` больше не совпадает с живым хэшем исходников. Значение имеет
-стабильность строки кода, а не факт его текущей эмиссии.
+`expected_project_source_hash` больше не совпадает с живым хэшем исходников. `NOT_FOUND`
+(аддитивный, F6) поднимается `shape_get`/`shape_set_on_action`/`control_get`/
+`control_set_on_action`, когда указанного объекта нет, чтобы вызывающая сторона могла отличить
+«объекта нет, не повторять» от общего фолбэка `COM_BUSY` («Excel занят, повторить»). Значение
+имеет стабильность строки кода, а не факт его текущей эмиссии.
 
 `BACKGROUND_SAFETY_NOT_VERIFIED` и `INTERACTIVE_UI_NOT_SUPPORTED` — аддитивные члены
 `ErrorCode` (task_b5), которые также появляются в `MacroRunResult.error_code` как коды

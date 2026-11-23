@@ -216,6 +216,15 @@ sequenceDiagram
   current instance, then creates a new one via `create_hidden()`.
   `SessionService.recover_session()` additionally clears the open-workbook bookkeeping and the
   per-path locks; if recovery fails, the state stays `needs_recovery` and new work is refused.
+- **Automatic macro recovery (F2b).** `macro_run` is the one path that calls `recover_session`
+  itself. When its `Application.Run` dispatch exceeds the soft deadline
+  (`macro_timeout_s`, default 90 s, `EXCEL_VBA_MCP_MACRO_TIMEOUT_S`) the service terminates only
+  the owned PID and rebuilds the hidden instance in-process (never a server restart), records
+  `MacroRunResult.session_recovery` (`"recovered"` / `"needs_recovery"`; `null` when no recovery
+  was attempted) and discards open workbooks — the caller's prior `workbook_id` becomes invalid and
+  the macro is never auto-replayed. The dispatch itself runs with
+  `Application.Interactive=False` / `DisplayAlerts=False` restored in `finally` (F2a,
+  defense-in-depth only; not a universal dialog blocker).
 
 ## Workbook session model
 
@@ -302,14 +311,17 @@ The base type is `ExcelVbaMcpError` (`domain/errors.py`). It carries:
 | Compile | `COMPILE_ERROR`, `COMPILE_INDETERMINATE` |
 | Macros | `MACRO_BLOCKED`, `MACRO_NOT_FOUND`, `MACRO_RUNTIME_ERROR`, `MACRO_TIMEOUT`, `BACKGROUND_SAFETY_NOT_VERIFIED`, `INTERACTIVE_UI_NOT_SUPPORTED` |
 | COM / worker | `COM_BUSY`, `RPC_E_CALL_REJECTED`, `EXCEL_HUNG`, `MODAL_UI_BLOCKED` |
-| Caller / concurrency | `WORKBOOK_NOT_FOUND`, `REVISION_CONFLICT` |
+| Caller / concurrency | `WORKBOOK_NOT_FOUND`, `REVISION_CONFLICT`, `NOT_FOUND` |
 | Snapshots | `SNAPSHOT_FAILED` |
 | Phase 2: ranges and pivots | `INVALID_RANGE`, `PROTECTED_TARGET`, `UNSUPPORTED_PIVOT_SOURCE`, `STALE_TARGET`, `AMBIGUOUS_FILTER`, `REFRESH_FAILED`, `LISTOBJECT_INTERSECTION` |
 
 The `ErrorCode` enum is a stable code contract; not every code must be raised by the current
 adapters (for example, `MODAL_UI_BLOCKED` is declared but unused in the current build).
 `STALE_TARGET` is emitted by `macro_classify_background` when `expected_project_source_hash` no
-longer matches the live source hash. What matters is the stability of the code string, not whether
+longer matches the live source hash. `NOT_FOUND` (additive, F6) is emitted by
+`shape_get`/`shape_set_on_action`/`control_get`/`control_set_on_action` when the named object does
+not exist, so a caller can distinguish "no such object, do not retry" from the generic `COM_BUSY`
+fallback ("Excel busy, retry"). What matters is the stability of the code string, not whether
 it is currently emitted.
 
 `BACKGROUND_SAFETY_NOT_VERIFIED` and `INTERACTIVE_UI_NOT_SUPPORTED` are additive `ErrorCode`
