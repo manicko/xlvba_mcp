@@ -162,9 +162,13 @@ by the guarded VBA editing tools.
 { "workbook_id": "<workbook_id>" }
 ```
 
-Call `vba_export_project`. Without `out_dir` the export goes to a temporary directory; a custom
-`out_dir` must live inside the `snapshots` or `artifacts` root. The result is a manifest with
-per-file hashes.
+Call `vba_export_project`. Without `out_dir` the export goes to a fresh temporary directory and the
+manifest returns absolute paths. A custom `out_dir` must live inside the resolved `snapshots` or
+`artifacts` artifact root — by default `<temp>/excel_vba_mcp/artifacts` (override with
+`EXCEL_VBA_MCP_ARTIFACT_DIR`). If `out_dir` is outside that root the call fails closed with
+`PATH_NOT_ALLOWED`; the error `context.allowed_root` (and `context.expected_root`) reports the
+**absolute** allowed artifacts root so you can retry with a valid path (the bare symbolic
+`"artifacts"` name is no longer returned). The result is a manifest with per-file hashes.
 
 **Expected outcome.** A `VbaProjectInfo`, a component list, one `VbaComponentSource` and a
 `VbaExportManifest`.

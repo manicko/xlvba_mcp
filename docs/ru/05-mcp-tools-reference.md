@@ -185,6 +185,13 @@ Document-модули и UserForms отклоняются с `PROTECTED_TARGET`
 (`reason=non_replaceable_component`). Устаревший `expected_source_hash` отклоняется с
 `REVISION_CONFLICT` (`reason=revision_conflict`).
 
+`vba_export_project` записывает файлы и защищён approval-проверкой (F-4). Без `out_dir` экспорт
+идёт в свежий временный каталог (манифест возвращает абсолютные пути). Указанный `out_dir` должен
+находиться внутри разрешённого артефакт-корня `snapshots` / `artifacts` (по умолчанию
+`<temp>/excel_vba_mcp/artifacts`, либо `EXCEL_VBA_MCP_ARTIFACT_DIR`); `out_dir` вне корня
+завершается отказом с `PATH_NOT_ALLOWED`, где `context.allowed_root` / `context.expected_root`
+содержат **абсолютный** путь разрешённого артефакт-корня (а не символьное имя `"artifacts"`).
+
 ## Compile
 
 | Инструмент | Назначение | Параметры | Возврат | Побочные эффекты | Ошибки | Доступ |

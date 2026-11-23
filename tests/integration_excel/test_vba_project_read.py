@@ -63,6 +63,7 @@ from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.vba_project_service import VBAProjectService
 from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.statuses import (
+    AccessMode,
     OperationClass,
     SessionMode,
     VbaComponentType,
@@ -302,8 +303,16 @@ class _Rig:
         self.work_dir = tmp_dir / "work"
         self.projects_dir = tmp_dir / "projects"
         self.projects_dir.mkdir(parents=True, exist_ok=True)
+        # Absolute artifacts root (mirrors EXCEL_VBA_MCP_ARTIFACT_DIR): a valid
+        # out_dir for vba_export_project must live under this resolved root (F4).
+        self.artifacts_dir = tmp_dir / "artifacts"
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.path_policy = PathPolicy(
-            {"work": str(self.work_dir), "projects": str(self.projects_dir)}
+            {
+                "work": str(self.work_dir),
+                "projects": str(self.projects_dir),
+                "artifacts": str(self.artifacts_dir),
+            }
         )
         self.approval = ApprovalPolicy()
         self.app_adapter = ExcelAppAdapter()
@@ -317,7 +326,18 @@ class _Rig:
             self.audit,
             work_dir=self.work_dir,
         )
-        self.service = VBAProjectService(self.worker, self.session, self.path_policy, self.audit)
+        # vba_export_project writes files, so it is approval-gated (F-4). A
+        # full-access policy auto-authorizes the export so the fidelity / hash
+        # tests can exercise an explicit out_dir under the resolved artifacts
+        # root (the session keeps its own deny-by-default approval for open).
+        vba_approval = ApprovalPolicy(mode=AccessMode.FULL)
+        self.service = VBAProjectService(
+            self.worker,
+            self.session,
+            self.path_policy,
+            self.audit,
+            approval=vba_approval,
+        )
         self._original: Path | None = None
 
     def bind_original(self, original: Path) -> None:
@@ -493,9 +513,13 @@ async def test_export_project_fidelity(tmp_path: Path) -> None:
 
         info = await rig.open()
 
-        manifest = await rig.service.export_project(info.workbook_id)
+        manifest = await rig.service.export_project(
+            info.workbook_id, str(rig.artifacts_dir / "vba_export")
+        )
         out_dir = Path(manifest.out_dir)
         assert out_dir.is_dir()
+        # The explicit out_dir under the resolved artifacts root is honored (F4).
+        assert out_dir.is_relative_to(rig.artifacts_dir.resolve())
 
         by_name = {entry.component_name: entry for entry in manifest.components}
         assert all(entry.export_status is VbaExportStatus.OK for entry in manifest.components), (
@@ -665,7 +689,9 @@ async def test_source_hash_matches_export(tmp_path: Path) -> None:
 
         info = await rig.open()
 
-        manifest = await rig.service.export_project(info.workbook_id)
+        manifest = await rig.service.export_project(
+            info.workbook_id, str(rig.artifacts_dir / "vba_export")
+        )
         out_dir = Path(manifest.out_dir)
         by_name = {entry.component_name: entry for entry in manifest.components}
         assert all(entry.export_status is VbaExportStatus.OK for entry in manifest.components), (

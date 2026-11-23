@@ -181,6 +181,13 @@ Document modules and UserForms are rejected with `PROTECTED_TARGET`
 (`reason=non_replaceable_component`). A stale `expected_source_hash` is rejected with
 `REVISION_CONFLICT` (`reason=revision_conflict`).
 
+`vba_export_project` writes files and is approval-gated (F-4). With `out_dir` omitted it exports to
+a fresh temporary directory (the manifest returns absolute paths). A supplied `out_dir` must live
+under the resolved `snapshots` / `artifacts` artifact root (default
+`<temp>/excel_vba_mcp/artifacts`, or `EXCEL_VBA_MCP_ARTIFACT_DIR`); an out-of-root `out_dir` fails
+closed with `PATH_NOT_ALLOWED` whose `context.allowed_root` / `context.expected_root` carry the
+**absolute** allowed artifacts-root path (not the symbolic `"artifacts"` name).
+
 ## Compile
 
 | Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |

@@ -20,6 +20,7 @@ that does not need Excel:
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -653,25 +654,61 @@ async def test_service_export_project_default_dir(tmp_path: Path) -> None:
 
     assert manifest.out_dir
     assert Path(manifest.out_dir).is_dir()
+    # The default (out_dir omitted) still returns absolute paths (unchanged).
+    assert Path(manifest.out_dir).is_absolute()
     assert {entry.component_name for entry in manifest.components} >= {"modTest", "frmTest"}
 
 
 async def test_service_export_project_validates_out_dir(tmp_path: Path) -> None:
     rig = Rig(tmp_path)
     info = await rig.open()
-    artifacts = tmp_path / "snapshots"
-    artifacts.mkdir()
 
-    manifest = await rig.service.export_project(info.workbook_id, str(artifacts / "vba"))
+    # A path policy whose "artifacts" logical root resolves to an absolute dir
+    # (mirrors the server's EXCEL_VBA_MCP_ARTIFACT_DIR registration).
+    artifacts_root = tmp_path / "artifacts"
+    artifacts_root.mkdir()
+    path_policy = PathPolicy(
+        {str(tmp_path): str(tmp_path), "artifacts": str(artifacts_root)}
+    )
+    service = VBAProjectService(
+        rig.worker,  # type: ignore[arg-type]
+        rig.session,
+        path_policy,
+        rig.audit,
+        approval=rig.approval,
+    )
 
+    # A valid out_dir under the resolved artifacts root exports successfully.
+    manifest = await service.export_project(info.workbook_id, str(artifacts_root / "vba"))
     assert Path(manifest.out_dir).is_dir()
-    assert manifest.out_dir.startswith(str(artifacts))
+    assert Path(manifest.out_dir).is_relative_to(artifacts_root.resolve())
 
-    # A path outside the allowlisted roots is rejected.
+    expected_root = os.path.realpath(artifacts_root)
+
+    # A path outside every allowlisted root is refused; the error context reports
+    # the ABSOLUTE artifacts root (not the bare symbolic "artifacts") so a caller
+    # can retry. code / reason are unchanged.
     outside = tmp_path.parent / f"outside_{uuid4().hex}"
     with pytest.raises(ExcelVbaMcpError) as exc_info:
-        await rig.service.export_project(info.workbook_id, str(outside / "vba"))
-    assert exc_info.value.code is ErrorCode.PATH_NOT_ALLOWED
+        await service.export_project(info.workbook_id, str(outside / "vba"))
+    error = exc_info.value
+    assert error.code is ErrorCode.PATH_NOT_ALLOWED
+    assert error.context["reason"] == "outside_roots"
+    assert error.context["allowed_root"] == expected_root
+    assert error.context["allowed_root"] != "artifacts"
+    assert Path(error.context["allowed_root"]).is_absolute()
+
+    # A directory inside an allowlisted root but NOT the artifacts root yields
+    # root_mismatch, with the symbolic expected_root replaced by the absolute
+    # artifacts-root path (still PATH_NOT_ALLOWED / root_mismatch).
+    other = tmp_path / "work"
+    other.mkdir(exist_ok=True)
+    with pytest.raises(ExcelVbaMcpError) as mismatch:
+        await service.export_project(info.workbook_id, str(other / "vba"))
+    assert mismatch.value.code is ErrorCode.PATH_NOT_ALLOWED
+    assert mismatch.value.context["reason"] == "root_mismatch"
+    assert mismatch.value.context["expected_root"] == expected_root
+    assert mismatch.value.context["expected_root"] != "artifacts"
 
 
 async def test_service_unknown_workbook_raises(tmp_path: Path) -> None:

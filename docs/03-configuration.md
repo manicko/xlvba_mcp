@@ -47,6 +47,13 @@ Each element becomes a logical root `root_N`; the artifact directory is addition
 under the name `artifacts`. If the variable is empty or missing, the current working directory
 (`Path.cwd()`) and the system temp directory are used.
 
+`vba_export_project` treats the resolved `artifacts` root (and `snapshots`, when configured) as the
+only valid location for a caller-supplied `out_dir`. When `out_dir` is outside that root the tool
+fails closed with `PATH_NOT_ALLOWED`; the error `context.allowed_root` (and `context.expected_root`)
+reports the **absolute** artifacts-root path — by default `<temp>/excel_vba_mcp/artifacts`, or the
+directory named by `EXCEL_VBA_MCP_ARTIFACT_DIR` — so a retry can use a valid path. Omitting `out_dir`
+exports to a fresh temporary directory instead (absolute paths in the manifest).
+
 > [!IMPORTANT]
 > `EXCEL_VBA_MCP_ROOTS` is read **once at server startup** by `server._configured_roots()`.
 > After changing it you **must restart the MCP server** (reload the server in Kilo / your MCP

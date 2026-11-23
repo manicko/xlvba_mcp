@@ -536,6 +536,12 @@ class VBAProjectService:
         directories; the export files themselves (``.bas`` / ``.cls`` / ``.frm``
         / ``.frx``) are written by the adapter, not by the caller, so the
         directory check is done on the canonical directory path directly.
+
+        F4: when the directory is refused the ``PATH_NOT_ALLOWED`` error context
+        is enriched with the **absolute** allowed artifacts root
+        (``context["allowed_root"]``) so a caller can retry with a usable path
+        instead of the symbolic ``"artifacts"`` name. ``code`` / ``reason`` are
+        unchanged.
         """
 
         if not isinstance(out_dir, str) or not out_dir.strip():
@@ -544,14 +550,18 @@ class VBAProjectService:
                 context={"field": "out_dir"},
             )
         expected_root = _artifact_root_for(self._path_policy)
+        allowed_root = _artifact_root_path(self._path_policy)
         candidate = Path(out_dir)
-        if candidate.suffix:
-            # A caller passed a file path; validate it as a file (extension gate
-            # applies) so the rejection reason is precise.
-            return self._path_policy.validate_path(
-                out_dir, OperationClass.READ_ONLY, expected_root=expected_root
-            )
-        return _validate_dir(out_dir, self._path_policy, expected_root)
+        try:
+            if candidate.suffix:
+                # A caller passed a file path; validate it as a file (extension
+                # gate applies) so the rejection reason is precise.
+                return self._path_policy.validate_path(
+                    out_dir, OperationClass.READ_ONLY, expected_root=expected_root
+                )
+            return _validate_dir(out_dir, self._path_policy, expected_root)
+        except PathNotAllowedError as exc:
+            raise _with_allowed_root(exc, allowed_root) from None
 
     def _record_audit(self, tool: str, workbook_id: str, result: dict[str, Any]) -> None:
         canonical = ""
@@ -832,6 +842,45 @@ def _artifact_root_for(path_policy: PathPolicy) -> str | None:
         if name in roots:
             return name
     return None
+
+
+def _artifact_root_path(path_policy: PathPolicy) -> Path | None:
+    """Return the absolute path of the first configured export artifact root.
+
+    The artifact root is registered under a logical name (``snapshots`` /
+    ``artifacts``); this resolves that name to the concrete absolute directory
+    the policy holds (already canonicalised on :class:`PathPolicy` construction),
+    so the value is a real filesystem path a caller can paste into a retry. F4.
+    """
+
+    roots = path_policy.roots
+    for name in _EXPORT_ROOT_NAMES:
+        root = roots.get(name)
+        if root is not None:
+            return root
+    return None
+
+
+def _with_allowed_root(
+    error: PathNotAllowedError, allowed_root: Path | None
+) -> PathNotAllowedError:
+    """Return ``error`` with the absolute artifacts root added to its context.
+
+    F4: an explicit ``out_dir`` outside the artifacts root is refused with
+    ``PATH_NOT_ALLOWED``; the error context must name the absolute allowed root
+    so a caller can retry with a valid path. Additive context only: ``code``
+    (``PATH_NOT_ALLOWED``) and ``reason`` are unchanged; a symbolic
+    ``expected_root`` name is replaced with the absolute root path.
+    """
+
+    if allowed_root is None:
+        return error
+    absolute = os.fspath(allowed_root)
+    context = dict(error.context)
+    context.setdefault("allowed_root", absolute)
+    if "expected_root" in context:
+        context["expected_root"] = absolute
+    return PathNotAllowedError(error.message, code=error.code, context=context)
 
 
 def _validate_dir(raw: str, path_policy: PathPolicy, expected_root: str | None) -> Path:
