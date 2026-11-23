@@ -367,12 +367,54 @@ async def _pivot_filters_count(rig: Rig, pivot_table: str, field: str) -> int:
     )
 
 
+async def _set_page_current(rig: Rig, pivot_table: str, field: str, page: str) -> None:
+    """Select ``page`` on a page (report-filter) field via ``CurrentPage`` (STA-local).
+
+    A small STA-local helper used only to set up the genuine page-selection case;
+    it locates the page field on the disposable working copy and assigns
+    ``PivotField.CurrentPage``.
+    """
+
+    def set_page() -> None:
+        app = rig.app.app
+        assert app is not None
+        target = pivot_table.strip().lower()
+        wanted = field.strip().lower()
+        for workbook in app.Workbooks:
+            for sheet in workbook.Worksheets:
+                try:
+                    pivots = sheet.PivotTables()
+                    count = int(pivots.Count)
+                except Exception:  # noqa: BLE001 - sheet without PivotTables
+                    continue
+                for index in range(1, count + 1):
+                    pivot = pivots.Item(index)
+                    if str(pivot.Name).lower() != target:
+                        continue
+                    fields = pivot.PivotFields()
+                    for field_index in range(1, int(fields.Count) + 1):
+                        candidate = fields.Item(field_index)
+                        if str(candidate.SourceName).lower() == wanted:
+                            candidate.CurrentPage = page
+                            return
+        raise AssertionError(f"page field {field!r} not found on {pivot_table!r}")
+
+    set_page.__name__ = "set_page_current"
+    await rig.worker.submit(
+        set_page,
+        timeout=_TEST_TIMEOUT_S,
+        section="diagnostic",
+        op_class=OperationClass.MUTATING,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Read
 # ---------------------------------------------------------------------------
 @requires_excel
 async def test_get_filters_reads_manual_state(rig: Rig) -> None:
-    info = await rig.open(read_only=True)
+    info = await rig.open_for_filters()
+    await rig.snapshot.create_snapshot(info.workbook_id)
 
     ptb = await _filters(rig, info.workbook_id, _FILTERED_PIVOT, "Region")
     assert ptb.all_items_visible is False
@@ -385,6 +427,45 @@ async def test_get_filters_reads_manual_state(rig: Rig) -> None:
     assert pta.all_items_visible is True
     assert pta.filter.kind is PivotFilterKind.NONE
     assert pta.hidden_items == []
+
+    # A page (report-filter) field is untouched in the fixture: it must report
+    # all-visible / NONE, never a false AMBIGUOUS hidden state (F3).
+    page = await _filters(rig, info.workbook_id, _ROUNDTRIP_PIVOT, "Quarter")
+    assert page.all_items_visible is True
+    assert page.hidden_items == []
+    assert page.filter.kind is PivotFilterKind.NONE
+    assert page.unsupported == []
+
+    # Field-scope clear on the untouched page field is verified (no AMBIGUOUS).
+    cleared_page = await rig.pivots.clear_pivot_field_filters(
+        info.workbook_id, _ROUNDTRIP_PIVOT, "Quarter", scope="field"
+    )
+    assert cleared_page.field == "Quarter"
+    assert cleared_page.all_items_visible is True
+    assert cleared_page.hidden_items == []
+
+    # Table-scope clear over a pivot with an untouched page field is not AMBIGUOUS.
+    cleared_table = await rig.pivots.clear_pivot_field_filters(
+        info.workbook_id, _ROUNDTRIP_PIVOT, scope="table"
+    )
+    assert cleared_table.field == ""
+    assert cleared_table.hidden_items == []
+
+    # Genuine page selection: pick Q2 -> MANUAL with the other quarters hidden.
+    await _set_page_current(rig, _ROUNDTRIP_PIVOT, "Quarter", "Q2")
+    selected = await _filters(rig, info.workbook_id, _ROUNDTRIP_PIVOT, "Quarter")
+    assert selected.all_items_visible is False
+    assert selected.filter.kind is PivotFilterKind.MANUAL
+    assert "Q2" in selected.visible_items
+    assert set(selected.hidden_items) == {"Q1", "Q3", "Q4"}
+
+    # Clearing returns the page to (All) / NONE.
+    reset = await rig.pivots.clear_pivot_field_filters(
+        info.workbook_id, _ROUNDTRIP_PIVOT, "Quarter", scope="field"
+    )
+    assert reset.all_items_visible is True
+    assert reset.hidden_items == []
+    assert reset.filter.kind is PivotFilterKind.NONE
 
     await rig.session.close_workbook(info.workbook_id)
 

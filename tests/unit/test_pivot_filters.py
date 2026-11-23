@@ -41,6 +41,7 @@ import pytest
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.pivot_tables_adapter import (
     PivotTablesAdapter,
+    _filter_kind_of,
     normalize_filter_scope,
     normalize_filter_spec,
 )
@@ -147,8 +148,23 @@ class FakePivotFilters:
         raise RuntimeError("PivotFilters.Add is not supported on the target build")
 
 
+class FakeCurrentPage:
+    """A page field's ``CurrentPage`` (an object whose string is the caption)."""
+
+    def __init__(self, caption: str) -> None:
+        self._caption = caption
+
+    def __str__(self) -> str:  # `_get_str` reads ``str(CurrentPage)``
+        return self._caption
+
+
 class FakePivotField:
-    """A source field with items, filter state and a clear operation."""
+    """A source field with items, filter state and a clear operation.
+
+    For a page (``xlPageField``) field the selection lives in ``CurrentPage`` /
+    ``AllItemsVisible`` — its items read ``Visible=False`` like Excel — so the
+    fake mirrors that with ``page_all`` (untouched flag) and ``current_page``.
+    """
 
     def __init__(
         self,
@@ -159,6 +175,8 @@ class FakePivotField:
         items: list[FakePivotItem] | None = None,
         filters: list[FakePivotFilter] | None = None,
         clear_is_noop: bool = False,
+        page_all: bool = True,
+        current_page: str = "(All)",
     ) -> None:
         self.SourceName = source_name
         self.Name = source_name
@@ -169,6 +187,10 @@ class FakePivotField:
         self._items = items or []
         self._filters = filters or []
         self._clear_is_noop = clear_is_noop
+        # Page (report-filter) field state: ``page_all`` is the untouched flag and
+        # ``current_page`` the selected caption ("(All)" when untouched).
+        self._page_all = page_all
+        self._current_page = current_page
         self.add_filter_calls = 0
         self.clear_all_filters_calls = 0
         self.deleted = False
@@ -189,9 +211,19 @@ class FakePivotField:
 
     @property
     def AllItemsVisible(self) -> bool:  # noqa: N802 - COM casing
-        """Excel computes this from the item visibility flags."""
+        """Excel computes this from the item visibility flags (or the page)."""
 
+        if self._orientation == XL_PAGE:
+            # A page field's AllItemsVisible reflects the page selection, not the
+            # (always-False) item Visible flags.
+            return self._page_all
         return all(item.Visible for item in self._items)
+
+    @property
+    def CurrentPage(self) -> FakeCurrentPage:  # noqa: N802 - COM casing
+        if self._orientation != XL_PAGE:
+            raise AttributeError("CurrentPage is only available on a page field")
+        return FakeCurrentPage(self._current_page)
 
     @property
     def PivotFilters(self) -> FakePivotFilters:  # noqa: N802 - COM casing
@@ -207,6 +239,10 @@ class FakePivotField:
         for item in self._items:
             item.Visible = True
         self._filters = []
+        if self._orientation == XL_PAGE:
+            # A report-filter clear resets the selection to the default (All).
+            self._page_all = True
+            self._current_page = "(All)"
 
     def Delete(self) -> None:  # noqa: N802 - COM casing
         self.deleted = True
@@ -560,6 +596,55 @@ def _seed(rig: Rig, pivot: FakePivotTable) -> FakePivotTable:
     return pivot
 
 
+def _page_pivot(
+    *,
+    name: str = "ptA",
+    page_all: bool = True,
+    current_page: str = "(All)",
+    hidden_region: tuple[str, ...] = (),
+) -> FakePivotTable:
+    """A ptA-like PivotTable with a row field plus a page (``Quarter``) field.
+
+    The page field's items read ``Visible=False`` (mirroring Excel); its
+    selection is driven by ``page_all`` / ``current_page``.
+    """
+
+    region = FakePivotField(
+        "Region",
+        orientation=XL_ROW,
+        position=1,
+        items=_items("North", "South", "East", "West", hidden=hidden_region),
+    )
+    quarter = FakePivotField(
+        "Quarter",
+        orientation=XL_PAGE,
+        position=1,
+        # Page items exist (for the hidden-items enumeration) but read Visible=False.
+        items=[FakePivotItem(value, visible=False) for value in ("Q1", "Q2", "Q3", "Q4")],
+        page_all=page_all,
+        current_page=current_page,
+    )
+    return FakePivotTable(
+        name,
+        cache=FakePivotCache(1),
+        fields=[region, quarter],
+        data_fields=[FakeDataField("Units", "Sum of Units", -4157, position=1)],
+    )
+
+
+def _quarter(pivot: FakePivotTable) -> FakePivotField:
+    field = next(f for f in pivot._fields if f.SourceName == "Quarter")
+    assert isinstance(field, FakePivotField)
+    return field
+
+
+def _field_info(adapter: PivotTablesAdapter, wb: FakeWorkbook, source_name: str) -> Any:
+    """Return the ``PivotFieldInfo`` for ``source_name`` on ptA (Reader B)."""
+
+    fields = adapter.enumerate_pivot_fields(wb, "ptA")
+    return next(f for f in fields if f.source_name == source_name)
+
+
 def _region(pivot: FakePivotTable) -> FakePivotField:
     field = next(f for f in pivot._fields if f.SourceName == "Region")
     assert isinstance(field, FakePivotField)
@@ -630,6 +715,44 @@ def test_get_filters_never_calls_pivot_filters_add() -> None:
     PivotTablesAdapter().get_field_filters(wb, "ptA", "Region")
 
     assert _region(pivot).add_filter_calls == 0
+
+
+def test_get_filters_reports_untouched_page_field_as_all_visible() -> None:
+    """An untouched page (report-filter) field is NONE / all-visible (F3)."""
+
+    pivot = _page_pivot()  # Quarter: page_all=True, CurrentPage="(All)"
+    wb = FakeWorkbook([FakeSheet("PivotReport", [pivot])])
+    adapter = PivotTablesAdapter()
+
+    filters = adapter.get_field_filters(wb, "ptA", "Quarter")
+
+    assert filters.all_items_visible is True
+    assert filters.hidden_items == []
+    assert filters.filter.kind is PivotFilterKind.NONE
+    assert filters.unsupported == []
+    # Reader B (pivot_table_get / pivot_fields_list filter_state) agrees.
+    quarter_info = _field_info(adapter, wb, "Quarter")
+    assert quarter_info.filter_state is PivotFilterKind.NONE
+    assert _filter_kind_of(_quarter(pivot)) is PivotFilterKind.NONE
+
+
+def test_get_filters_reports_genuine_page_selection() -> None:
+    """A picked page (CurrentPage="Q2") is MANUAL with the other pages hidden (F3)."""
+
+    pivot = _page_pivot(page_all=False, current_page="Q2")
+    wb = FakeWorkbook([FakeSheet("PivotReport", [pivot])])
+    adapter = PivotTablesAdapter()
+
+    filters = adapter.get_field_filters(wb, "ptA", "Quarter")
+
+    assert filters.all_items_visible is False
+    assert filters.filter.kind is PivotFilterKind.MANUAL
+    assert filters.visible_items == ["Q2"]
+    assert filters.hidden_items == ["Q1", "Q3", "Q4"]
+    # Reader B (pivot_table_get / pivot_fields_list filter_state) agrees.
+    quarter_info = _field_info(adapter, wb, "Quarter")
+    assert quarter_info.filter_state is PivotFilterKind.MANUAL
+    assert _filter_kind_of(_quarter(pivot)) is PivotFilterKind.MANUAL
 
 
 # ---------------------------------------------------------------------------
@@ -787,6 +910,26 @@ def test_apply_manual_filter_reports_postcondition_mismatch() -> None:
     assert all(item.Visible for item in _region(pivot)._items)
 
 
+def test_apply_manual_filter_rejects_page_field_without_mutation() -> None:
+    """A manual visible-item filter on a page field is rejected (F3, §4)."""
+
+    pivot = _page_pivot(page_all=False, current_page="Q2")
+    wb = FakeWorkbook([FakeSheet("PivotReport", [pivot])])
+    quarter = _quarter(pivot)
+
+    result = PivotTablesAdapter().apply_field_filter(wb, "ptA", "Quarter", _manual_spec("Q2"))
+
+    assert result["applied"] is False
+    assert result["verified"] is False
+    assert result["filters"].filter.supported is False
+    assert "page" in (result["filters"].filter.unsupported_reason or "").lower()
+    # No mutation: the page selection is unchanged (CurrentPage still "Q2",
+    # AllItemsVisible still False) and no PivotFilters.Add was attempted.
+    assert quarter._current_page == "Q2"
+    assert quarter._page_all is False
+    assert quarter.add_filter_calls == 0
+
+
 # ---------------------------------------------------------------------------
 # Adapter: clear
 # ---------------------------------------------------------------------------
@@ -837,6 +980,57 @@ def test_clear_table_scope_restores_page_field_selection_state() -> None:
 
     assert result["cleared_fields"] == ["Region"]
     assert result["filters"].field == ""
+
+
+def test_clear_field_scope_on_untouched_page_field_succeeds() -> None:
+    """Clearing an untouched page field is verified, not a false AMBIGUOUS (F3)."""
+
+    pivot = _page_pivot()  # Quarter untouched
+    wb = FakeWorkbook([FakeSheet("PivotReport", [pivot])])
+    adapter = PivotTablesAdapter()
+
+    result = adapter.clear_field_filters(wb, "ptA", "Quarter", scope="field")
+
+    assert _quarter(pivot).clear_all_filters_calls == 1
+    assert result["verified"] is True
+    assert result["field"] == "Quarter"
+    assert result["filters"].hidden_items == []
+    assert result["filters"].all_items_visible is True
+    assert result["filters"].filter.kind is PivotFilterKind.NONE
+
+
+def test_clear_table_scope_with_untouched_page_field_has_no_false_ambiguous() -> None:
+    """A table clear over a pivot with an untouched page field is not AMBIGUOUS (F3).
+
+    Before the fix the untouched page field reported hidden items (page items read
+    ``Visible=False``) and this raised ``AMBIGUOUS_FILTER``; it now succeeds.
+    """
+
+    pivot = _page_pivot()  # Quarter untouched, Region has no hidden items
+    wb = FakeWorkbook([FakeSheet("PivotReport", [pivot])])
+
+    result = PivotTablesAdapter().clear_field_filters(wb, "ptA", scope="table")
+
+    assert result["verified"] is True
+    assert result["scope"] == "table"
+    # After the clear the page field is all-visible / NONE.
+    assert _filter_kind_of(_quarter(pivot)) is PivotFilterKind.NONE
+
+
+def test_clear_field_scope_on_genuine_page_selection_resets_to_all() -> None:
+    """Clearing a genuine page selection returns it to (All) / NONE (F3)."""
+
+    pivot = _page_pivot(page_all=False, current_page="Q2")
+    wb = FakeWorkbook([FakeSheet("PivotReport", [pivot])])
+    adapter = PivotTablesAdapter()
+
+    result = adapter.clear_field_filters(wb, "ptA", "Quarter", scope="field")
+
+    assert result["verified"] is True
+    assert result["filters"].all_items_visible is True
+    assert result["filters"].hidden_items == []
+    assert result["filters"].filter.kind is PivotFilterKind.NONE
+    assert _quarter(pivot)._current_page == "(All)"
 
 
 def test_clear_field_scope_requires_field() -> None:

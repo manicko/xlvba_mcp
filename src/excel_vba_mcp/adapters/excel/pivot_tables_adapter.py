@@ -436,17 +436,18 @@ def _data_field_index(pivot: Any) -> dict[str, dict[str, Any]]:
 def _filter_kind_of(field: Any) -> PivotFilterKind:
     """Classify a field's manual filter state (task_039 §6).
 
-    Only the manual (``PivotItems.Visible``) filter state is classified here;
-    label/value/date filters are unsupported on the target build and are never
-    created, so a field with all items visible reports ``NONE``. A field with at
-    least one hidden item reports ``MANUAL``. ``AllItemsVisible`` raises on a
-    plain ``PivotFields(...)`` handle for some fields, so it is read defensively
-    and a missing value defaults to "all visible".
+    Thin wrapper over :func:`_classify_filter_state` so ``pivot_table_get`` /
+    ``pivot_fields_list`` (Reader B) and ``pivot_field_get_filters`` (Reader A)
+    share ONE classifier and can never diverge (F3). Only the manual
+    (``PivotItems.Visible``) filter state is classified for row/column/data
+    fields; a page (report-filter) field is classified from ``CurrentPage`` /
+    ``AllItemsVisible`` because Excel does not store its selection in
+    ``PivotItem.Visible``. A field with all items visible reports ``NONE``; a
+    field with a hidden item / a chosen page reports ``MANUAL``.
     """
 
-    if _get_bool(field, "AllItemsVisible", default=True):
-        return PivotFilterKind.NONE
-    return PivotFilterKind.MANUAL
+    kind, _all_items_visible, _visible, _hidden = _classify_filter_state(field)
+    return kind
 
 
 def _describe_field(
@@ -1398,6 +1399,90 @@ def _pivot_item_state(field: Any) -> tuple[list[str], list[str]]:
     return visible, hidden
 
 
+#: Strings Excel reports for an untouched page-field (report-filter) selection.
+#: ``CurrentPage`` returns the selected ``PivotItem``; ``"(All)"`` (and the
+#: localized/empty variants below) mean "no page picked". Compared case-folded
+#: and trimmed.
+_PAGE_ALL_MARKERS: frozenset[str] = frozenset({"(all)", "(everything)", ""})
+
+#: Reason reported when a manual visible-item filter is requested on a page field.
+_PAGE_FIELD_APPLY_REASON = (
+    "manual visible-item filter is not applicable to page (report-filter) fields; "
+    "select a page via the page dropdown / CurrentPage instead"
+)
+
+
+def _page_filter_state(
+    field: Any,
+) -> tuple[PivotFilterKind, bool | None, list[str], list[str]]:
+    """Classify a page (report-filter) field's selection state (F3).
+
+    Page fields do **not** store their selection in ``PivotItem.Visible`` (every
+    item reads ``Visible=False`` on the target build). The authoritative signals
+    are ``field.CurrentPage`` — a single ``PivotItem`` whose string is
+    ``"(All)"`` when untouched and the chosen caption otherwise — and
+    ``field.AllItemsVisible`` (``True`` when untouched / ``(All)``). Both are read
+    defensively; an unreadable ``CurrentPage`` defaults to the ALL-VISIBLE branch
+    (never a false ``MANUAL``).
+
+    Returns ``(kind, all_items_visible, visible_items, hidden_items)``.
+    """
+
+    all_items_visible = _get_bool(field, "AllItemsVisible", default=None)
+    current = _get_str(field, "CurrentPage")
+    normalized = current.strip().casefold() if isinstance(current, str) else None
+
+    is_all = (
+        all_items_visible is True
+        or normalized is None
+        or normalized in _PAGE_ALL_MARKERS
+    )
+    if is_all:
+        return PivotFilterKind.NONE, True, [], []
+
+    # Genuine page selection. Single-select reports the chosen caption; a
+    # multi-select page field (``EnableMultiplePageItems``) may leave
+    # ``CurrentPage`` unreadable, in which case ``AllItemsVisible is False`` is
+    # the only signal — report it as filtered with no enumerable items.
+    chosen = current.strip() if isinstance(current, str) and current.strip() else None
+    if chosen is None:
+        return PivotFilterKind.MANUAL, False, [], []
+
+    chosen_key = chosen.casefold()
+    entries = _pivot_item_entries(field)
+    hidden = [value for _item, value in entries if value.strip().casefold() != chosen_key]
+    # The single-select page reports its chosen caption; the other PivotItems are
+    # hidden. ``visible`` echoes the readable selection even when the item list is
+    # unavailable (best-effort).
+    visible = [chosen]
+    return PivotFilterKind.MANUAL, False, visible, hidden
+
+
+def _classify_filter_state(
+    field: Any,
+) -> tuple[PivotFilterKind, bool | None, list[str], list[str]]:
+    """Classify one field's filter state as a single shared truth (F3).
+
+    Returns ``(kind, all_items_visible, visible_items, hidden_items)``. This is
+    the ONE reader both the ``pivot_field_get_filters`` path (``_field_filters``,
+    Reader A) and the ``pivot_table_get`` / ``pivot_fields_list`` field
+    description (``_filter_kind_of`` via ``_describe_field``, Reader B) route
+    through, so the two can never diverge again.
+
+    Page (``xlPageField``) fields are classified from ``CurrentPage`` /
+    ``AllItemsVisible``; row/column/data/hidden fields keep the existing
+    ``PivotItems[i].Visible`` manual state.
+    """
+
+    if _orientation_of(field) is PivotFieldOrientation.PAGE:
+        return _page_filter_state(field)
+
+    visible, hidden = _pivot_item_state(field)
+    all_items_visible = _get_bool(field, "AllItemsVisible", default=None)
+    kind = PivotFilterKind.MANUAL if hidden else PivotFilterKind.NONE
+    return kind, all_items_visible, visible, hidden
+
+
 def _detected_filter_types(field: Any) -> list[str]:
     """Return a bounded description of any ``PivotFilters`` entries on a field.
 
@@ -1433,17 +1518,23 @@ def _detected_filter_types(field: Any) -> list[str]:
 
 
 def _field_filters(pivot_name: str, field: Any, source_name: str) -> PivotFieldFilters:
-    """Describe one field's current filter state (STA-local, read-only)."""
+    """Describe one field's current filter state (STA-local, read-only).
 
-    visible, hidden = _pivot_item_state(field)
+    The kind / all-items-visible / visible / hidden state comes from the shared
+    :func:`_classify_filter_state`, so a page field is reported from
+    ``CurrentPage`` / ``AllItemsVisible`` (never a false ``MANUAL``) and a
+    row/column/data field keeps its ``PivotItems[i].Visible`` manual state.
+    """
+
+    kind, all_items_visible, visible, hidden = _classify_filter_state(field)
     return PivotFieldFilters(
         pivot_table=pivot_name,
         field=source_name,
-        all_items_visible=_get_bool(field, "AllItemsVisible", default=None),
+        all_items_visible=all_items_visible,
         visible_items=visible,
         hidden_items=hidden,
         filter=PivotFilterSpec(
-            kind=PivotFilterKind.MANUAL if hidden else PivotFilterKind.NONE,
+            kind=kind,
             visible_items=list(visible),
             supported=True,
         ),
@@ -1452,7 +1543,12 @@ def _field_filters(pivot_name: str, field: Any, source_name: str) -> PivotFieldF
 
 
 def _filters_all_visible(filters: PivotFieldFilters) -> bool:
-    """Return whether a field's re-read state shows every item (postcondition)."""
+    """Return whether a field's re-read state shows every item (postcondition).
+
+    An untouched page field reports ``all_items_visible=True`` and no hidden
+    items (F3), so the existing contract already treats it as all-visible; the
+    row/column/data field contract is unchanged.
+    """
 
     if filters.all_items_visible is False:
         return False
@@ -2258,6 +2354,23 @@ class PivotTablesAdapter:
         _require_supported_source(pivot)
         target, info = _resolve_field_target(pivot, field)
         before = _field_filters(pivot_name, target, info.source_name)
+
+        # A manual visible-item filter is not applicable to a page (report-filter)
+        # field: its selection lives in ``CurrentPage`` and its items read
+        # ``Visible=False`` regardless, so writing ``PivotItem.Visible`` would be
+        # a no-op that the postcondition could only report as a false mismatch.
+        # Per the "never silently convert/downgrade" policy, reject explicitly
+        # before any COM mutation rather than writing ``PivotItem.Visible``.
+        if info.orientation is PivotFieldOrientation.PAGE:
+            return {
+                "filters": _unsupported_filter_result(
+                    pivot_table, field, normalized, _PAGE_FIELD_APPLY_REASON
+                ),
+                "verified": False,
+                "applied": False,
+                "notes": [],
+                "before": before,
+            }
 
         entries = _pivot_item_entries(target)
         requested = {item.strip().casefold() for item in normalized.visible_items}
