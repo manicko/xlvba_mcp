@@ -423,6 +423,14 @@ class FakeWorker:
         self.submits: list[dict[str, Any]] = []
         self.hang_execute = False
         self._owned_pid = owned_pid
+        # Recovery bookkeeping (F2b): recover_session drives worker.reset() on the
+        # real worker; the fake mirrors that with an in-memory reset that mints a
+        # new owned pid and returns to RUNNING.
+        self.reset_count = 0
+        self.state = WorkbookSessionState.RUNNING
+        self.accepting = True
+        self.reset_fails = False
+        self._next_pid = 5000
 
     async def submit(
         self,
@@ -441,12 +449,26 @@ class FakeWorker:
             }
         )
         if self.hang_execute and section == "execute":
+            self.state = WorkbookSessionState.NEEDS_RECOVERY
+            self.accepting = False
             raise ExcelHungError("simulated dispatch timeout")
         return fn()
 
+    async def reset(self) -> bool:
+        self.reset_count += 1
+        if self.reset_fails:
+            self.state = WorkbookSessionState.NEEDS_RECOVERY
+            self.accepting = False
+            raise ExcelHungError("simulated reset timeout")
+        self._next_pid += 1
+        self._owned_pid = self._next_pid
+        self.state = WorkbookSessionState.RUNNING
+        self.accepting = True
+        return True
+
     def get_status(self) -> WorkerStatus:
         return WorkerStatus(
-            state=WorkbookSessionState.RUNNING, accepting=True, owned_pid=self._owned_pid
+            state=self.state, accepting=self.accepting, owned_pid=self._owned_pid
         )
 
 
@@ -977,8 +999,14 @@ async def test_run_macro_timeout_no_retry(tmp_path: Path, monkeypatch: pytest.Mo
     assert result.error_code == ErrorCode.MACRO_TIMEOUT.value
     # Exactly one execute submission; no blind retry.
     assert len([s for s in rig.worker.submits if s["section"] == "execute"]) == 1
-    # No modal -> the owned PID was not terminated.
-    assert terminated == []
+    # F2b: the owned PID is terminated on a plain timeout too (behavior change) so
+    # the STA thread frees and the session can recover.
+    assert terminated == [4242]
+    # In-process recovery respawned the hidden instance and reached RUNNING again.
+    assert result.session_recovery == "recovered"
+    assert rig.worker.reset_count == 1
+    assert rig.worker.get_status().state is WorkbookSessionState.RUNNING
+    assert rig.worker.get_status().owned_pid != 4242
 
 
 async def test_run_macro_modal_hang_terminates_owned_pid(
@@ -1003,7 +1031,75 @@ async def test_run_macro_modal_hang_terminates_owned_pid(
     assert "NOT dismissed" in (result.error_text or "")
     # ONLY the owned PID was terminated (no wildcard, no dialog dismissal).
     assert terminated == [4242]
+    # Modal hang also recovers in-process and reports the honest outcome.
+    assert result.session_recovery == "recovered"
+    assert rig.worker.reset_count == 1
+    assert rig.worker.get_status().state is WorkbookSessionState.RUNNING
     assert len([s for s in rig.worker.submits if s["section"] == "execute"]) == 1
+
+
+async def test_run_macro_hung_recovery_failure_is_needs_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # When the in-process recovery itself fails (reset raises), the honest result
+    # is still returned (never masked, no exception escapes) and session_recovery
+    # is "needs_recovery".
+    rig = Rig(tmp_path)
+    info = await rig.open()
+    rig.grant_macro_run("modTest.Echo")
+    await rig.classify_safe(info.workbook_id, "modTest.Echo")
+    rig.worker.hang_execute = True
+    rig.worker.reset_fails = True
+
+    terminated: list[int] = []
+    monkeypatch.setattr(macro_service_module, "_owned_modal_present", lambda _pid: False)
+    monkeypatch.setattr(
+        macro_service_module, "_terminate_owned_pid", lambda pid: terminated.append(pid) or True
+    )
+
+    result = await rig.service.run_macro(info.workbook_id, "modTest.Echo")
+
+    # The honest timeout result survives the recovery failure.
+    assert result.status is MacroRunStatus.TIMEOUT
+    assert result.error_code == ErrorCode.MACRO_TIMEOUT.value
+    assert result.status is not MacroRunStatus.SUCCESS
+    assert result.session_recovery == "needs_recovery"
+    # The owned PID was still terminated (freeing the STA thread) before recovery.
+    assert terminated == [4242]
+    assert rig.worker.reset_count == 1
+    assert rig.worker.get_status().state is WorkbookSessionState.NEEDS_RECOVERY
+
+
+def test_default_timeout_is_ninety_seconds() -> None:
+    # F2b: the macro dispatch deadline default is 90s.
+    assert macro_service_module._DEFAULT_TIMEOUT_S == 90.0
+
+
+async def test_macro_timeout_uses_configured_deadline(tmp_path: Path) -> None:
+    # The configured macro_timeout_s is the default dispatch deadline.
+    rig = Rig(tmp_path)
+    info = await rig.open()
+    rig.grant_macro_run("modTest.Echo")
+    await rig.classify_safe(info.workbook_id, "modTest.Echo")
+
+    await rig.service.run_macro(info.workbook_id, "modTest.Echo")
+
+    execute = [s for s in rig.worker.submits if s["section"] == "execute"]
+    assert len(execute) == 1
+    assert execute[0]["timeout"] == macro_service_module._DEFAULT_TIMEOUT_S
+
+
+async def test_run_macro_explicit_timeout_overrides_config(tmp_path: Path) -> None:
+    rig = Rig(tmp_path)
+    info = await rig.open()
+    rig.grant_macro_run("modTest.Echo")
+    await rig.classify_safe(info.workbook_id, "modTest.Echo")
+
+    await rig.service.run_macro(info.workbook_id, "modTest.Echo", timeout_s=3.0)
+
+    execute = [s for s in rig.worker.submits if s["section"] == "execute"]
+    assert len(execute) == 1
+    assert execute[0]["timeout"] == 3.0
 
 
 # ---------------------------------------------------------------------------

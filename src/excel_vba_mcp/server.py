@@ -827,7 +827,14 @@ def _build_runtime(config: Config) -> _Runtime:
     # background_safe starts empty (deny-by-default, BG06): no procedure is
     # eligible for background execution until it is explicitly classified for the
     # current workbook hash and verified on a disposable copy.
-    macro_service = MacroService(worker, session, approval, BackgroundSafetyRegistry(), audit)
+    macro_service = MacroService(
+        worker,
+        session,
+        approval,
+        BackgroundSafetyRegistry(),
+        audit,
+        macro_timeout_s=config.server.macro_timeout_s,
+    )
     model_service = WorkbookModelService(
         worker,
         session,

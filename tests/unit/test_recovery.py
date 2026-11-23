@@ -158,6 +158,9 @@ class FakeWorker:
     ) -> Any:
         del timeout, op_class  # unused by the fake
         self.submits.append(section)
+        # Model the real worker's fail-fast: refuse non-close work while hung.
+        if self.state == WorkbookSessionState.NEEDS_RECOVERY and section != "close":
+            raise ExcelHungError("worker needs recovery; refusing new work")
         if section in self.fail_sections:
             self.state = WorkbookSessionState.NEEDS_RECOVERY
             self.accepting = False
@@ -309,6 +312,68 @@ async def test_recover_is_safe_when_worker_already_needs_recovery(rig: Rig) -> N
     assert status.state is WorkbookSessionState.RUNNING
     assert rig.worker.reset_count == 1
     assert any("EXCEL_HUNG" in note for note in status.notes)
+
+
+# ---------------------------------------------------------------------------
+# Lazy auto-recovery fallback (F2b / strategy C): open_workbook self-heals a
+# NEEDS_RECOVERY session whose owned pid is dead/stale (one recovery attempt).
+# ---------------------------------------------------------------------------
+async def _simulate_hang(rig: Rig) -> None:
+    """Drive the fake worker into NEEDS_RECOVERY (a hung execute call).
+
+    A raw worker hang flips the WORKER state to NEEDS_RECOVERY; the session-level
+    ``accepting`` flag is only changed by ``recover_session`` (mirroring the real
+    service), so it is intentionally not asserted here.
+    """
+
+    rig.worker.fail_sections = {"execute"}
+    with pytest.raises(ExcelHungError):
+        await rig.worker.submit(
+            lambda: "hang",
+            timeout=0.1,
+            section="execute",
+            op_class=OperationClass.EXECUTING,
+        )
+    assert rig.worker.state is WorkbookSessionState.NEEDS_RECOVERY
+
+
+async def test_lazy_auto_recovery_on_open_after_dead_owned_pid(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    info = await _open(rig)
+    await _simulate_hang(rig)
+    # The fake owned pid (4242) is not a real process -> dead/stale.
+    monkeypatch.setattr(rig.session, "_owned_pid_alive", lambda _pid: False)
+
+    resets_before = rig.worker.reset_count
+
+    # A new open self-heals with EXACTLY ONE in-process recovery, then succeeds.
+    again = await _open(rig)
+
+    assert rig.worker.reset_count == resets_before + 1
+    assert again.workbook_id != info.workbook_id
+    assert rig.session.accepting is True
+    assert rig.worker.state is WorkbookSessionState.RUNNING
+
+
+async def test_lazy_auto_recovery_skips_when_owned_pid_alive(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    info = await _open(rig)
+    # Close the workbook so a second open reaches the worker (not an "already open"
+    # fast-reject); the hang is a worker-level condition, independent of open books.
+    await rig.session.close_workbook(info.workbook_id)
+    await _simulate_hang(rig)
+    # A live owned pid means the STA call is genuinely hung; do NOT reset here.
+    monkeypatch.setattr(rig.session, "_owned_pid_alive", lambda _pid: True)
+
+    resets_before = rig.worker.reset_count
+
+    # The open is refused (the hung worker fails fast); no recovery was attempted.
+    with pytest.raises(ExcelHungError):
+        await _open(rig)
+
+    assert rig.worker.reset_count == resets_before, "a live hung STA must not be reset by open"
 
 
 # ---------------------------------------------------------------------------

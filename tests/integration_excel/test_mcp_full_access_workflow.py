@@ -685,10 +685,12 @@ async def test_health_reports_dead_owned_pid(tmp_path: Path) -> None:
     Killing the *owned* hidden ``EXCEL.EXE`` (and only that pid) leaves the
     worker bookkeeping unchanged, so without the FE-18 pid-liveness probe
     ``excel_health`` would still report ``ok``. The probe must flip the verdict
-    to ``needs_recovery`` truthfully. Recovery is then driven by the server
-    lifespan shutdown (no ``excel_recover_session`` tool is exposed); after the
-    server exits the owned pid is gone and no orphaned Excel remains beyond the
-    pre-existing baseline.
+    to ``needs_recovery`` truthfully. Auto-recovery is in-process (F2b): the next
+    ``excel_open`` self-heals a NEEDS_RECOVERY session with a dead owned pid via an
+    in-process ``recover_session`` (no server restart, no ``excel_recover_session``
+    tool). This test kills the pid externally (not via a hung macro), so it verifies
+    the truthful ``needs_recovery`` verdict; after the server exits the owned pid is
+    gone and no orphaned Excel remains beyond the pre-existing baseline.
     """
 
     baseline_pids = _excel_pids()

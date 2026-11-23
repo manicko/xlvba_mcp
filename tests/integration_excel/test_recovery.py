@@ -44,10 +44,12 @@ from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
 from excel_vba_mcp.api import workbook_tools
 from excel_vba_mcp.api.health_tools import excel_health
+from excel_vba_mcp.application.macro_service import BackgroundSafetyRegistry, MacroService
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.domain.errors import ErrorCode, ExcelHungError
 from excel_vba_mcp.domain.statuses import (
     HealthStatus,
+    MacroRunStatus,
     OperationClass,
     SessionMode,
     WorkbookSessionState,
@@ -128,6 +130,28 @@ def _wait_pid_gone(pid: int, timeout: float = _ORPHAN_POLL_TIMEOUT_S) -> bool:
             return True
         time.sleep(_ORPHAN_POLL_INTERVAL_S)
     return not _pid_alive(pid)
+
+
+def _excel_pids() -> set[int]:
+    """Read-only snapshot of current EXCEL.EXE pids (never kills anything)."""
+
+    try:  # pragma: no cover - depends on host
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq EXCEL.EXE", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception:  # noqa: BLE001
+        return set()
+    pids: set[int] = set()
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if line.startswith('"EXCEL.EXE"'):
+            parts = [p.strip('"') for p in line.split('","')]
+            if len(parts) >= 2 and parts[1].isdigit():
+                pids.add(int(parts[1]))
+    return pids
 
 
 def _foreground() -> dict[str, Any] | None:
@@ -456,3 +480,151 @@ async def test_excel_health_truthful_while_hung(tmp_path: Path) -> None:
 
     assert owned_pid is not None
     assert _wait_pid_gone(owned_pid), f"owned PID {owned_pid} still alive after shutdown"
+
+
+# ---------------------------------------------------------------------------
+# Test 4 (F2b): a hung MACRO (via MacroService) drives in-process auto-recovery
+# ---------------------------------------------------------------------------
+async def _inject_hang_macro(rig: _RecoveryRig, working_path: str) -> None:
+    """Add a busy-loop ``modTest.HangForever`` to the in-memory working copy.
+
+    The on-disk file is unchanged, so the workbook hash (and the background_safe
+    classification) still holds; only the in-memory VBA source gains the procedure.
+    """
+
+    app_adapter = rig.app_adapter
+
+    def inject() -> bool:
+        app = app_adapter.app
+        target = working_path.lower()
+        wb = None
+        for candidate in app.Workbooks:
+            if str(candidate.FullName).lower() == target:
+                wb = candidate
+                break
+        if wb is None:
+            raise RuntimeError("working copy not open")
+        module = wb.VBProject.VBComponents("modTest").CodeModule
+        module.AddFromString("Public Sub HangForever()\r\nDo\r\nLoop\r\nEnd Sub\r\n")
+        return True
+
+    inject.__name__ = "inject_hang"
+    await rig.worker.submit(
+        inject, timeout=30.0, section="diagnostic", op_class=OperationClass.EXECUTING
+    )
+
+
+async def _classify_safe(
+    macro: MacroService, session: SessionService, workbook_id: str, procedure: str
+) -> None:
+    """Classify ``procedure`` background_safe bound to the live hash + source revision."""
+
+    record = next(r for r in session.list_workbooks_sync() if r.workbook_id == workbook_id)
+    _inventory, project_source_hash = await macro._collect_project_state(workbook_id, record)
+    workbook_hash = _sha256(Path(record.path))
+    macro._background.classify(  # noqa: SLF001 - test reach-in
+        workbook_hash, project_source_hash, procedure, background_safe=True
+    )
+
+
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_hung_macro_drives_auto_recovery(tmp_path: Path) -> None:
+    """A hung macro via ``MacroService`` -> ``MACRO_TIMEOUT`` + in-process recovery.
+
+    Injects a busy-loop macro and runs it through the real ``MacroService`` with a
+    short deadline. Asserts the honest ``MACRO_TIMEOUT`` with
+    ``session_recovery == "recovered"``: the owned PID is terminated, the session is
+    rebuilt in-process (RUNNING, fresh pid) and a subsequent open + benign macro
+    succeeds WITHOUT a server restart. No user Excel PID is touched (BG05).
+    """
+
+    rig = _make_rig(tmp_path)
+    baseline_pids = _excel_pids()
+    # _RecoveryRig uses the default ApprovalPolicy (RESTRICTED): grant the open and
+    # the two macro_run approvals (bound to the working-copy hash + procedure).
+    background = BackgroundSafetyRegistry()
+    macro = MacroService(rig.worker, rig.service, rig.approval, background, rig.audit)
+    rig.grant("excel_open")
+    wb_hash = _sha256(rig.original)
+    for proc in ("modTest.HangForever", "modTest.AddNumbers"):
+        rig.approval.grant(
+            ApprovalGrant(
+                key=ApprovalKey(
+                    canonical_path=rig.canonical,
+                    sha256=wb_hash,
+                    action="macro_run",
+                    procedure=proc,
+                ),
+                scope=ApprovalScope.SESSION,
+                granted_at=datetime.now(UTC),
+                granted_by="integration-test",
+                source=ApprovalSource.CLIENT,
+                grant_id=uuid4().hex,
+            )
+        )
+    await rig.start()
+    old_pid: int | None = None
+    new_pid: int | None = None
+    try:
+        old_pid = rig.worker.get_status().owned_pid
+        assert old_pid is not None
+
+        info = await rig.service.open_workbook(
+            str(rig.original), mode=SessionMode.EXECUTE, read_only=False
+        )
+
+        await _inject_hang_macro(rig, info.path)
+        await _classify_safe(macro, rig.service, info.workbook_id, "modTest.HangForever")
+
+        result = await macro.run_macro(
+            info.workbook_id, "modTest.HangForever", timeout_s=_HANG_CALL_TIMEOUT_S
+        )
+
+        assert result.status is MacroRunStatus.TIMEOUT, f"expected TIMEOUT: {result}"
+        assert result.error_code == "MACRO_TIMEOUT"
+        assert result.status is not MacroRunStatus.SUCCESS
+        assert result.session_recovery == "recovered", (
+            f"expected in-process recovery: session_recovery={result.session_recovery!r}"
+        )
+
+        # Recovery rebuilt a fresh hidden instance; the old owned pid is gone.
+        new_pid = rig.worker.get_status().owned_pid
+        assert new_pid is not None and new_pid != old_pid, (
+            f"recovery did not rebuild a fresh instance: old={old_pid} new={new_pid}"
+        )
+        assert rig.worker.get_status().state is WorkbookSessionState.RUNNING
+        assert _wait_pid_gone(old_pid), f"old owned PID {old_pid} survived the timeout terminate"
+
+        # A subsequent open + benign macro SUCCEEDS without a server restart.
+        fresh = await rig.service.open_workbook(
+            str(rig.original), mode=SessionMode.EXECUTE, read_only=False
+        )
+        await _classify_safe(macro, rig.service, fresh.workbook_id, "modTest.AddNumbers")
+        ok = await macro.run_macro(fresh.workbook_id, "modTest.AddNumbers", [2, 3])
+        assert ok.status is MacroRunStatus.SUCCESS, f"post-recovery session unusable: {ok}"
+        assert ok.return_value == 5, f"fresh-session AddNumbers(2,3) != 5: {ok}"
+
+        # BG05: no user Excel PID was touched.
+        missing_user_pids = baseline_pids - _excel_pids()
+        assert not missing_user_pids, f"user Excel PIDs disappeared: {missing_user_pids}"
+
+        print(
+            f"[hung-macro-recover] status={result.status.value} "
+            f"session_recovery={result.session_recovery} old_pid={old_pid} new_pid={new_pid}"
+        )
+    finally:
+        for pid in (old_pid, new_pid):
+            if pid is not None and _pid_alive(pid):
+                with contextlib.suppress(Exception):
+                    subprocess.run(
+                        ["taskkill", "/F", "/PID", str(pid)],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+        await rig.stop()
+
+    assert old_pid is not None
+    assert _wait_pid_gone(old_pid), f"old owned PID {old_pid} still alive after shutdown"

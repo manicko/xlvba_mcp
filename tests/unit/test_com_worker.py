@@ -603,3 +603,70 @@ async def test_get_status_reflects_running_state() -> None:
     assert dumped["state"] == "running"
 
     await worker.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# reset(): rebuild the owned instance (F2b recovery exit)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_reset_after_hung_fn_released_rebuilds_and_runs() -> None:
+    """After the hung fn returns, ``reset()`` rebuilds a fresh owned instance."""
+
+    adapter = FakeAdapter()
+    worker = ExcelComWorker(adapter, orphan_timeout_s=2.0)
+    await worker.start()
+    assert adapter.create_count == 1
+    assert worker.get_status().owned_pid == 4242
+
+    def slow() -> str:
+        time.sleep(0.5)
+        return "done"
+
+    with pytest.raises(ExcelHungError):
+        await worker.submit(slow, timeout=0.1)
+    assert worker.get_status().state == WorkbookSessionState.NEEDS_RECOVERY
+
+    # Let the hung fn finish so the close-section reset item can be processed.
+    await asyncio.sleep(0.7)
+
+    await worker.reset()
+
+    # A fresh hidden instance was created and the worker is RUNNING again.
+    assert adapter.create_count == 2
+    assert worker.get_status().state == WorkbookSessionState.RUNNING
+    assert worker.get_status().accepting is True
+
+    # The rebuilt worker is usable again.
+    result = await worker.submit(lambda: "ok", timeout=2.0)
+    assert result == "ok"
+
+    await worker.shutdown()
+
+
+@pytest.mark.anyio
+async def test_reset_while_fn_hung_times_out_without_deadlock() -> None:
+    """``reset()`` while the fn is still hung is bounded by ``orphan_timeout_s``."""
+
+    adapter = FakeAdapter()
+    worker = ExcelComWorker(adapter, orphan_timeout_s=0.5)
+    await worker.start()
+
+    def very_slow() -> str:
+        time.sleep(1.5)
+        return "done"
+
+    with pytest.raises(ExcelHungError):
+        await worker.submit(very_slow, timeout=0.1)
+    assert worker.get_status().state == WorkbookSessionState.NEEDS_RECOVERY
+
+    # The fn is still running on the STA thread, so the close-section reset item is
+    # stuck behind it: reset() gives up after the bounded orphan timeout (no block).
+    started = time.monotonic()
+    with pytest.raises(ExcelHungError):
+        await worker.reset()
+    elapsed = time.monotonic() - started
+    assert elapsed < 3.0, f"reset blocked {elapsed:.2f}s (must be bounded by orphan_timeout_s)"
+
+    await worker.shutdown()

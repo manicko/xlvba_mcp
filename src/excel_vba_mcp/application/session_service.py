@@ -196,6 +196,11 @@ class SessionService:
         """
 
         mode = SessionMode(mode)
+        # Lazy auto-recovery fallback (F2b / strategy C): if the owned session was
+        # left in NEEDS_RECOVERY with a dead owned pid (e.g. the process was
+        # terminated after a hung macro), self-heal with ONE in-process recovery so
+        # the next open does not require a server restart.
+        await self._maybe_auto_recover()
         self._require_accepting_new_work("excel_open")
         canonical = self._path_policy.validate_path(path, OperationClass.MUTATING)
         canonical_str = str(canonical)
@@ -720,6 +725,42 @@ class SessionService:
                 "closed": self._closed,
             },
         )
+
+    async def _maybe_auto_recover(self) -> None:
+        """Lazy auto-recovery fallback (F2b / strategy C).
+
+        If the session is in ``NEEDS_RECOVERY`` because its automation-owned Excel
+        PID is dead/stale (the process was terminated after a hung macro), attempt
+        exactly ONE in-process :meth:`recover_session` so the next ``excel_open``
+        self-heals without a server restart. When the owned PID is still alive the
+        call is genuinely hung (an uninterruptible COM call in flight) and is left to
+        the explicit recovery path — a reset cannot reap a busy STA thread.
+
+        Best-effort: any failure is swallowed so :meth:`_require_accepting_new_work`
+        reports the truthful state and never masks the original condition. This guard
+        is deliberately narrow (open only), not sprinkled across every service.
+        """
+
+        if self._closed:
+            return
+        worker_status = self._worker.get_status()
+        # ``getattr`` keeps this guard a no-op for minimal fakes whose ``get_status``
+        # returns a bare state rather than a full ``WorkerStatus`` (the rest of the
+        # service reads worker status the same defensive way).
+        if getattr(worker_status, "state", None) != WorkbookSessionState.NEEDS_RECOVERY:
+            return
+        owned_pid = getattr(worker_status, "owned_pid", None)
+        # Only a dead/stale owned pid is self-healed here; a live hung STA is not.
+        if owned_pid is None or self._owned_pid_alive(owned_pid):
+            return
+        with contextlib.suppress(Exception):
+            await self.recover_session(reason="lazy_auto_recovery")
+
+    @staticmethod
+    def _owned_pid_alive(pid: int) -> bool:
+        """Read-only liveness probe delegating to the adapter (never raises)."""
+
+        return ExcelAppAdapter._pid_alive(pid)
 
     def _discard_open_workbooks(self) -> int:
         """Drop all workbook bookkeeping (the owned instance is being reset).

@@ -298,6 +298,14 @@ class MacroRunResult(TimestampedModel):
     return_value: Any | None = Field(default=None, description="Serializable Variant return value.")
     error_code: str | None = None
     error_text: str | None = None
+    session_recovery: str | None = Field(
+        default=None,
+        description="In-process session recovery outcome after a hang/timeout (F2b): "
+        "'recovered' when the owned Excel instance was rebuilt and is running again, "
+        "'needs_recovery' when recovery did not reach a running state, or None when the "
+        "run did not hang. The prior workbook_id is invalid after recovery (open "
+        "workbooks are discarded).",
+    )
 
 
 # ---------------------------------------------------------------------------

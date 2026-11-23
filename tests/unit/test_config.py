@@ -10,6 +10,7 @@ from excel_vba_mcp.domain.statuses import AccessMode
 
 _ENV_VAR = "EXCEL_VBA_MCP_LOG_LEVEL"
 _ENV_ACCESS_MODE = "EXCEL_VBA_MCP_ACCESS_MODE"
+_ENV_MACRO_TIMEOUT_S = "EXCEL_VBA_MCP_MACRO_TIMEOUT_S"
 
 
 def test_log_level_defaults_to_info(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -87,6 +88,33 @@ def test_invalid_access_mode_raises_with_valid_log_level(monkeypatch: pytest.Mon
     # F-01 companion: the same failure must surface when the log level is valid.
     monkeypatch.setenv(_ENV_VAR, "DEBUG")
     monkeypatch.setenv(_ENV_ACCESS_MODE, "bogus")
+
+    with pytest.raises(ValidationError):
+        load_config()
+
+
+# ---------------------------------------------------------------------------
+# Macro dispatch timeout configuration (F2b)
+# ---------------------------------------------------------------------------
+def test_macro_timeout_defaults_to_ninety_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(_ENV_MACRO_TIMEOUT_S, raising=False)
+
+    config = load_config()
+
+    assert config.server.macro_timeout_s == 90.0
+
+
+def test_macro_timeout_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(_ENV_MACRO_TIMEOUT_S, "15.5")
+
+    config = load_config()
+
+    assert config.server.macro_timeout_s == 15.5
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "not-a-number"])
+def test_invalid_macro_timeout_raises(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv(_ENV_MACRO_TIMEOUT_S, value)
 
     with pytest.raises(ValidationError):
         load_config()
