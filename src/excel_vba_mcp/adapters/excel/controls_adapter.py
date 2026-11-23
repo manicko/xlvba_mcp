@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ExcelVbaMcpError, ObjectNotFoundError
 from excel_vba_mcp.domain.models import ControlEntry
 from excel_vba_mcp.domain.statuses import ControlFormType, ControlKind, MacroMappingStatus
 
@@ -389,7 +389,7 @@ class ControlsAdapter:
             entry for entry in self.list_controls(wb) if entry.name.strip().lower() == target
         ]
         if not matches:
-            raise ExcelVbaMcpError(
+            raise ObjectNotFoundError(
                 f"Control {name!r} was not found in the workbook.",
                 context={"name": name},
             )
@@ -448,7 +448,7 @@ class ControlsAdapter:
                     f"Shape {target_name!r} is not a Form Control and has no OnAction property.",
                     context={"name": target_name, "kind": "shape"},
                 )
-        raise ExcelVbaMcpError(
+        raise ObjectNotFoundError(
             f"Control {target_name!r} was not found in the workbook.",
             context={"name": target_name},
         )

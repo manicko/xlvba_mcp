@@ -60,6 +60,11 @@ class ErrorCode(StrEnum):
     # contention, which the generic ``COM_BUSY`` fallback previously masked.
     WORKBOOK_NOT_FOUND = "WORKBOOK_NOT_FOUND"
     REVISION_CONFLICT = "REVISION_CONFLICT"
+    # Block B7a (finding F6): a workbook object (shape / control) addressed by
+    # name does not exist. Additive; distinct from ``WORKBOOK_NOT_FOUND`` /
+    # ``MACRO_NOT_FOUND`` and from the generic ``COM_BUSY`` fallback so callers
+    # can tell "no such object, do not retry" from "Excel busy, retry".
+    NOT_FOUND = "NOT_FOUND"
 
 
 # Well-known HRESULT values that map to domain codes (hex shown for readability).
@@ -382,6 +387,19 @@ class RevisionConflictError(ExcelVbaMcpError):
     default_message = "The component source changed since it was read."
 
 
+class ObjectNotFoundError(ExcelVbaMcpError):
+    """A workbook object (shape / control) addressed by name does not exist.
+
+    Raised for a missing shape / control so a caller can distinguish "no such
+    object, do not retry" from the generic ``COM_BUSY`` fallback ("Excel busy,
+    retry"). Deliberately distinct from ``WORKBOOK_NOT_FOUND`` (unknown
+    ``workbook_id``) and ``MACRO_NOT_FOUND`` (unknown procedure).
+    """
+
+    default_code = ErrorCode.NOT_FOUND
+    default_message = "The requested object was not found."
+
+
 def error_from_hresult(
     hresult: int,
     message: str,
@@ -434,4 +452,9 @@ _ERROR_BY_CODE: dict[ErrorCode, type[ExcelVbaMcpError]] = {
     # ``error_from_hresult`` (no HRESULT maps to them).
     ErrorCode.WORKBOOK_NOT_FOUND: WorkbookNotFoundError,
     ErrorCode.REVISION_CONFLICT: RevisionConflictError,
+    # Block B7a (finding F6): missing shape / control. Inert for
+    # ``error_from_hresult`` (no HRESULT maps to it); registered so the
+    # code -> exception mapping stays complete for callers that rebuild a typed
+    # error from a code.
+    ErrorCode.NOT_FOUND: ObjectNotFoundError,
 }

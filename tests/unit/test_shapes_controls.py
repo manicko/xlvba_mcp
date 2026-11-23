@@ -399,8 +399,10 @@ def test_get_shape_by_name_and_errors() -> None:
 
     assert adapter.get_shape(wb, "rect 1").name == "Rect 1"  # case-insensitive
 
-    with pytest.raises(ExcelVbaMcpError):
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
         adapter.get_shape(wb, "NoSuchShape")
+    # F6: a missing object is NOT_FOUND (not the generic COM_BUSY fallback).
+    assert exc_info.value.code is ErrorCode.NOT_FOUND
 
     with pytest.raises(ExcelVbaMcpError):
         adapter.get_shape(wb, "")
@@ -520,8 +522,10 @@ def test_get_control_and_errors() -> None:
 
     assert adapter.get_control(wb, "button 1").name == "Button 1"
 
-    with pytest.raises(ExcelVbaMcpError):
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
         adapter.get_control(wb, "NoSuchControl")
+    # F6: a missing object is NOT_FOUND (not the generic COM_BUSY fallback).
+    assert exc_info.value.code is ErrorCode.NOT_FOUND
 
 
 def test_set_control_on_action_writes_and_returns_reread() -> None:

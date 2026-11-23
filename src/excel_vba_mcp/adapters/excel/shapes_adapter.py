@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ExcelVbaMcpError, ObjectNotFoundError
 from excel_vba_mcp.domain.models import ShapeInfo
 from excel_vba_mcp.domain.statuses import ShapeKind
 
@@ -311,7 +311,7 @@ class ShapesAdapter:
                 if info.name.strip().lower() == target:
                     matches.append(info)
         if not matches:
-            raise ExcelVbaMcpError(
+            raise ObjectNotFoundError(
                 f"Shape {name!r} was not found in the workbook.",
                 context={"name": name},
             )
@@ -356,7 +356,7 @@ class ShapesAdapter:
                 if _safe_str(shape, "Name").strip().lower() == target_name:
                     matches.append(shape)
         if not matches:
-            raise ExcelVbaMcpError(
+            raise ObjectNotFoundError(
                 f"Shape {target_name!r} was not found in the workbook.",
                 context={"name": target_name},
             )

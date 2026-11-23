@@ -26,6 +26,7 @@ from excel_vba_mcp.application.vba_project_service import VBAProjectService
 from excel_vba_mcp.domain.errors import (
     ErrorCode,
     ExcelVbaMcpError,
+    ObjectNotFoundError,
     ProtectedTargetError,
     RevisionConflictError,
     WorkbookNotFoundError,
@@ -52,6 +53,8 @@ def test_new_error_codes_are_additive_members() -> None:
     values = {code.value for code in ErrorCode}
     assert "WORKBOOK_NOT_FOUND" in values
     assert "REVISION_CONFLICT" in values
+    # Block B7a (F6): the shape/control not-found code is a new additive member.
+    assert "NOT_FOUND" in values
     # The Stage-1 closed set is untouched (subset check).
     assert {
         "ACCESS_VBOM_DISABLED",
@@ -61,6 +64,17 @@ def test_new_error_codes_are_additive_members() -> None:
         "WORKBOOK_READ_ONLY",
         "PATH_NOT_ALLOWED",
     } <= values
+
+
+def test_object_not_found_error_carries_code_and_is_registered() -> None:
+    # F6: the NOT_FOUND code maps to ObjectNotFoundError and serializes as
+    # "NOT_FOUND" (the same code -> exception registry used by call_tool).
+    from excel_vba_mcp.domain import errors as err
+
+    assert err._ERROR_BY_CODE[ErrorCode.NOT_FOUND] is ObjectNotFoundError
+    error = ObjectNotFoundError()
+    assert error.code is ErrorCode.NOT_FOUND
+    assert error.to_dict()["code"] == "NOT_FOUND"
 
 
 def test_workbook_not_found_error_carries_code() -> None:
