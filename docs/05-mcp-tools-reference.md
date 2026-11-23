@@ -594,7 +594,10 @@ The top-level `sha256` is the snapshot **file** hash. Each `vba_exports` entry's
 from `sha256` at `model_version: 2` so it is not mistaken for the normalized `source_hash`). It
 is **not** a valid `expected_source_hash` for the VBA mutation tools — those require the
 normalized `source_hash` from `vba_read_component`. `snapshot_list` returns the same manifests;
-`snapshot_diff` compares the top-level snapshot file hashes (not `export_file_sha256`).
+`snapshot_diff` compares the full manifests — every field except the volatile
+`snapshot_id`/`created_at`/`stored_path`, so this includes `vba_exports` and therefore each
+`export_file_sha256` — and separately reports the top-level snapshot file-hash comparison
+(`file_identical`, `sha256_a`, `sha256_b`).
 
 Restore:
 

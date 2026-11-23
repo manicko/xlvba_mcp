@@ -143,6 +143,7 @@ Configuration is read from environment variables at server startup.
 |----------|---------|---------|
 | `EXCEL_VBA_MCP_ACCESS_MODE` | `full` | Server access policy: `full` authorizes mutations and macro execution without per-action grants; `restricted` keeps the deny-by-default approval gate. Any other value fails startup fast (a configuration error). |
 | `EXCEL_VBA_MCP_ROOTS` | Current working directory and system temp directory | `os.pathsep`-separated allowlist of directories that may contain workbooks. Paths outside these roots are rejected with `PATH_NOT_ALLOWED`. |
+| `EXCEL_VBA_MCP_MACRO_TIMEOUT_S` | `90` | Macro dispatch deadline in seconds (positive number). Soft per-call ceiling for the `Application.Run` dispatch inside `macro_run`; exceeding it classifies the run `MACRO_TIMEOUT` (or `MACRO_RUNTIME_ERROR` on a modal) and recovers the session. Set it below the MCP client request `timeout`. |
 | `EXCEL_VBA_MCP_WORK_DIR` | `<temp>/excel_vba_mcp/work` | Working-copy directory. Originals are never modified. |
 | `EXCEL_VBA_MCP_SNAPSHOT_DIR` | `<temp>/excel_vba_mcp/snapshots` | Snapshot storage. |
 | `EXCEL_VBA_MCP_ARTIFACT_DIR` | `<temp>/excel_vba_mcp/artifacts` | Test-run artifacts and evidence. |

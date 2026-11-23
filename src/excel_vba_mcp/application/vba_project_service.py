@@ -631,7 +631,9 @@ class VBAProjectService:
         if current_hash != expected_hash:
             raise RevisionConflictError(
                 f"Revision conflict for component {component!r}: the source has "
-                "changed since it was read.",
+                "changed since it was read. Use the normalized `source_hash` "
+                "returned by `xlvba_vba_read_component` as `expected_source_hash` "
+                "(the snapshot export file hash is a different hash).",
                 context={
                     "component": component,
                     "expected_source_hash": expected_hash,
@@ -965,7 +967,9 @@ def _do_replace(
     if current_hash != expected_source_hash:
         raise RevisionConflictError(
             f"Revision conflict for component {component!r}: the source changed "
-            "between the pre-check and the mutation.",
+            "between the pre-check and the mutation. Use the normalized `source_hash` "
+            "returned by `xlvba_vba_read_component` as `expected_source_hash` "
+            "(the snapshot export file hash is a different hash).",
             context={
                 "component": component,
                 "expected_source_hash": expected_source_hash,
@@ -1034,7 +1038,9 @@ def _do_insert(
     if current_hash != expected_source_hash:
         raise RevisionConflictError(
             f"Revision conflict for component {component!r}: the source changed "
-            "between the pre-check and the mutation.",
+            "between the pre-check and the mutation. Use the normalized `source_hash` "
+            "returned by `xlvba_vba_read_component` as `expected_source_hash` "
+            "(the snapshot export file hash is a different hash).",
             context={
                 "component": component,
                 "expected_source_hash": expected_source_hash,
