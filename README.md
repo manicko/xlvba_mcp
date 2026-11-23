@@ -93,7 +93,10 @@ Kilo's `mcp` block is runner-agnostic: `type: local` spawns the `command` array 
         "excel-vba-mcp"
       ],
       "enabled": true,
-      "timeout": 60000
+      "timeout": 60000,
+      "environment": {
+        "EXCEL_VBA_MCP_ROOTS": "C:\\py_exp\\mko_treport"
+      }
     }
   },
   "permission": {
@@ -103,6 +106,9 @@ Kilo's `mcp` block is runner-agnostic: `type: local` spawns the `command` array 
 ```
 
 - Replace `<absolute-path-to-repo>` with the absolute path to this repository's root.
+- The `environment` block sets `EXCEL_VBA_MCP_ROOTS` (pathsep-separated, `;` on Windows) so
+  `xlvba_excel_open` accepts workbooks under `C:\py_exp\mko_treport`. **Restart/reload the MCP
+  server after changing it** — roots are read once at startup.
 - Tools are exposed as `xlvba_<tool>` (for example `xlvba_excel_open`).
 - In the Kilo TUI, `/mcps` toggles loaded servers.
 - `permission` defaults to `"ask"` because the tools drive real Excel. Whitelist read-only tools later, for example `"xlvba_server_health": "allow"`.
@@ -150,7 +156,14 @@ Configuration is read from environment variables at server startup.
 > `EXCEL_VBA_MCP_LOG_LEVEL` is parsed by `config.load_config()` but not applied: logging is configured at import time with a fixed `INFO` level (`_configure_logging()`), so in this revision the server always logs at `INFO` and the variable has no effect. (`config.load_config()` is now called during server startup for `EXCEL_VBA_MCP_ACCESS_MODE`; an invalid access mode or log level fails startup fast.)
 
 > [!TIP]
-> Set `EXCEL_VBA_MCP_ROOTS` explicitly. The default (current working directory + temp) is convenient locally but broad.
+> Set `EXCEL_VBA_MCP_ROOTS` explicitly. The default (current working directory + temp) is convenient locally but broad. It is `os.pathsep`-separated (`;` on Windows) and is read once at server startup, so **restart/reload the MCP server after changing it**. For example, to allowlist the `mko_treport` project tree:
+>
+> ```powershell
+> $env:EXCEL_VBA_MCP_ROOTS = "C:\py_exp\mko_treport"
+> uv run excel-vba-mcp
+> ```
+>
+> An explicit value replaces the default (it is not merged); join extra roots with `;`. Paths outside every configured root are rejected with `PATH_NOT_ALLOWED / outside_roots`, and the error `context.allowed_roots` lists the roots the running server loaded.
 
 ## Usage
 

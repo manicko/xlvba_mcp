@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from pydantic import ValidationError
 
 from excel_vba_mcp.config import ServerConfig, load_config
 from excel_vba_mcp.domain.statuses import AccessMode
+from excel_vba_mcp.server import _configured_roots
 
 _ENV_VAR = "EXCEL_VBA_MCP_LOG_LEVEL"
 _ENV_ACCESS_MODE = "EXCEL_VBA_MCP_ACCESS_MODE"
 _ENV_MACRO_TIMEOUT_S = "EXCEL_VBA_MCP_MACRO_TIMEOUT_S"
+_ENV_ROOTS = "EXCEL_VBA_MCP_ROOTS"
 
 
 def test_log_level_defaults_to_info(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -118,3 +122,44 @@ def test_invalid_macro_timeout_raises(monkeypatch: pytest.MonkeyPatch, value: st
 
     with pytest.raises(ValidationError):
         load_config()
+
+
+# ---------------------------------------------------------------------------
+# Roots allowlist environment parsing (F5)
+#
+# ``EXCEL_VBA_MCP_ROOTS`` is consumed by ``server._configured_roots()`` (the
+# typed ``config.py`` model does not own roots). These tests pin the
+# os.pathsep-separated parsing that lets an operator allowlist an extra project
+# tree (e.g. ``C:\py_exp\mko_treport``) without a source change.
+# ---------------------------------------------------------------------------
+def test_roots_env_split_on_pathsep(monkeypatch: pytest.MonkeyPatch) -> None:
+    first = r"C:\py_exp\mko_treport"
+    second = r"C:\data\workbooks"
+    monkeypatch.setenv(_ENV_ROOTS, os.pathsep.join([first, second]))
+
+    roots = _configured_roots()
+
+    assert roots["root_0"] == first
+    assert roots["root_1"] == second
+    # The artifact root is always registered in addition to the generic roots.
+    assert "artifacts" in roots
+
+
+def test_roots_env_empty_falls_back_to_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(_ENV_ROOTS, "")
+
+    roots = _configured_roots()
+
+    # Default roots are CWD + system temp; only the generic + artifact keys are
+    # guaranteed, so assert the shape rather than host-specific paths.
+    assert "root_0" in roots
+    assert "artifacts" in roots
+
+
+def test_roots_env_blank_segments_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(_ENV_ROOTS, f"{os.pathsep}C:\\only{os.pathsep}  ")
+
+    roots = _configured_roots()
+
+    assert roots["root_0"] == r"C:\only"
+    assert "root_1" not in roots

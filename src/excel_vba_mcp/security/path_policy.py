@@ -127,7 +127,9 @@ class PathPolicy:
 
         Raises:
             PathNotAllowedError: For every rejection, with a ``reason`` category
-                in ``error.context["reason"]`` and code ``PATH_NOT_ALLOWED``.
+                in ``error.context["reason"]`` and code ``PATH_NOT_ALLOWED``. A
+                rejection because the path matches no root additionally lists the
+                configured roots in ``error.context["allowed_roots"]``.
         """
 
         op = _coerce_operation(operation)
@@ -160,7 +162,16 @@ class PathPolicy:
                 reason = PathDenyReason.TRAVERSAL
             else:
                 reason = PathDenyReason.OUTSIDE_ROOTS
-            raise self._reject(reason, op, probe, expected_root)
+            # List the currently-allowed roots so a caller can self-diagnose a
+            # missing allowlist entry (F5). Additive context only: the error
+            # ``code`` (PATH_NOT_ALLOWED) and ``reason`` are unchanged.
+            raise self._reject(
+                reason,
+                op,
+                probe,
+                expected_root,
+                extra_context={"allowed_roots": [os.fspath(root) for root in self._roots.values()]},
+            )
 
         if expected_root is not None and expected_root not in matches:
             raise self._reject(PathDenyReason.ROOT_MISMATCH, op, probe, expected_root)
@@ -184,6 +195,8 @@ class PathPolicy:
         operation: OperationClass,
         probe: str,
         expected_root: str | None,
+        *,
+        extra_context: Mapping[str, Any] | None = None,
     ) -> PathNotAllowedError:
         context: dict[str, Any] = {
             "reason": reason.value,
@@ -192,6 +205,8 @@ class PathPolicy:
         }
         if expected_root is not None:
             context["expected_root"] = expected_root
+        if extra_context:
+            context.update(extra_context)
         return PathNotAllowedError(
             f"Path not allowed ({reason.value}).",
             context=context,

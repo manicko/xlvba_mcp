@@ -171,3 +171,51 @@ def test_symlink_escape_rejected(roots: dict[str, Path], tmp_path: Path) -> None
     policy = PathPolicy(roots)
 
     _assert_rejected(policy, str(escape_link / "evil.xlsm"), "symlink_escape")
+
+
+# ---------------------------------------------------------------------------
+# F5: extra configured roots (e.g. EXCEL_VBA_MCP_ROOTS) must widen the
+# allowlist, while paths outside every root still raise ``outside_roots``.
+# ---------------------------------------------------------------------------
+def test_path_under_extra_configured_root_validates(tmp_path: Path) -> None:
+    # Mirrors an operator setting EXCEL_VBA_MCP_ROOTS to include an additional
+    # project tree (here the broad ``.../mko_treport`` decision PO1).
+    mko_root = tmp_path / "mko_treport"
+    xls_dir = mko_root / "src" / "xls"
+    xls_dir.mkdir(parents=True)
+    book = xls_dir / "treport.xlsm"
+    book.write_text("fixture")
+
+    policy = PathPolicy({"projects": mko_root})
+
+    result = policy.validate_path(str(book), _READ)
+
+    assert result == Path(os.path.realpath(book))
+
+
+def test_path_outside_configured_roots_still_rejected(tmp_path: Path) -> None:
+    mko_root = tmp_path / "mko_treport"
+    mko_root.mkdir()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+
+    policy = PathPolicy({"projects": mko_root})
+
+    _assert_rejected(policy, str(outside / "evil.xlsm"), "outside_roots")
+
+
+def test_outside_roots_context_lists_allowed_roots(tmp_path: Path) -> None:
+    mko_root = tmp_path / "mko_treport"
+    mko_root.mkdir()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+
+    policy = PathPolicy({"projects": mko_root})
+
+    with pytest.raises(PathNotAllowedError) as excinfo:
+        policy.validate_path(str(outside / "evil.xlsm"), _READ)
+
+    error = excinfo.value
+    assert error.code == ErrorCode.PATH_NOT_ALLOWED
+    assert error.context["reason"] == "outside_roots"
+    assert error.context["allowed_roots"] == [os.fspath(Path(os.path.realpath(mko_root)))]

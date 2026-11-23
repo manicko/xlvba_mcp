@@ -47,6 +47,17 @@ Each element becomes a logical root `root_N`; the artifact directory is addition
 under the name `artifacts`. If the variable is empty or missing, the current working directory
 (`Path.cwd()`) and the system temp directory are used.
 
+> [!IMPORTANT]
+> `EXCEL_VBA_MCP_ROOTS` is read **once at server startup** by `server._configured_roots()`.
+> After changing it you **must restart the MCP server** (reload the server in Kilo / your MCP
+> client) for the new roots to take effect. A running session keeps its original allowlist.
+
+> [!TIP]
+> `EXCEL_VBA_MCP_ROOTS` is the supported way to allowlist additional project trees — no source
+> change is required. Paths outside every configured root are rejected with `PATH_NOT_ALLOWED`
+> (reason `outside_roots`); the error `context` also lists the currently-allowed roots under
+> `allowed_roots` so a missing entry is easy to diagnose.
+
 `EXCEL_VBA_MCP_LOG_LEVEL` is parsed by `config.load_config()` and validated through Pydantic,
 but it effectively **does not affect** logging: logging is configured once at import time by
 `_configure_logging()` with a fixed `INFO` level, before the lifespan runs `load_config()`.
@@ -161,6 +172,30 @@ $env:EXCEL_VBA_MCP_ROOTS = "C:\data\workbooks;D:\projects\excel"
 uv run excel-vba-mcp
 ```
 
+### Local project tree (`C:\py_exp\mko_treport`)
+
+Allowlist the whole `mko_treport` tree so `xlvba_excel_open` accepts workbooks under it. Set the
+variable **before** starting the server, then start/reload the MCP server:
+
+```powershell
+# Allow only the mko_treport tree (plus any other roots you need, pathsep-separated).
+$env:EXCEL_VBA_MCP_ROOTS = "C:\py_exp\mko_treport"
+uv run excel-vba-mcp
+```
+
+To keep the existing defaults (CWD + temp) *and* add the project, join them explicitly with
+`;` (Windows) — the default is not merged with an explicit value:
+
+```powershell
+$env:EXCEL_VBA_MCP_ROOTS = "$env:TEMP;C:\py_exp\mko_treport"
+```
+
+> [!NOTE]
+> Restart / reload the MCP server after setting the variable. The value is read at startup only;
+> a live session continues to use its original allowlist. If `xlvba_excel_open` still returns
+> `PATH_NOT_ALLOWED / outside_roots`, confirm the server was restarted and that the path is under
+> one of the configured roots (see `context.allowed_roots` in the error).
+
 ### Production-ish (dedicated directories + audit)
 
 ```powershell
@@ -194,7 +229,9 @@ Omitting the variable (or setting `full`) keeps the default full-access behavior
 ## Configuration Diagnostics
 
 If tools return `PATH_NOT_ALLOWED`, check that the workbook path is inside
-`EXCEL_VBA_MCP_ROOTS` (by default CWD and temp). If mutating or executing tools return
+`EXCEL_VBA_MCP_ROOTS` (by default CWD and temp). The error `context.allowed_roots` lists the
+roots the running server actually loaded; if your newly configured root is missing, the server was
+not restarted after the change (see the restart note above). If mutating or executing tools return
 `APPROVAL_DENIED`, the server is running in `restricted` mode
 (`EXCEL_VBA_MCP_ACCESS_MODE=restricted`); unset it (or set `full`) for the default full-access
 behavior. If VBA features are unavailable, check the VBOM setting in Trust Center. For details —
