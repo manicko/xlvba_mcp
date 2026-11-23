@@ -989,6 +989,9 @@ def test_merge_allowed_with_allow_data_loss() -> None:
 
     assert result.verified is True
     assert result.affected_addresses == ["B6", "C6", "A7", "B7", "C7"]
+    assert result.range_after is not None
+    assert result.range_after.is_merged is True
+    assert result.range_after.merged_area == "$A$6:$C$7"
     assert sheet.merge_anchor(6, 1) == (6, 1)
     assert sheet.get(6, 1) == "a"  # the anchor value survives
     assert sheet.get(6, 2) is None  # non-anchor values are discarded
@@ -1056,6 +1059,70 @@ def test_unmerge_partial_overlap_uses_merge_area() -> None:
     assert result.verified is True
     assert result.affected_addresses == ["$J$1:$L$2"]
     assert sheet.merge_anchor(1, 11) is None
+
+
+# ---------------------------------------------------------------------------
+# Adapter — range descriptor merged-cell geometry (F1)
+# ---------------------------------------------------------------------------
+def test_describe_range_reports_merged_anchor_block() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    sheet = wb.sheet("Data")
+    sheet.merge_block(1, 1, 2, 2, across=False)
+    adapter = RangesAdapter()
+
+    resolved = adapter.resolve_range(wb, "Data", "A1:B2")
+
+    assert resolved.is_merged is True
+    assert resolved.merged_area == "$A$1:$B$2"
+
+
+def test_describe_range_reports_merged_interior_cell() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    sheet = wb.sheet("Data")
+    sheet.merge_block(1, 1, 2, 2, across=False)
+    adapter = RangesAdapter()
+
+    # B2 is an interior (non-anchor) cell of the merged block.
+    resolved = adapter.resolve_range(wb, "Data", "B2")
+
+    assert resolved.is_merged is True
+    assert resolved.merged_area == "$A$1:$B$2"
+
+
+def test_describe_range_reports_merged_subrange() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    sheet = wb.sheet("Data")
+    sheet.merge_block(1, 1, 2, 2, across=False)
+    adapter = RangesAdapter()
+
+    # A sub-range that sits wholly inside the merged block.
+    resolved = adapter.resolve_range(wb, "Data", "A1:B1")
+
+    assert resolved.is_merged is True
+    assert resolved.merged_area == "$A$1:$B$2"
+
+
+def test_describe_range_reports_unmerged_as_not_merged() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    adapter = RangesAdapter()
+
+    resolved = adapter.resolve_range(wb, "Data", "A1:B2")
+
+    assert resolved.is_merged is False
+    assert resolved.merged_area is None
+
+
+def test_describe_range_partial_overlap_is_not_a_single_merge() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    sheet = wb.sheet("Data")
+    sheet.merge_block(1, 1, 2, 2, across=False)
+    adapter = RangesAdapter()
+
+    # A1:B3 overlaps the merged A1:B2 block but adds an unmerged row 3.
+    resolved = adapter.resolve_range(wb, "Data", "A1:B3")
+
+    assert resolved.is_merged is False
+    assert resolved.merged_area is None
 
 
 # ---------------------------------------------------------------------------

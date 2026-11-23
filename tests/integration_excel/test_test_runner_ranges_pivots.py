@@ -97,6 +97,8 @@ _ORPHAN_POLL_INTERVAL_S = 0.5
 
 #: The approval action a ``range_write_values`` step needs (RangesService guard).
 _ACTION_WRITE_VALUES = "range_write_values"
+#: The approval action a ``range_merge`` step needs (RangesService guard).
+_ACTION_MERGE = "range_merge"
 #: The approval action a ``pivot_table_refresh`` step needs (PivotTablesService).
 _ACTION_REFRESH_TABLE = "pivot_table_refresh"
 
@@ -703,6 +705,62 @@ async def test_cases_start_from_the_same_baseline(tmp_path: Path) -> None:
         )
         open_ids = [record.workbook_id for record in rig.session.list_workbooks_sync()]
         assert open_ids == [info.workbook_id]
+    finally:
+        await rig.stop()
+
+
+# ---------------------------------------------------------------------------
+# range_structure {merged: true/false} observes real merge geometry (F1)
+# ---------------------------------------------------------------------------
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_range_structure_merged_flag_matches_geometry(tmp_path: Path) -> None:
+    fixture = _fixture_or_skip(_RANGES_PROJECT)
+    rig = _make_rig(tmp_path, fixture)
+    await rig.start()
+    try:
+        info = await rig.open()
+        rig.grant_mutation(_ACTION_MERGE)
+
+        suite = _suite(
+            [
+                {
+                    "id": "merge-then-structure",
+                    "steps": [
+                        {
+                            "action": "range_merge",
+                            "sheet": "StructOps",
+                            "range_address": "P20:Q20",
+                            "allow_data_loss": True,
+                        }
+                    ],
+                    "assertions": [
+                        {
+                            "type": "range_structure",
+                            "sheet": "StructOps",
+                            "address": "P20:Q20",
+                            "merged": True,
+                        },
+                        {
+                            "type": "range_structure",
+                            "sheet": "StructOps",
+                            "address": "A1:B2",
+                            "merged": False,
+                        },
+                    ],
+                }
+            ],
+            info.workbook_id,
+        )
+
+        result = await rig.runner.run_suite(suite)
+
+        assert result.status is RunStatus.PASSED, f"run failed: {result}"
+        case = result.cases[0]
+        assert case.status is CaseStatus.PASSED
+        assert case.steps[0].status is StepStatus.PASSED
+        assert all(assertion.passed for assertion in case.assertions), case.assertions
     finally:
         await rig.stop()
 

@@ -589,12 +589,52 @@ def _resolve_range(worksheet: Any, address: str, *, sheet_name: str) -> Any:
     return range_obj
 
 
+def _range_is_merged(range_obj: Any) -> tuple[bool, str | None]:
+    """Report merged-cell geometry for a resolved Range (defensive, never guesses).
+
+    Returns ``(is_merged, merged_area)`` where ``merged_area`` is the ``$``-absolute
+    ``MergeArea`` address (same format as :func:`_merged_areas`) or ``None``.
+
+    ``Range.MergeCells`` is ``True`` only when every cell of the target belongs to
+    the *same* merged block, ``False`` for an unmerged target and ``Null`` when the
+    target mixes merged and unmerged cells. The ``MergeCells is True`` gate is what
+    prevents a false positive: ``MergeArea`` on an unmerged cell returns the cell
+    itself, so an ungated ``MergeArea.Address`` comparison would always match. A
+    partial overlap (a merged block plus an extra unmerged row) yields ``Null`` and
+    is reported as *not* a single merged block.
+    """
+
+    state = _read_attr(range_obj, "MergeCells")
+    if state is not True:  # False -> unmerged; None -> Null / read-fail / fake lacking prop
+        return False, None
+
+    rows, cols = _declare(range_obj)  # (0, 0) on failure
+    if rows <= 0 or cols <= 0:
+        return False, None
+
+    try:
+        top_left = range_obj.Cells(1, 1)
+        bottom_right = range_obj.Cells(rows, cols)
+    except Exception:  # noqa: BLE001 - defensive COM read
+        return False, None
+
+    area = _merge_area_address(top_left)  # "$A$1:$B$2" or None
+    if not area:
+        return False, None
+    # Fragmentation guard: the target is ONE merged block only when both far
+    # corners resolve to the SAME MergeArea.
+    if _merge_area_address(bottom_right) != area:
+        return False, None
+    return True, area
+
+
 def _describe_range(range_obj: Any, *, sheet: str) -> RangeAddress:
     """Build a :class:`RangeAddress` from a resolved Range."""
 
     rows = _safe_int(range_obj.Rows.Count, default=0)
     cols = _safe_int(range_obj.Columns.Count, default=0)
     address = _safe_str(range_obj.Address)
+    is_merged, merged_area = _range_is_merged(range_obj)
     return RangeAddress(
         sheet=sheet,
         address=address,
@@ -602,6 +642,8 @@ def _describe_range(range_obj: Any, *, sheet: str) -> RangeAddress:
         cols=cols,
         shape=_shape_for(rows, cols),
         areas=1,
+        is_merged=is_merged,
+        merged_area=merged_area,
     )
 
 

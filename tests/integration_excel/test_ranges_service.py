@@ -842,6 +842,74 @@ async def test_unmerge_restores_merged_area(rig: Rig) -> None:
 
 
 @requires_excel
+async def test_get_range_reports_merged_geometry(rig: Rig) -> None:
+    wid = await _open_for_mutation(rig)
+
+    merged = await rig.ranges.merge_range(wid, "StructOps", "N2:P2", allow_data_loss=True)
+    assert merged.verified is True
+    assert merged.range_after.is_merged is True
+    assert merged.range_after.merged_area == "$N$2:$P$2"
+
+    # The descriptor of the merged block reports the anchor area.
+    anchor = await rig.ranges.get_range(wid, "StructOps", "N2:P2")
+    assert anchor.is_merged is True
+    assert anchor.merged_area == "$N$2:$P$2"
+
+    # An interior (non-anchor) cell resolves to the same merged area.
+    interior = await rig.ranges.get_range(wid, "StructOps", "O2")
+    assert interior.is_merged is True
+    assert interior.merged_area == "$N$2:$P$2"
+
+    # range_unmerge precondition agrees with the descriptor's merged_area.
+    unmerged = await rig.ranges.unmerge_range(wid, "StructOps", "N2")
+    assert unmerged.verified is True
+    assert unmerged.preconditions["merged_areas"] == ["$N$2:$P$2"]
+
+    after = await rig.ranges.get_range(wid, "StructOps", "N2:P2")
+    assert after.is_merged is False
+    assert after.merged_area is None
+
+
+@requires_excel
+async def test_get_range_fragmented_merge_is_not_merged(rig: Rig) -> None:
+    wid = await _open_for_mutation(rig)
+
+    # Two separate single-row merges; the union A1:B2 is NOT one merged block.
+    assert (await rig.ranges.merge_range(wid, "StructOps", "N5:O5", allow_data_loss=True)).verified
+    assert (await rig.ranges.merge_range(wid, "StructOps", "N6:O6", allow_data_loss=True)).verified
+
+    combined = await rig.ranges.get_range(wid, "StructOps", "N5:O6")
+    assert combined.is_merged is False
+    assert combined.merged_area is None
+
+    row = await rig.ranges.get_range(wid, "StructOps", "N5:O5")
+    assert row.is_merged is True
+    assert row.merged_area == "$N$5:$O$5"
+
+
+@requires_excel
+async def test_range_structure_descriptor_tracks_merge_flag(rig: Rig) -> None:
+    """The Range descriptor that backs ``range_structure`` must observe geometry.
+
+    The declarative ``range_structure {merged: ...}`` assertion reads
+    ``RangesService.get_range`` -> ``RangeAddress.is_merged`` / ``merged_area``;
+    this asserts that surface directly (the runner-backed case lives in
+    ``test_test_runner_ranges_pivots``).
+    """
+
+    wid = await _open_for_mutation(rig)
+    assert (await rig.ranges.merge_range(wid, "StructOps", "N9:P9", allow_data_loss=True)).verified
+
+    merged = await rig.ranges.get_range(wid, "StructOps", "N9:P9")
+    assert merged.is_merged is True
+    assert merged.merged_area == "$N$9:$P$9"
+
+    unmerged = await rig.ranges.get_range(wid, "StructOps", "A1:B2")
+    assert unmerged.is_merged is False
+    assert unmerged.merged_area is None
+
+
+@requires_excel
 async def test_structural_operations_reject_table_intersection(rig: Rig) -> None:
     wid = await _open_for_mutation(rig)
 
