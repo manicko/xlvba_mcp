@@ -510,6 +510,36 @@ async def _run_macro_sampling_foreground(
     return result, owned_foreground
 
 
+async def _read_guard_props(rig: _Rig) -> dict[str, Any] | None:
+    """Best-effort: read ``Interactive`` / ``DisplayAlerts`` from the owned instance.
+
+    Reads the F2a guard properties through the adapter's owned ``Application``
+    proxy, on the STA worker (COM is never touched from the event-loop thread).
+    Returns ``None`` — never raises — when the owned instance is unavailable
+    (e.g. terminated by the modal path or the worker is recovering), so a caller
+    can treat the read-back as optional evidence.
+    """
+
+    app_adapter = rig.app_adapter
+
+    def read() -> dict[str, Any]:
+        app = app_adapter.app
+        if app is None:
+            raise RuntimeError("owned app is gone")
+        return {
+            "Interactive": bool(app.Interactive),
+            "DisplayAlerts": bool(app.DisplayAlerts),
+        }
+
+    read.__name__ = "read_guard_props"
+    try:
+        return await rig.worker.submit(
+            read, timeout=10.0, section="diagnostic", op_class=OperationClass.READ_ONLY
+        )
+    except Exception:  # noqa: BLE001 - best-effort probe; absence is not a failure
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Test 1: success / not-found / preflight blocks + BG03/04/05 + no orphan
 # ---------------------------------------------------------------------------
@@ -1183,6 +1213,95 @@ async def test_full_mode_macro_runs_without_grant(tmp_path: Path) -> None:
 
         print(f"[b5-full-mode] status={result.status.value} rv={result.return_value}")
     finally:
+        await rig.stop()
+
+    assert owned_pid is not None
+    assert _wait_pid_gone(owned_pid), f"owned PID {owned_pid} still alive after shutdown"
+
+
+# ---------------------------------------------------------------------------
+# Test 11 (F2a): the Interactive/DisplayAlerts guard brackets Application.Run
+# and restores the pre-run values. Best-effort read-back via the adapter.
+# ---------------------------------------------------------------------------
+@requires_excel
+@pytest.mark.anyio
+@pytest.mark.integration_excel
+async def test_guard_restores_props_around_live_macro(tmp_path: Path) -> None:
+    """F2a defense-in-depth: ``Interactive`` / ``DisplayAlerts`` are restored.
+
+    Runs a background-safe macro (``AddNumbers``) and reads the guard properties
+    back through the adapter: they must equal their pre-run values (the guard sets
+    them ``False`` for the dispatch and restores them). Then runs ``RaiseError``
+    and asserts it is still honestly classified ``RUNTIME_ERROR`` (the guard never
+    converts a failure into success).
+
+    Best-effort by design: on the target build an unhandled VBA runtime error
+    raises a modal that ``DisplayAlerts = False`` does **not** suppress, so the
+    service terminates only the owned PID. When the owned instance survives, the
+    read-back is asserted; when it was terminated (or is otherwise unavailable),
+    the read-back is skipped — never a hard failure.
+    """
+
+    fixture = _fixture_or_skip(_CLEAN_PROJECT)
+    rig = _make_rig(tmp_path, fixture)
+    baseline_pids = _excel_pids()
+    await rig.start()
+    owned_pid: int | None = None
+    try:
+        info = await rig.open()
+        owned_pid = rig.worker.get_status().owned_pid
+        assert owned_pid is not None
+
+        # --- Successful macro: the instance survives, so the read-back is real. ---
+        pre = await _read_guard_props(rig)
+        rig.grant_macro_run("modTest.AddNumbers")
+        await rig.classify_safe("modTest.AddNumbers")
+        ok = await rig.service.run_macro(info.workbook_id, "modTest.AddNumbers", [2, 3])
+        assert ok.status is MacroRunStatus.SUCCESS, f"AddNumbers failed: {ok}"
+        assert ok.return_value == 5
+
+        post = await _read_guard_props(rig)
+        if pre is not None and post is not None:
+            assert post == pre, f"guard did not restore: pre={pre} post={post}"
+        else:
+            print("[guard-live] success read-back skipped (guard props unavailable)")
+
+        # --- Runtime-error macro: still classified RUNTIME_ERROR (never success). ---
+        rig.grant_macro_run("modTest.RaiseError")
+        await rig.classify_safe("modTest.RaiseError")
+        pre_err = await _read_guard_props(rig)
+
+        result = await rig.service.run_macro(
+            info.workbook_id, "modTest.RaiseError", timeout_s=_MODAL_TIMEOUT_S
+        )
+
+        assert result.status is MacroRunStatus.RUNTIME_ERROR, (
+            f"RaiseError did not classify as RUNTIME_ERROR: {result}"
+        )
+        assert result.status is not MacroRunStatus.SUCCESS
+
+        # Best-effort read-back: only meaningful if the owned instance survived
+        # (the modal path terminates it, so this is typically skipped here).
+        post_err = await _read_guard_props(rig)
+        if pre_err is not None and post_err is not None and _pid_alive(owned_pid):
+            assert post_err == pre_err, (
+                f"guard did not restore around runtime error: pre={pre_err} post={post_err}"
+            )
+        else:
+            print("[guard-live] runtime-error read-back skipped (owned instance terminated)")
+
+        # BG05: user-owned Excel processes are untouched.
+        missing_user_pids = baseline_pids - _excel_pids()
+        assert not missing_user_pids, f"user Excel PIDs disappeared: {missing_user_pids}"
+
+        print(
+            f"[guard-live] ok_rv={ok.return_value} ok_restored={pre == post} "
+            f"runtime_status={result.status.value} owned_pid={owned_pid}"
+        )
+    finally:
+        # The modal path may have terminated the owned PID; reap defensively.
+        if owned_pid is not None and _pid_alive(owned_pid):
+            _terminate_owned_pid(owned_pid)
         await rig.stop()
 
     assert owned_pid is not None

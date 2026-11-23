@@ -30,7 +30,11 @@ Binding ``Application.Run`` facts (research ``g1-poc-research-2026-11-19.md`` §
 
 The runner never retries: a single ``Application.Run`` dispatch is issued and its
 outcome (success, not-found, runtime error, blocked) is normalized into a
-:class:`MacroRunResult`. Timeout / hang handling (worker soft deadline, modal
+:class:`MacroRunResult`. The dispatch is wrapped in :func:`_suppress_dialogs`,
+which sets ``Interactive = False`` / ``DisplayAlerts = False`` for its duration and
+restores the prior values in ``finally`` (F2a, defense-in-depth: not a universal
+dialog blocker and never a replacement for the BG06 / R13 veto or owned-PID
+termination). Timeout / hang handling (worker soft deadline, modal
 detection, owned-PID termination) is owned by the application-layer
 ``MacroService`` because it needs the worker and process bookkeeping; this adapter
 only classifies the synchronous return / exception of one dispatch.
@@ -38,8 +42,10 @@ only classifies the synchronous return / exception of one dispatch.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import time
+from collections.abc import Iterator
 from typing import Any
 from uuid import uuid4
 
@@ -144,6 +150,57 @@ def serialize_return(value: Any) -> Any:
         code=ErrorCode.MACRO_BLOCKED,
         context={"reason": ERROR_NON_SERIALIZABLE_RETURN, "type": type(value).__name__},
     )
+
+
+# ---------------------------------------------------------------------------
+# Dialog suppression guard (F2a — defense-in-depth around a single dispatch)
+# ---------------------------------------------------------------------------
+# Properties suppressed around ``Application.Run`` for the duration of one
+# dispatch. ``Interactive = False`` blocks user input; ``DisplayAlerts = False``
+# suppresses Excel's own built-in alert prompts (e.g. "save changes?"). This is
+# **not** a universal dialog blocker: it does NOT suppress ``MsgBox``,
+# ``UserForm.Show``, ``FileDialog``, add-in UI or arbitrary Win32 dialogs, and it
+# does NOT replace the BG06 run-time gate, the R13 classify-time veto, or the
+# owned-PID termination on timeout. It is defense-in-depth only.
+_GUARD_PROPS = ("Interactive", "DisplayAlerts")
+
+
+@contextlib.contextmanager
+def _suppress_dialogs(app: Any) -> Iterator[None]:
+    """Suppress ``Interactive`` / ``DisplayAlerts`` around one ``Application.Run``.
+
+    For each property in :data:`_GUARD_PROPS` (in order): defensively read the
+    prior value, then defensively set it to ``False``. A property whose read or
+    set raises is skipped and is **not** restored. Only the properties that were
+    both read and set successfully are restored in reverse order in ``finally``,
+    each restore wrapped so it can never raise. The prior value is restored
+    verbatim — a property never read successfully is never blindly written.
+
+    The caller is responsible for placing this guard *after* argument coercion
+    (so an unsupported argument never touches these properties) and for letting
+    its ``finally`` run before any exception-classification body (the ``with``
+    block guarantees both).
+    """
+
+    saved: dict[str, Any] = {}
+    applied: list[str] = []
+    for name in _GUARD_PROPS:
+        try:
+            prior = getattr(app, name)
+        except Exception:  # noqa: BLE001 - unreadable -> skip; do not restore
+            continue
+        try:
+            setattr(app, name, False)
+        except Exception:  # noqa: BLE001 - unsettable -> skip; do not restore
+            continue
+        saved[name] = prior
+        applied.append(name)
+    try:
+        yield
+    finally:
+        for name in reversed(applied):
+            with contextlib.suppress(Exception):
+                setattr(app, name, saved[name])
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +364,8 @@ class MacroRunner:
             )
 
         try:
-            returned = self._app.Run(qualified_name, *coerced)
+            with _suppress_dialogs(self._app):
+                returned = self._app.Run(qualified_name, *coerced)
         except TypeError as exc:
             # pywin32 rejected an argument before dispatch (defensive: coerce_args
             # should already have caught this).

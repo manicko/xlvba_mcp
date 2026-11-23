@@ -277,19 +277,54 @@ class FakeWorkbook:
 
 
 class FakeApp:
-    """A fake ``Excel.Application`` whose ``Run`` simulates ``modTest`` macros."""
+    """A fake ``Excel.Application`` whose ``Run`` simulates ``modTest`` macros.
+
+    ``Interactive`` / ``DisplayAlerts`` are properties that record every write in
+    :attr:`writes` (so the F2a dialog-suppression guard can be asserted) and
+    snapshot both values at the start of each :meth:`Run` (so "were they ``False``
+    during the dispatch?" can be checked). Both start ``True`` (their Excel
+    default) so a guard that failed to set/restore them is observable.
+    """
 
     def __init__(self, project: FakeProject) -> None:
         self.Visible = False
-        self.DisplayAlerts = True
         self.ScreenUpdating = True
         self.AutomationSecurity = 1
         self.Version = "16.0"
         self.Caption = "Excel"
         self.Hwnd = 0
         self.Workbooks = FakeWorkbooks(project, self)
+        # Guard-tracked properties (F2a). Private backing fields keep the init
+        # writes out of the log; writes made after construction are recorded.
+        self._interactive = True
+        self._display_alerts = True
+        self.writes: list[tuple[str, bool]] = []
+        self.run_snapshots: list[dict[str, bool]] = []
+
+    @property
+    def Interactive(self) -> bool:  # noqa: N802 - COM casing
+        return self._interactive
+
+    @Interactive.setter
+    def Interactive(self, value: bool) -> None:  # noqa: N802 - COM casing
+        self._interactive = value
+        self.writes.append(("Interactive", value))
+
+    @property
+    def DisplayAlerts(self) -> bool:  # noqa: N802 - COM casing
+        return self._display_alerts
+
+    @DisplayAlerts.setter
+    def DisplayAlerts(self, value: bool) -> None:  # noqa: N802 - COM casing
+        self._display_alerts = value
+        self.writes.append(("DisplayAlerts", value))
 
     def Run(self, macro: str, *args: Any) -> Any:  # noqa: N802 - COM casing
+        # Snapshot both guard properties at dispatch time: the guard must have set
+        # them False for the duration of the macro.
+        self.run_snapshots.append(
+            {"Interactive": self._interactive, "DisplayAlerts": self._display_alerts}
+        )
         procedure = macro.split("!", 1)[-1]
         name = procedure.split(".")[-1]
         if name == "AddNumbers":
@@ -309,6 +344,76 @@ class FakeApp:
             "workbook or all macros may be disabled.",
             0x800A03ED - 0x100000000,
         )
+
+
+class GuardApp:
+    """Configurable fake ``Excel.Application`` for the F2a guard failure tests.
+
+    Each flag injects a failure at a specific point of the guard's defensive
+    read/set/restore cycle so the guard's skip / swallow behavior can be asserted:
+
+    * ``*_read_raises`` -> ``getattr`` raises (property skipped, not restored);
+    * ``*_set_false_raises`` -> the guard's ``setattr(False)`` raises (skipped);
+    * ``*_restore_raises`` -> the guard's restore write (a non-``False`` value)
+      raises (swallowed; prior value left as-is).
+    """
+
+    def __init__(
+        self,
+        *,
+        interactive_read_raises: bool = False,
+        alerts_read_raises: bool = False,
+        interactive_set_false_raises: bool = False,
+        alerts_set_false_raises: bool = False,
+        interactive_restore_raises: bool = False,
+        alerts_restore_raises: bool = False,
+        run_result: Any = "ok",
+    ) -> None:
+        self._interactive = True
+        self._display_alerts = True
+        self._interactive_read_raises = interactive_read_raises
+        self._alerts_read_raises = alerts_read_raises
+        self._interactive_set_false_raises = interactive_set_false_raises
+        self._alerts_set_false_raises = alerts_set_false_raises
+        self._interactive_restore_raises = interactive_restore_raises
+        self._alerts_restore_raises = alerts_restore_raises
+        self._run_result = run_result
+        self.writes: list[tuple[str, bool]] = []
+        self.run_count = 0
+
+    @property
+    def Interactive(self) -> bool:  # noqa: N802 - COM casing
+        if self._interactive_read_raises:
+            raise RuntimeError("Interactive read failed")
+        return self._interactive
+
+    @Interactive.setter
+    def Interactive(self, value: bool) -> None:  # noqa: N802 - COM casing
+        if value is False and self._interactive_set_false_raises:
+            raise RuntimeError("Interactive set(False) failed")
+        if value is not False and self._interactive_restore_raises:
+            raise RuntimeError("Interactive restore failed")
+        self._interactive = value
+        self.writes.append(("Interactive", value))
+
+    @property
+    def DisplayAlerts(self) -> bool:  # noqa: N802 - COM casing
+        if self._alerts_read_raises:
+            raise RuntimeError("DisplayAlerts read failed")
+        return self._display_alerts
+
+    @DisplayAlerts.setter
+    def DisplayAlerts(self, value: bool) -> None:  # noqa: N802 - COM casing
+        if value is False and self._alerts_set_false_raises:
+            raise RuntimeError("DisplayAlerts set(False) failed")
+        if value is not False and self._alerts_restore_raises:
+            raise RuntimeError("DisplayAlerts restore failed")
+        self._display_alerts = value
+        self.writes.append(("DisplayAlerts", value))
+
+    def Run(self, macro: str, *args: Any) -> Any:  # noqa: N802 - COM casing
+        self.run_count += 1
+        return self._run_result
 
 
 class FakeWorker:
@@ -535,6 +640,135 @@ def test_runner_blocks_non_serializable_return() -> None:
     result = MacroRunner(app).run("'Book.xlsm'!modTest.ReturnObject")
     assert result.status is MacroRunStatus.BLOCKED
     assert result.error_code == ERROR_NON_SERIALIZABLE_RETURN
+
+
+# ---------------------------------------------------------------------------
+# MacroRunner: F2a dialog-suppression guard (Interactive / DisplayAlerts)
+# ---------------------------------------------------------------------------
+def test_guard_sets_false_during_run_and_restores_in_reverse() -> None:
+    app = FakeApp(_default_project())
+
+    result = MacroRunner(app).run("'Book.xlsm'!modTest.AddNumbers", [2, 3])
+
+    assert result.status is MacroRunStatus.SUCCESS
+    assert result.return_value == 5
+    # During the dispatch both properties were False.
+    assert app.run_snapshots == [{"Interactive": False, "DisplayAlerts": False}]
+    # After the run both are restored to their original True.
+    assert app.Interactive is True
+    assert app.DisplayAlerts is True
+    # Set order Interactive -> DisplayAlerts; restore order DisplayAlerts -> Interactive.
+    assert app.writes == [
+        ("Interactive", False),
+        ("DisplayAlerts", False),
+        ("DisplayAlerts", True),
+        ("Interactive", True),
+    ]
+
+
+def test_guard_restores_when_run_raises() -> None:
+    app = FakeApp(_default_project())
+
+    result = MacroRunner(app).run("'Book.xlsm'!modTest.RaiseError")
+
+    assert result.status is MacroRunStatus.RUNTIME_ERROR
+    # Both properties restored despite the dispatch raising (restore never raises).
+    assert app.Interactive is True
+    assert app.DisplayAlerts is True
+    assert app.writes == [
+        ("Interactive", False),
+        ("DisplayAlerts", False),
+        ("DisplayAlerts", True),
+        ("Interactive", True),
+    ]
+
+
+def test_guard_skips_property_whose_set_fails() -> None:
+    # Interactive setter raises on set(False): it is skipped and NOT restored, the
+    # dispatch still runs, and DisplayAlerts is still set + restored.
+    app = GuardApp(interactive_set_false_raises=True)
+
+    result = MacroRunner(app).run("'Book.xlsm'!modTest.AddNumbers", [2, 3])
+
+    assert result.status is MacroRunStatus.SUCCESS
+    assert result.return_value == "ok"
+    assert app.run_count == 1
+    # Interactive was never written (skipped); its value is untouched (still True).
+    assert app.Interactive is True
+    assert ("Interactive", False) not in app.writes
+    assert ("Interactive", True) not in app.writes
+    # DisplayAlerts was set False and restored to True.
+    assert app.DisplayAlerts is True
+    assert app.writes == [("DisplayAlerts", False), ("DisplayAlerts", True)]
+
+
+def test_guard_skips_property_whose_read_fails() -> None:
+    # Interactive getter raises: it is skipped entirely; DisplayAlerts is still
+    # set + restored; the dispatch runs.
+    app = GuardApp(interactive_read_raises=True)
+
+    result = MacroRunner(app).run("'Book.xlsm'!modTest.AddNumbers", [2, 3])
+
+    assert result.status is MacroRunStatus.SUCCESS
+    assert result.return_value == "ok"
+    assert app.run_count == 1
+    assert app.DisplayAlerts is True
+    assert app.writes == [("DisplayAlerts", False), ("DisplayAlerts", True)]
+
+
+def test_guard_swallows_restore_failure_and_returns_result() -> None:
+    # Restore order is DisplayAlerts then Interactive (reverse of the applied set).
+    # Interactive (the second restore) raises: it is swallowed and the original
+    # result is returned unchanged; DisplayAlerts is restored first.
+    app = GuardApp(interactive_restore_raises=True)
+
+    result = MacroRunner(app).run("'Book.xlsm'!modTest.AddNumbers", [2, 3])
+
+    assert result.status is MacroRunStatus.SUCCESS
+    assert result.return_value == "ok"
+    # DisplayAlerts restore succeeded; Interactive restore failed (left False).
+    assert app.DisplayAlerts is True
+    assert app.Interactive is False
+
+
+def test_guard_not_entered_on_coercion_early_return() -> None:
+    # An unsupported argument is rejected before the guard: ZERO property writes.
+    app = FakeApp(_default_project())
+
+    result = MacroRunner(app).run("'Book.xlsm'!modTest.Echo", [object()])
+
+    assert result.status is MacroRunStatus.BLOCKED
+    assert result.error_code == ERROR_UNSUPPORTED_ARGUMENT
+    assert app.writes == []
+    assert app.run_snapshots == []
+
+
+def test_guard_sets_each_property_false_exactly_once() -> None:
+    app = FakeApp(_default_project())
+
+    MacroRunner(app).run("'Book.xlsm'!modTest.NoArgs")
+
+    assert app.writes.count(("Interactive", False)) == 1
+    assert app.writes.count(("DisplayAlerts", False)) == 1
+
+
+def test_guard_restores_before_non_serializable_return_rejection() -> None:
+    app = FakeApp(_default_project())
+
+    result = MacroRunner(app).run("'Book.xlsm'!modTest.ReturnObject")
+
+    assert result.status is MacroRunStatus.BLOCKED
+    assert result.error_code == ERROR_NON_SERIALIZABLE_RETURN
+    # The guard ran and restored both properties before serialize_return rejected.
+    assert app.run_snapshots == [{"Interactive": False, "DisplayAlerts": False}]
+    assert app.Interactive is True
+    assert app.DisplayAlerts is True
+    assert app.writes == [
+        ("Interactive", False),
+        ("DisplayAlerts", False),
+        ("DisplayAlerts", True),
+        ("Interactive", True),
+    ]
 
 
 # ---------------------------------------------------------------------------
