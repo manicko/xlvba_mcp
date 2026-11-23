@@ -314,7 +314,16 @@ class MacroRunResult(TimestampedModel):
 
 
 class SnapshotManifest(DomainModel):
-    """Snapshot manifest metadata (spec §9.1)."""
+    """Snapshot manifest metadata (spec §9.1).
+
+    ``vba_exports`` is a list of per-component record dicts (matching the
+    storage-layer manifest actually persisted in ``manifest.json``), each with
+    ``component_name``, ``type``, ``path``, ``export_file_sha256`` and, for
+    UserForms, ``frx``/``frx_sha256``. ``export_file_sha256`` is the SHA-256 of
+    the **exported file bytes** — it is not the normalized ``source_hash`` used by
+    the VBA mutation guards (F7). ``model_version`` is bumped to ``2`` for the
+    ``sha256`` -> ``export_file_sha256`` field rename.
+    """
 
     snapshot_id: str
     workbook_id: str
@@ -327,8 +336,8 @@ class SnapshotManifest(DomainModel):
     sha256: str
     excel_version: str | None = None
     has_vba: bool | None = None
-    model_version: int = Field(default=1)
-    vba_exports: list[str] = Field(default_factory=list)
+    model_version: int = Field(default=2)
+    vba_exports: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SnapshotInfo(DomainModel):

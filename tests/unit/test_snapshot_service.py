@@ -26,10 +26,14 @@ from uuid import uuid4
 
 import pytest
 
+import excel_vba_mcp.storage.snapshot_store as store_mod
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import WorkerStatus
 from excel_vba_mcp.application.session_service import SessionService
-from excel_vba_mcp.application.snapshot_service import SnapshotService
+from excel_vba_mcp.application.snapshot_service import (
+    SnapshotService,
+    _export_vba_components,
+)
 from excel_vba_mcp.domain.errors import (
     ApprovalDeniedError,
     ExcelVbaMcpError,
@@ -476,3 +480,201 @@ async def test_create_audit_records_mutating(tmp_path: Path) -> None:
     create_events = [record for record in records if record["tool"] == "snapshot_create"]
     assert create_events, "snapshot_create must be audited"
     assert create_events[-1]["operation_class"] == "mutating"
+
+
+# ---------------------------------------------------------------------------
+# F7: export file hash renamed to export_file_sha256 + model_version bump
+# ---------------------------------------------------------------------------
+class _FakeComponent:
+    """Minimal ``VBComponent`` that writes deterministic bytes on ``Export``."""
+
+    def __init__(self, name: str, ctype: int, payload: bytes) -> None:
+        self.Name = name
+        self.Type = ctype
+        self._payload = payload
+
+    def Export(self, path: str) -> None:  # noqa: N802 - COM casing
+        Path(path).write_bytes(self._payload)
+
+
+class _FakeComponents:
+    def __init__(self, items: list[_FakeComponent]) -> None:
+        self._items = items
+
+    @property
+    def Count(self) -> int:  # noqa: N802 - COM casing
+        return len(self._items)
+
+    def Item(self, index: int) -> _FakeComponent:  # noqa: N802 - COM casing
+        return self._items[index - 1]
+
+
+class _FakeProject:
+    def __init__(self, items: list[_FakeComponent]) -> None:
+        self.VBComponents = _FakeComponents(items)
+
+
+class _FakeWorkbookWithVba:
+    def __init__(self, items: list[_FakeComponent]) -> None:
+        self.VBProject = _FakeProject(items)
+
+
+def test_export_vba_components_uses_export_file_sha256(tmp_path: Path) -> None:
+    """``_export_vba_components`` names the file hash ``export_file_sha256`` (F7)."""
+
+    import hashlib
+
+    payload = b"Attribute VB_Name = \"Module1\"\r\nOption Explicit\r\n"
+    wb = _FakeWorkbookWithVba([_FakeComponent("Module1", 1, payload)])
+
+    entries = _export_vba_components(wb, tmp_path / "exports")
+
+    assert entries is not None
+    assert len(entries) == 1
+    entry = entries[0]
+    # The exported-file byte hash is exposed under the unambiguous name ...
+    assert entry["export_file_sha256"] == hashlib.sha256(payload).hexdigest()
+    # ... and the old ambiguous ``sha256`` key is gone.
+    assert "sha256" not in entry
+    assert entry["component_name"] == "Module1"
+    assert entry["type"] == 1
+    assert entry["path"] == "exports/Module1.bas"
+
+
+async def test_manifest_model_version_bumped(tmp_path: Path) -> None:
+    """New manifests are stamped with the bumped ``model_version`` (F7)."""
+
+    rig = Rig(tmp_path)
+    info = await rig.open(read_only=False)
+
+    manifest = await rig.service.create_snapshot(info.workbook_id)
+
+    assert manifest.model_version == store_mod._MANIFEST_SCHEMA_VERSION
+    assert manifest.model_version >= 2
+    # The on-disk manifest.json carries the same bumped version.
+    raw = json.loads(
+        (rig.store.path_for(manifest.snapshot_id) / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert raw["model_version"] >= 2
+
+
+async def test_snapshot_list_surfaces_export_file_sha256(tmp_path: Path) -> None:
+    """``snapshot_list`` surfaces ``export_file_sha256`` on vba_exports (F7)."""
+
+    rig = Rig(tmp_path)
+    src = tmp_path / "Book.xlsm"
+    src.write_bytes(b"workbook")
+    entry = {
+        "component_name": "Module1",
+        "type": 1,
+        "path": "exports/Module1.bas",
+        "export_file_sha256": "a" * 64,
+    }
+    rig.store.create("snap-e", source_path=src, vba_exports=[entry])
+
+    listed = await rig.service.list_snapshots()
+
+    manifest = next(m for m in listed if m.snapshot_id == "snap-e")
+    assert manifest.vba_exports is not None
+    assert manifest.vba_exports[0]["export_file_sha256"] == "a" * 64
+    assert "sha256" not in manifest.vba_exports[0]
+
+
+async def test_diff_surfaces_export_file_sha256_change(tmp_path: Path) -> None:
+    """``snapshot_diff`` still compares manifests by the renamed field (F7)."""
+
+    rig = Rig(tmp_path)
+    src = tmp_path / "Book.xlsm"
+    src.write_bytes(b"workbook")
+    rig.store.create(
+        "s1",
+        source_path=src,
+        vba_exports=[
+            {
+                "component_name": "m",
+                "type": 1,
+                "path": "exports/m.bas",
+                "export_file_sha256": "a" * 64,
+            }
+        ],
+    )
+    rig.store.create(
+        "s2",
+        source_path=src,
+        vba_exports=[
+            {
+                "component_name": "m",
+                "type": 1,
+                "path": "exports/m.bas",
+                "export_file_sha256": "b" * 64,
+            }
+        ],
+    )
+
+    diff = await rig.service.diff_snapshots("s1", "s2")
+
+    # The manifests differ only in the exported-file hash, surfaced as a change.
+    assert "vba_exports" in diff.changed
+    assert diff.changed["vba_exports"]["a"][0]["export_file_sha256"] == "a" * 64
+    assert diff.changed["vba_exports"]["b"][0]["export_file_sha256"] == "b" * 64
+
+
+def test_load_migrates_legacy_vba_exports_sha256(tmp_path: Path) -> None:
+    """An old-format manifest (v1 ``sha256``, no bumped version) migrates on load.
+
+    PO4 = B chose a hard rename + ``model_version`` bump; loading an older on-disk
+    manifest must not crash — it migrates ``sha256`` -> ``export_file_sha256`` in
+    memory and stamps the current ``model_version`` (F7).
+    """
+
+    store = SnapshotStore(tmp_path / "snapshots")
+    src = tmp_path / "Book.xlsm"
+    src.write_bytes(b"legacy")
+    store.create("snap-old", source_path=src)
+
+    # Rewrite the manifest in the pre-F7 (v1) shape.
+    manifest_path = store.path_for("snap-old") / "manifest.json"
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw["model_version"] = 1
+    raw["vba_exports"] = [
+        {"component_name": "mod", "type": 1, "path": "exports/mod.bas", "sha256": "deadbeef"}
+    ]
+    manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = store.load("snap-old")
+
+    assert loaded.model_version == store_mod._MANIFEST_SCHEMA_VERSION
+    assert loaded.vba_exports is not None
+    migrated = loaded.vba_exports[0]
+    assert migrated["export_file_sha256"] == "deadbeef"
+    assert "sha256" not in migrated
+    # The on-disk file is not rewritten (migration is in-memory only).
+    on_disk = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert on_disk["model_version"] == 1
+    assert on_disk["vba_exports"][0]["sha256"] == "deadbeef"
+
+
+def test_load_without_model_version_migrates(tmp_path: Path) -> None:
+    """A manifest missing ``model_version`` is treated as v1 and migrated (F7)."""
+
+    store = SnapshotStore(tmp_path / "snapshots")
+    src = tmp_path / "Book.xlsm"
+    src.write_bytes(b"legacy")
+    store.create("snap-nov", source_path=src)
+
+    manifest_path = store.path_for("snap-nov") / "manifest.json"
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw.pop("model_version", None)
+    raw["vba_exports"] = [
+        {"component_name": "mod", "type": 1, "path": "exports/mod.bas", "sha256": "c0ffee"}
+    ]
+    manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = store.load("snap-nov")
+
+    assert loaded.model_version == store_mod._MANIFEST_SCHEMA_VERSION
+    assert loaded.vba_exports is not None
+    assert loaded.vba_exports[0]["export_file_sha256"] == "c0ffee"
+    assert "sha256" not in loaded.vba_exports[0]

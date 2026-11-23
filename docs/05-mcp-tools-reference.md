@@ -547,9 +547,25 @@ Response — `SnapshotManifest`:
   "sha256": "…",
   "size": 48213,
   "snapshot_method": "SaveCopyAs",
+  "vba_exports": [
+    {
+      "component_name": "Module1",
+      "type": 1,
+      "path": "exports/Module1.bas",
+      "export_file_sha256": "…"
+    }
+  ],
+  "model_version": 2,
   "external_side_effects_not_undone": true
 }
 ```
+
+The top-level `sha256` is the snapshot **file** hash. Each `vba_exports` entry's
+`export_file_sha256` is the SHA-256 of the **exported component file bytes** (F7 renamed this
+from `sha256` at `model_version: 2` so it is not mistaken for the normalized `source_hash`). It
+is **not** a valid `expected_source_hash` for the VBA mutation tools — those require the
+normalized `source_hash` from `vba_read_component`. `snapshot_list` returns the same manifests;
+`snapshot_diff` compares the top-level snapshot file hashes (not `export_file_sha256`).
 
 Restore:
 
@@ -582,8 +598,12 @@ Standard/Class) and `vba_read_component` (obtain `source_hash`). Then:
 
 `expected_source_hash` is the stale-revision guard: the server compares it with the current
 normalized hash before and **inside** the STA worker. A mismatch raises `REVISION_CONFLICT` with
-`context.reason="revision_conflict"` and the mutation is not performed. The response is a
-`VbaMutationResult` with `before_hash`, `after_hash` and export paths. Document modules and
+`context.reason="revision_conflict"` and the mutation is not performed. The guard token is the
+**normalized `source_hash`** from `vba_read_component` — never the snapshot export **file** hash
+(`snapshot_create.vba_exports[].export_file_sha256`, the SHA-256 of the exported `.bas`/`.cls`/`.frm`
+bytes). The two hashes differ (UserForm exports carry a designer header and `.frx` is not
+byte-reproducible), so passing the snapshot file hash yields `REVISION_CONFLICT` (F7). The response
+is a `VbaMutationResult` with `before_hash`, `after_hash` and export paths. Document modules and
 UserForms are rejected.
 
 ### macro_run

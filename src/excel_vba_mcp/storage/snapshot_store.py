@@ -55,7 +55,13 @@ SnapshotMethod = Literal["SaveCopyAs", "file_copy"]
 _MANIFEST_NAME = "manifest.json"
 
 #: In-memory schema version for the on-disk manifest.
-_MANIFEST_SCHEMA_VERSION = 1
+#:
+#: v2 (F7): renamed the per-export file-hash key in ``vba_exports`` entries from
+#: ``sha256`` to ``export_file_sha256`` so it cannot be confused with the
+#: normalized ``source_hash`` used by the VBA mutation guards. ``load`` / ``list``
+#: migrate v1 (and pre-versioned) manifests in memory: ``sha256`` is renamed to
+#: ``export_file_sha256`` and ``model_version`` is stamped to the current value.
+_MANIFEST_SCHEMA_VERSION = 2
 
 # Type alias for the optional VBA-export list. Defined at module scope so the
 # builtin ``list`` is not shadowed by :meth:`SnapshotStore.list` inside the class.
@@ -83,7 +89,12 @@ class SnapshotManifest(BaseModel):
     workbook_model: dict[str, Any] = Field(default_factory=dict)
     vba_exports: list[dict[str, Any]] | None = Field(
         default=None,
-        description="Exported VBA components (path/sha256) or null when unavailable.",
+        description=(
+            "Exported VBA components (component_name/type/path/export_file_sha256, "
+            "plus frx/frx_sha256 for UserForms) or null when unavailable. "
+            "export_file_sha256 is the exported-file byte hash, not the normalized "
+            "source_hash (F7)."
+        ),
     )
     snapshot_method: SnapshotMethod = "file_copy"
     external_side_effects_not_undone: bool = True
@@ -444,7 +455,7 @@ class SnapshotStore:
     def _read_manifest(directory: Path) -> SnapshotManifest:
         manifest_path = directory / _MANIFEST_NAME
         raw = json.loads(manifest_path.read_text(encoding="utf-8"))
-        return SnapshotManifest.model_validate(raw)
+        return SnapshotManifest.model_validate(_migrate_legacy_manifest(raw))
 
     @staticmethod
     def _cleanup_dir(directory: Path) -> None:
@@ -459,6 +470,35 @@ def _canonical_source(source_path: Path) -> str:
         return str(source_path.resolve())
     except OSError:  # pragma: no cover - resolve rarely fails
         return str(source_path)
+
+
+def _migrate_legacy_manifest(raw: dict[str, Any]) -> dict[str, Any]:
+    """Return ``raw`` upgraded to the current on-disk manifest schema (in memory).
+
+    v1 -> v2 (F7): each ``vba_exports`` entry carried a ``sha256`` key holding the
+    exported **file** byte hash. v2 renames it to ``export_file_sha256`` so it is
+    not confused with the normalized ``source_hash`` used by the VBA mutation
+    guards. A missing ``model_version`` is treated as v1. The migration is
+    tolerant and idempotent: entries that already use ``export_file_sha256`` (or
+    have no hash) are left intact, and the file is never rewritten on disk — the
+    upgraded manifest is returned in memory only.
+    """
+
+    try:
+        version = int(raw.get("model_version", 1))
+    except (TypeError, ValueError):
+        version = 1
+
+    exports = raw.get("vba_exports")
+    if version < _MANIFEST_SCHEMA_VERSION and isinstance(exports, list):
+        for entry in exports:
+            if isinstance(entry, dict) and "sha256" in entry:
+                entry.setdefault("export_file_sha256", entry.pop("sha256"))
+
+    # Stamp the current version so downstream code sees a v2 manifest even when
+    # the on-disk file was written by an older server.
+    raw["model_version"] = _MANIFEST_SCHEMA_VERSION
+    return raw
 
 
 __all__ = ["SnapshotManifest", "SnapshotMethod", "SnapshotStore"]

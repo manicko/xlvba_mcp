@@ -263,7 +263,12 @@ sequenceDiagram
 - **Manifest and SHA-256.** `manifest.json` contains `snapshot_id`, `created_at`,
   `source_path`, `file_name`, `stored_path`, `sha256`, `size`, `excel_version`,
   `workbook_model`, `vba_exports`, `snapshot_method`, `model_version` and
-  `external_side_effects_not_undone: true`.
+  `external_side_effects_not_undone: true`. The top-level `sha256` is the
+  snapshot **file** hash. Each `vba_exports` entry carries `export_file_sha256`
+  (the exported `.bas`/`.cls`/`.frm` **file bytes** hash, plus `frx_sha256` for
+  UserForms) — this is **not** the normalized `source_hash`. `model_version` is
+  `2` since the F7 rename (`vba_exports[].sha256` → `export_file_sha256`);
+  `load`/`list` migrate older v1 manifests in memory.
 - **Immutability.** `create` / `finalize_open_branch` never mutate an existing snapshot
   directory; one `snapshot_id` corresponds to exactly one directory.
 - **Restore.** `snapshot_restore` closes the current working copy **without saving** (when

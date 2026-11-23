@@ -552,9 +552,25 @@ approval-гейт авторизует её в режиме `full` (по умо�
   "sha256": "…",
   "size": 48213,
   "snapshot_method": "SaveCopyAs",
+  "vba_exports": [
+    {
+      "component_name": "Module1",
+      "type": 1,
+      "path": "exports/Module1.bas",
+      "export_file_sha256": "…"
+    }
+  ],
+  "model_version": 2,
   "external_side_effects_not_undone": true
 }
 ```
+
+Верхнеуровневый `sha256` — хэш **файла** снапшота. `export_file_sha256` каждой записи
+`vba_exports` — SHA-256 байтов **экспортированного файла компонента** (F7 переименовал это из
+`sha256` при `model_version: 2`, чтобы не путать с нормализованным `source_hash`). Это **не**
+валидный `expected_source_hash` для инструментов мутации VBA — им нужен нормализованный
+`source_hash` из `vba_read_component`. `snapshot_list` возвращает те же манифесты; `snapshot_diff`
+сравнивает верхнеуровневые хэши файлов снапшотов (не `export_file_sha256`).
 
 Восстановление:
 
@@ -587,10 +603,14 @@ Standard/Class) и `vba_read_component` (получить `source_hash`). Зат
 ```
 
 `expected_source_hash` — защита от устаревшей ревизии: сервер сравнивает его с текущим
-нормализованным хэшем до и **внутри** STA-воркера. Несовпадение — `REVISION_CONFLICT` с
-`context.reason="revision_conflict"`; мутация не выполняется. Ответ — `VbaMutationResult`
-с `before_hash`, `after_hash` и путями экспорта. Document-модули и UserForms
-отклоняются.
+нормализованным хэшем до и **внутри** STA-воркера. Токен защиты — это **нормализованный
+`source_hash`** из `vba_read_component`, а не хэш файла экспорта снапшота
+(`snapshot_create.vba_exports[].export_file_sha256` — SHA-256 байтов экспортированного
+`.bas`/`.cls`/`.frm`). Эти хэши различаются (экспорт UserForm несёт заголовок дизайнера, а
+`.frx` не байт-воспроизводим), поэтому передача хэша файла снапшота даёт `REVISION_CONFLICT`
+(F7). Несовпадение — `REVISION_CONFLICT` с `context.reason="revision_conflict"`; мутация не
+выполняется. Ответ — `VbaMutationResult` с `before_hash`, `after_hash` и путями экспорта.
+Document-модули и UserForms отклоняются.
 
 ### macro_run
 

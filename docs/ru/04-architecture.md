@@ -265,7 +265,12 @@ sequenceDiagram
 - **Манифест и SHA-256.** `manifest.json` содержит `snapshot_id`, `created_at`,
   `source_path`, `file_name`, `stored_path`, `sha256`, `size`, `excel_version`,
   `workbook_model`, `vba_exports`, `snapshot_method`, `model_version` и
-  `external_side_effects_not_undone: true`.
+  `external_side_effects_not_undone: true`. Верхнеуровневый `sha256` — хэш **файла**
+  снапшота. Каждая запись `vba_exports` несёт `export_file_sha256` (хэш байтов
+  экспортированного `.bas`/`.cls`/`.frm`, плюс `frx_sha256` для UserForms) — это
+  **не** нормализованный `source_hash`. `model_version` равен `2` начиная с
+  переименования F7 (`vba_exports[].sha256` → `export_file_sha256`); `load`/`list`
+  мигрируют старые манифесты v1 в памяти.
 - **Иммутабельность.** `create` / `finalize_open_branch` никогда не изменяют существующий
   каталог снапшота; один `snapshot_id` соответствует ровно одному каталогу.
 - **Восстановление.** `snapshot_restore` закрывает текущую рабочую копию **без

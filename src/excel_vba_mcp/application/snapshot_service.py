@@ -546,9 +546,17 @@ def _model_from_info(info: WorkbookInfo) -> dict[str, Any]:
 def _export_vba_components(wb: Any, exports_dir: Path) -> list[dict[str, Any]] | None:
     """Best-effort VBA component export to ``exports_dir`` (STA thread only).
 
-    Returns a list of ``{"component_name", "type", "path", "sha256"}`` entries, or
-    ``None`` when VBIDE is unavailable / access is denied / the project is locked.
-    Never raises: exporting VBA is a best-effort enrichment of the manifest.
+    Returns a list of ``{"component_name", "type", "path", "export_file_sha256"}``
+    entries, or ``None`` when VBIDE is unavailable / access is denied / the project
+    is locked. Never raises: exporting VBA is a best-effort enrichment of the
+    manifest.
+
+    Each ``export_file_sha256`` is the SHA-256 of the **exported file bytes** (the
+    ``.bas``/``.cls``/``.frm`` written by ``VBComponent.Export``). It is a
+    *file* hash and is **not** interchangeable with the normalized
+    ``source_hash`` produced by ``vba_read_component``
+    (:func:`~excel_vba_mcp.adapters.excel.vbide_adapter.hash_code`), which is the
+    only token the VBA mutation guards accept as ``expected_source_hash`` (F7).
     """
 
     try:
@@ -571,7 +579,7 @@ def _export_vba_components(wb: Any, exports_dir: Path) -> list[dict[str, Any]] |
                 "component_name": name,
                 "type": ctype,
                 "path": f"exports/{target.name}",
-                "sha256": _sha256(target),
+                "export_file_sha256": _sha256(target),
             }
             frx = target.with_suffix(".frx")
             if frx.is_file():

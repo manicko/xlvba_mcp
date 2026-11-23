@@ -928,3 +928,69 @@ async def test_one_time_grant_consumed_after_use(tmp_path: Path) -> None:
             "Option Explicit\n",
             expected_source_hash=expected_hash,
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: F7 hash clarity — the snapshot export FILE hash is NOT a valid revision
+# token; only the normalized source_hash from vba_read_component is accepted.
+# ---------------------------------------------------------------------------
+async def test_snapshot_export_file_hash_rejected_as_source_hash(tmp_path: Path) -> None:
+    """A snapshot export file hash yields REVISION_CONFLICT naming source_hash.
+
+    F7: ``snapshot_create.vba_exports[].export_file_sha256`` is the SHA-256 of the
+    exported ``.bas`` **file bytes** (here: the ``Attribute VB_Name`` header plus the
+    source). It differs from the normalized ``source_hash`` that the mutation guard
+    compares against, so using it as ``expected_source_hash`` must be rejected with
+    a clear revision conflict whose ``current_source_hash`` is the normalized hash.
+    """
+
+    rig = _make_rig(tmp_path)
+    info = await rig.open()
+    source = await rig.service.read_component(info.workbook_id, "modTest")
+
+    # Simulate the exported file bytes (header + body); its hash is the snapshot
+    # export file hash a confused caller might pass as the revision token.
+    export_file_bytes = ('Attribute VB_Name = "modTest"\r\n' + MOD_SOURCE).encode("utf-8")
+    export_file_hash = hashlib.sha256(export_file_bytes).hexdigest()
+
+    # The file hash and the normalized source hash genuinely differ (the F7 trap).
+    assert export_file_hash != source.source_hash
+
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        await rig.service.replace_component_source(
+            info.workbook_id,
+            "modTest",
+            MOD_SOURCE_NEW,
+            expected_source_hash=export_file_hash,
+        )
+
+    context = exc_info.value.context
+    assert context.get("reason") == "revision_conflict"
+    # The conflict names the normalized source_hash the guard actually uses.
+    assert context.get("current_source_hash") == source.source_hash
+    assert context.get("expected_source_hash") == export_file_hash
+
+    # The source is unchanged (rejected before any write).
+    after = await rig.service.read_component(info.workbook_id, "modTest")
+    assert after.source_hash == source.source_hash
+    assert "BrandNew" not in after.source
+
+
+async def test_normalized_source_hash_succeeds(tmp_path: Path) -> None:
+    """The correct normalized ``source_hash`` is accepted (F7 companion check)."""
+
+    rig = _make_rig(tmp_path)
+    info = await rig.open()
+    source = await rig.service.read_component(info.workbook_id, "modTest")
+    expected_hash = source.source_hash
+
+    rig.grant_mutation("modTest", expected_hash, "vba_replace_component_source")
+    result = await rig.service.replace_component_source(
+        info.workbook_id,
+        "modTest",
+        MOD_SOURCE_NEW,
+        expected_source_hash=expected_hash,
+    )
+
+    assert result.before_hash == expected_hash
+    assert result.after_hash == hash_code(MOD_SOURCE_NEW)
