@@ -571,10 +571,18 @@ async def test_bg04_worker_refuses_mutation_on_hung_excel(rig: Rig) -> None:
             op_class=OperationClass.MUTATING,
         )
 
-    # BG04: the worker is now NEEDS_RECOVERY and refuses new work, so the table
-    # mutation never reaches Excel (fail fast, no enqueue).
-    with pytest.raises(ExcelVbaMcpError):
-        await rig.tables.append_table_rows(wid, "SampleTable", [{"Name": "x"}])
+    # Block E: a deadline-exceeded call is NOT a poison state — the worker stays
+    # accepting (running/deadline_exceeded) and does NOT fail-fast. The single-STA
+    # FIFO serializes the follow-up behind the still-running call (no parallel COM),
+    # so once the hang returns the worker accepts the table mutation again on its
+    # own (no auto-kill, no recovery needed).
+    hung_status = rig.worker.get_status()
+    assert hung_status.state is WorkbookSessionState.DEADLINE_EXCEEDED
+    assert hung_status.accepting is True
+
+    appended = await rig.tables.append_table_rows(wid, "SampleTable", [{"Name": "x"}])
+    assert appended is not None
+    assert rig.worker.get_status().state is WorkbookSessionState.RUNNING
 
 
 async def test_bg05_session_state_and_alerts(rig: Rig) -> None:

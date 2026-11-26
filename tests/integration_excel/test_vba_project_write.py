@@ -546,12 +546,14 @@ async def test_stale_revision_rejected(tmp_path: Path) -> None:
             )
 
         err = exc_info.value
-        assert err.code is ErrorCode.COM_BUSY
+        # FE-22 (F-5): a stale expected_source_hash is an optimistic-concurrency
+        # failure (REVISION_CONFLICT), not generic COM contention.
+        assert err.code is ErrorCode.REVISION_CONFLICT
         assert err.context.get("reason") == "revision_conflict"
         assert err.context.get("expected_source_hash") == stale_hash
         assert err.context.get("current_source_hash") == actual_hash
         diagnostics = err.to_dict()
-        assert diagnostics["code"] == ErrorCode.COM_BUSY.value
+        assert diagnostics["code"] == ErrorCode.REVISION_CONFLICT.value
         assert diagnostics["context"]["reason"] == "revision_conflict"
 
         after = await rig.service.read_component(info.workbook_id, "modTest")
@@ -738,13 +740,15 @@ async def test_failed_mutation_keeps_snapshot_and_diagnostics(tmp_path: Path) ->
             )
 
         err = exc_info.value
-        assert err.code is ErrorCode.COM_BUSY
+        # A Document-module (non-replaceable) mutation is a PROTECTED_TARGET
+        # failure, not generic COM contention.
+        assert err.code is ErrorCode.PROTECTED_TARGET
         assert err.context.get("reason") == "non_replaceable_component"
         assert err.context.get("component") == "ThisWorkbook"
         assert "component_type" in err.context
 
         diagnostics = err.to_dict()
-        assert diagnostics["code"] == ErrorCode.COM_BUSY.value
+        assert diagnostics["code"] == ErrorCode.PROTECTED_TARGET.value
         assert diagnostics["message"]
         assert diagnostics["context"]["reason"] == "non_replaceable_component"
         assert diagnostics["context"]["component"] == "ThisWorkbook"

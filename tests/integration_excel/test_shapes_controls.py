@@ -626,10 +626,18 @@ async def test_bg04_worker_refuses_mutation_on_hung_excel(rig: Rig) -> None:
             op_class=OperationClass.MUTATING,
         )
 
-    # BG04: the worker is now NEEDS_RECOVERY and refuses new work, so the shape
-    # mutation never reaches Excel (fail fast, no enqueue).
-    with pytest.raises(ExcelVbaMcpError):
-        await rig.shapes.set_on_action(wid, seeded["textbox"], "X")
+    # Block E: a deadline-exceeded call is NOT a poison state — the worker stays
+    # accepting (running/deadline_exceeded) and does NOT fail-fast. The single-STA
+    # FIFO serializes the follow-up behind the still-running call (no parallel COM),
+    # so once the hang returns the worker accepts the shape mutation again on its
+    # own (no auto-kill, no recovery needed).
+    hung_status = rig.worker.get_status()
+    assert hung_status.state is WorkbookSessionState.DEADLINE_EXCEEDED
+    assert hung_status.accepting is True
+
+    assigned = await rig.shapes.set_on_action(wid, seeded["textbox"], "X")
+    assert assigned is not None
+    assert rig.worker.get_status().state is WorkbookSessionState.RUNNING
 
 
 @requires_excel

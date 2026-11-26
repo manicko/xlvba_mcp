@@ -308,27 +308,20 @@ async def test_hung_call_then_recover_rebuilds_hidden_instance(tmp_path: Path) -
                 op_class=OperationClass.EXECUTING,
             )
         assert excinfo.value.code is ErrorCode.EXCEL_HUNG
-        assert rig.worker.get_status().state is WorkbookSessionState.NEEDS_RECOVERY
+        # Block E: an execution-deadline call is NOT a poison state. The worker
+        # moves to running/deadline_exceeded and stays accepting (no fail-fast);
+        # the call is never cancelled and the owned pid is never terminated.
+        hung_status = rig.worker.get_status()
+        assert hung_status.state is WorkbookSessionState.DEADLINE_EXCEEDED
+        assert hung_status.accepting is True
 
-        # Fail fast: no new parallel COM call is enqueued while NEEDS_RECOVERY.
-        submits_before = rig.worker._token_seq  # read-only diagnostic
-        started = time.monotonic()
-        with pytest.raises(ExcelHungError):
-            await rig.worker.submit(
-                lambda: "should-not-run",
-                timeout=_CALL_TIMEOUT_S,
-                section="diagnostic",
-                op_class=OperationClass.READ_ONLY,
-            )
-        elapsed = time.monotonic() - started
-        assert elapsed < 2.0, f"fail-fast submit took {elapsed:.2f}s (must not block on the hang)"
-        assert rig.worker._token_seq == submits_before, "no work item may be queued while hung"
-
-        # Health is truthful while hung and never forces a re-run.
+        # Health is truthful while the call is over its deadline and never forces a
+        # re-run: the worker is alive and accepting (OK), not needs_recovery.
         workbook_tools.set_session_service(rig.service)
         health = await excel_health()
-        assert health.status is HealthStatus.NEEDS_RECOVERY
-        assert health.needs_recovery is True
+        assert health.status is HealthStatus.OK
+        assert health.needs_recovery is False
+        assert health.worker_state is WorkbookSessionState.DEADLINE_EXCEEDED
         assert health.owned_pid == old_pid
 
         # Recover: close owned workbook (no save) + rebuild a fresh hidden instance.
@@ -355,8 +348,7 @@ async def test_hung_call_then_recover_rebuilds_hidden_instance(tmp_path: Path) -
         assert health_after.owned_pid == new_pid
 
         print(
-            f"[recover] old_pid={old_pid} new_pid={new_pid} "
-            f"fail_fast={elapsed:.2f}s original_unchanged=True"
+            f"[recover] old_pid={old_pid} new_pid={new_pid} original_unchanged=True"
         )
     finally:
         workbook_tools.set_session_service(None)
@@ -381,6 +373,10 @@ async def test_close_session_leaves_no_orphan_and_keeps_bystander(tmp_path: Path
     owned_pid: int | None = None
     bystander: Any = None
     bystander_pid: int | None = None
+    import pythoncom
+
+    # Guard: main-thread STA may be torn down by an import-time COM probe.
+    pythoncom.CoInitialize()
     try:
         original_hash = _sha256(rig.original)
         owned_pid = rig.worker.get_status().owned_pid
@@ -429,6 +425,8 @@ async def test_close_session_leaves_no_orphan_and_keeps_bystander(tmp_path: Path
                 bystander.Quit()
         if bystander_pid is not None:
             _wait_pid_gone(bystander_pid)
+        with contextlib.suppress(Exception):
+            pythoncom.CoUninitialize()
         await rig.stop()
 
     assert owned_pid is not None
@@ -469,8 +467,11 @@ async def test_excel_health_truthful_while_hung(tmp_path: Path) -> None:
 
         token_before = rig.worker._token_seq
         hung_health = await excel_health()
-        assert hung_health.status is HealthStatus.NEEDS_RECOVERY
-        assert hung_health.needs_recovery is True
+        # Block E: a deadline-exceeded call leaves the worker alive and accepting
+        # (running/deadline_exceeded), so health stays OK — not needs_recovery.
+        assert hung_health.status is HealthStatus.OK
+        assert hung_health.needs_recovery is False
+        assert hung_health.worker_state is WorkbookSessionState.DEADLINE_EXCEEDED
         assert rig.worker._token_seq == token_before, "excel_health must not submit work"
 
         print(f"[health] owned_pid={owned_pid} status={hung_health.status.value}")
@@ -531,13 +532,15 @@ async def _classify_safe(
 @pytest.mark.anyio
 @pytest.mark.integration_excel
 async def test_hung_macro_drives_auto_recovery(tmp_path: Path) -> None:
-    """A hung macro via ``MacroService`` -> ``MACRO_TIMEOUT`` + in-process recovery.
+    """A hung macro via ``MacroService`` -> ``SUSPECTED_STALLED`` + agent-directed recovery.
 
     Injects a busy-loop macro and runs it through the real ``MacroService`` with a
-    short deadline. Asserts the honest ``MACRO_TIMEOUT`` with
-    ``session_recovery == "recovered"``: the owned PID is terminated, the session is
-    rebuilt in-process (RUNNING, fresh pid) and a subsequent open + benign macro
-    succeeds WITHOUT a server restart. No user Excel PID is touched (BG05).
+    short deadline. Asserts the honest ``SUSPECTED_STALLED`` / ``MACRO_TIMEOUT`` with
+    ``session_recovery is None`` (no auto-kill, no in-process recovery): the owned PID
+    is left alive and the worker is ``running/deadline_exceeded``. Agent-directed
+    ``recover_owned_process`` then rebuilds a fresh hidden instance and a subsequent
+    open + benign macro succeeds WITHOUT a server restart. No user Excel PID is
+    touched (BG05).
     """
 
     rig = _make_rig(tmp_path)
@@ -582,20 +585,28 @@ async def test_hung_macro_drives_auto_recovery(tmp_path: Path) -> None:
             info.workbook_id, "modTest.HangForever", timeout_s=_HANG_CALL_TIMEOUT_S
         )
 
-        assert result.status is MacroRunStatus.TIMEOUT, f"expected TIMEOUT: {result}"
+        # Block E: the busy-loop macro outlives its soft deadline -> SUSPECTED_STALLED
+        # (MACRO_TIMEOUT). No auto-kill and no in-process recovery: the owned pid is
+        # left alive, session_recovery is None and the worker is
+        # running/deadline_exceeded; recovery is agent-directed.
+        assert result.status is MacroRunStatus.SUSPECTED_STALLED, (
+            f"expected SUSPECTED_STALLED: {result}"
+        )
         assert result.error_code == "MACRO_TIMEOUT"
         assert result.status is not MacroRunStatus.SUCCESS
-        assert result.session_recovery == "recovered", (
-            f"expected in-process recovery: session_recovery={result.session_recovery!r}"
+        assert result.session_recovery is None, (
+            f"recovery is agent-directed, not automatic: {result.session_recovery!r}"
         )
+        assert _pid_alive(old_pid), "the owned pid must NOT be terminated (no auto-kill)"
+        assert rig.worker.get_status().state is WorkbookSessionState.DEADLINE_EXCEEDED
 
-        # Recovery rebuilt a fresh hidden instance; the old owned pid is gone.
-        new_pid = rig.worker.get_status().owned_pid
+        # Agent-directed recovery rebuilds a fresh hidden instance; the old pid is reaped.
+        recover = await rig.service.recover_owned_process(reason="task066_hung_macro")
+        assert recover["process_restarted"] is True, f"agent-directed recovery failed: {recover}"
+        new_pid = recover["owned_pid"]
         assert new_pid is not None and new_pid != old_pid, (
             f"recovery did not rebuild a fresh instance: old={old_pid} new={new_pid}"
         )
-        assert rig.worker.get_status().state is WorkbookSessionState.RUNNING
-        assert _wait_pid_gone(old_pid), f"old owned PID {old_pid} survived the timeout terminate"
 
         # A subsequent open + benign macro SUCCEEDS without a server restart.
         fresh = await rig.service.open_workbook(

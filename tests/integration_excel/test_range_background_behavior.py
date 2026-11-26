@@ -553,10 +553,13 @@ async def test_owned_excel_reaped_after_needs_recovery_shutdown(tmp_path: Path) 
                 op_class=OperationClass.MUTATING,
             )
         assert hung_info.value.code is ErrorCode.EXCEL_HUNG
-        assert r.worker.get_status().state is WorkbookSessionState.NEEDS_RECOVERY
+        # Block E: a deadline-exceeded call leaves the worker in
+        # running/deadline_exceeded (still accepting), not a poison NEEDS_RECOVERY
+        # state; shutdown still reaps the owned pid (no orphan).
+        assert r.worker.get_status().state is WorkbookSessionState.DEADLINE_EXCEEDED
     finally:
         await r.close()
 
     assert _wait_pid_gone(owned_pid), (
-        f"owned PID {owned_pid} survived a needs-recovery shutdown (orphan)"
+        f"owned PID {owned_pid} survived a deadline-exceeded shutdown (orphan)"
     )

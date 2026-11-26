@@ -1217,13 +1217,18 @@ async def test_forced_hung_com_marks_needs_recovery(rig: Rig) -> None:
         )
     assert hung_info.value.code is ErrorCode.EXCEL_HUNG
 
+    # Block E: a deadline-exceeded call is NOT a poison state — the worker moves to
+    # running/deadline_exceeded and stays accepting (no fail-fast); the call is
+    # never cancelled and the owned pid is never terminated.
     status = rig.worker.get_status()
-    assert status.state is WorkbookSessionState.NEEDS_RECOVERY
+    assert status.state is WorkbookSessionState.DEADLINE_EXCEEDED
+    assert status.accepting is True
 
-    # New work fails fast (fail closed) and never reaches Excel.
-    with pytest.raises(ExcelVbaMcpError) as blocked_info:
-        await rig.ranges.get_range(wid, "Cells", "A1")
-    assert blocked_info.value.code is ErrorCode.EXCEL_HUNG
+    # No fail-fast: the single-STA FIFO serializes the follow-up behind the still-
+    # running call (no parallel COM); once the hang returns the read succeeds.
+    rng = await rig.ranges.get_range(wid, "Cells", "A1")
+    assert rng.address
+    assert rig.worker.get_status().state is WorkbookSessionState.RUNNING
 
 
 @requires_excel

@@ -912,7 +912,7 @@ async def test_compile_error_blocks_macro_step(tmp_path: Path) -> None:
 async def test_runtime_error_represented_with_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RaiseError ends MACRO_RUNTIME_ERROR with persisted evidence (no false success)."""
+    """RaiseError wedges the STA past the soft deadline -> SUSPECTED_STALLED evidence."""
 
     fixture = _fixture_or_skip(_CLEAN_PROJECT)
     # Short macro ceiling so the modal watchdog fires quickly (test-only patch of
@@ -955,10 +955,10 @@ async def test_runtime_error_represented_with_evidence(
         macro_step = case.steps[0]
         assert macro_step.action == "macro_run"
         assert macro_step.status is StepStatus.FAILED
-        assert macro_step.error_code == "MACRO_RUNTIME_ERROR"
-        assert macro_step.details["macro_status"] == "runtime_error"
+        assert macro_step.error_code == "MACRO_TIMEOUT"
+        assert macro_step.details["macro_status"] == "suspected_stalled"
         assert case.assertions[0].passed is False
-        assert case.assertions[0].actual == "runtime_error"
+        assert case.assertions[0].actual == "suspected_stalled"
 
         # Diagnostic evidence persisted: the per-case document records the failure.
         assert result.artifact_paths
@@ -969,8 +969,8 @@ async def test_runtime_error_represented_with_evidence(
         )
         diagnostic = json.loads(Path(case_doc).read_text(encoding="utf-8"))
         assert diagnostic["status"] == "failed"
-        assert diagnostic["steps"][0]["error_code"] == "MACRO_RUNTIME_ERROR"
-        assert diagnostic["steps"][0]["details"]["macro_status"] == "runtime_error"
+        assert diagnostic["steps"][0]["error_code"] == "MACRO_TIMEOUT"
+        assert diagnostic["steps"][0]["details"]["macro_status"] == "suspected_stalled"
         manifest_path = next(
             path for path in result.artifact_paths if Path(path).name.endswith("manifest.json")
         )
@@ -984,8 +984,8 @@ async def test_runtime_error_represented_with_evidence(
         assert _sha256(rig.original) == original_hash, "original must be unchanged"
         assert _sha256(fixture) == committed_hash, "committed fixture must never change"
     finally:
-        # The modal path normally terminates the owned PID; this is a safety net so
-        # a failed assertion can never leave an orphaned EXCEL.exe behind.
+        # Block E leaves the owned PID alive (the modal wedges the STA); terminate it
+        # defensively so a failed assertion can never leave an orphaned EXCEL.exe.
         if owned_pid is not None and _pid_alive(owned_pid):
             _terminate_owned_pid(owned_pid)
         await rig.shutdown_and_reap(owned_pid)

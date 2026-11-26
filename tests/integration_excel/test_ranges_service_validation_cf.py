@@ -708,15 +708,23 @@ async def test_bg04_worker_refuses_work_on_hung_excel(rig: Rig) -> None:
             op_class=OperationClass.MUTATING,
         )
 
-    # BG04: the worker is NEEDS_RECOVERY and refuses new work, so the validation
-    # write never reaches Excel (fail fast, no enqueue).
-    with pytest.raises(ExcelVbaMcpError):
-        await rig.ranges.set_validation(
-            wid,
-            "Cells",
-            "W1:W3",
-            ValidationSpec(type=DataValidationType.LIST, formula1='"Yes,No"'),
-        )
+    # Block E: a deadline-exceeded call is NOT a poison state — the worker stays
+    # accepting (running/deadline_exceeded) and does NOT fail-fast. The single-STA
+    # FIFO serializes the follow-up behind the still-running call (no parallel COM),
+    # so once the hang returns the worker accepts the validation write again on its
+    # own (no auto-kill, no recovery needed).
+    hung_status = rig.worker.get_status()
+    assert hung_status.state is WorkbookSessionState.DEADLINE_EXCEEDED
+    assert hung_status.accepting is True
+
+    applied = await rig.ranges.set_validation(
+        wid,
+        "Cells",
+        "W1:W3",
+        ValidationSpec(type=DataValidationType.LIST, formula1='"Yes,No"'),
+    )
+    assert applied.present
+    assert rig.worker.get_status().state is WorkbookSessionState.RUNNING
 
 
 @requires_excel

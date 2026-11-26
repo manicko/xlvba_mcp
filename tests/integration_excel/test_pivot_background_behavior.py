@@ -486,6 +486,11 @@ async def test_user_owned_excel_instance_is_untouched(rig: Rig) -> None:
 
     # A separate, non-owned Excel instance (the "user" Excel). Kept hidden so the
     # test itself never shows a window; it is never passed to the worker.
+    import pythoncom
+
+    # Guard: an import-time COM probe (test_excel_instance_poc) can leave the main
+    # thread uninitialized (CO_E_NOTINITIALIZED); CoInitialize is idempotent/refcounted.
+    pythoncom.CoInitialize()
     bystander = win32com.client.DispatchEx("Excel.Application")
     bystander_pid: int | None = None
     try:
@@ -512,6 +517,8 @@ async def test_user_owned_excel_instance_is_untouched(rig: Rig) -> None:
             bystander.Quit()
         if bystander_pid is not None:
             _wait_pid_gone(bystander_pid)
+        with contextlib.suppress(Exception):
+            pythoncom.CoUninitialize()
 
 
 # ---------------------------------------------------------------------------
@@ -539,21 +546,13 @@ async def test_hung_com_reports_excel_hung_and_recovers_hidden(rig: Rig) -> None
             op_class=OperationClass.EXECUTING,
         )
     assert hung_exc.value.code is ErrorCode.EXCEL_HUNG
-    assert rig.worker.get_status().state is WorkbookSessionState.NEEDS_RECOVERY
-
-    # Fail fast: no new parallel COM call is enqueued while NEEDS_RECOVERY.
-    submits_before = rig.worker._token_seq  # read-only diagnostic
-    started = time.monotonic()
-    with pytest.raises(ExcelHungError):
-        await rig.worker.submit(
-            lambda: "should-not-run",
-            timeout=_TEST_TIMEOUT_S,
-            section="diagnostic",
-            op_class=OperationClass.READ_ONLY,
-        )
-    elapsed = time.monotonic() - started
-    assert elapsed < 2.0, f"fail-fast submit took {elapsed:.2f}s (must not block on the hang)"
-    assert rig.worker._token_seq == submits_before, "no work item may be queued while hung"
+    # Block E: a deadline-exceeded call is NOT a poison state. The worker moves to
+    # running/deadline_exceeded and stays accepting (no fail-fast); the call is
+    # never cancelled and the owned pid is never terminated. Recovery is
+    # agent-directed (the explicit recover_session below), never automatic.
+    hung_status = rig.worker.get_status()
+    assert hung_status.state is WorkbookSessionState.DEADLINE_EXCEEDED
+    assert hung_status.accepting is True
 
     # Recovery rebuilds a fresh hidden instance and discards the open workbook.
     status = await rig.session.recover_session(reason="task_052_pivot_hung")

@@ -191,13 +191,23 @@ async def _call(
 
 
 def structured(result: CallToolResult) -> Any:
-    """Return the structured payload of a successful tool result."""
+    """Return the structured payload of a successful tool result.
+
+    Tools whose return annotation is a union (``excel_open`` / ``macro_run`` /
+    ``pivot_tables_list`` may return a ``RunningJob`` in background mode) are
+    wrapped by the MCP SDK as ``{"result": <payload>}``; unwrap that transport
+    envelope so callers see the domain DTO directly.
+    """
 
     assert not result.is_error, f"expected success, got error result: {result.content!r}"
     if result.structured_content is not None:
-        return result.structured_content
-    assert result.content, "successful result carried no content"
-    return json.loads(result.content[0].text)
+        payload = result.structured_content
+    else:
+        assert result.content, "successful result carried no content"
+        payload = json.loads(result.content[0].text)
+    if isinstance(payload, dict) and set(payload.keys()) == {"result"}:
+        return payload["result"]
+    return payload
 
 
 def _single_cell(result: CallToolResult) -> Any:

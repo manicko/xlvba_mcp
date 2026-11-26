@@ -562,7 +562,7 @@ async def test_com_busy_does_not_replay_mutation() -> None:
             f"got {read_calls['n']}"
         )
 
-        # --- Timeout -> NEEDS_RECOVERY; subsequent non-close submit fails fast ---
+        # --- Execution deadline exceeded: NOT a poison state (Block E) ---
         recovery_started = threading.Event()
 
         def slow() -> str:
@@ -573,28 +573,32 @@ async def test_com_busy_does_not_replay_mutation() -> None:
         with pytest.raises(ExcelHungError) as hung_excinfo:
             await worker.submit(slow, timeout=0.1)
         assert hung_excinfo.value.code == ErrorCode.EXCEL_HUNG
-        assert worker.get_status().state == WorkbookSessionState.NEEDS_RECOVERY
+        # The call is over its deadline but still running: the worker is
+        # running/deadline_exceeded and stays accepting (no fail-fast, no kill).
+        hung_status = worker.get_status()
+        assert hung_status.state == WorkbookSessionState.DEADLINE_EXCEEDED
+        assert hung_status.accepting is True
+        assert recovery_started.is_set(), "the slow fn did start"
 
-        # A new non-close submit must fail fast and NOT start a new COM call.
-        failfast_started = threading.Event()
+        # No fail-fast: the single-STA FIFO serializes the follow-up behind the
+        # still-running call (no parallel COM); once slow() returns it runs.
+        followup_started = threading.Event()
 
-        def should_not_run() -> str:
-            failfast_started.set()
+        def should_run() -> str:
+            followup_started.set()
             return "x"
 
-        with pytest.raises(ExcelHungError) as ff_excinfo:
-            await worker.submit(should_not_run, timeout=5.0, op_class=OperationClass.MUTATING)
-        assert ff_excinfo.value.code == ErrorCode.EXCEL_HUNG
-        assert recovery_started.is_set(), "the slow fn never started"
-        assert not failfast_started.is_set(), "fail-fast submit must not start a new COM call"
+        assert await worker.submit(should_run, timeout=5.0, op_class=OperationClass.MUTATING) == "x"
+        assert followup_started.is_set(), "the follow-up must run after the slow fn returns"
+        assert worker.get_status().state == WorkbookSessionState.RUNNING
 
-        # reset() is the documented recovery exit; it waits for the hung fn.
+        # reset() is still the documented recovery exit.
         await worker.reset()
         assert worker.get_status().state == WorkbookSessionState.RUNNING
 
         print(
             f"[busy] mutating_calls={mutating_calls['n']} read_calls={read_calls['n']} "
-            f"recovery_state=NEEDS_RECOVERY->RUNNING failfast_started={failfast_started.is_set()}"
+            f"deadline_exceeded->running followup_ran={followup_started.is_set()}"
         )
     finally:
         await worker.shutdown()

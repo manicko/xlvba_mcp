@@ -1209,18 +1209,13 @@ async def test_hung_com_recovers_to_fresh_hidden_instance(rig: Rig) -> None:
             op_class=OperationClass.MUTATING,
         )
     assert hung_exc.value.code is ErrorCode.EXCEL_HUNG
-    assert rig.worker.get_status().state is WorkbookSessionState.NEEDS_RECOVERY
-
-    # Fail-fast: new work never reaches Excel while NEEDS_RECOVERY.
-    started = time.monotonic()
-    with pytest.raises(ExcelHungError):
-        await rig.worker.submit(
-            lambda: "should-not-run",
-            timeout=_TEST_TIMEOUT_S,
-            section="diagnostic",
-            op_class=OperationClass.READ_ONLY,
-        )
-    assert time.monotonic() - started < 2.0
+    # Block E: a deadline-exceeded call is NOT a poison state — the worker moves to
+    # running/deadline_exceeded and stays accepting (no fail-fast); the call is
+    # never cancelled and the owned pid is never terminated. Recovery is
+    # agent-directed (the explicit recover_session below), never automatic.
+    hung_status = rig.worker.get_status()
+    assert hung_status.state is WorkbookSessionState.DEADLINE_EXCEEDED
+    assert hung_status.accepting is True
 
     status = await rig.session.recover_session(reason="task054_hung")
     assert status.state is WorkbookSessionState.RUNNING

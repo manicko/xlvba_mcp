@@ -656,35 +656,47 @@ async def test_macro_runtime_error_modal_owned_terminate(tmp_path: Path) -> None
             info.workbook_id, "modTest.RaiseError", timeout_s=_MODAL_TIMEOUT_S
         )
 
-        # Honest classification: never success.
-        assert result.status is MacroRunStatus.RUNTIME_ERROR, (
-            f"RaiseError did not classify as RUNTIME_ERROR: {result}"
+        # Block E: an unhandled VBA runtime error raises a modal that blocks
+        # Application.Run on this build, so the dispatch exceeds its soft deadline
+        # and is reported SUSPECTED_STALLED (MACRO_TIMEOUT) — never a false
+        # RUNTIME_ERROR and never a false success. The owned pid is NOT terminated
+        # and the dialog is NOT dismissed (dismissed=false); recovery is
+        # agent-directed.
+        assert result.status is MacroRunStatus.SUSPECTED_STALLED, (
+            f"RaiseError did not classify as SUSPECTED_STALLED: {result}"
         )
         assert result.status is not MacroRunStatus.SUCCESS
-        # The modal path terminates ONLY the owned PID and records dismissed=false.
-        assert "dismissed" in (result.error_text or "").lower(), (
-            f"expected the owned-PID-terminate modal path: {result.error_text!r}"
-        )
+        assert result.error_code == "MACRO_TIMEOUT"
         assert "dismissed=false" in (result.error_text or "").lower(), (
             f"expected dismissed=false (dialog not dismissed): {result.error_text!r}"
         )
-        # F2b: the session recovered in-process and rebuilt a fresh owned instance.
-        assert result.session_recovery == "recovered", (
-            f"expected in-process recovery: session_recovery={result.session_recovery!r}"
+        assert result.session_recovery is None, (
+            f"recovery is agent-directed, not automatic: {result.session_recovery!r}"
         )
-        # The old owned PID was terminated by the service (no orphan) and a NEW
-        # owned instance now exists; the worker is RUNNING again.
-        assert _wait_pid_gone(old_pid), f"owned PID {old_pid} survived the modal terminate"
-        new_pid = rig.worker.get_status().owned_pid
+        # No auto-kill: the owned instance is left alive (the modal still blocks it).
+        assert _pid_alive(old_pid), "the owned pid must NOT be terminated (no auto-kill)"
+
+        # Agent-directed recovery rebuilds a fresh hidden instance (the only way a
+        # wedged STA is freed: the owned pid is terminated via the held handle).
+        recover = await rig.session.recover_owned_process(reason="task066_modal_stalled")
+        assert recover["process_restarted"] is True, f"agent-directed recovery failed: {recover}"
+        new_pid = recover["owned_pid"]
         assert new_pid is not None and new_pid != old_pid, (
             f"recovery did not rebuild a fresh owned instance: old={old_pid} new={new_pid}"
         )
-        assert rig.worker.get_status().state is WorkbookSessionState.RUNNING
+
+        # A fresh session is usable: re-open and run a benign macro to success.
+        info2 = await rig.open()
+        rig.grant_macro_run("modTest.AddNumbers")
+        await rig.classify_safe("modTest.AddNumbers")
+        result2 = await rig.service.run_macro(info2.workbook_id, "modTest.AddNumbers", [2, 3])
+        assert result2.status is MacroRunStatus.SUCCESS, f"fresh-session macro failed: {result2}"
+        assert result2.return_value == 5
 
         print(
             f"[macro-runtime] status={result.status.value} error_code={result.error_code} "
             f"old_pid={old_pid} new_pid={new_pid} session_recovery={result.session_recovery} "
-            f"error_text={result.error_text!r}"
+            f"rerun={result2.return_value}"
         )
     finally:
         # Defensive: ensure every automation-owned instance is gone before shutdown.
@@ -722,31 +734,33 @@ async def test_macro_timeout_needs_recovery(tmp_path: Path) -> None:
             info.workbook_id, "modTest.HangForever", timeout_s=_HANG_TIMEOUT_S
         )
 
-        # A busy-loop macro has no modal -> plain timeout. F2b: the owned PID is
-        # terminated and the session recovers in-process (no server restart).
-        assert result.status is MacroRunStatus.TIMEOUT, (
-            f"HangForever did not classify as TIMEOUT: {result}"
+        # Block E: a busy-loop macro has no modal and simply outlives its soft
+        # deadline -> SUSPECTED_STALLED (MACRO_TIMEOUT). The owned pid is NOT
+        # terminated (no auto-kill, no in-process recovery); the operation is left
+        # running and recovery is agent-directed.
+        assert result.status is MacroRunStatus.SUSPECTED_STALLED, (
+            f"HangForever did not classify as SUSPECTED_STALLED: {result}"
         )
         assert result.error_code == "MACRO_TIMEOUT"
-        assert result.session_recovery == "recovered", (
-            f"expected in-process recovery: session_recovery={result.session_recovery!r}"
+        assert result.session_recovery is None, (
+            f"recovery is agent-directed, not automatic: {result.session_recovery!r}"
         )
         assert result.status is not MacroRunStatus.SUCCESS
 
-        # Recovery rebuilt the hidden instance: worker RUNNING with a NEW owned pid.
-        new_pid = rig.worker.get_status().owned_pid
+        # No auto-kill: the owned instance is left alive (the busy loop still owns it).
+        assert _pid_alive(old_pid), "the owned pid must NOT be terminated (no auto-kill)"
+        assert rig.worker.get_status().state is WorkbookSessionState.DEADLINE_EXCEEDED
+
+        # Agent-directed recovery rebuilds a fresh hidden instance.
+        recover = await rig.session.recover_owned_process(reason="task066_hang_stalled")
+        assert recover["process_restarted"] is True, f"agent-directed recovery failed: {recover}"
+        new_pid = recover["owned_pid"]
         assert new_pid is not None and new_pid != old_pid, (
             f"recovery did not rebuild a fresh owned instance: old={old_pid} new={new_pid}"
         )
-        assert rig.worker.get_status().state is WorkbookSessionState.RUNNING
 
-        # The old owned PID was terminated (no orphan).
-        assert _wait_pid_gone(old_pid), f"owned PID {old_pid} survived the timeout terminate"
-
-        # A subsequent open + benign macro SUCCEEDS without a server restart. The
-        # prior workbook_id is invalid after recovery, so re-open the fixture copy.
+        # A subsequent open + benign macro SUCCEEDS without a server restart.
         fresh = await rig.open()
-        new_pid = rig.worker.get_status().owned_pid
         rig.grant_macro_run("modTest.AddNumbers")
         await rig.classify_safe("modTest.AddNumbers")
         ok = await rig.service.run_macro(fresh.workbook_id, "modTest.AddNumbers", [2, 3])
@@ -982,14 +996,15 @@ async def test_not_found_macro(tmp_path: Path) -> None:
 @pytest.mark.anyio
 @pytest.mark.integration_excel
 async def test_runtime_error_classified_without_false_precision(tmp_path: Path) -> None:
-    """``RaiseError`` -> ``MACRO_RUNTIME_ERROR`` via owned-PID terminate (BG04).
+    """``RaiseError`` -> ``SUSPECTED_STALLED`` (modal wedges the STA past the deadline).
 
-    The unhandled VBA runtime error raises a modal that blocks ``Application.Run``;
-    the service classifies ``MACRO_RUNTIME_ERROR`` and terminates **only the owned
-    PID** without dismissing the dialog (``dismissed=false``). It is never reported
-    as success, the VBA error number/description is **not fabricated** (Excel does
-    not forward it), BG03 (no focus theft) holds during the modal, and the session
-    recovers in-process (F2b) so a fresh session runs a macro successfully.
+    The unhandled VBA runtime error raises a modal that blocks ``Application.Run``,
+    so the dispatch exceeds its soft deadline and is classified ``SUSPECTED_STALLED``
+    / ``MACRO_TIMEOUT`` with ``dismissed=false`` (the dialog is not dismissed). It is
+    never reported as success, the VBA error number/description is **not fabricated**
+    (Excel does not forward it), BG03 (no focus theft) holds during the modal, and the
+    owned pid is **not** terminated (no auto-kill): recovery is agent-directed
+    (``recover_owned_process``) so a fresh session runs a macro successfully.
     """
 
     fixture = _fixture_or_skip(_CLEAN_PROJECT)
@@ -1016,20 +1031,23 @@ async def test_runtime_error_classified_without_false_precision(tmp_path: Path) 
                 rig, info.workbook_id, "modTest.RaiseError", timeout_s=_MODAL_TIMEOUT_S
             )
 
-        # Honest classification: never success; single dispatch (no retry).
-        assert result.status is MacroRunStatus.RUNTIME_ERROR, (
-            f"RaiseError did not classify as RUNTIME_ERROR: {result}"
+        # Block E: honest classification is SUSPECTED_STALLED (the RaiseError modal
+        # blocks Application.Run past the soft deadline) — never success; single
+        # dispatch (no retry).
+        assert result.status is MacroRunStatus.SUSPECTED_STALLED, (
+            f"RaiseError did not classify as SUSPECTED_STALLED: {result}"
         )
         assert result.status is not MacroRunStatus.SUCCESS
-        assert result.error_code == "MACRO_RUNTIME_ERROR"
+        assert result.error_code == "MACRO_TIMEOUT"
         assert counts["execute"] == 1, (
             f"expected exactly 1 execute dispatch, got {counts['execute']}"
         )
 
-        # The owned PID was terminated (modal not dismissed; honest BG04 limitation).
+        # The modal is not dismissed and the owned pid is NOT terminated (no auto-kill).
         assert "dismissed=false" in (result.error_text or "").lower(), (
-            f"expected the owned-PID-terminate modal path: {result.error_text!r}"
+            f"expected dismissed=false (dialog not dismissed): {result.error_text!r}"
         )
+        assert _pid_alive(old_pid), "the owned pid must NOT be terminated (no auto-kill)"
         # No false precision: Excel does not forward the VBA error number/description,
         # so the service must not invent them.
         error_text = result.error_text or ""
@@ -1042,21 +1060,18 @@ async def test_runtime_error_classified_without_false_precision(tmp_path: Path) 
             f"{[w['title'] for w in owned_foreground]}"
         )
 
-        # The service terminated ONLY the owned PID; it is gone (no orphan).
-        assert _wait_pid_gone(old_pid), f"owned PID {old_pid} survived the modal terminate"
-
-        # --- Recovery: the modal path already recovered in-process (F2b). ---
-        assert result.session_recovery == "recovered", (
-            f"expected in-process recovery: session_recovery={result.session_recovery!r}"
+        # Recovery is agent-directed (no in-process recovery): rebuild a fresh hidden
+        # instance via the owned-process recovery path.
+        assert result.session_recovery is None, (
+            f"recovery is agent-directed, not automatic: {result.session_recovery!r}"
         )
-        assert rig.worker.get_status().state is WorkbookSessionState.RUNNING
-
-        # The prior workbook_id is invalid after recovery (open books discarded), so
-        # re-open the fixture copy and prove a fresh session runs a macro.
-        fresh = await rig.open()
-        fresh_pid = rig.worker.get_status().owned_pid
+        recover = await rig.session.recover_owned_process(reason="task066_runtime_stalled")
+        assert recover["process_restarted"] is True, f"agent-directed recovery failed: {recover}"
+        fresh_pid = recover["owned_pid"]
         assert fresh_pid is not None and fresh_pid != old_pid
 
+        # Re-open the fixture copy and prove a fresh session runs a macro.
+        fresh = await rig.open()
         rig.grant_macro_run("modTest.AddNumbers")
         await rig.classify_safe("modTest.AddNumbers")
         ok = await rig.service.run_macro(fresh.workbook_id, "modTest.AddNumbers", [2, 3])
@@ -1101,10 +1116,11 @@ async def test_timeout_not_retried(tmp_path: Path) -> None:
     """A hung macro -> ``MACRO_TIMEOUT`` + in-process recovery, attempted once.
 
     An injected ``modTest.HangForever`` busy loop exceeds the short soft deadline.
-    The service classifies ``MACRO_TIMEOUT``, records diagnostics, never auto-retries
-    (exactly one ``execute`` dispatch), terminates **only the owned PID** and
-    recovers the session in-process (F2b): the worker is RUNNING again with a fresh
-    owned instance and ``session_recovery == "recovered"``. No server restart.
+    The service classifies ``SUSPECTED_STALLED`` / ``MACRO_TIMEOUT``, records
+    diagnostics, never auto-retries (exactly one ``execute`` dispatch) and never
+    auto-kills: the owned PID is left alive, ``session_recovery is None`` and the
+    worker is ``running/deadline_exceeded``. Recovery is agent-directed
+    (``recover_owned_process`` rebuilds a fresh hidden instance). No server restart.
     """
 
     fixture = _fixture_or_skip(_CLEAN_PROJECT)
@@ -1134,9 +1150,10 @@ async def test_timeout_not_retried(tmp_path: Path) -> None:
                 info.workbook_id, "modTest.HangForever", timeout_s=_HANG_TIMEOUT_S
             )
 
-        # Plain timeout (no modal); never success.
-        assert result.status is MacroRunStatus.TIMEOUT, (
-            f"HangForever did not classify as TIMEOUT: {result}"
+        # Block E: a busy-loop macro outlives its soft deadline -> SUSPECTED_STALLED
+        # (MACRO_TIMEOUT); never success.
+        assert result.status is MacroRunStatus.SUSPECTED_STALLED, (
+            f"HangForever did not classify as SUSPECTED_STALLED: {result}"
         )
         assert result.error_code == "MACRO_TIMEOUT"
         assert result.status is not MacroRunStatus.SUCCESS
@@ -1149,17 +1166,19 @@ async def test_timeout_not_retried(tmp_path: Path) -> None:
             f"duration {result.duration_ms}ms does not reflect the soft deadline {_HANG_TIMEOUT_S}s"
         )
 
-        # F2b: in-process recovery rebuilt the owned instance -> RUNNING + fresh pid.
-        assert result.session_recovery == "recovered", (
-            f"expected in-process recovery: session_recovery={result.session_recovery!r}"
+        # No auto-kill / no in-process recovery: the owned pid is left alive and the
+        # worker is running/deadline_exceeded; recovery is agent-directed.
+        assert result.session_recovery is None, (
+            f"recovery is agent-directed, not automatic: {result.session_recovery!r}"
         )
-        assert rig.worker.get_status().state is WorkbookSessionState.RUNNING
-        new_pid = rig.worker.get_status().owned_pid
+        assert _pid_alive(old_pid), "the owned pid must NOT be terminated (no auto-kill)"
+        assert rig.worker.get_status().state is WorkbookSessionState.DEADLINE_EXCEEDED
+        recover = await rig.session.recover_owned_process(reason="task066_retry_stalled")
+        assert recover["process_restarted"] is True, f"agent-directed recovery failed: {recover}"
+        new_pid = recover["owned_pid"]
         assert new_pid is not None and new_pid != old_pid, (
             f"recovery did not rebuild a fresh owned instance: old={old_pid} new={new_pid}"
         )
-        # The old owned PID was terminated by the service (no orphan).
-        assert _wait_pid_gone(old_pid), f"owned PID {old_pid} survived the timeout terminate"
 
         # No user Excel PID was touched (BG05); disposable copies intact.
         missing_user_pids = baseline_pids - _excel_pids()
@@ -1322,29 +1341,26 @@ async def test_guard_restores_props_around_live_macro(tmp_path: Path) -> None:
         else:
             print("[guard-live] success read-back skipped (guard props unavailable)")
 
-        # --- Runtime-error macro: still classified RUNTIME_ERROR (never success). ---
+        # --- Runtime-error macro: the RaiseError modal wedges the STA past the soft
+        # deadline, so it is honestly SUSPECTED_STALLED (never a false success). ---
         rig.grant_macro_run("modTest.RaiseError")
         await rig.classify_safe("modTest.RaiseError")
-        pre_err = await _read_guard_props(rig)
 
         result = await rig.service.run_macro(
             info.workbook_id, "modTest.RaiseError", timeout_s=_MODAL_TIMEOUT_S
         )
 
-        assert result.status is MacroRunStatus.RUNTIME_ERROR, (
-            f"RaiseError did not classify as RUNTIME_ERROR: {result}"
+        assert result.status is MacroRunStatus.SUSPECTED_STALLED, (
+            f"RaiseError did not classify as SUSPECTED_STALLED: {result}"
         )
+        assert result.error_code == "MACRO_TIMEOUT"
+        assert result.session_recovery is None
         assert result.status is not MacroRunStatus.SUCCESS
-
-        # Best-effort read-back: only meaningful if the owned instance survived
-        # (the modal path terminates it, so this is typically skipped here).
-        post_err = await _read_guard_props(rig)
-        if pre_err is not None and post_err is not None and _pid_alive(owned_pid):
-            assert post_err == pre_err, (
-                f"guard did not restore around runtime error: pre={pre_err} post={post_err}"
-            )
-        else:
-            print("[guard-live] runtime-error read-back skipped (owned instance terminated)")
+        # No auto-kill: the owned instance is left alive (the modal still blocks it).
+        assert _pid_alive(owned_pid), "the owned pid must NOT be terminated (no auto-kill)"
+        # The guard restore around the runtime error cannot be read back: the modal
+        # wedges the single-STA worker, so a diagnostic submit would block. The
+        # guard-restore invariant is proven by the success read-back above.
 
         # BG05: user-owned Excel processes are untouched.
         missing_user_pids = baseline_pids - _excel_pids()
