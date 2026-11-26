@@ -18,7 +18,7 @@ related:
 
 ## Purpose
 
-This reference describes **all 88 tools** of the `xlvba` MCP server: purpose, parameters,
+This reference describes **all 91 tools** of the `xlvba` MCP server: purpose, parameters,
 return value, side effects, typical errors and access class. The document is based on the
 actual tool schemas obtained from a live `MCPServer` and on the source modules `api/*`,
 `application/*` and `adapters/*`.
@@ -69,10 +69,11 @@ Shared conventions:
 
 | Class | Count | Behavior |
 |-------|-------|----------|
-| `read-only` | 41 | Allowed automatically; does not change the workbook. May write snapshot, export, artifact and in-memory classification state. |
+| `read-only` | 43 | Allowed automatically; does not change the workbook. May write snapshot, export, artifact and in-memory classification state. |
 | `mutating` | 41 | Guarded: writable session → snapshot → approval → checks → postcondition + audit. |
 | `executing` | 3 | Runs code (`macro_run`, `test_run_suite`, `test_suite_run`); additionally gated by approval (in `restricted` mode) and `background_safe`. |
 | `mixed` | 2 | `excel_open` and `excel_close`: the class depends on parameters (`read_only`, `mode`, `save_changes`). |
+| `recovery` | 1 | `excel_recover`: agent-directed owned-process recovery; allow-by-default in **both** `full` and `restricted` mode, audited, pid-scoped, originals-safe. |
 | `config` (bookkeeping) | 1 | `macro_classify_background`: changes in-memory classification state only (no workbook mutation); ungated bookkeeping, `macro_run` remains the security boundary. |
 
 It is important to distinguish "the tool is implemented" from "the tool is available through
@@ -108,9 +109,10 @@ modes, is non-mutating/non-activating, and never changes the workbook or shows U
 
 | Group | Count | Tools | Access class |
 |-------|-------|-------|--------------|
-| Workbook/session | 6 | `excel_open`, `excel_close`, `excel_save`, `excel_get_status`, `excel_list_workbooks`, `excel_health` | mixed / mutating / read-only |
+| Workbook/session | 7 | `excel_open`, `excel_close`, `excel_save`, `excel_get_status`, `excel_list_workbooks`, `excel_health`, `excel_recover` | mixed / mutating / read-only / recovery |
 | Snapshots | 4 | `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff` | read-only + 2 mutating |
 | Test runner | 3 | `test_run_suite`, `test_suite_run`, `test_get_run` | executing + read-only |
+| Jobs | 2 | `job_get`, `job_cancel` | read-only |
 | VBA | 9 | `vba_project_info`, `vba_list_components`, `vba_list_procedures`, `vba_read_component`, `vba_export_project`, `vba_get_references`, `vba_search_code`, `vba_replace_component_source`, `vba_insert_code` | read-only + 2 mutating |
 | Compile | 2 | `vba_compile`, `vba_get_compile_diagnostics` | read-only (see access-class note) |
 | Macros | 4 | `macro_list`, `macro_run`, `macro_get_last_result`, `macro_classify_background` | read-only + 1 executing + 1 config (bookkeeping) |
@@ -123,24 +125,37 @@ modes, is non-mutating/non-activating, and never changes the workbook or shows U
 | Controls | 3 | `controls_list`, `control_get`, `control_set_on_action` | read-only + 1 mutating |
 | Workbook model | 1 | `workbook_get_model` | read-only |
 | Health | 1 | `server_health` | read-only |
-| **Total** | **88** | — | 41 read-only, 41 mutating, 3 executing, 2 mixed, 1 config (bookkeeping) |
+| **Total** | **91** | — | 43 read-only, 41 mutating, 3 executing, 2 mixed, 1 recovery, 1 config (bookkeeping) |
 
-Sum across groups: 6 + 4 + 3 + 9 + 2 + 4 + 7 + 11 + 13 + 16 + 5 + 3 + 3 + 1 + 1 = **88**.
+Sum across groups: 7 + 4 + 3 + 2 + 9 + 2 + 4 + 7 + 11 + 13 + 16 + 5 + 3 + 3 + 1 + 1 = **91**.
 
 ## Workbook/session
 
 | Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
 |------|---------|------------|---------|--------------|--------|--------|
-| `excel_open` | Opens an allowed workbook as a hidden working copy. | `path:string, mode:SessionMode=execute?, read_only:boolean=false?` | `WorkbookInfo` | File copy in `work/`; audit record | `PATH_NOT_ALLOWED`, `APPROVAL_DENIED` (restricted mode), `EXCEL_HUNG` | mixed |
+| `excel_open` | Opens an allowed workbook as a hidden working copy. | `path:string, mode:SessionMode=execute?, read_only:boolean=false?, background:boolean=false?` | `WorkbookInfo` or `RunningJob` | File copy in `work/`; audit record | `PATH_NOT_ALLOWED`, `APPROVAL_DENIED` (restricted mode), `EXCEL_HUNG` | mixed |
 | `excel_close` | Closes an open workbook; does not save by default. | `workbook_id:string, save_changes:boolean=false?` | `SessionStatus` | Closes the working copy; deletes the copy; audit record | `APPROVAL_DENIED` (restricted mode, when `save_changes=true`), `EXCEL_HUNG` | mixed |
 | `excel_save` | Explicitly saves the working copy. | `workbook_id:string` | `WorkbookInfo` | Writes the working-copy file; audit record | `APPROVAL_DENIED` (restricted mode), `EXCEL_HUNG`, `COM_BUSY` | mutating |
 | `excel_get_status` | Returns session/workbook state without touching COM. | `workbook_id:string?` | `SessionStatus` | — | — | read-only |
 | `excel_list_workbooks` | Lists open workbooks from bookkeeping. | — | `list[WorkbookInfo]` | — | — | read-only |
 | `excel_health` | Worker/session state without forcing a restart and without COM. | — | `ExcelHealth` | — | — (always a payload) | read-only |
+| `excel_recover` | Agent-directed recovery of the owned Excel process (fail-closed; originals safe). | `reason:string=agent_directed?` | `RecoveryResult` | Terminates the wedged owned `EXCEL.EXE` via the held handle; discards working copies; rebuilds a fresh hidden instance; audit | — (reports `ok=false` / `recovery_possible=false` when refused) | recovery |
 
 `excel_open` is `mixed`: `mode="inspect"` + `read_only=true` passes as `READ_ONLY`;
 `mode="inspect"` + `read_only=false` is `MUTATING`; `mode="execute"` is `EXECUTING`.
 `excel_close` is `read-only` with `save_changes=false` and `mutating` with `save_changes=true`.
+`excel_recover` is the only `recovery`-class tool: it is allow-by-default in **both** `full` and
+`restricted` mode, audited, pid-scoped (never a wildcard) and discards **working copies only** —
+originals are never modified. It is fail-closed: when no live, identity-verified handle is held it
+is refused and a server restart is the documented fallback. See
+[Architecture](04-architecture.md) and [Security](08-security.md).
+
+`ExcelHealth.worker_state` / `session_state` use `WorkbookSessionState`, which now includes
+`running/deadline_exceeded` (a single COM call exceeded its execution deadline; the call is **not**
+cancelled and the owned pid is **not** terminated — the worker resumes `running` when the call
+returns). This is distinct from `running/needs_recovery`, which is a genuine recovery state. A
+read-only owned-pid liveness probe additionally forces `needs_recovery` when the hidden `EXCEL.EXE`
+has died while the bookkeeping still says `running`/`accepting`.
 
 ## Snapshots
 
@@ -155,14 +170,28 @@ Sum across groups: 6 + 4 + 3 + 9 + 2 + 4 + 7 + 11 + 13 + 16 + 5 + 3 + 3 + 1 + 1 
 
 | Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
 |------|---------|------------|---------|--------------|--------|--------|
-| `test_run_suite` | Runs a declarative test suite against disposable copies of the workbook. | `suite:TestSuiteSpec` | `TestRunResult` | Baseline snapshot, a working copy per case, artifacts, `runs/`, audit | `INVALID_RANGE`, `APPROVAL_DENIED` (restricted mode), `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED`, `EXCEL_HUNG` | executing |
-| `test_suite_run` | Explicit entry point: accepts a suite object or a JSON-like mapping. | `suite:TestSuiteSpec` or `object` | `TestRunResult` | Same as `test_run_suite` | `INVALID_RANGE`, `APPROVAL_DENIED` (restricted mode), `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED` | executing |
+| `test_run_suite` | Runs a declarative test suite against disposable copies of the workbook. | `suite:TestSuiteSpec, background:boolean=false?` | `TestRunResult` or `RunningJob` | Baseline snapshot, a working copy per case, artifacts, `runs/`, audit | `INVALID_RANGE`, `APPROVAL_DENIED` (restricted mode), `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED`, `EXCEL_HUNG` | executing |
+| `test_suite_run` | Explicit entry point: accepts a suite object or a JSON-like mapping. | `suite:TestSuiteSpec` or `object`, `background:boolean=false?` | `TestRunResult` or `RunningJob` | Same as `test_run_suite` | `INVALID_RANGE`, `APPROVAL_DENIED` (restricted mode), `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED` | executing |
 | `test_get_run` | Returns a persisted run by `run_id`. | `run_id:string` | `TestRunResult` | — | `ExcelVbaMcpError` (not found) | read-only |
 
 Both runners open the working copy in `execute` mode. In the default `full` mode this is
 authorized; in `restricted` mode every case gets `blocked` (`APPROVAL_DENIED`) and the suite is
 `blocked`. A `macro_run` step on an unclassified procedure is blocked with
 `BACKGROUND_SAFETY_NOT_VERIFIED` in either mode.
+
+`test_suite_run` (and `test_run_suite`) accept `background=true` to return a `RunningJob` handle
+promptly instead of blocking; poll with `job_get` (see [Background jobs](#background-jobs)).
+
+## Jobs
+
+| Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
+|------|---------|------------|---------|--------------|--------|--------|
+| `job_get` | Returns one background job's status/result by `job_id` (poll; never touches COM). | `job_id:string` | `JobStatus` | — | `NOT_FOUND` (unknown `job_id`) | read-only |
+| `job_cancel` | Records a job's cancel **intent** (intent-only; never interrupts the running COM call). | `job_id:string` | `JobStatus` | — | `NOT_FOUND` (unknown `job_id`) | read-only |
+
+`job_get` and `job_cancel` never touch COM. `job_cancel` only sets `cancel_requested` on the job so
+a poller can observe it: the single-STA COM call runs to completion and the job still reaches a
+terminal state. See [Background jobs](#background-jobs) for the full lifecycle.
 
 ## VBA
 
@@ -205,7 +234,7 @@ closed with `PATH_NOT_ALLOWED` whose `context.allowed_root` / `context.expected_
 | Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
 |------|---------|------------|---------|--------------|--------|--------|
 | `macro_list` | Lists callable macros with their `background_safe` classification. | `workbook_id:string` | `list[MacroInfo]` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED`, `EXCEL_HUNG` | read-only |
-| `macro_run` | Runs one approved `background_safe` macro. | `workbook_id:string, macro_name:string, args:array?` | `MacroRunResult` | VBA execution; possible external effects; audit | `APPROVAL_DENIED` (restricted mode), `MACRO_BLOCKED` (Office macro-security), `MACRO_NOT_FOUND`, `MACRO_RUNTIME_ERROR`, `MACRO_TIMEOUT`, `BACKGROUND_SAFETY_NOT_VERIFIED`, `INTERACTIVE_UI_NOT_SUPPORTED` | executing |
+| `macro_run` | Runs one approved `background_safe` macro. | `workbook_id:string, macro_name:string, args:array?, background:boolean=false?` | `MacroRunResult` or `RunningJob` | VBA execution; possible external effects; audit | `APPROVAL_DENIED` (restricted mode), `MACRO_BLOCKED` (Office macro-security), `MACRO_NOT_FOUND`, `MACRO_RUNTIME_ERROR`, `MACRO_TIMEOUT`, `BACKGROUND_SAFETY_NOT_VERIFIED`, `INTERACTIVE_UI_NOT_SUPPORTED` | executing |
 | `macro_classify_background` | Records a procedure's `background_safe` for the current workbook hash and VBA source revision (ungated bookkeeping). | `workbook_id:string, procedure:string, background_safe:boolean, expected_project_source_hash:string?` | `BackgroundSafetyClassification` | Mutates in-memory classification state (bookkeeping); audit | `MACRO_NOT_FOUND`, `STALE_TARGET` (source hash mismatch), `INTERACTIVE_UI_NOT_SUPPORTED` (interactive/heuristic + `background_safe=true`), `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED`, `EXCEL_HUNG` | config (bookkeeping, ungated) |
 | `macro_get_last_result` | Returns the cached last run without re-executing. | `workbook_id:string` | `MacroRunResult` | — | — | read-only |
 
@@ -252,7 +281,7 @@ write with `STALE_TARGET`.
 
 | Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
 |------|---------|------------|---------|--------------|--------|--------|
-| `pivot_tables_list` | All PivotTables and their caches across all sheets. | `workbook_id:string` | `PivotInventory` | — | `COM_BUSY` | read-only |
+| `pivot_tables_list` | All PivotTables and their caches across all sheets. | `workbook_id:string, background:boolean=false?` | `PivotInventory` or `RunningJob` | — | `COM_BUSY` | read-only |
 | `pivot_table_get` | Metadata for one PivotTable by `Name`. | `workbook_id:string, pivot_table:string` | `PivotTableInfo` | — | `COM_BUSY` | read-only |
 | `pivot_cache_get` | PivotCache metadata by 1-based `CacheIndex`. | `workbook_id:string, cache_index:integer` | `PivotCacheInfo` | — | `COM_BUSY` | read-only |
 | `pivot_fields_list` | PivotTable fields with orientation and aggregation. | `workbook_id:string, pivot_table:string` | `list[PivotFieldInfo]` | — | `COM_BUSY` | read-only |
@@ -286,6 +315,16 @@ with `hidden_items:[]`, exactly matching the `filter_state` reported by `pivot_t
   dropdown / `CurrentPage` instead.
 
 Row/column/data fields keep the existing `PivotItems[i].Visible` manual-filter semantics.
+
+**Inventory sweep status (Block B).** `pivot_tables_list` performs a **single worksheet sweep**
+feeding both the PivotTable and PivotCache inventories (linked by a `CacheIndex` memo). The source
+type is gated first per PivotTable, so an external / OLAP / Data Model cache is reported with its
+identity only and `source_status="unsupported_source"` (otherwise `"supported"`). A per-sheet
+**measured** budget (field / `PivotItems` reads, never file size / row count / `UsedRange`) stops
+the sweep between COM ops: a sheet is reported `ok`, `capped` (partial results kept) or `too_large`
+(named, no partial) in the audit record. `pivot_tables_list` also accepts `background=true` (see
+[Background jobs](#background-jobs)). Output cells are never materialized and `Workbook.RefreshAll`
+is never used.
 
 ## Ranges
 
@@ -793,6 +832,44 @@ The tool never returns `compiled` or `compile_error`, and never shows or activat
 `NON_ACTIVATING_COMPILE_UNAVAILABLE`, `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED`.
 `vba_get_compile_diagnostics` returns the same data from the cache without re-collecting.
 
+## Background jobs
+
+Four long-running tools accept `background=true`: `excel_open`, `macro_run`, `test_suite_run`
+(and `test_run_suite`) and `pivot_tables_list`. With `background=true` the tool schedules the
+operation on the in-process job registry and returns a prompt `RunningJob` handle well within the
+client wall-clock:
+
+```json
+{ "status": "running", "job_id": "job-…", "poll_after_s": 5 }
+```
+
+The client then **pulls/poll**s `job_get(job_id)` no sooner than `poll_after_s` (clamped to
+`[1, 30]`, default `5`). The registry **owns the result**, so a client timeout or disconnect never
+drops it; a completed result stays retrievable by `job_id` (and, after a restart, from the
+persisted `JobStore`).
+
+`JobStatus` fields: `job_id`, `status`, `started`, `cancel_requested`, `poll_after_s`, `result`
+(once terminal), `error_code`, `error_text`, `retry_after_s`, `phase`, `outcome`, `retryable` and
+an additive `events` history.
+
+`status` is one of:
+
+| Status | Meaning |
+|--------|---------|
+| `queued` | Scheduled but not yet started on the STA worker. |
+| `running` | The operation is executing on the single-STA worker. |
+| `succeeded` | The wrapped op returned a value (stored on the job). |
+| `failed` | The wrapped op raised a domain or unexpected error. |
+| `expired` | The op exceeded its execution deadline (`EXCEL_HUNG`); the call is left running on the STA (never cancelled). |
+| `interrupted_unknown` | A persisted non-terminal job reconciled at startup, or a job finalized after a successful `excel_recover`. `outcome="unknown"`, `retryable=false`; never completed, never auto-retried. |
+| `unknown` | Reserved; never produced by the registry. |
+
+`job_cancel` records cancel **intent** only (`cancel_requested=true`); it cannot interrupt the
+uninterruptible COM call, so the job still runs to a terminal state. `interrupted_unknown` jobs are
+never replayed. The lifecycle and persistence model are described in
+[Architecture](04-architecture.md); the `excel_recover` interaction is in
+[Troubleshooting](10-troubleshooting.md).
+
 ## Tool dependencies
 
 1. **`excel_open` before any workbook tool.** Every tool with a `workbook_id` requires an open
@@ -834,6 +911,7 @@ calls using the same `workbook_id` — after closing, the identifier is no longe
 | `shape_set_on_action` | Assigns a macro to a shape | `MUTATING`, gated | Check `shapes_list`; an empty `macro_name` clears the assignment |
 | `control_set_on_action` | Assigns a macro to a Form Control | `MUTATING`, gated | Work only with Form Controls; ActiveX is unsupported |
 | `macro_run` | Executes VBA code | `EXECUTING`, gated by approval (restricted mode) + `background_safe` + R13 | Only after `macro_list` / `macro_classify_background` and preflight; do not run macros with external effects |
+| `excel_recover` | Terminates the owned Excel process and discards working copies | `recovery` class; allow-by-default (both modes), audited, pid-scoped, fail-closed | Use only when `excel_health` shows `needs_recovery` / `running/deadline_exceeded`; originals are never modified, but open working copies are lost and an in-flight op is `prior_job="unknown"` (never replayed) |
 
 ## Read-only resources
 
@@ -874,28 +952,31 @@ Resources are read-only: they do not mutate the workbook and do not execute VBA.
    `range_copy` works only within one workbook and without the clipboard.
 10. **No list pagination.** `tables_list` and `pivot_tables_list` return the full bounded list
     without paging.
-11. **A dead owned Excel is detected as `needs_recovery`; only the macro path auto-recovers.**
+11. **A dead owned Excel is detected as `needs_recovery`; recovery is agent-directed.**
     `excel_health` reads worker/session bookkeeping without touching COM and additionally runs a
     read-only owned-pid liveness probe (`OpenProcess` + `GetExitCodeProcess`, no COM, no kill): if
     the hidden `EXCEL.EXE` the worker owns has died while the bookkeeping still says
     `running`/`accepting`, `excel_health` reports `needs_recovery` instead of a false `ok`. A
-    `macro_run` hang/timeout is the one path that rebuilds the instance automatically (F2b, see
-    the `macro_run` section); any other `needs_recovery` state has no MCP-callable recovery tool.
-    Remedy there: re-open the workbook, or restart the server process.
+    `macro_run` hang/timeout rebuilds the instance automatically (F2b). For every other
+    `needs_recovery` / `running/deadline_exceeded` state the agent calls `excel_recover`
+    (agent-directed, fail-closed, originals-safe); the server never auto-terminates a live pid on a
+    deadline. If recovery is refused (no live, identity-verified handle) the fallback is a server
+    restart.
 12. **`macro_run` has no snapshot precondition (spec deviation, tracked).**
     Unlike content-mutating tools, `macro_run` does not require a prior `snapshot_create`; it runs
     a classified, approved macro without one. The recommended workflow still snapshots first so a
     macro's external side effects have a rollback baseline. This asymmetry is a documented
     limitation, not a guarantee that macros are snapshot-gated.
-13. **There is no `excel_recover_session` tool.**
+13. **`excel_recover` is the only recovery tool; there is no `excel_recover_session` tool.**
     `SessionService.recover_session`/`close_session` exist internally but are not exposed as MCP
-    tools. A client cannot trigger recovery in-band; the only automatic recovery is the F2b
-    macro-hang path, which runs `recover_session` itself and reports it in
-    `MacroRunResult.session_recovery`. In every other case the supported remedy is to close and
-    re-open the workbook (or restart the server).
+    tools. The agent-directed `excel_recover` terminates the wedged owned process (through the held
+    handle), discards working copies and rebuilds a fresh hidden instance; it is allow-by-default
+    in both modes, audited and pid-scoped. The `macro_run` hang/timeout path also recovers
+    automatically (F2b) and reports it in `MacroRunResult.session_recovery`. An interrupted
+    operation is reported `prior_job="unknown"` and is never auto-retried.
 14. **`macro_policy.classify_operation` is non-authoritative (dead/illustrative table).**
     The `classify_operation` function in `security/macro_policy.py` is retained for illustration
     and is **not** wired into the runtime enforcement path; the live operation class of each tool
-    is defined per-service. Its table is stale (it predates the current 88-tool catalogue) and
+    is defined per-service. Its table is stale (it predates the current 91-tool catalogue) and
     must not be read as the authoritative tool classification — use this reference or the service
     code for that.

@@ -26,13 +26,15 @@ logging and audit.
 There is no configuration file. All settings are defined **exclusively through environment
 variables**, which are read when the server starts. The configuration model is typed with Pydantic
 (`src/excel_vba_mcp/config.py`) and is now wired into the server: `config.load_config()` is called
-in `server.lifespan` at startup, so `EXCEL_VBA_MCP_ACCESS_MODE`, `EXCEL_VBA_MCP_LOG_LEVEL` and
-`EXCEL_VBA_MCP_MACRO_TIMEOUT_S` are validated together and an invalid value for any of them fails
-startup with a `ValidationError`.
+in `server.lifespan` at startup, so `EXCEL_VBA_MCP_ACCESS_MODE`, `EXCEL_VBA_MCP_LOG_LEVEL`,
+`EXCEL_VBA_MCP_MACRO_TIMEOUT_S`, `EXCEL_VBA_MCP_OPEN_TIMEOUT_S` and
+`EXCEL_VBA_MCP_LIVENESS_CEILING_S` are validated together and an invalid value for any of them
+fails startup with a `ValidationError`.
 
-The remaining variables (`EXCEL_VBA_MCP_ROOTS` and the runtime-directory variables) are read
-separately by `server._configured_roots()` / `server._resolve_runtime_path()`, not by
-`config.load_config()`; they are still read only at startup.
+The remaining variables (`EXCEL_VBA_MCP_ROOTS`, `EXCEL_VBA_MCP_JOB_DIR`,
+`EXCEL_VBA_MCP_OWNED_PID_DIR` and the other runtime-directory variables) are read separately by
+`server._configured_roots()` / `server._resolve_runtime_path()` / `server._resolve_owned_pid_dir()`,
+not by `config.load_config()`; they are still read only at startup.
 
 ## Environment Variables
 
@@ -40,11 +42,15 @@ separately by `server._configured_roots()` / `server._resolve_runtime_path()`, n
 |----------|---------|---------|----------------|--------|
 | `EXCEL_VBA_MCP_ACCESS_MODE` | Server access policy (approval behavior) | `full` | `full`, `restricted` | `full` authorizes `MUTATING`/`EXECUTING` operations without a per-action grant; `restricted` keeps deny-by-default approval. Any other value fails startup fast (Pydantic `ValidationError`). |
 | `EXCEL_VBA_MCP_MACRO_TIMEOUT_S` | Macro dispatch deadline (seconds) | `90` | Positive number | Soft per-call ceiling for the `Application.Run` dispatch inside `macro_run` (F2b). Exceeding it classifies the run `MACRO_TIMEOUT` (or `MACRO_RUNTIME_ERROR` when the owned PID shows a modal), terminates only the owned Excel PID and recovers the session in-process. A non-positive value fails startup fast (Pydantic `ValidationError`). |
+| `EXCEL_VBA_MCP_OPEN_TIMEOUT_S` | Server-side deadline for the `excel_open` STA open (seconds) | `300` | Positive number | The per-op-class server authority for the open path (Block E). A non-positive value fails startup fast (Pydantic `ValidationError`). |
+| `EXCEL_VBA_MCP_LIVENESS_CEILING_S` | Server-wide upper bound applied to every per-call COM deadline (seconds) | `600` | Positive number | Every per-call timeout is clamped to this ceiling so no single operation's deadline exceeds it (Block E). A non-positive value fails startup fast (Pydantic `ValidationError`). |
 | `EXCEL_VBA_MCP_ROOTS` | Allowlist of root directories for workbook paths | CWD + system temp | A path string separated by `os.pathsep` (on Windows `;`) | Paths outside the roots are rejected with `PATH_NOT_ALLOWED`. Empty/missing value → default. |
 | `EXCEL_VBA_MCP_WORK_DIR` | Working-copy directory | `<temp>/excel_vba_mcp/work` | Absolute path | Where working copies of opened workbooks are created. |
 | `EXCEL_VBA_MCP_SNAPSHOT_DIR` | Snapshot store | `<temp>/excel_vba_mcp/snapshots` | Absolute path | Snapshot directory with manifest and SHA-256. |
 | `EXCEL_VBA_MCP_ARTIFACT_DIR` | Artifacts directory | `<temp>/excel_vba_mcp/artifacts` | Absolute path | Artifacts and evidence; also registered as the logical root `artifacts`. |
 | `EXCEL_VBA_MCP_RUN_DIR` | Persisted-runs directory | `<temp>/excel_vba_mcp/runs` | Absolute path | Storage for declarative test runs. |
+| `EXCEL_VBA_MCP_JOB_DIR` | Background-job store directory | `<temp>/excel_vba_mcp/jobs` | Absolute path | One JSON document per background job (`JobStore`): a `RUNNING` marker at start, finalized on a terminal state, and reconciled to `interrupted_unknown` at startup. |
+| `EXCEL_VBA_MCP_OWNED_PID_DIR` | Ownership-record directory (startup reconcile) | `%LOCALAPPDATA%\excel-vba-mcp` | Absolute path | Stable per-user directory for `owned_pid.json` (owner + owned-Excel identity: pid + create-time + exe + session). Deliberately non-volatile so the marker survives a restart / logoff-logon. Falls back to the system temp dir only when `LOCALAPPDATA` is unset. |
 | `EXCEL_VBA_MCP_AUDIT_LOG` | Audit-log path | `<temp>/excel_vba_mcp/audit.jsonl` | Absolute path | Append-only JSONL journal. |
 | `EXCEL_VBA_MCP_LOG_LEVEL` | Logging level | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` | Parsed in `config.load_config()`, but **not applied**. See the "Logging" section. |
 
@@ -84,6 +90,8 @@ The variable is accepted (and validated) but has no effect in this revision.
 | `snapshots/` | `EXCEL_VBA_MCP_SNAPSHOT_DIR` | Snapshots: manifest `manifest.json` and SHA-256; snapshots are immutable. |
 | `artifacts/` | `EXCEL_VBA_MCP_ARTIFACT_DIR` | Test-run artifacts and evidence; registered as the logical root `artifacts`. |
 | `runs/` | `EXCEL_VBA_MCP_RUN_DIR` | Persisted declarative test runs (by `run_id`). |
+| `jobs/` | `EXCEL_VBA_MCP_JOB_DIR` | Background-job documents (one JSON file per job); RUNNING marker + startup reconcile to `interrupted_unknown`. |
+| `owned_pid.json` | `EXCEL_VBA_MCP_OWNED_PID_DIR` | Ownership record (owner + owned-Excel identity) for startup reconcile; default `%LOCALAPPDATA%\excel-vba-mcp` (non-volatile). |
 | `audit.jsonl` | `EXCEL_VBA_MCP_AUDIT_LOG` | Append-only audit journal in JSONL format. |
 
 In addition to its user-facing purpose, the `artifacts` directory is registered in the path policy

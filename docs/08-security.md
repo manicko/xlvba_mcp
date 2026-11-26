@@ -198,6 +198,35 @@ What applies in **both** modes:
 `READ_ONLY` operations are always auto-allowed. Neither mode bypasses the path
 policy, Office trust, snapshot requirement or audit.
 
+### RECOVERY class (`excel_recover`)
+
+`excel_recover` is the agent-directed owned-process recovery tool. It is the one tool in a
+dedicated **`recovery`** access class with a deliberately permissive policy, because it is the
+safe exit from a wedged owned process and the server never auto-terminates a live pid on a
+deadline:
+
+- **Allow-by-default in BOTH modes.** `ApprovalPolicy.check_recovery` auto-allows recovery in
+  `full` **and** `restricted` mode (audited). A mutating op stays denied in `restricted` mode;
+  recovery does not weaken that.
+- **Audited.** Every call writes an audit record (`tool="excel_recover"`,
+  `operation_class="recovery"`) with the owned pid, discarded-workbook count and outcome.
+- **Pid-scoped, never a wildcard.** The approval key is `"pid:<owned_pid>"`; there is no
+  image-name or wildcard kill. Only the automation-owned `DispatchEx` process is ever targeted.
+- **Originals-safe.** Recovery discards **working copies only** (`work/`); the original workbook
+  is never modified. The outcome `what_lost` states this explicitly.
+- **Fail-closed on identity/handle failure.** Termination runs only through a live,
+  identity-verified held `PyHANDLE` (`TerminateProcess` → `WaitForSingleObject == WAIT_OBJECT_0`).
+  When no such handle is held (or the worker is closed) recovery is **refused**
+  (`recovery_possible=false`, `ok=false`) and the documented fallback is a server restart. There
+  is **no pid-only kill** and no `taskkill` re-resolution.
+- **Interrupted work is unknown, never replayed.** An in-flight / deadline-exceeded /
+  needs-recovery op is reported `prior_job="unknown"`; a successful recovery finalizes in-flight
+  jobs to `interrupted_unknown` (`retryable=false`). The caller must not replay them.
+
+The lifecycle and Job Object backstop are in [Architecture](04-architecture.md); the tool contract
+is in [MCP tools reference](05-mcp-tools-reference.md); symptoms are in
+[Troubleshooting](10-troubleshooting.md).
+
 ## Input validation
 
 Tool arguments are validated before any Excel call:
@@ -311,7 +340,7 @@ These are **not enforced** by the application; they are operator choices:
 | Dependency compromise | A compromised `mcp`/`pywin32`/`comtypes` release | Arbitrary code in the server process | Pinned versions in `uv.lock` | Pin and review updates; rebuild the venv from the lock |
 | Log tampering | Someone edits or truncates `audit.jsonl` | Loss of accountability | Append-only writes; serialized with a lock | Protect with filesystem ACLs; ship logs off-host; do not rely on it as tamper-evident |
 | Restricted-mode misconfiguration | Expecting deny-by-default while running `full` (default) | Mutations/macros run without per-action approval | Startup validation of `EXCEL_VBA_MCP_ACCESS_MODE` | Set `EXCEL_VBA_MCP_ACCESS_MODE=restricted` explicitly for untrusted callers |
-| Stale worker / lost Excel | The hidden `EXCEL.EXE` dies or hangs | Calls fail or hang; `needs_recovery` | Soft timeouts; `excel_health` owned-pid liveness probe; truthful `EXCEL_HUNG`; the macro path auto-recovers in-process (F2b) | Monitor `excel_health`; a macro hang self-recovers (re-open the workbook); otherwise close/reopen or restart the server (no in-band recovery tool) |
+| Stale worker / lost Excel | The hidden `EXCEL.EXE` dies or hangs | Calls fail or hang; `needs_recovery` | Soft timeouts; `excel_health` owned-pid liveness probe; truthful `EXCEL_HUNG`; agent-directed `excel_recover` (fail-closed, pid-scoped, originals-safe) plus the macro path auto-recovering in-process (F2b) | Monitor `excel_health`; call `excel_recover` for a wedged owned process (a macro hang self-recovers — re-open the workbook); restart the server only if recovery is refused |
 | Over-broad roots | Default roots are CWD + temp | Any workbook under CWD/temp is reachable | Path policy still canonicalises and checks roots | Always set an explicit, dedicated `EXCEL_VBA_MCP_ROOTS` |
 
 ## Control categories
@@ -333,6 +362,12 @@ These are **not enforced** by the application; they are operator choices:
 - Hidden, non-activating Excel instance; no `.Activate`/`.Select`/`SendKeys`.
 - Single-STA COM worker with bounded retry for reads only and no blind replay of
   mutations.
+- Kernel Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, unnamed, non-inheritable,
+  fail-closed assignment) so the owned Excel dies with the server and never orphans.
+- Ownership record + startup reconcile (pid + create-time + exe + session) — never a
+  pid-alone kill, never a cross-session kill.
+- Agent-directed `excel_recover` (RECOVERY class): allow-by-default in both modes,
+  audited, pid-scoped, fail-closed, originals-safe.
 
 ### Controls that depend on Windows / Office settings
 
@@ -371,11 +406,13 @@ These are **not enforced** by the application; they are operator choices:
 - **`macro_run` has no snapshot precondition.** Unlike content-mutating tools it
   does not require a prior `snapshot_create`; this is a documented spec
   deviation.
-- **Session recovery is not exposed over MCP.** `excel_health` reports
-  `needs_recovery`, but a client cannot trigger recovery in-band. The one exception
-  is a `macro_run` hang/timeout, which rebuilds the owned instance automatically
-  (F2b) and reports it in `MacroRunResult.session_recovery`; every other case is
-  close/reopen or restarting the server.
+- **Session recovery is agent-directed via `excel_recover`.** `excel_health` reports
+  `needs_recovery` / `running/deadline_exceeded`, and the agent calls `excel_recover` to terminate
+  the wedged owned process and rebuild the instance (allow-by-default in both modes, audited,
+  pid-scoped, fail-closed, originals-safe). The one automatic path is a `macro_run` hang/timeout,
+  which rebuilds the owned instance itself (F2b) and reports it in
+  `MacroRunResult.session_recovery`. If `excel_recover` is refused (no live, identity-verified
+  handle) the fallback is restarting the server.
 - **The macro dialog guard is defense-in-depth, not a sandbox.** F2a sets
   `Application.Interactive=False` / `DisplayAlerts=False` around the single
   `Application.Run` dispatch and restores them in `finally`; this suppresses only

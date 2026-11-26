@@ -57,13 +57,13 @@ STA thread of `ExcelComWorker`. Every other layer works with typed DTOs and the 
 
 | Layer | Modules | Responsibility | Rule the layer must not violate |
 |-------|---------|----------------|---------------------------------|
-| Transport | `server.py`, `__main__.py` | Builds `MCPServer`, lifespan, registration of 88 tools and 4 resources, logging to `stderr`, startup via `mcp.run(transport="stdio")`. | Contains no business logic and never touches COM; writes nothing to `stdout` except protocol traffic. |
+| Transport | `server.py`, `__main__.py` | Builds `MCPServer`, lifespan, registration of 91 tools and 4 resources, logging to `stderr`, startup via `mcp.run(transport="stdio")`. | Contains no business logic and never touches COM; writes nothing to `stdout` except protocol traffic. |
 | API | `api/*.py` | Thin async MCP handlers: argument validation (including tool Pydantic models) and delegation to an application service; returns DTOs. | Performs no business logic, does not import `pythoncom`/`win32com`, never touches COM (ARCH-009). |
 | Application | `application/*.py` | Orchestration: workbook session, snapshots, sheets, tables, ranges, PivotTables, names, shapes, controls, VBA, compile, macros, test runner, workbook model. | Owns no COM proxy: every operation is `await worker.submit(...)`; a service builds only an STA-local callable and DTOs. |
 | Adapters | `adapters/excel/*`, `adapters/windows_ui/*` | `ExcelComWorker` (single STA thread, queue, recovery), `ExcelAppAdapter` (hidden `Application`), sheet/table/range/pivot/VBIDE/shape/control adapters, `macro_runner`; `VBECompileUI` — read-only VBE command discovery and dialog observation. | COM proxies never leave the STA thread; adapters never change `Visible` and never call `.Activate`/`.Select`/`SendKeys`. |
 | Domain | `domain/*` | Models (`models.py`), statuses and enums (`statuses.py`), stable error codes (`errors.py`), declarative test schema (`test_spec.py`). | Does not import `pywin32` and contains no COM; an HRESULT is only an integer. |
 | Security | `security/*` | `PathPolicy` (allowlist + canonicalisation), `ApprovalPolicy` (access-mode policy: `full` by default, `restricted` deny-by-default), `AuditLogger` (append-only JSONL, redaction), `macro_policy` (`AutomationSecurity` modes, operation class). | Never bypasses policy: every path goes through `validate_path`, every mutation through an approval gate; audit never writes to `stdout`. |
-| Storage | `storage/*` | `SnapshotStore` (immutable snapshots, `manifest.json`, SHA-256), `ArtifactStore` (artifacts and evidence), `RunRepository` (persisted declarative runs). | Filesystem only; no COM. `ArtifactStore` validates its root via `PathPolicy`; `SnapshotStore` and `RunRepository` write only to server-configured runtime directories (paths are server-internal, not caller-supplied). |
+| Storage | `storage/*` | `SnapshotStore` (immutable snapshots, `manifest.json`, SHA-256), `ArtifactStore` (artifacts and evidence), `RunRepository` (persisted declarative runs), `JobStore` (persisted background jobs + startup reconcile), `OwnedPidStore` (ownership record for startup reconcile). | Filesystem only; no COM. `ArtifactStore` validates its root via `PathPolicy`; `SnapshotStore`, `RunRepository`, `JobStore` and `OwnedPidStore` write only to server-configured runtime directories (paths are server-internal, not caller-supplied). |
 
 Additionally, the `adapters/windows_ui` layer matters for diagnostics: `VBECompileUI.discover_command`
 only enumerates `VBE.CommandBars` and performs a read-only `FindControl` probe; it never calls
@@ -185,9 +185,13 @@ sequenceDiagram
   times with 0.5/1.0/2.0-second pauses (pumping between attempts). There are no retries for
   `MUTATING`/`EXECUTING`: a mutation is never blindly re-executed. `RPC_E_SERVERCALL_RETRYLATER`
   maps to `COM_BUSY`; other HRESULTs go through `error_from_hresult` into a typed error.
-- **Timeout and recovery.** When the deadline is exceeded the worker enters `NEEDS_RECOVERY`,
-  records the active token/section and raises a truthful `EXCEL_HUNG`. The already-running call
-  is **not cancelled** (a COM call is not interrupted) and **not replayed**.
+- **Timeout and recovery.** When the execution deadline is exceeded the worker enters
+  `DEADLINE_EXCEEDED` (`running/deadline_exceeded`), records the active token/section and raises a
+  truthful `EXCEL_HUNG` (`verdict=SUSPECTED_STALLED`). The already-running call is **not cancelled**
+  (a COM call is not interrupted), the owned pid is **not** terminated, and the call is **not
+  replayed**; the worker resumes `RUNNING` when it returns. A genuine `NEEDS_RECOVERY` is reserved
+  for real recovery (Block A) and is only exited by the hung `fn` returning or an explicit
+  `reset()` / `excel_recover`.
 
 ## Excel process ownership
 
@@ -226,6 +230,62 @@ sequenceDiagram
   `Application.Interactive=False` / `DisplayAlerts=False` restored in `finally` (F2a,
   defense-in-depth only; not a universal dialog blocker).
 
+### Process lifecycle and job model (Block A/E/F)
+
+The server owns exactly one hidden Excel process for its whole lifetime and never leaks or
+double-launches it. Four mechanisms make that guarantee hold across crashes, tree-kills and client
+timeouts.
+
+**Single-STA worker.** All COM runs on one dedicated `excel-com-sta` thread created by
+`ExcelComWorker.start()` (`CoInitializeEx(COINIT_APARTMENTTHREADED)` once, `CoUninitialize` once).
+Every call is a `_WorkItem` on a FIFO `queue.SimpleQueue`; `submit` awaits
+`asyncio.wrap_future(fut)` under `asyncio.wait_for`, so the event loop is never blocked. The
+per-call timeout is clamped to the server-wide liveness ceiling
+(`EXCEL_VBA_MCP_LIVENESS_CEILING_S`, default 600 s). The deadline is split into a **queue-wait**
+phase (the item never started → `ComBusyError` / `busy`, worker state unchanged) and an
+**execution** phase (the item started but is slow → `DEADLINE_EXCEEDED` + truthful `EXCEL_HUNG`;
+the call is not cancelled and the pid is not terminated). `running/deadline_exceeded` is not a
+poison state: the worker resumes `running` when the call returns.
+
+**Job Object (kernel backstop).** `ExcelAppAdapter.create_hidden()` creates an **unnamed,
+non-inheritable** `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` job **before** `DispatchEx` and assigns the
+owned `EXCEL.exe` into it **right after** the pid is resolved (`AssignProcessToJobObject`, verified
+with `IsProcessInJob`). The kernel therefore guarantees the owned Excel dies when the server dies
+(tree-kill / crash) with no orphan. Assignment is **fail-closed**: on any failure the just-spawned,
+image-verified Excel is terminated and never handed over. The job handle is held as a live
+`PyHANDLE` (never reduced to an `int`) and closed only after the verified reap.
+
+**Ownership record + startup reconcile.** A small atomic JSON document
+(`owned_pid.json`, `SCHEMA_VERSION=1` additive) records the owner (pid + create-time + exe +
+session) and the owned Excel (pid + create-time + exe + session + image-verified) under a stable
+per-user directory (`%LOCALAPPDATA%\excel-vba-mcp`, or `EXCEL_VBA_MCP_OWNED_PID_DIR`). A
+`state="creating"` marker is written **before** `DispatchEx` to cover the create→assign gap. At
+startup the server reconciles precisely:
+
+- **owner alive + identity match** → refuse to launch a second Excel (an operator/agent decision
+  is required);
+- **owner dead + owned Excel alive + identity verified (pid + create-time + image, same session)**
+  → reap exactly that orphan and clear the marker;
+- **pid reuse** (create-time mismatch, or the pid is now a non-Excel process) → never kill on
+  pid-alone; clear a stale marker and proceed, or refuse when an alive `EXCEL.EXE` cannot be
+  identity-verified;
+- **cross-session** orphan → refuse (never kill a process in another Windows session).
+
+**In-process JobRegistry + JobStore.** A loop-side, lock-guarded `JobRegistry` **owns the result**
+of a long op so a client timeout/disconnect never drops it; it wraps the same single-STA `submit`
+(no second STA). A long op returns `{status:"running", job_id, poll_after_s}` promptly; the client
+polls `job_get(job_id)`. Lifecycle:
+`queued → running → {succeeded | failed | expired | interrupted_unknown}`. When a `JobStore` is
+wired, a `RUNNING` marker is written at start and the record is finalized on every terminal state;
+after a restart a persisted non-terminal job is reconciled to `interrupted_unknown`
+(`outcome="unknown"`, `retryable=false`) — **never** `succeeded`, **never** auto-retried. A
+successful `excel_recover` also finalizes in-flight jobs to `interrupted_unknown`. `job_cancel`
+records cancel intent only and never interrupts the uninterruptible COM call.
+
+The agent-directed `excel_recover` tool and the `DEADLINE_EXCEEDED` / `SUSPECTED_STALLED` signals
+are described in [MCP tools reference](05-mcp-tools-reference.md) and
+[Troubleshooting](10-troubleshooting.md); the security class is in [Security](08-security.md).
+
 ## Workbook session model
 
 - **Working copy.** `excel_open` copies the source file into the `work/` directory
@@ -252,7 +312,7 @@ sequenceDiagram
   `state`, `mode`, `access_mode`, `busy`, `read_only`, `dirty`, `active_operation`, `notes` and
   timestamps. `access_mode` reports the server access policy (`full` or `restricted`).
   The state comes from `WorkbookSessionState` (`starting`, `running`,
-  `running/needs_recovery`, `busy`, `closing`, `closed`, `error`).
+  `running/needs_recovery`, `running/deadline_exceeded`, `busy`, `closing`, `closed`, `error`).
 - **Bookkeeping without COM.** `excel_get_status`, `excel_list_workbooks` and `excel_health`
   read only in-memory session records and never submit work to the STA thread.
 
@@ -488,7 +548,7 @@ The complete list of limits and compatibility constraints is in
 | Declarative test runner | `src/excel_vba_mcp/application/test_runner.py` |
 | Aggregated workbook model | `src/excel_vba_mcp/application/workbook_model_service.py` |
 | Single STA thread, queue, recovery | `src/excel_vba_mcp/adapters/excel/com_worker.py` |
-| Hidden `Excel.Application`, `DispatchEx` | `src/excel_vba_mcp/adapters/excel/app_adapter.py` |
+| Hidden `Excel.Application`, `DispatchEx`, Job Object, process identity | `src/excel_vba_mcp/adapters/excel/app_adapter.py` |
 | Excel adapters (sheets/tables/ranges/pivots/VBIDE/shapes/controls) | `src/excel_vba_mcp/adapters/excel/*.py` |
 | Read-only VBE command discovery and dialog observation | `src/excel_vba_mcp/adapters/windows_ui/vbe_compile_ui.py` |
 | Domain models, statuses, errors, test schema | `src/excel_vba_mcp/domain/{models,statuses,errors,test_spec}.py` |
@@ -499,3 +559,6 @@ The complete list of limits and compatibility constraints is in
 | Snapshot store | `src/excel_vba_mcp/storage/snapshot_store.py` |
 | Artifact store | `src/excel_vba_mcp/storage/artifact_store.py` |
 | Declarative run store | `src/excel_vba_mcp/storage/run_repository.py` |
+| In-process job registry (owns the result) | `src/excel_vba_mcp/application/job_registry.py` |
+| Persisted job store (RUNNING marker + startup reconcile) | `src/excel_vba_mcp/storage/job_store.py` |
+| Ownership record (pid + create-time + exe + session) | `src/excel_vba_mcp/storage/owned_pid_store.py` |

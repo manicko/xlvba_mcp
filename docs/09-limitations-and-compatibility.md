@@ -87,7 +87,7 @@ behavior as unproven until tested on a copy.
 | Macros require `background_safe` classification | `macro_run` runs only a procedure classified `background_safe` for the current workbook hash and VBA source revision. An unclassified procedure returns `BACKGROUND_SAFETY_NOT_VERIFIED`; an interactive one returns `INTERACTIVE_UI_NOT_SUPPORTED`. | Verified |
 | `EXCEL_VBA_MCP_LOG_LEVEL` is parsed but not applied | Logging is configured at import time with a fixed `INFO` level on `stderr`; the variable has no effect in this revision. | Verified |
 | ActiveX event mapping is inferred | The probable event procedure is inferred from `<sheet_code_name>_<control>_<Event>` naming. It is never click-tested and may be absent or wrong. | Suspected / not verified |
-| Session recovery is not exposed as an MCP tool | `SessionService.recover_session` exists internally, but no MCP tool triggers it. The single exception is a `macro_run` hang/timeout, which terminates the owned PID and rebuilds the instance in-process (F2b), reporting `session_recovery` and discarding open workbooks; `excel_health` surfaces `needs_recovery` for every other case, where the remedy is close/reopen or restarting the server. | Verified |
+| Session recovery is agent-directed via `excel_recover` | `excel_health` surfaces `needs_recovery` / `running/deadline_exceeded`; the agent calls `excel_recover` (allow-by-default in both modes, audited, pid-scoped, fail-closed, originals-safe) to terminate the wedged owned process and rebuild the instance. The single automatic path is a `macro_run` hang/timeout (F2b), which reports `session_recovery` and discards open workbooks. If recovery is refused the fallback is restarting the server. | Verified |
 | `pywinauto` is not a dependency | `pywinauto` was removed from `pyproject.toml` and `uv.lock`; VBE compile UI diagnostics use `comtypes` `IUIAutomation` (read-only). Do not expect a `pywinauto` API. | Verified |
 | Missing manual fixtures | `LockedProject.xlsm` and `TableNamesProject.xlsm` are not committed; the related tests skip with explicit reasons. | Verified |
 | Non-`.xlsm` formats are allowed but not validated | The path allowlist accepts the extensions above, but only `.xlsm` is validated on the target build. | Suspected / not verified |
@@ -147,7 +147,8 @@ behavior as unproven until tested on a copy.
   cells per response. Oversized requests are rejected, not silently clipped.
 - **Large-workbook limits.** Very large workbooks increase memory use and COM
   call latency; a call that exceeds its soft deadline moves the worker to
-  `NEEDS_RECOVERY` and raises `EXCEL_HUNG`. Read large ranges in chunks with
+  `running/deadline_exceeded` and raises `EXCEL_HUNG` (the call is not cancelled
+  and the pid is not terminated). Read large ranges in chunks with
   `offset` / `limit`.
 
 ## External dependencies and known issues
@@ -166,12 +167,26 @@ behavior as unproven until tested on a copy.
   [MCP tools reference](05-mcp-tools-reference.md).
 - **`MODAL_UI_BLOCKED` is declared but unused.** It is part of the stable
   `ErrorCode` vocabulary but is not emitted by the current adapters.
-- **No general in-band recovery.** The server exposes no recovery tool; the single
-  automatic path is a `macro_run` hang/timeout, which rebuilds the owned instance
-  in-process (F2b). In every other case the remedy is close/reopen or restarting
-  the process.
+- **Recovery is agent-directed.** `excel_recover` (RECOVERY class, allow-by-default
+  in both modes, fail-closed, originals-safe) is the in-band recovery path; the
+  single automatic path is a `macro_run` hang/timeout (F2b). If recovery is
+  refused the remedy is restarting the process.
 - **R13 preflight is a heuristic.** See [Security](08-security.md) for the
   residual false-safe boundary.
+
+## Autonomous Excel observability limits (Block A/E/F)
+
+These limits concern the process-lifecycle, job and recovery model added in the autonomous-Excel
+work; the mechanisms themselves are described in [Architecture](04-architecture.md).
+
+| Item | Detail | Verified/Suspected |
+|------|--------|--------------------|
+| `SCHEMA_VERSION=1` is additive | The ownership record (`owned_pid.json`) and job documents use `SCHEMA_VERSION=1`; readers ignore unknown fields, so an older/newer document stays readable. A reader that does not know a field does not fail. | Verified |
+| U3 — client timeout is client-side | A long op returns `{status:"running", job_id, poll_after_s}` and the registry owns the result, so a client timeout/disconnect never drops it. Pull/poll (`job_get`) is independent of the op's own progress and of any deadline reset; `poll_after_s` is clamped to `[1, 30]`. A low-timeout client reload plus a tree-kill was verified to leave no orphan (Job Object backstop). | Verified |
+| U4 — additive enums are EXTERNALLY ASSUMED | New status/enum members (for example `running/deadline_exceeded`, `interrupted_unknown`, the `recovery` access class) are additive; an external consumer's tolerance of unknown enum values is **assumed, not verified** against any specific client. | Suspected / not verified |
+| Detached worker / MCP Tasks deferred | The worker is owned by the server lifespan; a detached, long-lived worker and MCP Tasks are **not** implemented. A server restart ends the worker and its owned Excel (Job Object guarantees no orphan). | Verified |
+| Opaque single COM call = `inconclusive` | A single uninterruptible COM call that exceeds its deadline is reported `EXCEL_HUNG` / `SUSPECTED_STALLED` (never a fabricated completion percentage); the outcome is `inconclusive`, not a false `succeeded`. | Verified |
+| Host-specific integration skips | Integration tests that need a live Excel/COM or a specific Office build skip with an explicit reason when the host/build differs (for example missing fixtures, non-`.xlsm`, or a non-validated build). | Verified |
 
 ## Verified vs suspected
 

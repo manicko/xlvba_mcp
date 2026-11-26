@@ -77,7 +77,7 @@ its rationale are in [Architecture](04-architecture.md).
 
 | Excel capability | Supported operations | MCP tools | Coverage | Limitations |
 |------------------|----------------------|-----------|----------|-------------|
-| Application management (hidden instance, health, recovery) | READ | `server_health`, `excel_health`, `excel_list_workbooks`, `excel_get_status` | Fully supported | `server_health` never touches COM; `excel_health` reports `ok` / `needs_recovery` / `unavailable` without forcing a restart. No `.Activate`, `.Select`, `ShowWindow` or `SendKeys` exists. Recovery is implicit: a later call rebuilds the owned instance. |
+| Application management (hidden instance, health, recovery) | READ / RECOVERY | `server_health`, `excel_health`, `excel_list_workbooks`, `excel_get_status`, `excel_recover` | Fully supported | `server_health` never touches COM; `excel_health` reports `ok` / `needs_recovery` / `unavailable` (worker states include `running/deadline_exceeded`) without forcing a restart. No `.Activate`, `.Select`, `ShowWindow` or `SendKeys` exists. Recovery is agent-directed: `excel_recover` terminates the wedged owned process (fail-closed, pid-scoped, originals-safe) and rebuilds a fresh hidden instance; a `macro_run` hang/timeout also self-recovers (F2b). |
 | Workbook open (existing file, inspect/execute, read-only) | READ / EXECUTE | `excel_open` | Fully supported | The original is copied into `work/` and only the copy is opened. The default open is writable and execution-capable (`mode="execute"`, `read_only=False`), authorized in `full` mode and refused with `APPROVAL_DENIED` in `restricted` mode. Path must be inside `EXCEL_VBA_MCP_ROOTS` (`PATH_NOT_ALLOWED`). |
 | Workbook close and save | UPDATE | `excel_close`, `excel_save` | Fully supported | `excel_close` without saving is allowed; `save_changes=true` and `excel_save` are mutating (authorized in `full` mode; `APPROVAL_DENIED` in `restricted` mode). Close deletes the working copy; edits live only in the working copy, so use snapshot-restore to persist and return to an earlier state. Changes are never saved implicitly. |
 | Workbook creation (new workbook) | CREATE | — | Not supported | There is no new-workbook tool. `excel_open` only opens an existing file; a new workbook cannot be created through MCP. |
@@ -99,7 +99,7 @@ its rationale are in [Architecture](04-architecture.md).
 | Excel tables: append, insert, update, delete rows | CREATE / UPDATE / DELETE | `table_append_rows`, `table_insert_row`, `table_update_rows`, `table_delete_rows` | Fully supported | Guarded mutations. Append/insert go through `ListRows.Add` so table structure is preserved. `table_insert_row` uses a 1-based `at`. Update/delete accept explicit indices or an **unambiguous** `where`; ambiguity is rejected with a preview, never guessed. |
 | Excel tables: add and delete columns | CREATE / DELETE | `table_add_column`, `table_delete_column` | Fully supported | Guarded. Add uses `ListColumns.Add(Position)` with a unique header; delete resolves one unique header. |
 | Excel tables: create and resize | CREATE / UPDATE | `table_create`, `table_resize` | Fully supported | Guarded. Create uses `ListObjects.Add` over an A1 range or a defined name; resize uses `ListObject.Resize`. |
-| PivotTables: list, get, cache, fields | READ | `pivot_tables_list`, `pivot_table_get`, `pivot_cache_get`, `pivot_fields_list` | Fully supported | Enumeration is a worksheet-scoped sweep because `Workbook.PivotTables` is unusable on the target build. Caches are identified by 1-based `CacheIndex`; shared caches are reported once with the affected tables. Output cells are never materialized. |
+| PivotTables: list, get, cache, fields | READ | `pivot_tables_list`, `pivot_table_get`, `pivot_cache_get`, `pivot_fields_list` | Fully supported | Enumeration is a **single worksheet sweep** (one pass feeds both the PivotTable and PivotCache inventories, linked by a `CacheIndex` memo) because `Workbook.PivotTables` is unusable on the target build. The source type is gated first per PivotTable: external / OLAP / Data Model caches are reported with identity only and `source_status="unsupported_source"`. A per-sheet **measured** budget (field / `PivotItems` reads, never file size / row count / `UsedRange`) stops the sweep between COM ops and reports the sheet `ok` / `capped` (partial) / `too_large` (named) in the audit record. Caches are identified by 1-based `CacheIndex`; shared caches are reported once with the affected tables. Output cells are never materialized; `Workbook.RefreshAll` is never used. `pivot_tables_list` accepts `background=true`. |
 | PivotTables: refresh | UPDATE | `pivot_table_refresh`, `pivot_cache_refresh` | Partially supported | Table refresh uses `PivotTable.RefreshTable`; cache refresh uses `PivotCache.Refresh`. Only database/Table-backed caches are refreshed; external, OLAP and Data Model sources return `UNSUPPORTED_PIVOT_SOURCE`. `Workbook.RefreshAll` is never used. |
 | PivotTables: layout, position, aggregation, properties | UPDATE | `pivot_field_set_layout`, `pivot_field_set_position`, `pivot_field_set_aggregation`, `pivot_field_set_properties` | Partially supported | Layout accepts hidden/row/column/page; `orientation="data"` is rejected and aggregation must be set through `pivot_field_set_aggregation`. Only eleven aggregation codes are accepted; legacy codes are rejected. `pivot_field_set_properties` is sparse (`caption`, `number_format`, `show_all_items`) and requires a unique caption. |
 | PivotTables: filters | READ / UPDATE | `pivot_field_get_filters`, `pivot_field_apply_filter`, `pivot_field_clear_filters` | Partially supported | Only manual visible-items filters (`PivotItems[i].Visible`). Label, value, date and top/bottom filters (`PivotFilters.Add`) are unsupported on the target build and return an explicit unsupported result instead of being converted. Clear scope is `field` or `table`. Page (report-filter) fields are classified from `CurrentPage` / `AllItemsVisible` (F3): an untouched page field reports `kind:"none"`, `hidden_items:[]`, matching `pivot_table_get.filter_state`; clearing an untouched page field no longer raises a false `AMBIGUOUS_FILTER`; `pivot_field_apply_filter` on a page field is rejected (`supported:false`) rather than downgraded. |
@@ -236,11 +236,20 @@ or table merging.
 ### PivotTables
 
 Implemented against `Worksheet.PivotTables`, `PivotCache`, `PivotFields`, `PivotItems` and
-`PivotTable.RefreshTable`. Inventory is a worksheet sweep. Refresh is table-scoped or cache-scoped
-and only for database/Table sources. Field layout, position, aggregation and properties are
-patched and re-read. Filters are manual visible-items only. Not exposed: creating or deleting
-PivotTables/PivotCaches, changing the PivotTable source range, calculated fields/items, grouping,
-slicers, timelines, `Workbook.RefreshAll`, or label/value/date/top-bottom filters.
+`PivotTable.RefreshTable`. Inventory is a **single worksheet sweep** (one pass feeds both the
+PivotTable and PivotCache inventories via a `CacheIndex` memo). The source type is gated first per
+PivotTable, so an external / OLAP / Data Model cache is reported with its identity only
+(`source_status="unsupported_source"`). A per-sheet **measured** budget (field / `PivotItems` reads,
+never file size / row count / `UsedRange`) is enforced **between** COM ops: a sheet whose measured
+cost reaches the budget is reported `capped` (partial results kept) or `too_large` (named, no
+partial) rather than stalling the single STA. `PivotCache.SourceData` is optional metadata read
+defensively — an external cache whose `SourceData` getter raises Excel 1004
+(`DISP_E_EXCEPTION`) is reported with `source_data_kind="unavailable"` and never aborts the sweep.
+Refresh is table-scoped or cache-scoped and only for database/Table sources. Field layout, position,
+aggregation and properties are patched and re-read. Filters are manual visible-items only. Not
+exposed: creating or deleting PivotTables/PivotCaches, changing the PivotTable source range,
+calculated fields/items, grouping, slicers, timelines, `Workbook.RefreshAll`, or
+label/value/date/top-bottom filters.
 
 ### Shapes and controls
 

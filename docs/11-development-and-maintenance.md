@@ -51,7 +51,7 @@ change under `docs/`.
 | `src/excel_vba_mcp/adapters/windows_ui/` | Read-only VBE compile UI adapter (`comtypes`) |
 | `src/excel_vba_mcp/domain/` | Models, statuses/enums, stable error codes, declarative test schema |
 | `src/excel_vba_mcp/security/` | Approval, audit, path policy, macro policy |
-| `src/excel_vba_mcp/storage/` | Snapshot store, artifact store, run repository |
+| `src/excel_vba_mcp/storage/` | Snapshot store, artifact store, run repository, job store, owned-pid store |
 | `tests/unit/` | No COM / Excel |
 | `tests/integration_excel/` | Live Excel COM tests (marker `integration_excel`) |
 | `tests/fixtures/` | Workbook fixtures and deterministic generators |
@@ -63,8 +63,8 @@ change under `docs/`.
 
 | Module | Responsibility |
 |--------|----------------|
-| `server.py` | Builds `MCPServer`, owns the runtime via `lifespan`, registers 88 tools and 4 resources, re-raises structured `ToolError`s, configures `stderr` logging |
-| `config.py` | Loads `EXCEL_VBA_MCP_LOG_LEVEL`, `EXCEL_VBA_MCP_ACCESS_MODE` and `EXCEL_VBA_MCP_MACRO_TIMEOUT_S` into a Pydantic `Config`; validates them together |
+| `server.py` | Builds `MCPServer`, owns the runtime via `lifespan`, registers 91 tools and 4 resources, re-raises structured `ToolError`s, configures `stderr` logging |
+| `config.py` | Loads `EXCEL_VBA_MCP_LOG_LEVEL`, `EXCEL_VBA_MCP_ACCESS_MODE`, `EXCEL_VBA_MCP_MACRO_TIMEOUT_S`, `EXCEL_VBA_MCP_OPEN_TIMEOUT_S` and `EXCEL_VBA_MCP_LIVENESS_CEILING_S` into a Pydantic `Config`; validates them together |
 | `api/*_tools.py` | One module per tool group; each handler is thin: validate arguments, delegate to a service, return a DTO |
 | `application/session_service.py` | Open/close/save working copies, per-path lock, session status, recovery |
 | `application/snapshot_service.py` | Immutable snapshots and restore |
@@ -75,7 +75,7 @@ change under `docs/`.
 | `application/test_runner.py` | Declarative test runner over disposable copies |
 | `application/workbook_model_service.py` | Aggregated workbook model |
 | `adapters/excel/com_worker.py` | Single STA thread, FIFO queue, soft timeouts, read-only retry, recovery |
-| `adapters/excel/app_adapter.py` | Hidden `Excel.Application`, `DispatchEx`, narrowly scoped settings, pid-scoped teardown |
+| `adapters/excel/app_adapter.py` | Hidden `Excel.Application`, `DispatchEx`, Job Object (`KILL_ON_JOB_CLOSE`), process identity, pid-scoped teardown |
 | `adapters/excel/*.py` | Sheet/table/range/pivot/VBIDE/shape/control/macro adapters |
 | `adapters/windows_ui/vbe_compile_ui.py` | Read-only VBE command discovery and dialog observation (`comtypes`) |
 | `domain/models.py` | Pydantic DTOs and size ceilings |
@@ -83,12 +83,15 @@ change under `docs/`.
 | `domain/errors.py` | `ExcelVbaMcpError` hierarchy, `ErrorCode`, HRESULT mapping |
 | `domain/test_spec.py` | Declarative test schema (closed action/assertion enums) |
 | `security/path_policy.py` | Allowlist and canonicalisation |
-| `security/approval.py` | `full` / `restricted` approval policy |
+| `security/approval.py` | `full` / `restricted` approval policy + RECOVERY class |
 | `security/audit.py` | Append-only JSONL audit with redaction |
 | `security/macro_policy.py` | `AutomationSecurity` modes and macro diagnostics |
 | `storage/snapshot_store.py` | Immutable snapshot store |
 | `storage/artifact_store.py` | Artifacts and evidence |
 | `storage/run_repository.py` | Persisted declarative runs |
+| `storage/job_store.py` | Persisted background jobs (RUNNING marker + startup reconcile to `interrupted_unknown`) |
+| `storage/owned_pid_store.py` | Ownership record (`owned_pid.json`, `SCHEMA_VERSION=1`) for startup reconcile |
+| `application/job_registry.py` | In-process job registry that owns the long-op result (`queued→running→terminal`) |
 
 ## Development environment
 
@@ -199,6 +202,39 @@ uv run pytest -m integration_excel
 
 Run all four static/unit commands before proposing a change; run the integration
 suite on Windows with Excel when the change touches COM behavior.
+
+### Process lifecycle, job persistence and reconcile
+
+When changing the worker, recovery or job code, preserve these invariants (see
+[Architecture](04-architecture.md) for the full model):
+
+- **Single-STA worker.** All COM stays on the one `excel-com-sta` thread; services only
+  `await worker.submit(...)`. Never create a second STA.
+- **Job Object backstop.** The owned `DispatchEx` Excel is created into an unnamed
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` job before `DispatchEx` and assigned right after the pid is
+  resolved (fail-closed). Do not reduce the job handle to an `int`.
+- **Ownership record + startup reconcile.** `storage/owned_pid_store.py` persists owner + owned
+  identity (pid + create-time + exe + session) atomically under `%LOCALAPPDATA%\excel-vba-mcp`
+  (or `EXCEL_VBA_MCP_OWNED_PID_DIR`); a `state="creating"` marker covers the create→assign gap.
+  The startup reconcile refuses a live owner, reaps only a verified same-session orphan, and never
+  kills on pid-alone or cross-session.
+- **JobStore reconcile.** `storage/job_store.py` writes a `RUNNING` marker at job start and
+  finalizes on a terminal state; at startup any non-terminal record becomes
+  `interrupted_unknown` (`outcome="unknown"`, `retryable=false`) — never `succeeded`, never
+  auto-retried. A successful `excel_recover` also finalizes in-flight jobs this way.
+- **Agent-directed recovery.** `excel_recover` is fail-closed and pid-scoped; the server never
+  auto-terminates a live pid on a deadline.
+
+### Testing the lifecycle and jobs
+
+- **Unit tests** (`tests/unit`) cover the reconcile logic, the job registry/store transitions and
+  the ownership-record parsing without COM (pure filesystem / injected probes).
+- **Integration tests** (`tests/integration_excel`, marker `integration_excel`) exercise the live
+  Job Object, `excel_recover` and background jobs against a real Excel; they skip with an explicit
+  reason on hosts/builds where the behavior cannot be validated (host-specific skips).
+- Rebuild fixtures with `tests/fixtures/build_fixtures.py` / `build_phase2_fixtures.py` when the
+  binary fixtures are missing or stale; `LockedProject.xlsm` and `TableNamesProject.xlsm` are not
+  committed, so those tests skip with an explicit reason.
 
 ## Logging and debugging
 

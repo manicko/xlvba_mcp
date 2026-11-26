@@ -36,7 +36,7 @@ and resources that an MCP client (for example, Kilo or Claude Desktop) invokes.
 Key facts:
 
 - Package: `excel-vba-mcp`, version `0.1.0` (Proprietary license).
-- The server registers **88 tools** and **4 read-only resources**.
+- The server registers **91 tools** and **4 read-only resources**.
 - Transport — MCP over STDIO: protocol messages go to `stdout`, diagnostics and
   tracebacks go to `stderr`.
 - The Excel instance is created via `win32com.client.DispatchEx` and stays `Visible=False`
