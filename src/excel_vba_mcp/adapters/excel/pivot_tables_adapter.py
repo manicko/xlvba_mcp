@@ -75,7 +75,7 @@ mismatch is reported through ``verified=False`` rather than claimed as success.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from excel_vba_mcp.domain.errors import (
     AmbiguousFilterError,
@@ -412,8 +412,14 @@ def _describe_data_field(data_field: Any) -> dict[str, Any]:
     }
 
 
-def _data_field_index(pivot: Any) -> dict[str, dict[str, Any]]:
-    """Map ``source_name`` -> data-field metadata for one PivotTable."""
+def _data_field_index(
+    pivot: Any, meter: _CostMeter | None = None
+) -> dict[str, dict[str, Any]]:
+    """Map ``source_name`` -> data-field metadata for one PivotTable.
+
+    ``meter`` (Block B) measures each ``DataFields`` read against the per-sheet
+    budget; the read stops between ops once the budget is reached.
+    """
 
     index: dict[str, dict[str, Any]] = {}
     try:
@@ -422,6 +428,8 @@ def _data_field_index(pivot: Any) -> dict[str, dict[str, Any]]:
     except Exception:  # noqa: BLE001 - defensive COM read
         return index
     for position in range(1, count + 1):
+        if meter is not None:
+            meter.tick()
         try:
             item = data_fields.Item(position)
         except Exception:  # noqa: BLE001 - defensive per-item COM read
@@ -433,7 +441,7 @@ def _data_field_index(pivot: Any) -> dict[str, dict[str, Any]]:
     return index
 
 
-def _filter_kind_of(field: Any) -> PivotFilterKind:
+def _filter_kind_of(field: Any, meter: _CostMeter | None = None) -> PivotFilterKind:
     """Classify a field's manual filter state (task_039 §6).
 
     Thin wrapper over :func:`_classify_filter_state` so ``pivot_table_get`` /
@@ -444,9 +452,13 @@ def _filter_kind_of(field: Any) -> PivotFilterKind:
     ``AllItemsVisible`` because Excel does not store its selection in
     ``PivotItem.Visible``. A field with all items visible reports ``NONE``; a
     field with a hidden item / a chosen page reports ``MANUAL``.
+
+    ``meter`` (Block B) is the optional per-sheet cost meter; when supplied, each
+    ``PivotItems`` read is measured and the enumeration stops between ops once the
+    sheet budget is reached (never interrupting an in-flight COM call).
     """
 
-    kind, _all_items_visible, _visible, _hidden = _classify_filter_state(field)
+    kind, _all_items_visible, _visible, _hidden = _classify_filter_state(field, meter)
     return kind
 
 
@@ -454,8 +466,14 @@ def _describe_field(
     pivot: Any,
     field: Any,
     data_field_index: dict[str, dict[str, Any]],
+    meter: _CostMeter | None = None,
 ) -> PivotFieldInfo:
-    """Build a :class:`PivotFieldInfo` for one ``PivotField`` (STA-local)."""
+    """Build a :class:`PivotFieldInfo` for one ``PivotField`` (STA-local).
+
+    ``meter`` (Block B) is the optional per-sheet cost meter threaded into the
+    ``PivotItems`` classification so a high-cardinality field cannot stall the
+    single STA; the read stops between ops once the sheet budget is reached.
+    """
 
     source_name = _get_str(field, "SourceName") or ""
     caption = _get_str(field, "Caption")
@@ -463,7 +481,7 @@ def _describe_field(
     position = _position_of(field)
     show_all_items = _get_bool(field, "ShowAllItems")
     all_items_visible = _get_bool(field, "AllItemsVisible")
-    filter_kind = _filter_kind_of(field)
+    filter_kind = _filter_kind_of(field, meter)
 
     data_meta = data_field_index.get(source_name)
     is_data_field = data_meta is not None
@@ -499,23 +517,56 @@ def _describe_field(
 # PivotTable description (read-only)
 # ---------------------------------------------------------------------------
 def _describe_pivot_table(
-    wb: Any,
     sheet: Any,
     sheet_index: int,
     pivot: Any,
+    *,
+    meter: _CostMeter | None = None,
 ) -> PivotTableInfo:
     """Build a :class:`PivotTableInfo` for one PivotTable (STA-local).
 
     The description reads the PivotTable's identity, range metadata, its cache's
-    source type and its field layout. It never materializes the PivotTable cell
-    output — only metadata.
+    source type and (only for a supported source) its field layout. It never
+    materializes the PivotTable cell output — only metadata.
+
+    **SourceType gate FIRST (Block B):** an external / OLAP / Data Model /
+    otherwise unsupported cache is reported with its identity only — the
+    expensive field / ``PivotItems`` enumeration is skipped entirely, so an
+    unsupported pivot can never stall the single STA.
+
+    ``meter`` (Block B) is the optional per-sheet cost meter. When supplied, each
+    field / ``PivotItems`` read is measured and :class:`_SheetBudgetExceededError` is
+    raised **between** ops once the sheet budget is reached (an in-flight COM call
+    is never interrupted); the sheet loop catches it and reports ``capped`` /
+    ``too_large``.
     """
 
     name = _get_str(pivot, "Name") or ""
     cache = pivot.PivotCache()
     source_type, _olap = _classify_source_type(cache)
 
-    data_field_index = _data_field_index(pivot)
+    identity: dict[str, Any] = {
+        "name": name,
+        "sheet_name": _get_str(sheet, "Name") or "",
+        "sheet_index": sheet_index,
+        "index": _get_int(pivot, "Index", default=0) or 0,
+        "cache_index": _get_int(pivot, "CacheIndex", default=0) or 0,
+        "table_range1": _get_address(pivot, "TableRange1"),
+        "table_range2": _get_address(pivot, "TableRange2"),
+        "data_body_range": _get_address(pivot, "DataBodyRange"),
+        "row_grand": _get_bool(pivot, "RowGrand"),
+        "column_grand": _get_bool(pivot, "ColumnGrand"),
+        "refresh_date": _get_datetime(pivot, "RefreshDate"),
+        "source_type": source_type,
+        "source_status": _source_status(source_type),
+    }
+
+    # SourceType gate FIRST: an unsupported cache is reported with identity only;
+    # no field / PivotItems enumeration is attempted (Block B).
+    if source_type in _UNSUPPORTED_SOURCE_TYPES:
+        return PivotTableInfo(**identity)
+
+    data_field_index = _data_field_index(pivot, meter)
 
     # Enumerate every source field once and bucket it by orientation.
     data_fields: list[PivotFieldInfo] = []
@@ -534,6 +585,10 @@ def _describe_pivot_table(
     for position in range(1, field_count + 1):
         if pivot_fields is None:
             break
+        # Budget check BETWEEN ops: stop before the next field read once the sheet
+        # budget is reached (never interrupts an in-flight call — Block B).
+        if meter is not None:
+            meter.tick()
         try:
             field = pivot_fields.Item(position)
         except Exception:  # noqa: BLE001 - defensive per-item COM read
@@ -542,7 +597,7 @@ def _describe_pivot_table(
         # two or more data fields (its SourceName is the #N/A sentinel).
         if _is_synthetic_data_placeholder(field):
             continue
-        info = _describe_field(pivot, field, data_field_index)
+        info = _describe_field(pivot, field, data_field_index, meter)
         if info.is_data_field or info.orientation is PivotFieldOrientation.DATA:
             data_fields.append(info)
         elif info.orientation is PivotFieldOrientation.ROW:
@@ -555,19 +610,7 @@ def _describe_pivot_table(
             hidden_fields.append(info)
 
     return PivotTableInfo(
-        name=name,
-        sheet_name=_get_str(sheet, "Name") or "",
-        sheet_index=sheet_index,
-        index=_get_int(pivot, "Index", default=0) or 0,
-        cache_index=_get_int(pivot, "CacheIndex", default=0) or 0,
-        table_range1=_get_address(pivot, "TableRange1"),
-        table_range2=_get_address(pivot, "TableRange2"),
-        data_body_range=_get_address(pivot, "DataBodyRange"),
-        row_grand=_get_bool(pivot, "RowGrand"),
-        column_grand=_get_bool(pivot, "ColumnGrand"),
-        refresh_date=_get_datetime(pivot, "RefreshDate"),
-        source_type=source_type,
-        source_status=_source_status(source_type),
+        **identity,
         data_fields=data_fields,
         row_fields=row_fields,
         column_fields=column_fields,
@@ -577,8 +620,56 @@ def _describe_pivot_table(
 
 
 # ---------------------------------------------------------------------------
-# Full-inventory enumeration (worksheet sweep)
+# Full-inventory enumeration (single worksheet sweep + per-sheet budget)
 # ---------------------------------------------------------------------------
+#: Default per-sheet **measured** budget (field / ``PivotItems`` reads) for the
+#: single-sweep inventory (Block B). A sheet whose measured enumeration cost
+#: reaches this budget is reported ``capped`` (partial results kept) or
+#: ``too_large`` (no partial, the sheet is named) instead of stalling the single
+#: STA. This is a MEASURED cost — never a prediction from file size / row count /
+#: ``UsedRange`` (report_07 §2.8 (a); plan_02 work item B).
+_DEFAULT_SHEET_FIELD_BUDGET = 2000
+
+#: Per-sheet status values reported by the single-sweep inventory (Block B).
+SHEET_STATUS_OK = "ok"
+SHEET_STATUS_CAPPED = "capped"
+SHEET_STATUS_TOO_LARGE = "too_large"
+
+
+class _SheetBudgetExceededError(Exception):
+    """Raised **between** COM ops when a sheet's measured budget is reached.
+
+    Checked before the next field / ``PivotItems`` read (never interrupting an
+    in-flight call); the sheet loop catches it and reports ``capped`` (partial
+    results already collected) or ``too_large`` (no completed PivotTable).
+    """
+
+
+class _CostMeter:
+    """Counts a sheet's measured field / ``PivotItems`` reads and enforces a budget.
+
+    ``budget`` is the maximum number of measured reads allowed for one sheet, or
+    ``None`` for an unbounded (full) sweep. :meth:`tick` is called **before** the
+    next read: when starting it would exceed the budget it raises
+    :class:`_SheetBudgetExceededError` so the caller stops starting the next op (an
+    in-flight COM call is never interrupted).
+    """
+
+    def __init__(self, budget: int | None) -> None:
+        self.budget = budget
+        self.cost = 0
+
+    def tick(self, amount: int = 1) -> None:
+        """Account for the next read, raising when it would exceed the budget."""
+
+        if self.budget is None:
+            self.cost += amount
+            return
+        if self.cost + amount > self.budget:
+            raise _SheetBudgetExceededError
+        self.cost += amount
+
+
 def _iter_pivot_tables(wb: Any) -> list[tuple[Any, int, Any]]:
     """Return ``(sheet, sheet_index, pivot)`` for every PivotTable on every sheet.
 
@@ -607,32 +698,30 @@ def _iter_pivot_tables(wb: Any) -> list[tuple[Any, int, Any]]:
     return triples
 
 
-def _describe_cache(
-    wb: Any, cache_index: int, pivot_tables: list[PivotTableInfo]
-) -> PivotCacheInfo:
-    """Build a :class:`PivotCacheInfo` for ``cache_index`` (STA-local).
+def _cache_metadata(cache: Any, source_type: PivotSourceType, olap: bool) -> dict[str, Any]:
+    """Read one ``PivotCache``'s source metadata into a plain dict (STA-local).
 
-    The cache is resolved through the first PivotTable whose ``CacheIndex``
-    matches (the ``PivotCaches`` collection is unusable for enumeration on this
-    build — task_039 §3). The shared-cache relationship is computed from the
-    already-described PivotTables: every table with the same ``cache_index`` is
-    listed in ``affected_pivot_tables``.
+    The shared-cache relationship (``shared_cache`` / ``affected_pivot_tables``)
+    is computed by the caller from the full PivotTable inventory once every sheet
+    has been swept, so the cache is memoized here by ``CacheIndex`` and never
+    re-resolved (Block B single-sweep + ``CacheIndex`` memo).
+
+    ``SourceData`` is **optional** metadata: it is read defensively so a cache
+    whose ``SourceData`` getter raises ``DISP_E_EXCEPTION`` (Excel 1004,
+    ``0x800A03EC``) — as an external (``xlExternal``) cache does on the target
+    build, where ``SourceData`` is a Variant array Excel refuses to render — is
+    reported with ``source_data=None`` / ``source_data_kind="unavailable"`` and
+    never aborts the whole single-sweep inventory. ``getattr(cache, "SourceData",
+    default)`` does **not** swallow a ``com_error`` (only ``AttributeError``), so
+    the attribute access must happen inside the ``try`` (see the ``_get_*``
+    helpers above). Every other cache property is read through a defensive
+    ``_get_*`` helper; this is the only optional read that needs its own guard.
     """
 
-    cache = None
-    for _sheet, _sheet_index, pivot in _iter_pivot_tables(wb):
-        pivot_cache_index = _get_int(pivot, "CacheIndex")
-        if pivot_cache_index == cache_index:
-            cache = pivot.PivotCache()
-            break
-    if cache is None:
-        raise ExcelVbaMcpError(
-            f"PivotCache {cache_index} was not found in the workbook.",
-            context={"cache_index": cache_index},
-        )
-
-    source_type, _olap = _classify_source_type(cache)
-    source_data_raw = getattr(cache, "SourceData", None)
+    try:
+        source_data_raw = getattr(cache, "SourceData", None)
+    except Exception:  # noqa: BLE001 - optional metadata; a raising getter -> unavailable
+        source_data_raw = None
     source_data: str | None
     source_data_kind = "text"
     if isinstance(source_data_raw, str):
@@ -644,20 +733,16 @@ def _describe_cache(
         # exposed rather than a raw nested array (task_039 §7).
         source_data, source_data_kind = str(source_data_raw), "array"
 
-    affected = [pt.name for pt in pivot_tables if pt.cache_index == cache_index]
-    return PivotCacheInfo(
-        cache_index=cache_index,
-        source_type=source_type,
-        source_data=source_data,
-        source_data_kind=source_data_kind,
-        refresh_date=_get_datetime(cache, "RefreshDate"),
-        refresh_on_file_open=_get_bool(cache, "RefreshOnFileOpen"),
-        enable_refresh=_get_bool(cache, "EnableRefresh"),
-        record_count=_get_int(cache, "RecordCount"),
-        olap=_olap,
-        shared_cache=len(affected) > 1,
-        affected_pivot_tables=affected,
-    )
+    return {
+        "source_type": source_type,
+        "source_data": source_data,
+        "source_data_kind": source_data_kind,
+        "refresh_date": _get_datetime(cache, "RefreshDate"),
+        "refresh_on_file_open": _get_bool(cache, "RefreshOnFileOpen"),
+        "enable_refresh": _get_bool(cache, "EnableRefresh"),
+        "record_count": _get_int(cache, "RecordCount"),
+        "olap": olap,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1358,12 +1443,19 @@ def _unsupported_filter_result(
     )
 
 
-def _pivot_item_entries(field: Any) -> list[tuple[Any, str]]:
+def _pivot_item_entries(
+    field: Any, meter: _CostMeter | None = None
+) -> list[tuple[Any, str]]:
     """Return ``(item, value)`` for every ``PivotItems`` entry of one field.
 
     ``PivotItems`` is a **method** on this build (task_039 §3); it is called and
     then indexed with ``Item(i)``. The read is bounded and defensive: an
     unreadable item is skipped rather than guessed.
+
+    ``meter`` (Block B) measures each ``PivotItems`` read against the per-sheet
+    budget; the read stops **between** item reads once the budget is reached (an
+    in-flight ``Item(i)`` call is never interrupted) so a high-cardinality field
+    cannot stall the single STA.
     """
 
     try:
@@ -1376,6 +1468,8 @@ def _pivot_item_entries(field: Any) -> list[tuple[Any, str]]:
         return []
     entries: list[tuple[Any, str]] = []
     for position in range(1, min(count, _MAX_PIVOT_ITEMS) + 1):
+        if meter is not None:
+            meter.tick()
         try:
             item = items.Item(position)
         except Exception:  # noqa: BLE001 - defensive per-item COM read
@@ -1385,12 +1479,14 @@ def _pivot_item_entries(field: Any) -> list[tuple[Any, str]]:
     return entries
 
 
-def _pivot_item_state(field: Any) -> tuple[list[str], list[str]]:
+def _pivot_item_state(
+    field: Any, meter: _CostMeter | None = None
+) -> tuple[list[str], list[str]]:
     """Return ``(visible_items, hidden_items)`` for one field (STA-local)."""
 
     visible: list[str] = []
     hidden: list[str] = []
-    for item, value in _pivot_item_entries(field):
+    for item, value in _pivot_item_entries(field, meter):
         is_visible = _get_bool(item, "Visible", default=True)
         if is_visible:
             visible.append(value)
@@ -1414,6 +1510,7 @@ _PAGE_FIELD_APPLY_REASON = (
 
 def _page_filter_state(
     field: Any,
+    meter: _CostMeter | None = None,
 ) -> tuple[PivotFilterKind, bool | None, list[str], list[str]]:
     """Classify a page (report-filter) field's selection state (F3).
 
@@ -1449,7 +1546,7 @@ def _page_filter_state(
         return PivotFilterKind.MANUAL, False, [], []
 
     chosen_key = chosen.casefold()
-    entries = _pivot_item_entries(field)
+    entries = _pivot_item_entries(field, meter)
     hidden = [value for _item, value in entries if value.strip().casefold() != chosen_key]
     # The single-select page reports its chosen caption; the other PivotItems are
     # hidden. ``visible`` echoes the readable selection even when the item list is
@@ -1460,6 +1557,7 @@ def _page_filter_state(
 
 def _classify_filter_state(
     field: Any,
+    meter: _CostMeter | None = None,
 ) -> tuple[PivotFilterKind, bool | None, list[str], list[str]]:
     """Classify one field's filter state as a single shared truth (F3).
 
@@ -1472,12 +1570,16 @@ def _classify_filter_state(
     Page (``xlPageField``) fields are classified from ``CurrentPage`` /
     ``AllItemsVisible``; row/column/data/hidden fields keep the existing
     ``PivotItems[i].Visible`` manual state.
+
+    ``meter`` (Block B) is the optional per-sheet cost meter; the filter tools
+    pass ``None`` (unchanged), while the single-sweep inventory threads it so the
+    ``PivotItems`` read is bounded.
     """
 
     if _orientation_of(field) is PivotFieldOrientation.PAGE:
-        return _page_filter_state(field)
+        return _page_filter_state(field, meter)
 
-    visible, hidden = _pivot_item_state(field)
+    visible, hidden = _pivot_item_state(field, meter)
     all_items_visible = _get_bool(field, "AllItemsVisible", default=None)
     kind = PivotFilterKind.MANUAL if hidden else PivotFilterKind.NONE
     return kind, all_items_visible, visible, hidden
@@ -1592,32 +1694,185 @@ class PivotTablesAdapter:
     # ------------------------------------------------------------------
     # Inventory (read-only)
     # ------------------------------------------------------------------
+    def inventory_single_sweep(
+        self, wb: Any, *, sheet_budget: int | None = _DEFAULT_SHEET_FIELD_BUDGET
+    ) -> dict[str, Any]:
+        """Return the full PivotTable + PivotCache inventory in ONE worksheet sweep.
+
+        Block B: a single worksheet sweep feeds **both** the PivotTable inventory
+        and the PivotCache inventory (linked by a ``CacheIndex`` memo), replacing
+        the former ``2 + N`` re-enumeration (``enumerate_pivot_tables`` +
+        ``_collect_caches`` + per-cache ``_describe_cache``). The source type is
+        gated **first** per PivotTable, so an external / OLAP / Data Model cache is
+        reported with its identity only and never triggers field / ``PivotItems``
+        enumeration.
+
+        ``sheet_budget`` is the per-sheet **measured** budget (field /
+        ``PivotItems`` reads); ``None`` means an unbounded (full) sweep. When a
+        sheet's measured cost reaches the budget, the sweep stops starting the next
+        op and reports the sheet as ``capped`` (partial results kept) or
+        ``too_large`` (no partial, the sheet is named) — never keyed on file size /
+        row count / ``UsedRange`` (report_07 §2.8 (a); plan_02 work item B).
+
+        Returns a plain dict (safe to cross the STA boundary): ``pivot_tables``
+        (``list[PivotTableInfo]``), ``caches`` (``list[PivotCacheInfo]``) and
+        ``sheet_statuses`` (one ``{sheet, sheet_index, status, pivot_table_count,
+        cost}`` entry per worksheet).
+        """
+
+        tables: list[PivotTableInfo] = []
+        cache_memo: dict[int, dict[str, Any]] = {}
+        sheet_statuses: list[dict[str, Any]] = []
+
+        try:
+            worksheets = list(wb.Worksheets)
+        except Exception:  # noqa: BLE001 - defensive COM read
+            worksheets = []
+
+        for sheet_index, sheet in enumerate(worksheets, start=1):
+            sheet_name = _get_str(sheet, "Name") or ""
+            sheet_tables, status, cost = self._sweep_sheet(
+                sheet, sheet_index, sheet_budget, cache_memo
+            )
+            tables.extend(sheet_tables)
+            sheet_statuses.append(
+                {
+                    "sheet": sheet_name,
+                    "sheet_index": sheet_index,
+                    "status": status,
+                    "pivot_table_count": len(sheet_tables),
+                    "cost": cost,
+                }
+            )
+
+        tables.sort(key=lambda pt: (pt.sheet_index, pt.name))
+        caches = self._build_caches(tables, cache_memo)
+        return {
+            "pivot_tables": tables,
+            "caches": caches,
+            "sheet_statuses": sheet_statuses,
+        }
+
     def enumerate_pivot_tables(self, wb: Any) -> list[PivotTableInfo]:
         """Return one :class:`PivotTableInfo` per PivotTable on every worksheet.
 
         The sweep is worksheet-scoped (``ws.PivotTables()``) because
         ``Workbook.PivotTables`` is unusable on the target build. The result is
-        sorted deterministically by ``(sheet_index, pivot_table_name)``.
+        sorted deterministically by ``(sheet_index, pivot_table_name)``. This is
+        the unbounded (full) single sweep used by the targeted refresh / lookup
+        paths; the budgeted inventory is :meth:`inventory_single_sweep`.
         """
 
-        described = [
-            _describe_pivot_table(wb, sheet, sheet_index, pivot)
-            for sheet, sheet_index, pivot in _iter_pivot_tables(wb)
-        ]
-        described.sort(key=lambda pt: (pt.sheet_index, pt.name))
-        return described
+        sweep = self.inventory_single_sweep(wb, sheet_budget=None)
+        return cast("list[PivotTableInfo]", sweep["pivot_tables"])
 
     def read_pivot_cache(self, wb: Any, cache_index: int) -> PivotCacheInfo:
         """Return the :class:`PivotCacheInfo` for a 1-based ``cache_index``.
 
         The cache is resolved through the PivotTable that references it (the
-        ``PivotCaches`` collection is unusable for enumeration). The shared-cache
-        relationship is computed from the full PivotTable inventory so
-        ``affected_pivot_tables`` lists every table sharing this cache.
+        ``PivotCaches`` collection is unusable for enumeration) in a single
+        worksheet sweep (Block B). The shared-cache relationship is computed from
+        the full PivotTable inventory so ``affected_pivot_tables`` lists every
+        table sharing this cache.
         """
 
-        pivot_tables = self.enumerate_pivot_tables(wb)
-        return _describe_cache(wb, cache_index, pivot_tables)
+        sweep = self.inventory_single_sweep(wb, sheet_budget=None)
+        caches = cast("list[PivotCacheInfo]", sweep["caches"])
+        for cache in caches:
+            if cache.cache_index == cache_index:
+                return cache
+        raise ExcelVbaMcpError(
+            f"PivotCache {cache_index} was not found in the workbook.",
+            context={"cache_index": cache_index},
+        )
+
+    def _sweep_sheet(
+        self,
+        sheet: Any,
+        sheet_index: int,
+        sheet_budget: int | None,
+        cache_memo: dict[int, dict[str, Any]],
+    ) -> tuple[list[PivotTableInfo], str, int]:
+        """Sweep one worksheet's PivotTables under the per-sheet budget (STA-local).
+
+        Returns ``(pivot_tables, status, cost)`` where ``status`` is ``ok`` /
+        ``capped`` / ``too_large``. The budget is checked **between** completed
+        COM ops: a sheet whose first PivotTable blows the budget is ``too_large``
+        (no partial); a later one is ``capped`` (the completed tables are kept).
+        """
+
+        meter = _CostMeter(sheet_budget)
+        tables: list[PivotTableInfo] = []
+        status = SHEET_STATUS_OK
+
+        try:
+            pivot_tables = sheet.PivotTables()
+            count = _safe_int(pivot_tables.Count, default=0) or 0
+        except Exception:  # noqa: BLE001 - sheet without PivotTables
+            return tables, status, meter.cost
+
+        for position in range(1, count + 1):
+            # Budget check BETWEEN ops: stop before starting the next PivotTable
+            # once the sheet budget is already reached (Block B).
+            if meter.budget is not None and meter.cost >= meter.budget:
+                status = SHEET_STATUS_TOO_LARGE if not tables else SHEET_STATUS_CAPPED
+                break
+            try:
+                pivot = pivot_tables.Item(position)
+            except Exception:  # noqa: BLE001 - defensive per-item COM read
+                continue
+            self._memoize_cache(pivot, cache_memo)
+            try:
+                info = _describe_pivot_table(sheet, sheet_index, pivot, meter=meter)
+            except _SheetBudgetExceededError:
+                status = SHEET_STATUS_TOO_LARGE if not tables else SHEET_STATUS_CAPPED
+                break
+            tables.append(info)
+
+        return tables, status, meter.cost
+
+    @staticmethod
+    def _memoize_cache(pivot: Any, cache_memo: dict[int, dict[str, Any]]) -> None:
+        """Memoize one PivotTable's cache metadata by ``CacheIndex`` (STA-local).
+
+        The first PivotTable seen for a ``CacheIndex`` records the cache's source
+        metadata; later tables on the same cache reuse it, so the cache is read
+        once per sweep (Block B ``CacheIndex`` memo).
+        """
+
+        cache_index = _get_int(pivot, "CacheIndex", default=0) or 0
+        if cache_index in cache_memo:
+            return
+        try:
+            cache = pivot.PivotCache()
+        except Exception:  # noqa: BLE001 - defensive COM read
+            return
+        source_type, olap = _classify_source_type(cache)
+        cache_memo[cache_index] = _cache_metadata(cache, source_type, olap)
+
+    @staticmethod
+    def _build_caches(
+        tables: list[PivotTableInfo], cache_memo: dict[int, dict[str, Any]]
+    ) -> list[PivotCacheInfo]:
+        """Build the memoized ``PivotCacheInfo`` list with the shared-cache link.
+
+        ``shared_cache`` / ``affected_pivot_tables`` are computed from the full
+        PivotTable inventory (every table with the same ``cache_index``), so a
+        shared cache is reported once with all its tables (Block B).
+        """
+
+        caches: list[PivotCacheInfo] = []
+        for cache_index in sorted(cache_memo):
+            affected = sorted(pt.name for pt in tables if pt.cache_index == cache_index)
+            caches.append(
+                PivotCacheInfo(
+                    cache_index=cache_index,
+                    shared_cache=len(affected) > 1,
+                    affected_pivot_tables=affected,
+                    **cache_memo[cache_index],
+                )
+            )
+        return caches
 
     def enumerate_pivot_fields(self, wb: Any, pivot_table: str) -> list[PivotFieldInfo]:
         """Return every :class:`PivotFieldInfo` of one PivotTable (read-only).

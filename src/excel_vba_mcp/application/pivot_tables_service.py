@@ -61,6 +61,9 @@ from typing import Any, TypeVar, cast
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
 from excel_vba_mcp.adapters.excel.pivot_tables_adapter import (
+    SHEET_STATUS_CAPPED,
+    SHEET_STATUS_OK,
+    SHEET_STATUS_TOO_LARGE,
     PivotTablesAdapter,
     normalize_filter_scope,
     normalize_filter_spec,
@@ -157,33 +160,42 @@ class PivotTablesService:
     async def list_pivot_tables(self, workbook_id: str) -> PivotInventory:
         """Return every PivotTable and its cache across all worksheets.
 
-        Enumeration is worksheet-scoped (a full-workbook sweep) because
-        ``Workbook.PivotTables`` is not a usable inventory on the target build.
-        Shared caches are reported once with their affected tables.
+        Enumeration is a **single worksheet sweep** (Block B): one pass feeds both
+        the PivotTable inventory and the PivotCache inventory (linked by a
+        ``CacheIndex`` memo), replacing the former ``2 + N`` re-enumeration. The
+        source type is gated first per PivotTable, so an external / OLAP / Data
+        Model cache is reported with its identity only. A per-sheet **measured**
+        budget (field / ``PivotItems`` reads, never file size / row count /
+        ``UsedRange``) stops the sweep between ops and reports the sheet as
+        ``capped`` (partial) or ``too_large`` (named) in the audit record.
         """
 
         record = self._resolve_record(workbook_id)
         result = await self._submit_read(
             workbook_id,
             "pivot_tables_list",
-            lambda wb: PivotInventory(
-                workbook_id=workbook_id,
-                pivot_tables=self._adapter.enumerate_pivot_tables(wb),
-                caches=self._collect_caches(wb),
-            ),
+            lambda wb: self._adapter.inventory_single_sweep(wb),
             record,
         )
+        inventory = PivotInventory(
+            workbook_id=workbook_id,
+            pivot_tables=result["pivot_tables"],
+            caches=result["caches"],
+        )
+        sheet_statuses = result["sheet_statuses"]
         self._record_audit(
             "pivot_tables_list",
             "read_only",
             record,
             {"workbook_id": workbook_id},
             {
-                "pivot_table_count": len(result.pivot_tables),
-                "cache_count": len(result.caches),
+                "pivot_table_count": len(inventory.pivot_tables),
+                "cache_count": len(inventory.caches),
+                "status": _overall_sheet_status(sheet_statuses),
+                "sheets": sheet_statuses,
             },
         )
-        return result
+        return inventory
 
     async def get_pivot_table(self, workbook_id: str, pivot_table: str) -> PivotTableInfo:
         """Return one PivotTable's metadata by name.
@@ -893,16 +905,6 @@ class PivotTablesService:
     # ------------------------------------------------------------------
     # Adapter helpers (non-COM)
     # ------------------------------------------------------------------
-    def _collect_caches(self, wb: Any) -> list[PivotCacheInfo]:
-        """Build one :class:`PivotCacheInfo` per distinct ``CacheIndex`` (STA-local)."""
-
-        pivot_tables = self._adapter.enumerate_pivot_tables(wb)
-        cache_indices = sorted({pt.cache_index for pt in pivot_tables})
-        caches: list[PivotCacheInfo] = []
-        for cache_index in cache_indices:
-            caches.append(self._adapter.read_pivot_cache(wb, cache_index))
-        return caches
-
     def _find_pivot_table(self, wb: Any, pivot_table: str) -> PivotTableInfo:
         """Return the :class:`PivotTableInfo` matching ``pivot_table`` by name."""
 
@@ -1070,6 +1072,22 @@ def _filter_states_audit(states: Any) -> Any:
     if isinstance(states, dict):
         return {name: _filters_audit_state(value) for name, value in states.items()}
     return None
+
+
+def _overall_sheet_status(sheet_statuses: list[dict[str, Any]]) -> str:
+    """Reduce the per-sheet sweep statuses to one overall status (Block B).
+
+    Severity is ``too_large`` > ``capped`` > ``ok``: a workbook with any
+    ``too_large`` sheet is reported ``too_large`` (the most severe), else
+    ``capped`` if any sheet was capped, else ``ok``.
+    """
+
+    statuses = {entry.get("status") for entry in sheet_statuses}
+    if SHEET_STATUS_TOO_LARGE in statuses:
+        return SHEET_STATUS_TOO_LARGE
+    if SHEET_STATUS_CAPPED in statuses:
+        return SHEET_STATUS_CAPPED
+    return SHEET_STATUS_OK
 
 
 def _find_open_workbook(app_adapter: ExcelAppAdapter, working_path: str) -> Any | None:

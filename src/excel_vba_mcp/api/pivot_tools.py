@@ -32,6 +32,10 @@ never refreshed or reconfigured. ``Workbook.RefreshAll`` is never used.
 
 from __future__ import annotations
 
+from functools import partial
+
+from excel_vba_mcp.api.job_tools import start_long_op
+from excel_vba_mcp.application.job_registry import RunningJob
 from excel_vba_mcp.application.pivot_tables_service import PivotTablesService
 from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
@@ -44,7 +48,7 @@ from excel_vba_mcp.domain.models import (
     PivotRefreshResult,
     PivotTableInfo,
 )
-from excel_vba_mcp.domain.statuses import PivotAggregation, PivotFieldOrientation
+from excel_vba_mcp.domain.statuses import OperationClass, PivotAggregation, PivotFieldOrientation
 
 # The active pivot tables service, published by the server lifespan. ``None``
 # before startup and after shutdown; the read tools raise a clear error if used
@@ -191,7 +195,11 @@ def _require_scope(value: object) -> str:
 # ---------------------------------------------------------------------------
 # Read-only tools (implemented: task_048)
 # ---------------------------------------------------------------------------
-async def pivot_tables_list(workbook_id: str) -> PivotInventory:
+async def pivot_tables_list(
+    workbook_id: str,
+    *,
+    background: bool = False,
+) -> PivotInventory | RunningJob:
     """List every PivotTable and its cache across all worksheets.
 
     Enumeration is worksheet-scoped (a full-workbook sweep) because
@@ -200,10 +208,21 @@ async def pivot_tables_list(workbook_id: str) -> PivotInventory:
 
     Args:
         workbook_id: The id returned by ``excel_open``.
+        background: When ``True`` (Block F), schedule the sweep on the job registry
+            and return ``{status: "running", job_id, poll_after_s}`` promptly
+            instead of blocking; retrieve the :class:`PivotInventory` with
+            ``job_get``. Default ``False`` (unchanged blocking behaviour).
     """
 
     _require_non_empty(workbook_id, "workbook_id")
     service = get_pivot_tables_service()
+    if background:
+        return start_long_op(
+            partial(service.list_pivot_tables, workbook_id),
+            timeout=60.0,
+            section="pivot",
+            op_class=OperationClass.READ_ONLY,
+        )
     return await service.list_pivot_tables(workbook_id)
 
 
