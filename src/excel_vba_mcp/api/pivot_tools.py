@@ -48,7 +48,12 @@ from excel_vba_mcp.domain.models import (
     PivotRefreshResult,
     PivotTableInfo,
 )
-from excel_vba_mcp.domain.statuses import OperationClass, PivotAggregation, PivotFieldOrientation
+from excel_vba_mcp.domain.statuses import (
+    OperationClass,
+    PivotAggregation,
+    PivotFieldLayoutOrientation,
+    PivotFieldOrientation,
+)
 
 # The active pivot tables service, published by the server lifespan. ``None``
 # before startup and after shutdown; the read tools raise a clear error if used
@@ -102,26 +107,34 @@ def _require_int(value: object, field: str, *, minimum: int | None = None) -> in
 
 
 def _require_orientation(value: object) -> PivotFieldOrientation:
-    """Validate a target orientation (accepts the enum or its string name)."""
+    """Validate a target layout orientation and return the full read enum.
+
+    Accepts a :class:`PivotFieldLayoutOrientation` (the pruned request vocabulary),
+    a full :class:`PivotFieldOrientation` (direct/programmatic callers) or its
+    string name. ``data`` is not a settable layout bucket and is rejected here;
+    the service re-validates before any STA dispatch.
+    """
 
     if isinstance(value, PivotFieldOrientation):
         return value
+    if isinstance(value, PivotFieldLayoutOrientation):
+        return PivotFieldOrientation(value.value)
     if isinstance(value, str):
         try:
-            return PivotFieldOrientation(value.strip().lower())
+            return PivotFieldOrientation(PivotFieldLayoutOrientation(value.strip().lower()).value)
         except ValueError as exc:
             raise ExcelVbaMcpError(
                 f"Argument 'orientation' {value!r} is not a valid orientation; use "
-                "one of 'hidden', 'row', 'column', 'page' or 'data'.",
+                "one of 'hidden', 'row', 'column' or 'page'.",
                 code=ErrorCode.INVALID_RANGE,
                 context={
                     "orientation": value,
-                    "accepted": [member.value for member in PivotFieldOrientation],
+                    "accepted": [member.value for member in PivotFieldLayoutOrientation],
                     "reason": "invalid_orientation",
                 },
             ) from exc
     raise ExcelVbaMcpError(
-        f"Argument 'orientation' must be a PivotFieldOrientation or its string "
+        f"Argument 'orientation' must be a PivotFieldLayoutOrientation or its string "
         f"name, got {value!r}.",
         code=ErrorCode.INVALID_RANGE,
         context={"orientation": repr(value), "reason": "invalid_orientation"},
@@ -335,7 +348,7 @@ async def pivot_field_set_layout(
     workbook_id: str,
     pivot_table: str,
     field: str,
-    orientation: PivotFieldOrientation,
+    orientation: PivotFieldLayoutOrientation,
     *,
     delete: bool = False,
 ) -> PivotFieldInfo:

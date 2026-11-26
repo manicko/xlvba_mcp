@@ -33,6 +33,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
@@ -540,29 +541,11 @@ async def test_set_conditional_formatting_delete_rule(rig: Rig) -> None:
     assert await rig.ranges.get_conditional_formatting(wid, "Cells", "X1:X5") == []
 
 
-@requires_excel
-async def test_set_conditional_formatting_rejects_unsupported_type(rig: Rig) -> None:
-    wid = await _open_for_writes(rig)
-    await rig.ranges.set_conditional_formatting(
-        wid,
-        "Cells",
-        "X1:X5",
-        ConditionalFormatSpec(
-            type=ConditionalFormatType.CELL_VALUE,
-            operator=ValidationOperator.GREATER,
-            formula1="10",
-        ),
-    )
-    before = await rig.ranges.get_conditional_formatting(wid, "Cells", "X1:X5")
-
-    with pytest.raises(ExcelVbaMcpError) as exc_info:
-        await rig.ranges.set_conditional_formatting(
-            wid, "Cells", "X1:X5", ConditionalFormatSpec(type=ConditionalFormatType.COLOR_SCALE)
-        )
-    assert exc_info.value.code is ErrorCode.INVALID_RANGE
-
-    after = await rig.ranges.get_conditional_formatting(wid, "Cells", "X1:X5")
-    assert [rule.type for rule in after] == [rule.type for rule in before]
+async def test_set_conditional_formatting_rejects_unsupported_type() -> None:
+    # U3: color_scale/data_bar/icon_set/unsupported are rejected at the pydantic
+    # request layer and never reach validation or COM.
+    with pytest.raises(ValidationError):
+        ConditionalFormatSpec(type=ConditionalFormatType.COLOR_SCALE)
 
 
 @requires_excel

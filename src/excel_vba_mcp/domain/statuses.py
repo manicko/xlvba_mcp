@@ -440,6 +440,30 @@ class ConditionalFormatType(StrEnum):
     UNSUPPORTED = "unsupported"
 
 
+class ConditionalFormatRequestType(StrEnum):
+    """Request-side conditional-format type (U3; plan_03 §12.2).
+
+    The plain ``FormatCondition`` set only — the values
+    :meth:`RangesAdapter.set_conditional_formatting` can actually apply. The
+    distinct COM objects (``color_scale`` / ``data_bar`` / ``icon_set``) and the
+    read-only ``unsupported`` marker are **not** accepted on write; use
+    :class:`ConditionalFormatType` (full) for read/classify, which still reports
+    those rule types with ``supported=false``.
+    """
+
+    CELL_VALUE = "cell_value"
+    EXPRESSION = "expression"
+    TEXT_STRING = "text_string"
+    BLANKS = "blanks"
+    NO_BLANKS = "no_blanks"
+    ERRORS = "errors"
+    NO_ERRORS = "no_errors"
+    TIME_PERIOD = "time_period"
+    TOP10 = "top10"
+    ABOVE_AVERAGE = "above_average"
+    UNIQUE_VALUES = "unique_values"
+
+
 class PivotSourceType(StrEnum):
     """``PivotCache.SourceType`` classification (task_039 §7).
 
@@ -468,6 +492,21 @@ class PivotFieldOrientation(StrEnum):
     COLUMN = "column"
     PAGE = "page"
     DATA = "data"
+
+
+class PivotFieldLayoutOrientation(StrEnum):
+    """Request-side settable orientation (U3; plan_03 §12.2).
+
+    The layout buckets a field can be moved into. ``data`` is **not** accepted:
+    assigning ``Orientation = xlDataField`` never creates a data field — use
+    ``pivot_field_set_aggregation`` (``PivotTable.AddDataField``). The full
+    :class:`PivotFieldOrientation` (incl. ``data``) is retained for read/classify.
+    """
+
+    HIDDEN = "hidden"
+    ROW = "row"
+    COLUMN = "column"
+    PAGE = "page"
 
 
 class PivotAggregation(StrEnum):
@@ -522,3 +561,16 @@ class PivotFilterKind(StrEnum):
     DATE = "date"
     TOP_BOTTOM = "top_bottom"
     UNSUPPORTED = "unsupported"
+
+
+class PivotFilterRequestKind(StrEnum):
+    """Request-side pivot filter kind (U3; plan_03 §12.2).
+
+    Only ``MANUAL`` (hide/show items via ``PivotItems[i].Visible``) can be applied
+    on the target build. Label / value / date / top-bottom requests
+    (``PivotFilters.Add``) are **not** accepted; the full
+    :class:`PivotFilterKind` is retained for read/classify, which still reports
+    those filter kinds with ``supported=false``.
+    """
+
+    MANUAL = "manual"

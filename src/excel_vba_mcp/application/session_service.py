@@ -38,7 +38,7 @@ import dataclasses
 import os
 import shutil
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -54,8 +54,9 @@ from excel_vba_mcp.domain.errors import (
     ExcelVbaMcpError,
     WorkbookNotFoundError,
 )
-from excel_vba_mcp.domain.models import SessionStatus, WorkbookInfo
+from excel_vba_mcp.domain.models import SessionPolicy, SessionStatus, WorkbookInfo
 from excel_vba_mcp.domain.statuses import (
+    AccessMode,
     OperationClass,
     SessionMode,
     WorkbookSessionState,
@@ -162,6 +163,12 @@ class SessionService:
         # recovery can finalize in-flight jobs to INTERRUPTED_UNKNOWN. ``None`` in
         # minimal/embedder use (recovery then leaves jobs untouched).
         self._jobs: JobRegistry | None = None
+        # Optional in-memory snapshot gate (U2; plan_03 §6.2). Published by the
+        # server as ``SnapshotService.has_snapshot`` so the ``excel_get_status``
+        # policy block can report ``has_snapshot`` from the in-memory
+        # ``_latest_snapshot`` (never the on-disk store). ``None`` in
+        # minimal/embedder use (the policy then reports ``has_snapshot=False``).
+        self._snapshot_gate: Callable[[str], bool] | None = None
 
     # ------------------------------------------------------------------
     # Properties (non-COM)
@@ -197,6 +204,17 @@ class SessionService:
         """
 
         self._jobs = jobs
+
+    def set_snapshot_gate(self, gate: Callable[[str], bool] | None) -> None:
+        """Publish the in-memory snapshot gate used by the status policy block (U2).
+
+        The server calls this once at startup with
+        :meth:`SnapshotService.has_snapshot`. The gate is read-only and changes no
+        behavior — it only lets :meth:`excel_get_status` report ``has_snapshot``
+        truthfully from the in-memory ``_latest_snapshot`` (never the store).
+        """
+
+        self._snapshot_gate = gate
 
     # ------------------------------------------------------------------
     # Open
@@ -1102,9 +1120,37 @@ class SessionService:
             dirty=dirty,
             active_operation=active_operation,
             access_mode=self._approval.access_mode,
+            policy=self._build_policy(workbook_id),
             notes=merged_notes,
             created_at=now,
             updated_at=_utc_now(),
+        )
+
+    def _build_policy(self, workbook_id: str | None) -> SessionPolicy:
+        """Assemble the additive per-workbook ``SessionPolicy`` (U2; plan_03 §6.2).
+
+        ``has_snapshot`` reads the in-memory gate (``SnapshotService.has_snapshot``
+        -> ``_latest_snapshot``) when a workbook is identified; with no workbook it
+        is ``False``. ``classification_is_authorization`` is always ``False`` and
+        ``r13_preflight`` is always ``"veto"`` (enforced by the DTO literal types).
+        """
+
+        access_mode = self._approval.access_mode
+        requires_grant = access_mode == AccessMode.RESTRICTED
+        has_snapshot = (
+            self._snapshot_gate(workbook_id)
+            if workbook_id is not None and self._snapshot_gate is not None
+            else False
+        )
+        return SessionPolicy(
+            approval_mode=access_mode,
+            mutating_requires_grant=requires_grant,
+            executing_requires_grant=requires_grant,
+            recovery_auto_allowed=True,
+            snapshot_required_for_mutations=True,
+            has_snapshot=has_snapshot,
+            classification_is_authorization=False,
+            r13_preflight="veto",
         )
 
     def _require_record(self, workbook_id: str) -> _SessionRecord:

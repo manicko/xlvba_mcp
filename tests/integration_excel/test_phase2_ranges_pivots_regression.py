@@ -66,6 +66,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
 # Optional COM dependencies (None when unavailable so the module skips cleanly).
 try:  # pragma: no cover - exercised implicitly by skip logic
@@ -106,9 +107,9 @@ from excel_vba_mcp.domain.models import (
     ConditionalFormatSpec,
     DefinedNameInfo,
     PivotCacheInfo,
-    PivotFieldFilters,
     PivotFieldInfo,
     PivotFilterSpec,
+    PivotFilterState,
     PivotInventory,
     PivotRefreshResult,
     PivotTableInfo,
@@ -1416,64 +1417,21 @@ async def test_unsupported_pivot_source_is_explicit(rig: Rig) -> None:
     await rig.session.close_workbook(wid)
 
 
-@requires_excel
-async def test_unsupported_pivot_filter_kind_is_explicit(rig: Rig) -> None:
-    """A label (PivotFilters.Add) filter is reported unsupported and writes nothing."""
+async def test_unsupported_pivot_filter_kind_is_explicit() -> None:
+    """A non-manual filter kind is rejected at the request layer (U3), never sent to Excel."""
 
-    fixture = _fixture_or_skip(_PIVOTS_PROJECT)
-    original = rig.copy_fixture(fixture)
-    info = await rig.open(original, mode=SessionMode.INSPECT, read_only=False)
-    wid = info.workbook_id
-    await rig.snapshot.create_snapshot(wid)
-    rig.grant(original, _ACTION_APPLY_FILTER)
-
-    result = await rig.pivots.apply_pivot_field_filter(
-        wid, "ptA", "Region", PivotFilterSpec(kind=PivotFilterKind.LABEL)
-    )
-
-    # Explicit unsupported status, never a silent conversion.
-    assert result.filter.supported is False
-    assert result.filter.kind is PivotFilterKind.LABEL
-    assert result.unsupported == ["label"]
-    assert "PivotFilters.Add is unsupported" in (result.filter.unsupported_reason or "")
-
-    # Nothing was written: no manual filter and no PivotFilters entry.
-    after = await rig.pivots.get_pivot_field_filters(wid, "ptA", "Region")
-    assert isinstance(after, PivotFieldFilters)
-    assert after.hidden_items == []
-    assert after.filter.kind is PivotFilterKind.NONE
-    assert await _pivot_filters_count(rig, "ptA", "Region") == 0
-
-    await rig.session.close_workbook(wid)
+    with pytest.raises(ValidationError):
+        PivotFilterSpec(kind=PivotFilterKind.LABEL)
+    state = PivotFilterState(kind=PivotFilterKind.LABEL, supported=False)
+    assert state.kind is PivotFilterKind.LABEL
+    assert state.supported is False
 
 
-@requires_excel
-async def test_unsupported_color_scale_cf_is_explicit(rig: Rig) -> None:
-    """A ColorScale conditional format is rejected with INVALID_RANGE; nothing changes."""
+async def test_unsupported_color_scale_cf_is_explicit() -> None:
+    """A ColorScale conditional format is rejected at the pydantic request layer (U3)."""
 
-    fixture = _fixture_or_skip(_RANGES_PROJECT)
-    original = rig.copy_fixture(fixture)
-    info = await rig.open(original, mode=SessionMode.INSPECT, read_only=False)
-    wid = info.workbook_id
-    await rig.snapshot.create_snapshot(wid)
-    rig.grant(original, _ACTION_SET_CF)
-
-    # Seed a supported rule, then attempt the unsupported ColorScale rule.
-    await rig.ranges.set_conditional_formatting(wid, "Cells", "X1:X5", _cell_value_cf())
-    before = await rig.ranges.get_conditional_formatting(wid, "Cells", "X1:X5")
-
-    with pytest.raises(ExcelVbaMcpError) as exc_info:
-        await rig.ranges.set_conditional_formatting(
-            wid, "Cells", "X1:X5", ConditionalFormatSpec(type=ConditionalFormatType.COLOR_SCALE)
-        )
-    assert exc_info.value.code is ErrorCode.INVALID_RANGE
-    assert exc_info.value.context["type"] == ConditionalFormatType.COLOR_SCALE.value
-
-    after = await rig.ranges.get_conditional_formatting(wid, "Cells", "X1:X5")
-    assert [rule.type for rule in after] == [rule.type for rule in before]
-    assert len(after) == len(before) == 1
-
-    await rig.session.close_workbook(wid)
+    with pytest.raises(ValidationError):
+        ConditionalFormatSpec(type=ConditionalFormatType.COLOR_SCALE)
 
 
 # ---------------------------------------------------------------------------

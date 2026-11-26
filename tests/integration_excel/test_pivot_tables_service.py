@@ -55,6 +55,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
 # Optional COM dependencies (None when unavailable so the module skips cleanly).
 try:  # pragma: no cover - exercised implicitly by skip logic
@@ -81,6 +82,7 @@ from excel_vba_mcp.domain.models import (
     PivotFieldInfo,
     PivotFieldProperties,
     PivotFilterSpec,
+    PivotFilterState,
     PivotInventory,
     PivotTableInfo,
 )
@@ -763,30 +765,14 @@ async def test_manual_filter_round_trip_and_clear_scopes(rig: Rig) -> None:
     await rig.session.close_workbook(wid)
 
 
-@requires_excel
-async def test_unsupported_label_filter_is_explicit(rig: Rig) -> None:
-    info = await rig.open_for_mutation()
-    await rig.snapshot.create_snapshot(info.workbook_id)
-    wid = info.workbook_id
-
-    result = await rig.pivots.apply_pivot_field_filter(
-        wid, "ptA", "Region", PivotFilterSpec(kind=PivotFilterKind.LABEL)
-    )
-
-    # The request is reported as unsupported, never silently converted.
-    assert result.filter.supported is False
-    assert result.filter.kind is PivotFilterKind.LABEL
-    assert result.unsupported == ["label"]
-    assert "PivotFilters.Add is unsupported" in (result.filter.unsupported_reason or "")
-
-    # Nothing was written: no manual filter and no PivotFilters entry.
-    after = await rig.pivots.get_pivot_field_filters(wid, "ptA", "Region")
-    assert after.hidden_items == []
-    assert after.filter.kind is PivotFilterKind.NONE
-    assert after.unsupported == []
-    assert await _pivot_filters_count(rig, "ptA", "Region") == 0
-
-    await rig.session.close_workbook(wid)
+async def test_unsupported_label_filter_is_explicit() -> None:
+    # U3: the request vocabulary is pruned to ``manual``; a label request is
+    # rejected at the pydantic layer before any COM call. The full kind stays
+    # representable on the read-state model with supported=False.
+    with pytest.raises(ValidationError):
+        PivotFilterSpec(kind=PivotFilterKind.LABEL)
+    state = PivotFilterState(kind=PivotFilterKind.LABEL, supported=False)
+    assert state.kind is PivotFilterKind.LABEL
 
 
 # ---------------------------------------------------------------------------

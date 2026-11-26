@@ -13,7 +13,7 @@ The models intentionally cover only Stage 1 entities. Phase 2 concepts
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -23,6 +23,7 @@ from excel_vba_mcp.domain.statuses import (
     CellValueKind,
     CompileMethod,
     CompileStatus,
+    ConditionalFormatRequestType,
     ConditionalFormatType,
     ControlFormType,
     ControlKind,
@@ -34,8 +35,10 @@ from excel_vba_mcp.domain.statuses import (
     NameScope,
     NameTargetKind,
     PivotAggregation,
+    PivotFieldLayoutOrientation,
     PivotFieldOrientation,
     PivotFilterKind,
+    PivotFilterRequestKind,
     PivotRefreshMethod,
     PivotRefreshStatus,
     PivotSourceType,
@@ -96,6 +99,35 @@ class WorkbookInfo(DomainModel):
     model_version: int = Field(default=1)
 
 
+class SessionPolicy(DomainModel):
+    """Per-workbook policy subset co-located on ``excel_get_status`` (U2; plan_03 §6.2).
+
+    The authoritative server-level policy lives in ``xlvba_environment``; this
+    block co-locates the per-workbook context on the status DTO. It is additive
+    and optional (``SessionStatus.policy`` defaults to ``None``).
+
+    ``classification_is_authorization`` is always ``False`` (a BG06 classification
+    is bookkeeping only and never grants run permission) and ``r13_preflight`` is
+    always ``"veto"`` (the R13 scan can only veto a dispatch, never certify one).
+    ``has_snapshot`` reads the **in-memory** snapshot gate
+    (``SnapshotService.has_snapshot`` -> ``_latest_snapshot``), not the on-disk
+    store.
+    """
+
+    approval_mode: AccessMode
+    mutating_requires_grant: bool
+    executing_requires_grant: bool
+    recovery_auto_allowed: bool
+    snapshot_required_for_mutations: bool
+    has_snapshot: bool = Field(
+        default=False,
+        description="Whether an in-memory snapshot gate exists for this workbook "
+        "(SnapshotService.has_snapshot; the in-memory _latest_snapshot, not the store).",
+    )
+    classification_is_authorization: Literal[False] = False
+    r13_preflight: Literal["veto"] = "veto"
+
+
 class SessionStatus(TimestampedModel):
     """Excel session / workbook runtime status (spec §6.1 ``excel_get_status``)."""
 
@@ -109,7 +141,143 @@ class SessionStatus(TimestampedModel):
     active_operation: str | None = None
     active_test_run_id: str | None = None
     access_mode: AccessMode | None = None
+    policy: SessionPolicy | None = None
     notes: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Environment / policy discovery (U2; plan_03 §6.1)
+# ---------------------------------------------------------------------------
+# The ``xlvba_environment`` payload is a strongly typed, additive DTO
+# (``extra="forbid"``). It is non-COM and side-effect-free: ``excel.build`` is
+# always ``None`` (no 4-part build source exists — never fabricated) and
+# ``excel.available`` is ``False`` when the worker is down. ``has_snapshot`` in
+# ``workbooks`` reads the in-memory snapshot gate, not the on-disk store.
+
+
+class EnvironmentServerInfo(DomainModel):
+    """Server-level identity and configuration (``xlvba_environment.server``)."""
+
+    name: str
+    version: str
+    access_mode: AccessMode
+    macro_timeout_s: float
+    open_timeout_s: float
+    liveness_ceiling_s: float
+    log_level: str
+
+
+class EnvironmentExcelInfo(DomainModel):
+    """Owned Excel instance summary (``xlvba_environment.excel``).
+
+    ``build`` is **always** ``None`` — there is no 4-part build source, so the
+    field is honest ``null`` and can never be fabricated. ``target_build`` is a
+    labelled design-time constant only (not a detected build).
+    ``application_version`` is a non-COM best-effort value taken from an open
+    workbook's cached ``Application.Version`` (or ``None`` when none is open).
+    ``vbom_available`` is ``None`` at server level (no workbook model is built).
+    """
+
+    available: bool
+    application_version: str | None = None
+    build: None = Field(default=None, description="Always null; no 4-part build source exists.")
+    target_build: str = Field(
+        default="16.0.14332",
+        description="Labelled design-time constant only; not a detected build.",
+    )
+    owned_pid: int | None = None
+    vbom_available: bool | None = None
+
+
+class EnvironmentCapabilities(DomainModel):
+    """Capability flags derived from registration + status enums (plan_03 §6.1)."""
+
+    vba: bool
+    macros: bool
+    pivot_tables: bool
+    background_jobs: bool
+    recovery: bool
+    non_activating_compile: bool = Field(
+        default=False,
+        description="Always false on the validated build (compile never returns compiled/error).",
+    )
+    pivot_filter_kinds: list[str] = Field(default_factory=list)
+    pivot_source_types: list[str] = Field(default_factory=list)
+
+
+class EnvironmentApprovalPolicy(DomainModel):
+    """Approval policy summary (``xlvba_environment.policy.approval``)."""
+
+    mode: AccessMode
+    mutating_requires_grant: bool
+    executing_requires_grant: bool
+    recovery_auto_allowed: bool
+
+
+class EnvironmentSnapshotPolicy(DomainModel):
+    """Snapshot policy summary (``xlvba_environment.policy.snapshot``)."""
+
+    required_for_mutations: bool = True
+    created_by: str = "agent:snapshot_create"
+
+
+class EnvironmentPathPolicy(DomainModel):
+    """Path allowlist summary (``xlvba_environment.policy.path``)."""
+
+    allowed_roots: list[str] = Field(default_factory=list)
+    allow_unc: bool = False
+
+
+class EnvironmentMacroPolicy(DomainModel):
+    """Macro gate summary (``xlvba_environment.policy.macro``).
+
+    ``classification_is_authorization`` is always ``False`` and ``r13_preflight``
+    is always ``"veto"`` — a classification never grants run permission and the
+    R13 preflight can only veto.
+    """
+
+    background_safe_required: bool = True
+    r13_preflight: Literal["veto"] = "veto"
+    classification_is_authorization: Literal[False] = False
+
+
+class EnvironmentPolicy(DomainModel):
+    """Aggregate policy block for ``xlvba_environment`` (plan_03 §6.1)."""
+
+    approval: EnvironmentApprovalPolicy
+    snapshot: EnvironmentSnapshotPolicy = Field(default_factory=EnvironmentSnapshotPolicy)
+    path: EnvironmentPathPolicy = Field(default_factory=EnvironmentPathPolicy)
+    macro: EnvironmentMacroPolicy = Field(default_factory=EnvironmentMacroPolicy)
+
+
+class EnvironmentWorkbook(DomainModel):
+    """Per-open-workbook summary for ``xlvba_environment.workbooks`` (plan_03 §6.1).
+
+    ``has_snapshot`` reads the in-memory snapshot gate
+    (``SnapshotService.has_snapshot``), never the on-disk store.
+    """
+
+    workbook_id: str
+    read_only: bool
+    mode: SessionMode
+    has_snapshot: bool
+    dirty: bool
+
+
+class EnvironmentReport(DomainModel):
+    """Read-only ``xlvba_environment`` payload (plan_03 §6.1; ``extra="forbid"``).
+
+    Non-COM and side-effect-free: it never starts the worker, never creates
+    snapshots / grants / classifications and never authorizes a mutation.
+    """
+
+    schema_version: int = SCHEMA_VERSION
+    server: EnvironmentServerInfo
+    excel: EnvironmentExcelInfo
+    capabilities: EnvironmentCapabilities
+    policy: EnvironmentPolicy
+    glossary_uri: str = "xlvba://glossary"
+    workbooks: list[EnvironmentWorkbook] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -967,9 +1135,15 @@ class ConditionalFormatRule(DomainModel):
 
 
 class ConditionalFormatSpec(DomainModel):
-    """Request payload for one conditional-formatting rule (task_038 §6.3)."""
+    """Request payload for one conditional-formatting rule (task_038 §6.3).
 
-    type: ConditionalFormatType
+    ``type`` is the pruned request vocabulary (:class:`ConditionalFormatRequestType`):
+    ``color_scale`` / ``data_bar`` / ``icon_set`` / ``unsupported`` are rejected
+    here (pydantic) and are never sent to Excel. Read/classify uses the full
+    :class:`ConditionalFormatType` (:class:`ConditionalFormatRule`).
+    """
+
+    type: ConditionalFormatRequestType
     operator: ValidationOperator | None = None
     formula1: str | None = None
     formula2: str | None = None
@@ -1184,9 +1358,14 @@ class PivotInventory(DomainModel):
 
 
 class PivotFieldLayout(DomainModel):
-    """Target orientation/position for a field layout change (task_039 §5)."""
+    """Target orientation/position for a field layout change (task_039 §5).
 
-    orientation: PivotFieldOrientation
+    ``orientation`` is the pruned request vocabulary
+    (:class:`PivotFieldLayoutOrientation`): ``data`` is rejected here (pydantic)
+    — use ``pivot_field_set_aggregation`` to place a field in the data area.
+    """
+
+    orientation: PivotFieldLayoutOrientation
     position: int | None = None
 
 
@@ -1199,13 +1378,30 @@ class PivotFieldProperties(DomainModel):
 
 
 class PivotFilterSpec(DomainModel):
-    """Manual (visible-items) filter request (task_039 §6).
+    """Manual (visible-items) filter request (task_039 §6; U3 pruned request).
 
-    Only ``MANUAL`` (hide/show items) is supported on the target build; label,
-    value, date and top/bottom filters are reported as ``UNSUPPORTED``.
+    ``kind`` is the pruned request vocabulary (:class:`PivotFilterRequestKind`):
+    only ``manual`` is accepted. Label / value / date / top-bottom requests are
+    rejected here (pydantic) and never reach Excel. The current filter state is
+    reported with the full :class:`PivotFilterKind` via :class:`PivotFilterState`.
     """
 
-    kind: PivotFilterKind = PivotFilterKind.MANUAL
+    kind: PivotFilterRequestKind = PivotFilterRequestKind.MANUAL
+    visible_items: list[str] = Field(default_factory=list)
+    supported: bool = True
+    unsupported_reason: str | None = None
+
+
+class PivotFilterState(DomainModel):
+    """Current filter state of a PivotField (read/classify; full kind set).
+
+    Mirrors :class:`PivotFilterSpec` but keeps the full :class:`PivotFilterKind`
+    so a read can report ``label`` / ``value`` / ``date`` / ``top_bottom`` /
+    ``unsupported`` / ``none`` filter kinds with ``supported=false`` rather than
+    flattening them. Never used as a write request.
+    """
+
+    kind: PivotFilterKind = PivotFilterKind.NONE
     visible_items: list[str] = Field(default_factory=list)
     supported: bool = True
     unsupported_reason: str | None = None
@@ -1219,7 +1415,7 @@ class PivotFieldFilters(DomainModel):
     all_items_visible: bool | None = None
     visible_items: list[str] = Field(default_factory=list)
     hidden_items: list[str] = Field(default_factory=list)
-    filter: PivotFilterSpec = Field(default_factory=PivotFilterSpec)
+    filter: PivotFilterState = Field(default_factory=PivotFilterState)
     unsupported: list[str] = Field(default_factory=list)
 
 

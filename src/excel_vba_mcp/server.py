@@ -30,7 +30,7 @@ from typing import Any
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ResourceError, ToolError
-from mcp.types import CallToolResult, InputRequiredResult
+from mcp.types import CallToolResult, InputRequiredResult, ToolAnnotations
 from pydantic import ValidationError
 
 from excel_vba_mcp import __version__
@@ -39,6 +39,7 @@ from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
 from excel_vba_mcp.api import (
     compile_tools,
     control_tools,
+    environment_tools,
     job_tools,
     macro_tools,
     name_tools,
@@ -57,6 +58,7 @@ from excel_vba_mcp.api.control_tools import (
     control_set_on_action,
     controls_list,
 )
+from excel_vba_mcp.api.environment_tools import xlvba_environment
 from excel_vba_mcp.api.health_tools import excel_health
 from excel_vba_mcp.api.job_tools import job_cancel, job_get
 from excel_vba_mcp.api.macro_tools import (
@@ -214,17 +216,53 @@ _ENV_OWNED_PID_DIR = "EXCEL_VBA_MCP_OWNED_PID_DIR"
 
 # Tool descriptions surfaced over MCP (kept explicit for a stable contract).
 _DESC_OPEN = (
-    "Open an allowlisted workbook as a hidden working copy. mode='inspect' "
-    "disables macros; mode='execute' applies macro-by-UI (allowed by default; "
-    "restricted mode requires approval). The original file is never modified. "
-    "background=true returns {status:'running', job_id, poll_after_s} promptly; "
-    "retrieve the WorkbookInfo with job_get."
+    "Purpose: Open an allowlisted workbook as a hidden working copy. "
+    "Use when: you need to read or mutate a workbook through any other tool. "
+    "Do not use when: the workbook is already open — reuse its workbook_id "
+    "(excel_list_workbooks); for read-only work prefer mode='inspect'. "
+    "Preconditions: path must be under an allowlisted root (EXCEL_VBA_MCP_ROOTS, "
+    "default cwd + temp); the original file is never modified. "
+    "Parameters: path; mode='execute' (default; applies macro-by-UI) or "
+    "'inspect' (macros disabled); read_only=False (default; writable unless "
+    "read_only=true); background=False. "
+    "Behavior: copies the file into work/ and opens it hidden; in restricted "
+    "mode execute/writable needs approval; background=true returns a RunningJob "
+    "handle. "
+    "Result: WorkbookInfo, or RunningJob when background=true. "
+    "Next actions: snapshot_create before any mutation, then the read/write tools. "
+    "Example: {\"path\": \"C:/data/report.xlsm\", \"mode\": \"execute\", "
+    "\"read_only\": false}"
 )
 _DESC_CLOSE = (
-    "Close an open workbook. Defaults to NOT saving; set save_changes=true to persist changes."
+    "Purpose: Close an open workbook. "
+    "Use when: you are done with a workbook and want to release the working copy. "
+    "Preconditions: an open workbook_id. "
+    "Parameters: workbook_id; save_changes=False. "
+    "Behavior: Defaults to NOT saving — unsaved edits are lost unless "
+    "save_changes=true. "
+    "Result: SessionStatus. "
+    "Next actions: excel_list_workbooks to confirm the workbook is gone."
 )
-_DESC_SAVE = "Explicitly save an open workbook's working copy."
-_DESC_STATUS = "Return session/workbook status (busy, read-only, dirty, active operation)."
+_DESC_SAVE = (
+    "Purpose: Save an open workbook's working copy in place. "
+    "Use when: you want to persist mutations to the working-copy file. "
+    "Do not use when: you need a new output path — there is no save-as "
+    "(see xlvba://glossary / docs 09). "
+    "Preconditions: an open, writable workbook_id. "
+    "Behavior: writes the working copy in place (no path argument). "
+    "Result: WorkbookInfo. "
+    "Next actions: snapshot_create if you plan further mutations."
+)
+_DESC_STATUS = (
+    "Purpose: Return session/workbook status (busy, read-only, dirty, active operation). "
+    "Use when: you need to check a workbook's state before acting. "
+    "Preconditions: an open workbook_id (or omit for the server session). "
+    "Behavior: reports access_mode; the additive policy block (U2) co-locates "
+    "per-workbook approval/snapshot context. "
+    "Result: SessionStatus. "
+    "Next actions: excel_health for worker state; xlvba_environment for access "
+    "mode / policy / build."
+)
 _DESC_LIST = "List currently open workbooks from session bookkeeping."
 _DESC_HEALTH = (
     "Return worker/session health (state, accepting, owned Excel pid, active "
@@ -232,16 +270,19 @@ _DESC_HEALTH = (
     "Read-only: use it to check whether the session needs recovery."
 )
 _DESC_EXCEL_RECOVER = (
-    "Recover the owned Excel process (agent-directed). The server never "
-    "auto-terminates a live pid on a deadline; call this only when recovery is "
-    "justified. Terminates the wedged owned EXCEL.EXE through the held process "
-    "handle (TerminateProcess + WaitForSingleObject), discards the working copies "
-    "and rebuilds a fresh hidden instance. Auto-allowed (RECOVERY class) in full "
-    "and restricted mode, audited, pid-scoped (never a wildcard); destructive to "
-    "working copies only, originals are never modified. Fail-closed: if no live, "
-    "identity-verified handle is held it is refused and a server restart is the "
-    "fallback. An interrupted operation is reported prior_job='unknown' and is "
-    "never auto-retried."
+    "Purpose: Recover the owned Excel process (agent-directed). "
+    "Use when: excel_health shows needs_recovery or a call is wedged. "
+    "Do not use when: the server should not terminate a live pid on a deadline — "
+    "it never auto-terminates; call this only when recovery is justified. "
+    "Preconditions: a held, identity-verified owned process handle (RECOVERY class; "
+    "see xlvba://glossary). "
+    "Behavior: terminates the wedged owned EXCEL.EXE through the held handle "
+    "(TerminateProcess + WaitForSingleObject), discards the working copies and "
+    "rebuilds a fresh hidden instance; auto-allowed in full and restricted mode, "
+    "audited, pid-scoped; fail-closed if no live handle is held. "
+    "Result: a recovery report; an interrupted operation is reported "
+    "prior_job='unknown' and is never auto-retried. "
+    "Next actions: re-open the workbook (the old workbook_id is invalid)."
 )
 _DESC_SNAPSHOT_CREATE = (
     "Create an immutable snapshot of a workbook (SaveCopyAs for open books, file "
@@ -249,35 +290,61 @@ _DESC_SNAPSHOT_CREATE = (
 )
 _DESC_SNAPSHOT_LIST = "List snapshots and their metadata."
 _DESC_SNAPSHOT_RESTORE = (
-    "Restore a working session from a snapshot: close the current working copy "
-    "without saving, then open the snapshot baseline. Does NOT undo external "
-    "macro side effects."
+    "Purpose: Restore a working session from a snapshot. "
+    "Use when: you want to roll the working copy back to a known baseline. "
+    "Preconditions: an existing snapshot_id (and workbook_id when closed). "
+    "Behavior: closes the current working copy without saving — unsaved changes "
+    "are discarded — then opens the snapshot baseline; does NOT undo external "
+    "macro side effects. "
+    "Result: WorkbookInfo. "
+    "Next actions: snapshot_create to re-baseline before further mutations."
 )
 _DESC_SNAPSHOT_DIFF = "Compare two snapshots by manifest metadata and file hash."
 _DESC_TEST_RUN_SUITE = (
-    "Run a bounded declarative test suite on disposable copies of an open "
-    "workbook. Actions and assertions come from closed allowlists, so no "
-    "arbitrary Python, shell, COM or VBA can be expressed; an unknown action or "
-    "assertion is rejected before any Excel call. Every case starts from its own "
-    "disposable working copy of one immutable baseline snapshot (one case cannot "
-    "contaminate another); a failed compile step blocks the case's macro steps. "
-    "Returns per-case and per-step statuses; external macro side effects are NOT "
-    "rolled back by the snapshot."
+    "Purpose: Run a bounded declarative test suite on disposable copies of an open "
+    "workbook (legacy typed-spec blocking runner). "
+    "Use when: you already hold a TestSuiteSpec and want a blocking run. "
+    "Do not use when: you have raw JSON or need background=true — use "
+    "test_suite_run. "
+    "Preconditions: suite.workbook_id must be an open workbook (call excel_open "
+    "first); a baseline snapshot is created automatically unless "
+    "baseline='use_existing'. "
+    "Parameters: suite:TestSuiteSpec; actions/assertions come from closed "
+    "allowlists, so no arbitrary Python/shell/COM/VBA can be expressed. "
+    "Behavior: every case starts from its own disposable working copy of one "
+    "immutable baseline snapshot; a failed compile step blocks the case's macro "
+    "steps; external macro side effects are NOT rolled back. "
+    "Result: TestRunResult (per-case and per-step statuses). "
+    "Next actions: test_get_run to read a persisted run by run_id."
 )
 _DESC_TEST_GET_RUN = (
     "Return a previously persisted test run by run_id (statuses, per-case steps, "
     "assertions, artifact references). Read-only: it never touches Excel."
 )
 _DESC_TEST_SUITE_RUN = (
-    "Validate and run a declarative test suite (task_053 explicit entry point). "
-    "Accepts the suite as an object or a plain JSON-style mapping; the closed "
+    "Purpose: Validate and run a declarative test suite (canonical entry point for "
+    "new use). "
+    "Use when: you have a suite object or a plain JSON-style mapping, or you need "
+    "background=true. "
+    "Do not use when: you hold a typed TestSuiteSpec and want a blocking run — use "
+    "test_run_suite. "
+    "Preconditions: suite.workbook_id must be an open workbook (call excel_open "
+    "first); a baseline snapshot is created automatically unless "
+    "baseline='use_existing'. "
+    "Parameters: suite:TestSuiteSpec or mapping; background=False. The closed "
     "Range/Pivot action and assertion vocabularies are validated before any Excel "
     "call, so an unknown action/assertion or an arbitrary-code/unbounded payload "
-    "is rejected up front. Behaves like test_run_suite: one immutable baseline "
-    "snapshot, one disposable working copy per case, Range/Pivot steps dispatched "
-    "to the existing services; external macro side effects are NOT rolled back. "
-    "background=true returns {status:'running', job_id, poll_after_s} promptly; "
-    "retrieve the TestRunResult with job_get."
+    "is rejected up front. "
+    "Behavior: one immutable baseline snapshot, one disposable working copy per "
+    "case; external macro side effects are NOT rolled back; background=true returns "
+    "a RunningJob handle. "
+    "Result: TestRunResult, or RunningJob when background=true. "
+    "Next actions: job_get to retrieve a background result; test_get_run to read a "
+    "persisted run. "
+    "Example: {\"suite\": {\"suite\": \"smoke\", \"workbook_id\": \"<id>\", "
+    "\"cases\": [{\"id\": \"c1\", \"steps\": [{\"action\": \"range_write_values\", "
+    "\"sheet\": \"Sheet1\", \"range_address\": \"A1\", \"values_grid\": "
+    "{\"rows\": 1, \"cols\": 1, \"values\": [[1]]}}]}]}, \"background\": false}"
 )
 _DESC_VBA_PROJECT_INFO = (
     "Return the VBA project summary: name, protection/lock state, component "
@@ -306,24 +373,51 @@ _DESC_VBA_SEARCH_CODE = (
     "Search every VBA component's code for a substring or regular expression (bounded results)."
 )
 _DESC_VBA_REPLACE_COMPONENT_SOURCE = (
-    "Replace the entire code module of a Standard/Class VBA component. Guarded "
-    "mutation: requires a writable session, a successful snapshot and a matching "
-    "expected_source_hash (revision check); allowed by default (full-access "
-    "policy), with approval required only in restricted mode. Document modules "
-    "and UserForms are rejected."
+    "Purpose: Replace the entire code module of a Standard/Class VBA component. "
+    "Use when: you need to rewrite a component's source wholesale. "
+    "Do not use when: you only add code at a position — use vba_insert_code; "
+    "Document modules and UserForms are rejected. "
+    "Preconditions: writable session + snapshot + approval (full-access default; "
+    "restricted requires approval) + postcondition re-read. "
+    "Parameters: workbook_id; component; new_source; expected_source_hash — obtain "
+    "it from vba_read_component / vba_list_components (the normalized source hash, "
+    "not the snapshot export file hash). "
+    "Behavior: the revision check runs before and inside the STA worker "
+    "(see xlvba://glossary); a mismatch raises REVISION_CONFLICT. "
+    "Result: VbaMutationResult (post-mutation component state). "
+    "Next actions: vba_read_component to confirm the new source hash. "
+    "Example: {\"workbook_id\": \"<id>\", \"component\": \"Module1\", "
+    "\"new_source\": \"Sub Hello()\\n  MsgBox \\\"hi\\\"\\nEnd Sub\", "
+    "\"expected_source_hash\": \"<hash from vba_read_component>\"}"
 )
 _DESC_VBA_INSERT_CODE = (
-    "Insert VBA code at a semantic position in a Standard/Class component. "
-    "position is 'declarations', 'before_procedure:<name>' or "
-    "'after_procedure:<name>'. Same guard chain as replace."
+    "Purpose: Insert VBA code at a semantic position in a Standard/Class component. "
+    "Use when: you add a procedure or declaration without rewriting the module. "
+    "Do not use when: you replace the whole module — use "
+    "vba_replace_component_source. "
+    "Preconditions: writable session + snapshot + approval (full-access default; "
+    "restricted requires approval) + postcondition re-read. "
+    "Parameters: position is 'declarations', 'before_procedure:<name>' or "
+    "'after_procedure:<name>'; expected_source_hash from vba_read_component / "
+    "vba_list_components. "
+    "Behavior: same revision guard as replace (REVISION_CONFLICT on mismatch). "
+    "Result: VbaMutationResult. "
+    "Next actions: vba_read_component to confirm the new source hash."
 )
 _DESC_VBA_COMPILE = (
-    "Return a fail-closed compile result for an open workbook. On the validated "
-    "build non-activating compilation is unavailable, so this returns "
-    "status='indeterminate' with reason='NON_ACTIVATING_COMPILE_UNAVAILABLE' and "
-    "partial diagnostics (is_compile=false: broken references, protection, "
-    "component inventory, VBOM availability). It never returns compiled or "
-    "compile_error and never shows or activates UI."
+    "Purpose: Return a fail-closed compile diagnostic for an open workbook — "
+    "diagnostic only, does NOT compile. "
+    "Use when: you need the compile/protection/inventory diagnostic snapshot. "
+    "Do not use when: you need a real compiled/compile_error result — none is "
+    "available; use vba_get_compile_diagnostics to re-read the cache. "
+    "Preconditions: an open workbook_id. "
+    "Behavior: on the validated build non-activating compilation is unavailable, "
+    "so this returns status='indeterminate' with "
+    "reason='NON_ACTIVATING_COMPILE_UNAVAILABLE' and partial diagnostics "
+    "(is_compile=false); it never returns compiled or compile_error and never "
+    "shows or activates UI (see xlvba://glossary: indeterminate). "
+    "Result: a compile diagnostic DTO (status indeterminate). "
+    "Next actions: vba_get_compile_diagnostics for the cached result."
 )
 _DESC_VBA_GET_COMPILE_DIAGNOSTICS = (
     "Return the last compile diagnostics (is_compile=false) without forcing a compile re-run."
@@ -334,40 +428,75 @@ _DESC_MACRO_LIST = (
     "background_safe classification (BG06)."
 )
 _DESC_MACRO_RUN = (
-    "Run one approved, background-safe macro of an execute-mode workbook. The "
-    "macro runs only when it is approved (allowed by default; restricted mode is "
-    "opt-in), classified "
-    "background_safe for the current workbook hash (BG06) and passes the "
-    "interactive-UI preflight (R13); otherwise a truthful blocked result is "
-    "returned and the macro is NOT dispatched. Never dismisses a dialog or reports "
-    "a waiting macro as passed. background=true returns "
-    "{status:'running', job_id, poll_after_s} promptly; retrieve the result with "
-    "job_get."
+    "Purpose: Run one approved, background-safe macro of an execute-mode workbook. "
+    "Use when: you need to execute a reviewed VBA procedure. "
+    "Do not use when: the procedure is not yet classified — run "
+    "macro_classify_background first; to re-read the last result use "
+    "macro_get_last_result. "
+    "Preconditions (gates, in order): (1) execute-mode + writable session; "
+    "(2) procedure resolution; (3) approval — 'approved' is the call-time "
+    "ApprovalPolicy.check(EXECUTING) outcome (allowed by default in full; "
+    "allowlist/live grant in restricted); (4) background_safe for the current "
+    "workbook hash (BG06); (5) interactive-UI preflight (R13; see "
+    "xlvba://glossary); (6) dispatch. "
+    "Parameters: workbook_id; macro_name; args (≤30 — the Excel Application.Run "
+    "limit; a bare datetime.date is rejected, pass datetime.datetime); "
+    "background=False. "
+    "Behavior: otherwise a truthful blocked result is returned and the macro is "
+    "NOT dispatched; never dismisses a dialog or reports a waiting macro as "
+    "passed; background=true returns a RunningJob handle. "
+    "Result: MacroRunResult, or RunningJob when background=true. "
+    "Next actions: macro_get_last_result; job_get for a background run."
 )
 _DESC_MACRO_GET_LAST_RESULT = (
     "Return the cached last macro run result (status, duration, return value, "
     "structured error) without re-running the macro."
 )
 _DESC_MACRO_CLASSIFY_BACKGROUND = (
-    "Classify a procedure's background_safe for the current workbook + VBA source "
-    "revision. UNGATED bookkeeping (macro_run remains the security boundary): "
-    "review a procedure (vba_read_component / vba_list_procedures) then assert "
-    "background_safe here. The classification is bound to (workbook hash, source "
-    "hash, procedure) and is invalidated on VBA source change; a heuristic or "
-    "interactive-UI procedure cannot be classified background_safe (R13 veto)."
+    "Purpose: Classify a procedure's background_safe for the current workbook + "
+    "VBA source revision. "
+    "Use when: you have reviewed a procedure and want to enable macro_run for it. "
+    "Do not use when: you expect this to authorize execution — classification is "
+    "bookkeeping only and never grants run permission; macro_run still enforces "
+    "approval + BG06 + R13. "
+    "Preconditions: an open workbook_id; review the code first "
+    "(vba_read_component / vba_list_procedures). "
+    "Parameters: workbook_id; procedure; background_safe; "
+    "expected_project_source_hash (optional optimistic-concurrency guard). "
+    "Behavior: UNGATED bookkeeping; the classification is bound to (workbook hash, "
+    "source hash, procedure) (BG06) and invalidated on VBA source change; a "
+    "heuristic or interactive-UI procedure cannot be classified background_safe "
+    "(R13 veto). "
+    "Result: BackgroundSafetyClassification. "
+    "Next actions: macro_run once classified."
 )
 _DESC_JOB_GET = (
-    "Return one job's status/result by job_id (poll; never touches COM). Long ops "
-    "return {status:'running', job_id, poll_after_s} promptly; re-call job_get no "
-    "sooner than poll_after_s. status is one of queued/running/succeeded/failed/"
-    "expired/unknown/interrupted_unknown; the result is available once terminal. "
-    "interrupted_unknown (outcome='unknown', retryable=false) is a job left "
-    "non-terminal by a prior process: it is never completed and never auto-retried."
+    "Purpose: Return one job's status/result by job_id (poll; never touches COM). "
+    "Use when: you hold a job_id from a background=true call and want its state. "
+    "Preconditions: a job_id from a long-op handle. "
+    "Parameters: job_id. "
+    "Behavior: re-call no sooner than poll_after_s; status is one of "
+    "queued/running/succeeded/failed/expired/unknown/interrupted_unknown; the "
+    "result is available once terminal. interrupted_unknown (outcome='unknown', "
+    "retryable=false) is a job left non-terminal by a prior process — never "
+    "completed and never auto-retried; SUSPECTED_STALLED means a soft deadline "
+    "was exceeded and the op was left running (not confirmed hung) — see "
+    "xlvba://glossary. "
+    "Result: JobStatus. "
+    "Next actions: job_cancel to record cancel intent; excel_recover to actually "
+    "stop a wedged op."
 )
 _DESC_JOB_CANCEL = (
-    "Record a job's cancel intent (intent-only; never interrupts the running COM "
-    "call). The single-STA operation runs to completion; a poller observes "
-    "cancel_requested on the job status."
+    "Purpose: Record a job's cancel intent. "
+    "Use when: you want to signal a long op to stop at its next checkpoint. "
+    "Do not use when: you expect it to interrupt the running COM call — it is "
+    "intent-only; never interrupts; observe cancel_requested via job_get and use "
+    "excel_recover to actually stop a wedged process. "
+    "Preconditions: a non-terminal job_id. "
+    "Behavior: sets cancel_requested=True only if non-terminal; the single-STA "
+    "COM call runs to completion and a poller observes cancel_requested. "
+    "Result: JobStatus. "
+    "Next actions: job_get to observe; excel_recover if it must be stopped."
 )
 _DESC_SHEETS_LIST = (
     "List every sheet of an open workbook (all types: Worksheet / Chart / Macro "
@@ -376,30 +505,44 @@ _DESC_SHEETS_LIST = (
 )
 _DESC_SHEET_GET = "Return one sheet's SheetInfo by name (Sheets vs Worksheets aware)."
 _DESC_SHEET_ADD = (
-    "Add a worksheet (MVP: Worksheet only). Guarded mutation: requires a writable "
-    "session and a snapshot; allowed by default (full-access policy), with approval "
-    "required only in restricted mode."
+    "Purpose: Add a worksheet. "
+    "Use when: you need a new sheet in an open workbook. "
+    "Do not use when: you need a non-worksheet sheet — only 'worksheet' is "
+    "supported (others rejected). "
+    "Preconditions: writable session + snapshot + approval (full-access default; "
+    "restricted requires approval) + postcondition re-read. "
+    "Parameters: workbook_id; name; sheet_type='worksheet' (default). "
+    "Behavior: creates the sheet and returns its DTO. "
+    "Result: SheetInfo. "
+    "Next actions: range_write_values / table_create to populate it."
 )
 _DESC_SHEET_RENAME = (
-    "Rename a sheet; CodeName is never changed. Guarded mutation: requires a "
-    "writable session and a snapshot; allowed by default (full-access policy), "
-    "with approval required only in restricted mode."
+    "Rename a sheet; CodeName is never changed. Guarded mutation: writable "
+    "session + snapshot + approval (full-access default; restricted requires "
+    "approval) + postcondition re-read."
 )
 _DESC_SHEET_COPY = (
-    "Copy a sheet and return the new sheet's DTO. Guarded mutation: requires a "
-    "writable session and a snapshot; allowed by default (full-access policy), "
-    "with approval required only in restricted mode."
+    "Purpose: Copy a sheet and return the new sheet's DTO. "
+    "Use when: you need an in-workbook duplicate of an existing sheet. "
+    "Do not use when: you need a cross-workbook copy or an arbitrary position — "
+    "neither is supported. "
+    "Preconditions: writable session + snapshot + approval (full-access default; "
+    "restricted requires approval) + postcondition re-read. "
+    "Parameters: workbook_id; name (source sheet). "
+    "Behavior: the copy's name is generated by Excel (typically '<name> (2)'). "
+    "Result: SheetInfo. "
+    "Next actions: sheet_rename to give the copy a deliberate name."
 )
 _DESC_SHEET_DELETE = (
-    "Delete a sheet (destructive). Requires a writable session and a snapshot; "
-    "allowed by default (full-access policy), with approval required only in "
-    "restricted mode; rejected when it would leave no visible worksheet."
+    "Delete a sheet (destructive). Guarded mutation: writable session + snapshot "
+    "+ approval (full-access default; restricted requires approval) + postcondition "
+    "re-read. Rejected when it would leave no visible worksheet."
 )
 _DESC_SHEET_SET_VISIBILITY = (
     "Set a sheet's visibility (xlSheetVisible / xlSheetHidden). Guarded mutation: "
-    "requires a writable session and a snapshot; allowed by default (full-access "
-    "policy), with approval required only in restricted mode; hiding the last "
-    "visible worksheet is rejected."
+    "writable session + snapshot + approval (full-access default; restricted "
+    "requires approval) + postcondition re-read. Hiding the last visible worksheet "
+    "is rejected."
 )
 _DESC_TABLES_LIST = (
     "List every Excel Table (ListObject) of an open workbook with name, sheet, "
@@ -416,40 +559,72 @@ _DESC_TABLE_READ_ROWS = (
     "date/Excel error) and the response is size-limited (truncated flag)."
 )
 _DESC_TABLE_APPEND_ROWS = (
-    "Append rows through ListRows.Add (table structure preserved). Guarded "
-    "mutation: requires a writable session and a snapshot; allowed by default "
-    "(full-access policy), with approval required only in restricted mode."
+    "Purpose: Append rows through ListRows.Add (table structure preserved). "
+    "Use when: you want to add records to the end of an Excel Table. "
+    "Do not use when: you need to update or delete existing rows — use "
+    "table_update_rows / table_delete_rows. "
+    "Preconditions: writable session + snapshot + approval (full-access default; "
+    "restricted requires approval) + postcondition re-read. "
+    "Parameters: workbook_id; name; rows is a non-empty list of {header: value} "
+    "objects; headers must match the table columns (case-insensitive). "
+    "Behavior: appends the rows and returns the new row count. "
+    "Result: TableMutationResult. "
+    "Next actions: table_read_rows to verify the appended data."
 )
 _DESC_TABLE_INSERT_ROW = (
     "Insert one data row at a 1-based position via ListRows.Add. Guarded mutation: "
-    "requires a writable session and a snapshot; allowed by default (full-access "
-    "policy), with approval required only in restricted mode."
+    "writable session + snapshot + approval (full-access default; restricted "
+    "requires approval) + postcondition re-read."
 )
 _DESC_TABLE_UPDATE_ROWS = (
-    "Update rows by explicit index or an unambiguous where filter. Ambiguous "
-    "filters are rejected with a preview (no auto-guess). Guarded mutation: "
-    "writable session + snapshot + approval."
+    "Purpose: Update rows by explicit index or an unambiguous where filter. "
+    "Use when: you need to change values in existing Table rows. "
+    "Do not use when: you need to add rows — use table_append_rows; to delete rows "
+    "use table_delete_rows. "
+    "Preconditions: writable session + snapshot + approval (full-access default; "
+    "restricted requires approval) + postcondition re-read. "
+    "Parameters: updates=[{index|where, values}] — exactly one selector per entry; "
+    "a where that matches zero or multiple rows is rejected with AMBIGUOUS_FILTER "
+    "(no auto-guess). "
+    "Behavior: applies each update and re-reads the postcondition. "
+    "Result: TableMutationResult. "
+    "Next actions: table_read_rows to verify. "
+    "Example: {\"workbook_id\": \"<id>\", \"name\": \"Sales\", \"updates\": "
+    "[{\"index\": 3, \"values\": {\"Amount\": 250}}, {\"where\": {\"SKU\": "
+    "\"A-1\"}, \"values\": {\"Amount\": 99}}]}"
 )
 _DESC_TABLE_DELETE_ROWS = (
-    "Delete rows by explicit indices or an unambiguous where filter. Ambiguous "
-    "filters are rejected with a preview. Guarded mutation: writable session + "
-    "snapshot + approval."
+    "Purpose: Delete rows by explicit indices or an unambiguous where filter. "
+    "Use when: you need to remove rows from an Excel Table. "
+    "Do not use when: you need to change row values — use table_update_rows. "
+    "Preconditions: writable session + snapshot + approval (full-access default; "
+    "restricted requires approval) + postcondition re-read. "
+    "Parameters: indices (explicit 1-based) or where (object) — exactly one "
+    "selector; a where that matches zero or multiple rows is rejected with "
+    "AMBIGUOUS_FILTER (no auto-guess). "
+    "Behavior: deletes the matched rows and re-reads the postcondition. "
+    "Result: TableMutationResult. "
+    "Next actions: table_read_rows to verify."
 )
 _DESC_TABLE_ADD_COLUMN = (
     "Add a column via ListColumns.Add(Position) with a unique header. Guarded "
-    "mutation: writable session + snapshot + approval."
+    "mutation: writable session + snapshot + approval (full-access default; "
+    "restricted requires approval) + postcondition re-read."
 )
 _DESC_TABLE_DELETE_COLUMN = (
     "Delete the column identified by a unique header. Guarded mutation: writable "
-    "session + snapshot + approval."
+    "session + snapshot + approval (full-access default; restricted requires "
+    "approval) + postcondition re-read."
 )
 _DESC_TABLE_CREATE = (
     "Create a ListObject on a sheet over an A1 range or defined name. Guarded "
-    "mutation: writable session + snapshot + approval."
+    "mutation: writable session + snapshot + approval (full-access default; "
+    "restricted requires approval) + postcondition re-read."
 )
 _DESC_TABLE_RESIZE = (
     "Resize a table to a new A1 range via ListObject.Resize. Guarded mutation: "
-    "writable session + snapshot + approval."
+    "writable session + snapshot + approval (full-access default; restricted "
+    "requires approval) + postcondition re-read."
 )
 _DESC_RANGE_GET = (
     "Resolve an explicit worksheet + A1-style address to Range metadata "
@@ -457,10 +632,17 @@ _DESC_RANGE_GET = (
     "invalid addresses are rejected with a structured error."
 )
 _DESC_RANGE_READ_VALUES = (
-    "Read typed cell values from a bounded Range window. Values are typed "
-    "(empty/string/number/boolean/date/error) with no lossy string coercion; "
-    "offset is a 0-based row index and limit caps the rows. The response is "
-    "size-limited (truncated flag); oversized requests are rejected."
+    "Purpose: Read typed cell values from a bounded Range window. "
+    "Use when: you need cell values (not formulas) from a sheet. "
+    "Do not use when: you need formulas — use range_read_formulas. "
+    "Preconditions: an open workbook_id. "
+    "Parameters: sheet; address; offset (0-based row index); limit. Caps: a "
+    "request over 100000 cells is rejected; the response is capped at 50000 cells "
+    "/ 8 MiB; truncated=true marks a cut-short window. "
+    "Behavior: values are typed (empty/string/number/boolean/date/error) with no "
+    "lossy string coercion. "
+    "Result: RangeValues (rows, cols, values, truncated). "
+    "Next actions: range_get for geometry; range_read_formulas for formulas."
 )
 _DESC_RANGE_READ_FORMULAS = (
     "Read typed formulas from a bounded Range window (Formula2 primary, Formula "
@@ -469,21 +651,39 @@ _DESC_RANGE_READ_FORMULAS = (
     "are rejected."
 )
 _DESC_RANGE_WRITE_VALUES = (
-    "Write typed cell values to a bounded Range. The payload shape is validated "
-    "against the target before any mutation (a wrong-sized payload is rejected "
-    "with no change). A string beginning with '=' is stored as text, not a "
-    "formula. Guarded mutation: requires a writable working copy, a successful "
-    "snapshot and a postcondition re-read; allowed by default (full-access "
-    "policy), with approval required only in restricted mode. Cell writes inside "
-    "an Excel Table are allowed only when the table row/column structure is "
-    "unchanged."
+    "Purpose: Write typed cell values to a bounded Range. "
+    "Use when: you need to set cell values (constants) in a sheet. "
+    "Do not use when: you need formulas — a leading '=' is stored as text here; "
+    "use range_write_formulas. "
+    "Preconditions: this tool does NOT snapshot — call snapshot_create first; then "
+    "writable session + snapshot + approval (full-access default; restricted "
+    "requires approval) + postcondition re-read. "
+    "Parameters: {rows, cols, values}; rows≤100000, cols≤512, cells≤100000; "
+    "address is the top-left anchor; a string beginning with '=' is stored as "
+    "text, not a formula. "
+    "Behavior: the payload shape is validated against the target before any "
+    "mutation (a wrong-sized payload is rejected with no change); cell writes "
+    "inside an Excel Table are allowed only when the table row/column structure is "
+    "unchanged. "
+    "Result: RangeMutationResult. "
+    "Next actions: range_read_values to verify. "
+    "Example: {\"workbook_id\": \"<id>\", \"sheet\": \"Sheet1\", \"address\": "
+    "\"A1\", \"payload\": {\"rows\": 1, \"cols\": 2, \"values\": [[1, 2]]}}"
 )
 _DESC_RANGE_WRITE_FORMULAS = (
-    "Write formulas (Formula2 primary, Formula fallback) to a bounded Range. "
-    "Every entry must be a formula string beginning with '='; a bare constant "
-    "belongs in range_write_values. Guarded mutation: writable session + "
-    "snapshot + approval + postcondition re-read. Cell writes inside an Excel "
-    "Table are allowed only when the table row/column structure is unchanged."
+    "Purpose: Write formulas (Formula2 primary, Formula fallback) to a bounded "
+    "Range. "
+    "Use when: you need to set formula strings beginning with '='. "
+    "Do not use when: you need literal '=' text — use range_write_values (which "
+    "stores a leading '=' as text). "
+    "Preconditions: writable session + snapshot + approval (full-access default; "
+    "restricted requires approval) + postcondition re-read. "
+    "Parameters: every entry must be a formula string beginning with '='; a bare "
+    "constant belongs in range_write_values. "
+    "Behavior: cell writes inside an Excel Table are allowed only when the table "
+    "row/column structure is unchanged. "
+    "Result: RangeMutationResult. "
+    "Next actions: range_read_formulas to verify."
 )
 _DESC_RANGE_GET_FORMAT = (
     "Read bounded, tri-state formatting for a Range: number_format, font "
@@ -496,8 +696,8 @@ _DESC_RANGE_SET_FORMAT = (
     "Apply a partial formatting update to a Range. Only the fields explicitly "
     "set in the patch are written; absent fields are left untouched. Values and "
     "enums are validated before any mutation; a null clears to automatic only "
-    "where Excel allows. Guarded mutation: writable session + snapshot + "
-    "approval + postcondition re-read."
+    "where Excel allows. Guarded mutation: writable session + snapshot + approval "
+    "(full-access default; restricted requires approval) + postcondition re-read."
 )
 _DESC_RANGE_COPY = (
     "Copy a Range to an explicit destination (same workbook, no clipboard). The "
@@ -505,35 +705,39 @@ _DESC_RANGE_COPY = (
     "mismatched destination or a destination intersecting merged cells is "
     "rejected. Structural copies that intersect an Excel Table (ListObject) are "
     "rejected and routed to the table tools. Guarded mutation: writable session "
-    "+ snapshot + approval + postcondition re-read."
+    "+ snapshot + approval (full-access default; restricted requires approval) + "
+    "postcondition re-read."
 )
 _DESC_RANGE_INSERT = (
     "Insert cells at an explicit address and shift them in an explicit direction "
     "('right' or 'down'). An omitted/unknown shift is rejected (never guessed). "
     "Rejected for a protected sheet, an Excel Table (ListObject) intersection, a "
     "dynamic-array spill range, or merged cells without allow_merged. Guarded "
-    "mutation: writable session + snapshot + approval + postcondition re-read."
+    "mutation: writable session + snapshot + approval (full-access default; "
+    "restricted requires approval) + postcondition re-read."
 )
 _DESC_RANGE_DELETE = (
     "Delete cells at an explicit address and shift the remainder in an explicit "
     "direction ('left' or 'up'). An omitted/unknown shift is rejected (never "
     "guessed). Rejected for a protected sheet, an Excel Table (ListObject) "
     "intersection, a dynamic-array spill range, or merged cells without "
-    "allow_merged. Guarded mutation: writable session + snapshot + approval + "
-    "postcondition re-read."
+    "allow_merged. Guarded mutation: writable session + snapshot + approval "
+    "(full-access default; restricted requires approval) + postcondition re-read."
 )
 _DESC_RANGE_MERGE = (
     "Merge a Range into one cell (or one cell per row with across=true). Merging "
     "discards non-anchor data: the preflight reports the affected cells and the "
     "merge is blocked unless allow_data_loss=true is passed after review. "
     "Rejected for a protected sheet, an Excel Table (ListObject) intersection or "
-    "a spill range. Guarded mutation: writable session + snapshot + approval."
+    "a spill range. Guarded mutation: writable session + snapshot + approval "
+    "(full-access default; restricted requires approval) + postcondition re-read."
 )
 _DESC_RANGE_UNMERGE = (
     "Unmerge every merged area intersecting an explicit target. Rejected when no "
     "merged area intersects the target, for a protected sheet, or for an Excel "
     "Table (ListObject) intersection. Guarded mutation: writable session + "
-    "snapshot + approval + postcondition re-read."
+    "snapshot + approval (full-access default; restricted requires approval) + "
+    "postcondition re-read."
 )
 _DESC_RANGE_GET_VALIDATION = (
     "Read the data-validation rule of a Range (type, Formula1/Formula2, operator, "
@@ -548,7 +752,8 @@ _DESC_RANGE_SET_VALIDATION = (
     "strings bounded at 255 characters and are never evaluated; a missing operand, "
     "an over-long formula or an unsupported type is rejected before any mutation. "
     "An existing rule is modified so unspecified properties are preserved. Guarded "
-    "mutation: writable session + snapshot + approval + postcondition re-read."
+    "mutation: writable session + snapshot + approval (full-access default; "
+    "restricted requires approval) + postcondition re-read."
 )
 _DESC_RANGE_GET_CONDITIONAL_FORMATTING = (
     "Read the conditional-formatting rules applying to a Range in ascending "
@@ -562,8 +767,12 @@ _DESC_RANGE_SET_CONDITIONAL_FORMATTING = (
     "modify, delete). spec.priority is the only stable rule identity and is "
     "required for modify/delete; a rule type is never silently converted. "
     "Priorities are sheet-wide: assigning one renumbers the other rules. "
-    "ColorScale / DataBar / IconSet are rejected explicitly. Guarded mutation: "
-    "writable session + snapshot + approval + postcondition re-read."
+    "spec.type is the plain FormatCondition set only (cell_value, expression, "
+    "text_string, blanks, no_blanks, errors, no_errors, time_period, top10, "
+    "above_average, unique_values); color_scale, data_bar, icon_set and unsupported "
+    "are not accepted — use range_get_conditional_formatting to read those rule "
+    "types (reported supported=false). Guarded mutation: writable session + "
+    "snapshot + approval + postcondition re-read."
 )
 _DESC_NAMES_LIST = (
     "List every defined name (Named Range) of an open workbook across workbook "
@@ -576,18 +785,34 @@ _DESC_NAME_GET = (
     "'worksheet'; worksheet scope also requires the owning sheet)."
 )
 _DESC_NAME_CREATE = (
-    "Create a defined name in an explicit scope. Guarded mutation: requires a "
-    "writable session and a snapshot; allowed by default (full-access policy), "
-    "with approval required only in restricted mode; duplicate and cross-scope "
-    "conflicts are rejected."
+    "Purpose: Create a defined name in an explicit scope. "
+    "Use when: you need a named range or constant in an open workbook. "
+    "Do not use when: you need to change an existing name — use name_update. "
+    "Preconditions: writable session + snapshot + approval (full-access default; "
+    "restricted requires approval) + postcondition re-read. "
+    "Parameters: workbook_id; name; refers_to (may be given with or without a "
+    "leading '=', normalized); scope ('workbook' or 'worksheet' + owning sheet). "
+    "Behavior: duplicate and cross-scope conflicts are rejected. "
+    "Result: DefinedNameInfo. "
+    "Next actions: names_list to confirm."
 )
 _DESC_NAME_UPDATE = (
-    "Update a defined name's RefersTo in an explicit scope (scope is preserved). "
-    "Guarded mutation: writable session + snapshot + approval."
+    "Purpose: Update a defined name's RefersTo in an explicit scope (scope is "
+    "preserved). "
+    "Use when: you need to repoint an existing defined name. "
+    "Do not use when: the name does not exist yet — use name_create. "
+    "Preconditions: writable session + snapshot + approval (full-access default; "
+    "restricted requires approval) + postcondition re-read. "
+    "Parameters: refers_to may be given with or without a leading '=' "
+    "(normalized). "
+    "Behavior: scope is preserved; the postcondition is re-read. "
+    "Result: DefinedNameInfo. "
+    "Next actions: name_get to confirm."
 )
 _DESC_NAME_DELETE = (
     "Delete a defined name in an explicit scope. Guarded mutation: writable "
-    "session + snapshot + approval. Returns the pre-delete name."
+    "session + snapshot + approval (full-access default; restricted requires "
+    "approval) + postcondition re-read. Returns the pre-delete name."
 )
 _DESC_SHAPES_LIST = (
     "List every drawing shape of an open workbook (all worksheets) with name, "
@@ -598,9 +823,9 @@ _DESC_SHAPES_LIST = (
 _DESC_SHAPE_GET = "Return one shape's ShapeInfo by name (case-insensitive)."
 _DESC_SHAPE_SET_ON_ACTION = (
     "Assign OnAction to a shape (the macro is NOT executed). Guarded mutation: "
-    "requires a writable session and a snapshot; allowed by default (full-access "
-    "policy), with approval required only in restricted mode. An empty "
-    "macro_name clears the assignment."
+    "writable session + snapshot + approval (full-access default; restricted "
+    "requires approval) + postcondition re-read. An empty macro_name clears the "
+    "assignment."
 )
 _DESC_CONTROLS_LIST = (
     "List every Form Control and ActiveX control of an open workbook. Form "
@@ -611,9 +836,9 @@ _DESC_CONTROLS_LIST = (
 _DESC_CONTROL_GET = "Return one control's ControlEntry by name (case-insensitive)."
 _DESC_CONTROL_SET_ON_ACTION = (
     "Assign OnAction to a Form Control (the macro is NOT executed; ActiveX "
-    "controls are rejected). Guarded mutation: requires a writable session and a "
-    "snapshot; allowed by default (full-access policy), with approval required "
-    "only in restricted mode."
+    "controls are rejected). Guarded mutation: writable session + snapshot + "
+    "approval (full-access default; restricted requires approval) + postcondition "
+    "re-read."
 )
 _DESC_WORKBOOK_GET_MODEL = (
     "Return the aggregated Stage 1 workbook model: sheets, tables, names, shapes, "
@@ -660,7 +885,8 @@ _DESC_PIVOT_TABLE_REFRESH = (
     "(affected_pivot_tables), the RefreshDate before/after and a refreshed "
     "status confirmed by Excel's truth signal (the RefreshTable Boolean and/or "
     "an advanced RefreshDate), never by the absence of a COM exception. "
-    "Guarded mutation: writable session + snapshot + approval + audit."
+    "Guarded mutation: writable session + snapshot + approval (full-access "
+    "default; restricted requires approval) + postcondition re-read."
 )
 _DESC_PIVOT_CACHE_REFRESH = (
     "Refresh one PivotCache via PivotCache.Refresh (cache-scoped). A cache is "
@@ -669,14 +895,14 @@ _DESC_PIVOT_CACHE_REFRESH = (
     "external/OLAP/Data Model sources return unsupported_source. PivotCache."
     "Refresh returns no Boolean, so success is confirmed by the shared "
     "RefreshDate advancing. Never touches Workbook.RefreshAll or unrelated "
-    "connections/queries. Guarded mutation: writable session + snapshot + "
-    "approval + audit."
+    "connections/queries. Guarded mutation: writable session + snapshot + approval "
+    "(full-access default; restricted requires approval) + postcondition re-read."
 )
 _DESC_PIVOT_FIELD_SET_LAYOUT = (
-    "Set one PivotField's orientation bucket (hidden/row/column/page), or "
-    "remove it. orientation='data' is rejected: assigning xlDataField does not "
-    "create a data field, so use pivot_field_set_aggregation "
-    "(PivotTable.AddDataField) for the data area. Removal is explicit: "
+    "Set one PivotField's orientation bucket, or remove it. orientation is limited "
+    "to hidden/row/column/page; 'data' is not accepted (assigning xlDataField does "
+    "not create a data field, so use pivot_field_set_aggregation "
+    "(PivotTable.AddDataField) for the data area). Removal is explicit: "
     "orientation='hidden' (default) is the non-destructive "
     "PivotField.Orientation=0 (the field and its items/filter state stay), "
     "while orientation='hidden' with delete=true is the destructive "
@@ -691,8 +917,9 @@ _DESC_PIVOT_FIELD_SET_POSITION = (
     "fields are rejected before any COM mutation; the resulting orientation "
     "order is recorded in the audit entry. External/OLAP/Data Model sources are "
     "rejected with unsupported_source. The returned PivotFieldInfo is the "
-    "post-mutation state re-read from the PivotTable. Guarded mutation: "
-    "writable session + snapshot + approval + audit + postcondition."
+    "post-mutation state re-read from the PivotTable. Guarded mutation: writable "
+    "session + snapshot + approval (full-access default; restricted requires "
+    "approval) + postcondition re-read."
 )
 _DESC_PIVOT_FIELD_SET_AGGREGATION = (
     "Add or update one data field's aggregation. An existing data field on the "
@@ -704,7 +931,8 @@ _DESC_PIVOT_FIELD_SET_AGGREGATION = (
     "pre-validated here and rejected by Excel). External/OLAP/Data Model "
     "sources are rejected with unsupported_source. The returned PivotFieldInfo "
     "is the post-mutation state re-read from the PivotTable. Guarded mutation: "
-    "writable session + snapshot + approval + audit + postcondition."
+    "writable session + snapshot + approval (full-access default; restricted "
+    "requires approval) + postcondition re-read."
 )
 _DESC_PIVOT_FIELD_SET_PROPERTIES = (
     "Set bounded PivotField properties (caption / number_format / "
@@ -714,8 +942,9 @@ _DESC_PIVOT_FIELD_SET_PROPERTIES = (
     "An empty patch, a blank caption/number format or a duplicate caption is "
     "rejected before any COM mutation. External/OLAP/Data Model sources are "
     "rejected with unsupported_source. The returned PivotFieldInfo is the "
-    "post-mutation state re-read from the PivotTable. Guarded mutation: "
-    "writable session + snapshot + approval + audit + postcondition."
+    "post-mutation state re-read from the PivotTable. Guarded mutation: writable "
+    "session + snapshot + approval (full-access default; restricted requires "
+    "approval) + postcondition re-read."
 )
 
 _DESC_PIVOT_FIELD_GET_FILTERS = (
@@ -726,10 +955,11 @@ _DESC_PIVOT_FIELD_GET_FILTERS = (
 )
 _DESC_PIVOT_FIELD_APPLY_FILTER = (
     "Apply a supported manual (visible-items) filter to one PivotField by setting "
-    "PivotItems[i].Visible. Only the manual kind is supported: label, value, date "
-    "and top/bottom filters (PivotFilters.Add) are unsupported on the target "
-    "build, return an explicit unsupported result with filter.supported=false and "
-    "a reason, and are never silently converted into a manual filter. The request "
+    "PivotItems[i].Visible. spec.kind is manual only; label, value, date and "
+    "top_bottom are not accepted (rejected at the request layer) — use "
+    "pivot_field_get_filters to read those filter kinds (reported with "
+    "filter.supported=false). A manual request on a page field returns an explicit "
+    "unsupported result and is never silently converted. The request "
     "(field identity, item names, duplicates, size) is validated before any "
     "mutation. External/OLAP/Data Model sources are rejected with "
     "unsupported_source. The returned PivotFieldFilters is the post-mutation state "
@@ -742,8 +972,8 @@ _DESC_PIVOT_FIELD_CLEAR_FILTERS = (
     "calls PivotTable.ClearAllFilters for the whole PivotTable and returns a "
     "table-level result whose field is empty. External/OLAP/Data Model sources are "
     "rejected with unsupported_source. The result is confirmed by a post-mutation "
-    "re-read. Guarded mutation: writable session + snapshot + approval + audit + "
-    "postcondition."
+    "re-read. Guarded mutation: writable session + snapshot + approval "
+    "(full-access default; restricted requires approval) + postcondition re-read."
 )
 
 # Read-only MCP resource descriptions (spec §6.6). The URIs are per-workbook
@@ -767,6 +997,31 @@ _DESC_RES_TEST_RUN = (
     "Read-only summary of one declarative test run (JSON): suite, overall status, "
     "baseline snapshot id, per-case statuses/steps/assertions and the artifact "
     "references. Never touches Excel and never re-runs anything."
+)
+# Description for the read-only xlvba_environment tool (registered by U2). Kept
+# here with the other descriptions so the contract is stable; it is non-COM and
+# side-effect-free and never authorizes a mutation.
+_DESC_ENVIRONMENT = (
+    "Purpose: Report the server's access mode, policy, build and capabilities "
+    "without touching COM. "
+    "Use when: you need to know the access mode, whether mutations need a grant, "
+    "the snapshot gate, path roots, macro gates or the honest build (always "
+    "null). "
+    "Do not use when: you need worker/session liveness — use excel_health; for a "
+    "pure liveness probe use server_health. "
+    "Preconditions: none (non-COM, side-effect-free, read-only). "
+    "Behavior: never creates snapshots, grants or classifications; "
+    "policy.classification_is_authorization=false is stated explicitly; build is "
+    "null (no 4-part source); excel.available=false when the worker is down. "
+    "Result: EnvironmentReport (server, excel, capabilities, policy, "
+    "glossary_uri, workbooks). "
+    "Next actions: excel_open / snapshot_create as the policy requires."
+)
+_DESC_RES_GLOSSARY = (
+    "Read-only glossary (Markdown) of the server's jargon: R13, BG06, preflight, "
+    "truth signal, fail-closed, RECOVERY, STA, Stage 1, normalized source hash, "
+    "SUSPECTED_STALLED, interrupted_unknown, indeterminate, working copy and the "
+    "snapshot gate. Static; never touches Excel."
 )
 
 
@@ -1031,6 +1286,17 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         logger.error("Invalid server configuration: %s", exc)
         raise
     runtime = _build_runtime(config)
+    # Publish the read-only environment runtime (U2) and the in-memory snapshot
+    # gate unconditionally (before the worker start) so ``xlvba_environment`` and
+    # ``excel_get_status`` report truthfully even when the worker is down
+    # (``excel.available=false``). This is non-COM and never starts the worker.
+    runtime.session.set_snapshot_gate(runtime.snapshot.has_snapshot)
+    environment_tools.set_environment_runtime(
+        config=config.server,
+        session=runtime.session,
+        snapshot=runtime.snapshot,
+        path_policy=runtime.path_policy,
+    )
     runtime.audit.record(
         tool="server_startup",
         operation_class="config",
@@ -1082,6 +1348,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
     finally:
         workbook_tools.set_session_service(None)
         workbook_tools.set_workbook_model_service(None)
+        environment_tools.clear_environment_runtime()
         test_tools.set_snapshot_service(None)
         test_tools.set_test_runner(None)
         vba_tools.set_vba_project_service(None)
@@ -1473,234 +1740,643 @@ def _configure_logging() -> None:
     )
 
 
+# Truthful MCP ``ToolAnnotations`` (U3; plan_03 §11). Derived from each tool's
+# access class; emitted on every ``add_tool`` call. These are hints only (client
+# display is best-effort; Kilo approval is name-glob based) — they never change
+# enforcement. ``macro_run`` and ``vba_compile`` are intentionally NOT read-only.
+_ANN_READ_ONLY = frozenset(
+    {
+        "excel_get_status",
+        "excel_list_workbooks",
+        "excel_health",
+        "xlvba_environment",
+        "snapshot_list",
+        "snapshot_diff",
+        "test_get_run",
+        "vba_project_info",
+        "vba_list_components",
+        "vba_list_procedures",
+        "vba_read_component",
+        "vba_get_references",
+        "vba_search_code",
+        "vba_get_compile_diagnostics",
+        "macro_list",
+        "macro_get_last_result",
+        "job_get",
+        "sheets_list",
+        "sheet_get",
+        "tables_list",
+        "table_get",
+        "table_read_rows",
+        "pivot_tables_list",
+        "pivot_table_get",
+        "pivot_cache_get",
+        "pivot_fields_list",
+        "pivot_field_get_filters",
+        "range_get",
+        "range_read_values",
+        "range_read_formulas",
+        "range_get_format",
+        "range_get_validation",
+        "range_get_conditional_formatting",
+        "names_list",
+        "name_get",
+        "shapes_list",
+        "shape_get",
+        "controls_list",
+        "control_get",
+        "workbook_get_model",
+    }
+)
+_ANN_DESTRUCTIVE = frozenset(
+    {
+        "sheet_delete",
+        "range_merge",
+        "excel_recover",
+        "snapshot_restore",
+        "table_delete_rows",
+        "name_delete",
+        "range_delete",
+        "vba_replace_component_source",
+        "vba_insert_code",
+    }
+)
+_ANN_IDEMPOTENT = frozenset(
+    {
+        "range_write_values",
+        "range_write_formulas",
+        "range_set_format",
+        "range_copy",
+        "range_merge",
+        "range_unmerge",
+        "range_set_validation",
+        "range_set_conditional_formatting",
+        "table_update_rows",
+        "table_resize",
+        "sheet_rename",
+        "sheet_set_visibility",
+        "pivot_table_refresh",
+        "pivot_cache_refresh",
+        "pivot_field_set_layout",
+        "pivot_field_set_position",
+        "pivot_field_set_aggregation",
+        "pivot_field_set_properties",
+        "pivot_field_apply_filter",
+        "pivot_field_clear_filters",
+        "name_create",
+        "name_update",
+        "shape_set_on_action",
+        "control_set_on_action",
+        "vba_replace_component_source",
+    }
+)
+
+
+def _annotations(name: str) -> ToolAnnotations:
+    """Build truthful :class:`ToolAnnotations` for one tool by name (U3 §11)."""
+
+    return ToolAnnotations(
+        read_only_hint=True if name in _ANN_READ_ONLY else None,
+        destructive_hint=True if name in _ANN_DESTRUCTIVE else None,
+        idempotent_hint=True if name in _ANN_IDEMPOTENT else None,
+    )
+
+
 def _register_tools(server: MCPServer) -> None:
     """Register the base workbook/session tools on ``server``."""
-
-    server.add_tool(excel_open, name="excel_open", description=_DESC_OPEN)
-    server.add_tool(excel_close, name="excel_close", description=_DESC_CLOSE)
-    server.add_tool(excel_save, name="excel_save", description=_DESC_SAVE)
-    server.add_tool(excel_get_status, name="excel_get_status", description=_DESC_STATUS)
-    server.add_tool(excel_list_workbooks, name="excel_list_workbooks", description=_DESC_LIST)
-    server.add_tool(excel_health, name="excel_health", description=_DESC_HEALTH)
-    server.add_tool(excel_recover, name="excel_recover", description=_DESC_EXCEL_RECOVER)
-    server.add_tool(snapshot_create, name="snapshot_create", description=_DESC_SNAPSHOT_CREATE)
-    server.add_tool(snapshot_list, name="snapshot_list", description=_DESC_SNAPSHOT_LIST)
-    server.add_tool(snapshot_restore, name="snapshot_restore", description=_DESC_SNAPSHOT_RESTORE)
-    server.add_tool(snapshot_diff, name="snapshot_diff", description=_DESC_SNAPSHOT_DIFF)
-    server.add_tool(test_run_suite, name="test_run_suite", description=_DESC_TEST_RUN_SUITE)
-    server.add_tool(test_suite_run, name="test_suite_run", description=_DESC_TEST_SUITE_RUN)
-    server.add_tool(test_get_run, name="test_get_run", description=_DESC_TEST_GET_RUN)
-    server.add_tool(vba_project_info, name="vba_project_info", description=_DESC_VBA_PROJECT_INFO)
     server.add_tool(
-        vba_list_components, name="vba_list_components", description=_DESC_VBA_LIST_COMPONENTS
+        excel_open, name="excel_open", description=_DESC_OPEN, annotations=_annotations("excel_open")
     )
     server.add_tool(
-        vba_list_procedures, name="vba_list_procedures", description=_DESC_VBA_LIST_PROCEDURES
+        excel_close,
+        name="excel_close",
+        description=_DESC_CLOSE,
+        annotations=_annotations("excel_close"),
     )
     server.add_tool(
-        vba_read_component, name="vba_read_component", description=_DESC_VBA_READ_COMPONENT
+        excel_save, name="excel_save", description=_DESC_SAVE, annotations=_annotations("excel_save")
     )
     server.add_tool(
-        vba_export_project, name="vba_export_project", description=_DESC_VBA_EXPORT_PROJECT
+        excel_get_status,
+        name="excel_get_status",
+        description=_DESC_STATUS,
+        annotations=_annotations("excel_get_status"),
     )
     server.add_tool(
-        vba_get_references, name="vba_get_references", description=_DESC_VBA_GET_REFERENCES
+        excel_list_workbooks,
+        name="excel_list_workbooks",
+        description=_DESC_LIST,
+        annotations=_annotations("excel_list_workbooks"),
     )
-    server.add_tool(vba_search_code, name="vba_search_code", description=_DESC_VBA_SEARCH_CODE)
+    server.add_tool(
+        excel_health,
+        name="excel_health",
+        description=_DESC_HEALTH,
+        annotations=_annotations("excel_health"),
+    )
+    server.add_tool(
+        excel_recover,
+        name="excel_recover",
+        description=_DESC_EXCEL_RECOVER,
+        annotations=_annotations("excel_recover"),
+    )
+    server.add_tool(
+        snapshot_create,
+        name="snapshot_create",
+        description=_DESC_SNAPSHOT_CREATE,
+        annotations=_annotations("snapshot_create"),
+    )
+    server.add_tool(
+        snapshot_list,
+        name="snapshot_list",
+        description=_DESC_SNAPSHOT_LIST,
+        annotations=_annotations("snapshot_list"),
+    )
+    server.add_tool(
+        snapshot_restore,
+        name="snapshot_restore",
+        description=_DESC_SNAPSHOT_RESTORE,
+        annotations=_annotations("snapshot_restore"),
+    )
+    server.add_tool(
+        snapshot_diff,
+        name="snapshot_diff",
+        description=_DESC_SNAPSHOT_DIFF,
+        annotations=_annotations("snapshot_diff"),
+    )
+    server.add_tool(
+        test_run_suite,
+        name="test_run_suite",
+        description=_DESC_TEST_RUN_SUITE,
+        annotations=_annotations("test_run_suite"),
+    )
+    server.add_tool(
+        test_suite_run,
+        name="test_suite_run",
+        description=_DESC_TEST_SUITE_RUN,
+        annotations=_annotations("test_suite_run"),
+    )
+    server.add_tool(
+        test_get_run,
+        name="test_get_run",
+        description=_DESC_TEST_GET_RUN,
+        annotations=_annotations("test_get_run"),
+    )
+    server.add_tool(
+        vba_project_info,
+        name="vba_project_info",
+        description=_DESC_VBA_PROJECT_INFO,
+        annotations=_annotations("vba_project_info"),
+    )
+    server.add_tool(
+        vba_list_components,
+        name="vba_list_components",
+        description=_DESC_VBA_LIST_COMPONENTS,
+        annotations=_annotations("vba_list_components"),
+    )
+    server.add_tool(
+        vba_list_procedures,
+        name="vba_list_procedures",
+        description=_DESC_VBA_LIST_PROCEDURES,
+        annotations=_annotations("vba_list_procedures"),
+    )
+    server.add_tool(
+        vba_read_component,
+        name="vba_read_component",
+        description=_DESC_VBA_READ_COMPONENT,
+        annotations=_annotations("vba_read_component"),
+    )
+    server.add_tool(
+        vba_export_project,
+        name="vba_export_project",
+        description=_DESC_VBA_EXPORT_PROJECT,
+        annotations=_annotations("vba_export_project"),
+    )
+    server.add_tool(
+        vba_get_references,
+        name="vba_get_references",
+        description=_DESC_VBA_GET_REFERENCES,
+        annotations=_annotations("vba_get_references"),
+    )
+    server.add_tool(
+        vba_search_code,
+        name="vba_search_code",
+        description=_DESC_VBA_SEARCH_CODE,
+        annotations=_annotations("vba_search_code"),
+    )
     server.add_tool(
         vba_replace_component_source,
         name="vba_replace_component_source",
         description=_DESC_VBA_REPLACE_COMPONENT_SOURCE,
+        annotations=_annotations("vba_replace_component_source"),
     )
     server.add_tool(
         vba_insert_code,
         name="vba_insert_code",
         description=_DESC_VBA_INSERT_CODE,
+        annotations=_annotations("vba_insert_code"),
     )
-    server.add_tool(vba_compile, name="vba_compile", description=_DESC_VBA_COMPILE)
+    server.add_tool(
+        vba_compile,
+        name="vba_compile",
+        description=_DESC_VBA_COMPILE,
+        annotations=_annotations("vba_compile"),
+    )
     server.add_tool(
         vba_get_compile_diagnostics,
         name="vba_get_compile_diagnostics",
         description=_DESC_VBA_GET_COMPILE_DIAGNOSTICS,
+        annotations=_annotations("vba_get_compile_diagnostics"),
     )
-    server.add_tool(macro_list, name="macro_list", description=_DESC_MACRO_LIST)
-    server.add_tool(macro_run, name="macro_run", description=_DESC_MACRO_RUN)
+    server.add_tool(
+        macro_list,
+        name="macro_list",
+        description=_DESC_MACRO_LIST,
+        annotations=_annotations("macro_list"),
+    )
+    server.add_tool(
+        macro_run, name="macro_run", description=_DESC_MACRO_RUN, annotations=_annotations("macro_run")
+    )
     server.add_tool(
         macro_classify_background,
         name="macro_classify_background",
         description=_DESC_MACRO_CLASSIFY_BACKGROUND,
+        annotations=_annotations("macro_classify_background"),
     )
     server.add_tool(
         macro_get_last_result,
         name="macro_get_last_result",
         description=_DESC_MACRO_GET_LAST_RESULT,
+        annotations=_annotations("macro_get_last_result"),
     )
-    server.add_tool(job_get, name="job_get", description=_DESC_JOB_GET)
-    server.add_tool(job_cancel, name="job_cancel", description=_DESC_JOB_CANCEL)
-    server.add_tool(sheets_list, name="sheets_list", description=_DESC_SHEETS_LIST)
-    server.add_tool(sheet_get, name="sheet_get", description=_DESC_SHEET_GET)
-    server.add_tool(sheet_add, name="sheet_add", description=_DESC_SHEET_ADD)
-    server.add_tool(sheet_rename, name="sheet_rename", description=_DESC_SHEET_RENAME)
-    server.add_tool(sheet_copy, name="sheet_copy", description=_DESC_SHEET_COPY)
-    server.add_tool(sheet_delete, name="sheet_delete", description=_DESC_SHEET_DELETE)
+    server.add_tool(
+        job_get, name="job_get", description=_DESC_JOB_GET, annotations=_annotations("job_get")
+    )
+    server.add_tool(
+        job_cancel,
+        name="job_cancel",
+        description=_DESC_JOB_CANCEL,
+        annotations=_annotations("job_cancel"),
+    )
+    server.add_tool(
+        sheets_list,
+        name="sheets_list",
+        description=_DESC_SHEETS_LIST,
+        annotations=_annotations("sheets_list"),
+    )
+    server.add_tool(
+        sheet_get,
+        name="sheet_get",
+        description=_DESC_SHEET_GET,
+        annotations=_annotations("sheet_get"),
+    )
+    server.add_tool(
+        sheet_add,
+        name="sheet_add",
+        description=_DESC_SHEET_ADD,
+        annotations=_annotations("sheet_add"),
+    )
+    server.add_tool(
+        sheet_rename,
+        name="sheet_rename",
+        description=_DESC_SHEET_RENAME,
+        annotations=_annotations("sheet_rename"),
+    )
+    server.add_tool(
+        sheet_copy,
+        name="sheet_copy",
+        description=_DESC_SHEET_COPY,
+        annotations=_annotations("sheet_copy"),
+    )
+    server.add_tool(
+        sheet_delete,
+        name="sheet_delete",
+        description=_DESC_SHEET_DELETE,
+        annotations=_annotations("sheet_delete"),
+    )
     server.add_tool(
         sheet_set_visibility,
         name="sheet_set_visibility",
         description=_DESC_SHEET_SET_VISIBILITY,
+        annotations=_annotations("sheet_set_visibility"),
     )
-    server.add_tool(tables_list, name="tables_list", description=_DESC_TABLES_LIST)
-    server.add_tool(table_get, name="table_get", description=_DESC_TABLE_GET)
-    server.add_tool(table_read_rows, name="table_read_rows", description=_DESC_TABLE_READ_ROWS)
+    server.add_tool(
+        tables_list,
+        name="tables_list",
+        description=_DESC_TABLES_LIST,
+        annotations=_annotations("tables_list"),
+    )
+    server.add_tool(
+        table_get,
+        name="table_get",
+        description=_DESC_TABLE_GET,
+        annotations=_annotations("table_get"),
+    )
+    server.add_tool(
+        table_read_rows,
+        name="table_read_rows",
+        description=_DESC_TABLE_READ_ROWS,
+        annotations=_annotations("table_read_rows"),
+    )
     server.add_tool(
         table_append_rows,
         name="table_append_rows",
         description=_DESC_TABLE_APPEND_ROWS,
+        annotations=_annotations("table_append_rows"),
     )
     server.add_tool(
         table_insert_row,
         name="table_insert_row",
         description=_DESC_TABLE_INSERT_ROW,
+        annotations=_annotations("table_insert_row"),
     )
     server.add_tool(
         table_update_rows,
         name="table_update_rows",
         description=_DESC_TABLE_UPDATE_ROWS,
+        annotations=_annotations("table_update_rows"),
     )
     server.add_tool(
         table_delete_rows,
         name="table_delete_rows",
         description=_DESC_TABLE_DELETE_ROWS,
+        annotations=_annotations("table_delete_rows"),
     )
     server.add_tool(
         table_add_column,
         name="table_add_column",
         description=_DESC_TABLE_ADD_COLUMN,
+        annotations=_annotations("table_add_column"),
     )
     server.add_tool(
         table_delete_column,
         name="table_delete_column",
         description=_DESC_TABLE_DELETE_COLUMN,
+        annotations=_annotations("table_delete_column"),
     )
-    server.add_tool(table_create, name="table_create", description=_DESC_TABLE_CREATE)
-    server.add_tool(table_resize, name="table_resize", description=_DESC_TABLE_RESIZE)
     server.add_tool(
-        pivot_tables_list, name="pivot_tables_list", description=_DESC_PIVOT_TABLES_LIST
+        table_create,
+        name="table_create",
+        description=_DESC_TABLE_CREATE,
+        annotations=_annotations("table_create"),
     )
-    server.add_tool(pivot_table_get, name="pivot_table_get", description=_DESC_PIVOT_TABLE_GET)
-    server.add_tool(pivot_cache_get, name="pivot_cache_get", description=_DESC_PIVOT_CACHE_GET)
     server.add_tool(
-        pivot_fields_list, name="pivot_fields_list", description=_DESC_PIVOT_FIELDS_LIST
+        table_resize,
+        name="table_resize",
+        description=_DESC_TABLE_RESIZE,
+        annotations=_annotations("table_resize"),
+    )
+    server.add_tool(
+        pivot_tables_list,
+        name="pivot_tables_list",
+        description=_DESC_PIVOT_TABLES_LIST,
+        annotations=_annotations("pivot_tables_list"),
+    )
+    server.add_tool(
+        pivot_table_get,
+        name="pivot_table_get",
+        description=_DESC_PIVOT_TABLE_GET,
+        annotations=_annotations("pivot_table_get"),
+    )
+    server.add_tool(
+        pivot_cache_get,
+        name="pivot_cache_get",
+        description=_DESC_PIVOT_CACHE_GET,
+        annotations=_annotations("pivot_cache_get"),
+    )
+    server.add_tool(
+        pivot_fields_list,
+        name="pivot_fields_list",
+        description=_DESC_PIVOT_FIELDS_LIST,
+        annotations=_annotations("pivot_fields_list"),
     )
     server.add_tool(
         pivot_table_refresh,
         name="pivot_table_refresh",
         description=_DESC_PIVOT_TABLE_REFRESH,
+        annotations=_annotations("pivot_table_refresh"),
     )
     server.add_tool(
         pivot_cache_refresh,
         name="pivot_cache_refresh",
         description=_DESC_PIVOT_CACHE_REFRESH,
+        annotations=_annotations("pivot_cache_refresh"),
     )
     server.add_tool(
         pivot_field_set_layout,
         name="pivot_field_set_layout",
         description=_DESC_PIVOT_FIELD_SET_LAYOUT,
+        annotations=_annotations("pivot_field_set_layout"),
     )
     server.add_tool(
         pivot_field_set_position,
         name="pivot_field_set_position",
         description=_DESC_PIVOT_FIELD_SET_POSITION,
+        annotations=_annotations("pivot_field_set_position"),
     )
     server.add_tool(
         pivot_field_set_aggregation,
         name="pivot_field_set_aggregation",
         description=_DESC_PIVOT_FIELD_SET_AGGREGATION,
+        annotations=_annotations("pivot_field_set_aggregation"),
     )
     server.add_tool(
         pivot_field_set_properties,
         name="pivot_field_set_properties",
         description=_DESC_PIVOT_FIELD_SET_PROPERTIES,
+        annotations=_annotations("pivot_field_set_properties"),
     )
     server.add_tool(
         pivot_field_get_filters,
         name="pivot_field_get_filters",
         description=_DESC_PIVOT_FIELD_GET_FILTERS,
+        annotations=_annotations("pivot_field_get_filters"),
     )
     server.add_tool(
         pivot_field_apply_filter,
         name="pivot_field_apply_filter",
         description=_DESC_PIVOT_FIELD_APPLY_FILTER,
+        annotations=_annotations("pivot_field_apply_filter"),
     )
     server.add_tool(
         pivot_field_clear_filters,
         name="pivot_field_clear_filters",
         description=_DESC_PIVOT_FIELD_CLEAR_FILTERS,
-    )
-    server.add_tool(range_get, name="range_get", description=_DESC_RANGE_GET)
-    server.add_tool(
-        range_read_values, name="range_read_values", description=_DESC_RANGE_READ_VALUES
+        annotations=_annotations("pivot_field_clear_filters"),
     )
     server.add_tool(
-        range_read_formulas, name="range_read_formulas", description=_DESC_RANGE_READ_FORMULAS
+        range_get,
+        name="range_get",
+        description=_DESC_RANGE_GET,
+        annotations=_annotations("range_get"),
     )
     server.add_tool(
-        range_write_values, name="range_write_values", description=_DESC_RANGE_WRITE_VALUES
+        range_read_values,
+        name="range_read_values",
+        description=_DESC_RANGE_READ_VALUES,
+        annotations=_annotations("range_read_values"),
+    )
+    server.add_tool(
+        range_read_formulas,
+        name="range_read_formulas",
+        description=_DESC_RANGE_READ_FORMULAS,
+        annotations=_annotations("range_read_formulas"),
+    )
+    server.add_tool(
+        range_write_values,
+        name="range_write_values",
+        description=_DESC_RANGE_WRITE_VALUES,
+        annotations=_annotations("range_write_values"),
     )
     server.add_tool(
         range_write_formulas,
         name="range_write_formulas",
         description=_DESC_RANGE_WRITE_FORMULAS,
+        annotations=_annotations("range_write_formulas"),
     )
-    server.add_tool(range_get_format, name="range_get_format", description=_DESC_RANGE_GET_FORMAT)
-    server.add_tool(range_set_format, name="range_set_format", description=_DESC_RANGE_SET_FORMAT)
-    server.add_tool(range_copy, name="range_copy", description=_DESC_RANGE_COPY)
-    server.add_tool(range_insert, name="range_insert", description=_DESC_RANGE_INSERT)
-    server.add_tool(range_delete, name="range_delete", description=_DESC_RANGE_DELETE)
-    server.add_tool(range_merge, name="range_merge", description=_DESC_RANGE_MERGE)
-    server.add_tool(range_unmerge, name="range_unmerge", description=_DESC_RANGE_UNMERGE)
+    server.add_tool(
+        range_get_format,
+        name="range_get_format",
+        description=_DESC_RANGE_GET_FORMAT,
+        annotations=_annotations("range_get_format"),
+    )
+    server.add_tool(
+        range_set_format,
+        name="range_set_format",
+        description=_DESC_RANGE_SET_FORMAT,
+        annotations=_annotations("range_set_format"),
+    )
+    server.add_tool(
+        range_copy,
+        name="range_copy",
+        description=_DESC_RANGE_COPY,
+        annotations=_annotations("range_copy"),
+    )
+    server.add_tool(
+        range_insert,
+        name="range_insert",
+        description=_DESC_RANGE_INSERT,
+        annotations=_annotations("range_insert"),
+    )
+    server.add_tool(
+        range_delete,
+        name="range_delete",
+        description=_DESC_RANGE_DELETE,
+        annotations=_annotations("range_delete"),
+    )
+    server.add_tool(
+        range_merge,
+        name="range_merge",
+        description=_DESC_RANGE_MERGE,
+        annotations=_annotations("range_merge"),
+    )
+    server.add_tool(
+        range_unmerge,
+        name="range_unmerge",
+        description=_DESC_RANGE_UNMERGE,
+        annotations=_annotations("range_unmerge"),
+    )
     server.add_tool(
         range_get_validation,
         name="range_get_validation",
         description=_DESC_RANGE_GET_VALIDATION,
+        annotations=_annotations("range_get_validation"),
     )
     server.add_tool(
         range_set_validation,
         name="range_set_validation",
         description=_DESC_RANGE_SET_VALIDATION,
+        annotations=_annotations("range_set_validation"),
     )
     server.add_tool(
         range_get_conditional_formatting,
         name="range_get_conditional_formatting",
         description=_DESC_RANGE_GET_CONDITIONAL_FORMATTING,
+        annotations=_annotations("range_get_conditional_formatting"),
     )
     server.add_tool(
         range_set_conditional_formatting,
         name="range_set_conditional_formatting",
         description=_DESC_RANGE_SET_CONDITIONAL_FORMATTING,
+        annotations=_annotations("range_set_conditional_formatting"),
     )
-    server.add_tool(names_list, name="names_list", description=_DESC_NAMES_LIST)
-    server.add_tool(name_get, name="name_get", description=_DESC_NAME_GET)
-    server.add_tool(name_create, name="name_create", description=_DESC_NAME_CREATE)
-    server.add_tool(name_update, name="name_update", description=_DESC_NAME_UPDATE)
-    server.add_tool(name_delete, name="name_delete", description=_DESC_NAME_DELETE)
-    server.add_tool(shapes_list, name="shapes_list", description=_DESC_SHAPES_LIST)
-    server.add_tool(shape_get, name="shape_get", description=_DESC_SHAPE_GET)
+    server.add_tool(
+        names_list,
+        name="names_list",
+        description=_DESC_NAMES_LIST,
+        annotations=_annotations("names_list"),
+    )
+    server.add_tool(
+        name_get,
+        name="name_get",
+        description=_DESC_NAME_GET,
+        annotations=_annotations("name_get"),
+    )
+    server.add_tool(
+        name_create,
+        name="name_create",
+        description=_DESC_NAME_CREATE,
+        annotations=_annotations("name_create"),
+    )
+    server.add_tool(
+        name_update,
+        name="name_update",
+        description=_DESC_NAME_UPDATE,
+        annotations=_annotations("name_update"),
+    )
+    server.add_tool(
+        name_delete,
+        name="name_delete",
+        description=_DESC_NAME_DELETE,
+        annotations=_annotations("name_delete"),
+    )
+    server.add_tool(
+        shapes_list,
+        name="shapes_list",
+        description=_DESC_SHAPES_LIST,
+        annotations=_annotations("shapes_list"),
+    )
+    server.add_tool(
+        shape_get,
+        name="shape_get",
+        description=_DESC_SHAPE_GET,
+        annotations=_annotations("shape_get"),
+    )
     server.add_tool(
         shape_set_on_action,
         name="shape_set_on_action",
         description=_DESC_SHAPE_SET_ON_ACTION,
+        annotations=_annotations("shape_set_on_action"),
     )
-    server.add_tool(controls_list, name="controls_list", description=_DESC_CONTROLS_LIST)
-    server.add_tool(control_get, name="control_get", description=_DESC_CONTROL_GET)
+    server.add_tool(
+        controls_list,
+        name="controls_list",
+        description=_DESC_CONTROLS_LIST,
+        annotations=_annotations("controls_list"),
+    )
+    server.add_tool(
+        control_get,
+        name="control_get",
+        description=_DESC_CONTROL_GET,
+        annotations=_annotations("control_get"),
+    )
     server.add_tool(
         control_set_on_action,
         name="control_set_on_action",
         description=_DESC_CONTROL_SET_ON_ACTION,
+        annotations=_annotations("control_set_on_action"),
     )
     server.add_tool(
         workbook_get_model,
         name="workbook_get_model",
         description=_DESC_WORKBOOK_GET_MODEL,
+        annotations=_annotations("workbook_get_model"),
+    )
+    server.add_tool(
+        xlvba_environment,
+        name="xlvba_environment",
+        description=_DESC_ENVIRONMENT,
+        annotations=ToolAnnotations(read_only_hint=True),
     )
 
 
@@ -1831,9 +2507,13 @@ _configure_logging()
 mcp: ExcelVbaMcpServer = ExcelVbaMcpServer("excel-vba-mcp", version=__version__, lifespan=lifespan)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
 def server_health() -> dict[str, str]:
-    """Read-only liveness probe (never touches Excel/COM)."""
+    """Purpose: Read-only liveness probe (never touches Excel/COM).
+
+    Do not use when: you need worker/session state (use excel_health) or access
+    mode / policy / build (use xlvba_environment) — liveness is not policy.
+    """
 
     return {"status": "ok", "service": "excel-vba-mcp", "version": __version__}
 
@@ -1941,6 +2621,44 @@ async def test_run_resource(run_id: str) -> str:
     except ExcelVbaMcpError as exc:
         raise ResourceError(json.dumps(exc.to_dict())) from exc
     return run.model_dump_json(indent=2)
+
+
+# Static glossary (plan_03 §5.3, D-U8). The single authoritative term set; tool
+# descriptions reference this resource by URI instead of re-explaining jargon.
+_GLOSSARY_MD = """# xlvba glossary
+
+- **R13** — heuristic interactive-UI token veto; a veto, never a certificate.
+- **BG06** — background-safe classification bound to (workbook hash, source hash,
+  procedure); invalidated on VBA source change.
+- **preflight** — the R13 scan performed before dispatch.
+- **truth signal** — Excel's own success evidence (the `RefreshTable` Boolean or an
+  advanced `RefreshDate`); never "the absence of a COM exception".
+- **fail-closed** — unknown/ambiguous states are non-success, never a fabricated
+  success.
+- **RECOVERY** — the auto-allowed, agent-directed recovery class (`excel_recover`).
+- **STA** — single-threaded apartment: the one serialized Excel thread.
+- **Stage 1** — the typed-DTO contract layer (`SCHEMA_VERSION=1`).
+- **normalized source hash** — SHA-256 of the canonicalized component body; the
+  `expected_source_hash` revision key.
+- **SUSPECTED_STALLED** — a soft deadline was exceeded and the operation was left
+  running; not a confirmed hang.
+- **interrupted_unknown** — a job finalized by recovery; never replayed.
+- **indeterminate** — the compile probe never returns compiled/compile_error.
+- **working copy** — the opened, mutable copy; originals are never touched.
+- **snapshot gate** — the in-memory `_latest_snapshot` checked by `require_snapshot`.
+"""
+
+
+@mcp.resource(
+    "xlvba://glossary",
+    name="glossary",
+    description=_DESC_RES_GLOSSARY,
+    mime_type="text/markdown",
+)
+async def glossary_resource() -> str:
+    """Read-only static glossary of server jargon (never touches Excel)."""
+
+    return _GLOSSARY_MD
 
 
 def main() -> None:

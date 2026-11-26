@@ -37,6 +37,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.pivot_tables_adapter import (
@@ -48,10 +49,11 @@ from excel_vba_mcp.adapters.excel.pivot_tables_adapter import (
 from excel_vba_mcp.application.pivot_tables_service import PivotTablesService
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
-from excel_vba_mcp.domain.models import PivotFieldFilters, PivotFilterSpec
+from excel_vba_mcp.domain.models import PivotFieldFilters, PivotFilterSpec, PivotFilterState
 from excel_vba_mcp.domain.statuses import (
     OperationClass,
     PivotFilterKind,
+    PivotFilterRequestKind,
     SessionMode,
     WorkbookSessionState,
 )
@@ -842,48 +844,35 @@ def test_apply_manual_filter_rejects_empty_item_set() -> None:
 
 
 def test_apply_unsupported_label_filter_is_explicit() -> None:
-    pivot = _region_pivot()
-    wb = FakeWorkbook([FakeSheet("PivotReport", [pivot])])
-    adapter = PivotTablesAdapter()
-    spec = PivotFilterSpec(
-        kind=PivotFilterKind.LABEL,
-        visible_items=[],
-        supported=False,
-        unsupported_reason=None,
-    )
+    # U3: label/value/date/top-bottom requests are rejected at the pydantic layer
+    # and never reach the adapter. The full kind stays representable on the
+    # read-state model (PivotFilterState), which reports it with supported=False.
+    with pytest.raises(ValidationError):
+        PivotFilterSpec(
+            kind=PivotFilterKind.LABEL,
+            visible_items=[],
+            supported=False,
+            unsupported_reason=None,
+        )
 
-    result = adapter.apply_field_filter(wb, "ptA", "Region", spec)
-
-    assert result["applied"] is False
-    assert result["filters"].filter.supported is False
-    assert result["filters"].filter.kind is PivotFilterKind.LABEL
-    assert result["filters"].unsupported == ["label"]
-    assert "PivotFilters.Add is unsupported" in (result["filters"].filter.unsupported_reason or "")
-    # No Excel mutation and no ``PivotFilters.Add`` attempt.
-    assert all(item.Visible for item in _region(pivot)._items)
-    assert _region(pivot).add_filter_calls == 0
+    state = PivotFilterState(kind=PivotFilterKind.LABEL, supported=False)
+    assert state.kind is PivotFilterKind.LABEL
 
 
 @pytest.mark.parametrize(
-    ("kind", "expected"),
+    "kind",
     [
-        (PivotFilterKind.VALUE, "value"),
-        (PivotFilterKind.DATE, "date"),
-        (PivotFilterKind.TOP_BOTTOM, "top_bottom"),
-        (PivotFilterKind.UNSUPPORTED, "unsupported"),
+        PivotFilterKind.VALUE,
+        PivotFilterKind.DATE,
+        PivotFilterKind.TOP_BOTTOM,
+        PivotFilterKind.UNSUPPORTED,
     ],
 )
-def test_every_non_manual_kind_is_unsupported(kind: PivotFilterKind, expected: str) -> None:
-    pivot = _region_pivot()
-    wb = FakeWorkbook([FakeSheet("PivotReport", [pivot])])
-
-    result = PivotTablesAdapter().apply_field_filter(
-        wb, "ptA", "Region", PivotFilterSpec(kind=kind)
-    )
-
-    assert result["applied"] is False
-    assert result["filters"].unsupported == [expected]
-    assert _region(pivot).add_filter_calls == 0
+def test_every_non_manual_kind_is_rejected(kind: PivotFilterKind) -> None:
+    # U3: the request vocabulary is pruned to ``manual``; every other kind is a
+    # pydantic validation error before any COM call.
+    with pytest.raises(ValidationError):
+        PivotFilterSpec(kind=kind)
 
 
 def test_apply_filter_rejects_olap_source() -> None:
@@ -1093,7 +1082,7 @@ def test_normalize_filter_spec_cleans_items() -> None:
     spec = normalize_filter_spec(_manual_spec(" North ", "South"))
 
     assert spec.visible_items == ["North", "South"]
-    assert spec.kind is PivotFilterKind.MANUAL
+    assert spec.kind is PivotFilterRequestKind.MANUAL
 
 
 def test_normalize_filter_spec_rejects_non_dto() -> None:
@@ -1234,16 +1223,18 @@ async def test_service_unsupported_filter_returns_before_dispatch(tmp_path: Path
     info = await rig.open()
     _seed(rig, _region_pivot())
     # No snapshot and no approval: an unsupported request must not need them.
-
-    filters = await rig.pivots.apply_pivot_field_filter(
-        info.workbook_id,
-        "ptA",
-        "Region",
-        PivotFilterSpec(kind=PivotFilterKind.VALUE),
+    # U3: a non-manual kind is rejected at the request layer, so the unsupported
+    # path is exercised with a manual request explicitly marked unsupported.
+    spec = PivotFilterSpec(
+        kind=PivotFilterRequestKind.MANUAL,
+        supported=False,
+        unsupported_reason="PivotFilters.Add is unsupported on this build.",
     )
 
+    filters = await rig.pivots.apply_pivot_field_filter(info.workbook_id, "ptA", "Region", spec)
+
     assert filters.filter.supported is False
-    assert filters.unsupported == ["value"]
+    assert filters.unsupported == ["manual"]
     assert not [s for s in rig.worker.submits if s["name"] == "pivot_field_apply_filter"]
     records = [json.loads(line) for line in (tmp_path / "audit.jsonl").read_text().splitlines()]
     entry = next(r for r in records if r["tool"] == "pivot_field_apply_filter")

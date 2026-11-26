@@ -49,6 +49,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
 # Optional COM dependencies (None when unavailable so the module skips cleanly).
 try:  # pragma: no cover - exercised implicitly by skip logic
@@ -68,7 +69,7 @@ from excel_vba_mcp.application.pivot_tables_service import PivotTablesService
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
 from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
-from excel_vba_mcp.domain.models import PivotFieldFilters, PivotFilterSpec
+from excel_vba_mcp.domain.models import PivotFieldFilters, PivotFilterSpec, PivotFilterState
 from excel_vba_mcp.domain.statuses import (
     OperationClass,
     PivotFilterKind,
@@ -533,31 +534,14 @@ async def test_apply_manual_filter_rejects_unknown_item(rig: Rig) -> None:
     await rig.session.close_workbook(info.workbook_id)
 
 
-@requires_excel
-async def test_apply_unsupported_label_filter_is_explicit(rig: Rig) -> None:
-    info = await rig.open_for_filters()
-    await rig.snapshot.create_snapshot(info.workbook_id)
-
-    result = await rig.pivots.apply_pivot_field_filter(
-        info.workbook_id,
-        _ROUNDTRIP_PIVOT,
-        "Region",
-        PivotFilterSpec(kind=PivotFilterKind.LABEL),
-    )
-
-    assert result.filter.supported is False
-    assert result.filter.kind is PivotFilterKind.LABEL
-    assert result.unsupported == ["label"]
-    assert "PivotFilters.Add is unsupported" in (result.filter.unsupported_reason or "")
-
-    # No manual filter was silently applied and no PivotFilters entry was added.
-    after = await _filters(rig, info.workbook_id, _ROUNDTRIP_PIVOT, "Region")
-    assert after.hidden_items == []
-    assert after.filter.kind is PivotFilterKind.NONE
-    assert after.unsupported == []
-    assert await _pivot_filters_count(rig, _ROUNDTRIP_PIVOT, "Region") == 0
-
-    await rig.session.close_workbook(info.workbook_id)
+async def test_apply_unsupported_label_filter_is_explicit() -> None:
+    # U3: label/value/date/top-bottom requests are rejected at the pydantic layer
+    # and never reach the adapter. The full kind stays representable on the
+    # read-state model (PivotFilterState), which reports it with supported=False.
+    with pytest.raises(ValidationError):
+        PivotFilterSpec(kind=PivotFilterKind.LABEL)
+    state = PivotFilterState(kind=PivotFilterKind.LABEL, supported=False)
+    assert state.kind is PivotFilterKind.LABEL
 
 
 # ---------------------------------------------------------------------------

@@ -90,6 +90,7 @@ from excel_vba_mcp.domain.models import (
     PivotFieldInfo,
     PivotFieldProperties,
     PivotFilterSpec,
+    PivotFilterState,
     PivotRefreshResult,
     PivotTableInfo,
 )
@@ -97,6 +98,7 @@ from excel_vba_mcp.domain.statuses import (
     PivotAggregation,
     PivotFieldOrientation,
     PivotFilterKind,
+    PivotFilterRequestKind,
     PivotRefreshMethod,
     PivotRefreshStatus,
     PivotSourceType,
@@ -1346,12 +1348,12 @@ def normalize_filter_spec(spec: PivotFilterSpec) -> PivotFilterSpec:
             "Argument 'spec' must be a PivotFilterSpec.",
             context={"spec": repr(spec), "reason": "invalid_filter_spec"},
         )
-    if not isinstance(spec.kind, PivotFilterKind):
+    if not isinstance(spec.kind, PivotFilterRequestKind):
         raise InvalidRangeError(
-            f"Argument 'spec.kind' must be a PivotFilterKind, got {spec.kind!r}.",
+            f"Argument 'spec.kind' must be a PivotFilterRequestKind, got {spec.kind!r}.",
             context={
                 "kind": repr(spec.kind),
-                "accepted": [member.value for member in PivotFilterKind],
+                "accepted": [member.value for member in PivotFilterRequestKind],
                 "reason": "invalid_filter_kind",
             },
         )
@@ -1392,7 +1394,7 @@ def normalize_filter_spec(spec: PivotFilterSpec) -> PivotFilterSpec:
                 "reason": "too_many_filter_items",
             },
         )
-    if spec.kind is PivotFilterKind.MANUAL and spec.supported and not cleaned:
+    if spec.kind is PivotFilterRequestKind.MANUAL and spec.supported and not cleaned:
         raise InvalidRangeError(
             "A manual filter must name at least one visible item; an empty set "
             "would hide every item. Use pivot_field_clear_filters to show all items.",
@@ -1410,7 +1412,7 @@ def unsupported_filter_reason(spec: PivotFilterSpec) -> str | None:
     unsupported and is **never** silently converted into a manual filter.
     """
 
-    if not isinstance(spec.kind, PivotFilterKind) or spec.kind is not PivotFilterKind.MANUAL:
+    if not isinstance(spec.kind, PivotFilterRequestKind) or spec.kind is not PivotFilterRequestKind.MANUAL:
         kind = getattr(spec.kind, "value", repr(spec.kind))
         return f"{_FILTERS_ADD_UNSUPPORTED} Requested kind: {kind!r}."
     if not spec.supported:
@@ -1426,14 +1428,14 @@ def _unsupported_filter_result(
 ) -> PivotFieldFilters:
     """Build the explicit ``unsupported`` result (no Excel mutation)."""
 
-    kind = spec.kind if isinstance(spec.kind, PivotFilterKind) else PivotFilterKind.UNSUPPORTED
+    kind = PivotFilterKind(spec.kind.value) if isinstance(spec.kind, PivotFilterRequestKind) else PivotFilterKind.UNSUPPORTED
     return PivotFieldFilters(
         pivot_table=pivot_table,
         field=field,
         all_items_visible=None,
         visible_items=[],
         hidden_items=[],
-        filter=PivotFilterSpec(
+        filter=PivotFilterState(
             kind=kind,
             visible_items=[],
             supported=False,
@@ -1635,7 +1637,7 @@ def _field_filters(pivot_name: str, field: Any, source_name: str) -> PivotFieldF
         all_items_visible=all_items_visible,
         visible_items=visible,
         hidden_items=hidden,
-        filter=PivotFilterSpec(
+        filter=PivotFilterState(
             kind=kind,
             visible_items=list(visible),
             supported=True,
@@ -2783,7 +2785,7 @@ class PivotTablesAdapter:
             all_items_visible=None,
             visible_items=[],
             hidden_items=[],
-            filter=PivotFilterSpec(kind=PivotFilterKind.NONE, visible_items=[], supported=True),
+            filter=PivotFilterState(kind=PivotFilterKind.NONE, visible_items=[], supported=True),
             unsupported=[],
         )
         return {

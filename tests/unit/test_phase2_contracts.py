@@ -39,6 +39,7 @@ from excel_vba_mcp.domain.models import (
     PivotFieldOrientation,
     PivotFieldProperties,
     PivotFilterSpec,
+    PivotFilterState,
     PivotInventory,
     PivotRefreshResult,
     PivotTableInfo,
@@ -63,6 +64,7 @@ from excel_vba_mcp.domain.statuses import (
     OperationClass,
     PivotAggregation,
     PivotFilterKind,
+    PivotFilterRequestKind,
     PivotRefreshMethod,
     PivotRefreshStatus,
     PivotSourceType,
@@ -442,14 +444,15 @@ def test_pivot_field_layout_and_properties() -> None:
 
 
 def test_pivot_filter_spec_manual_vs_unsupported() -> None:
-    manual = PivotFilterSpec(kind=PivotFilterKind.MANUAL, visible_items=["South"])
+    manual = PivotFilterSpec(kind=PivotFilterRequestKind.MANUAL, visible_items=["South"])
     assert manual.supported is True
-    unsupported = PivotFilterSpec(
-        kind=PivotFilterKind.LABEL,
-        supported=False,
-        unsupported_reason="PivotFilters.Add fails on build 14332.",
-    )
-    assert unsupported.supported is False
+    # The request vocabulary is pruned to ``manual`` only (U3): a label/value/date/
+    # top-bottom request is rejected at the pydantic layer, never sent to Excel.
+    with pytest.raises(ValidationError):
+        PivotFilterSpec(kind=PivotFilterKind.LABEL, supported=False)
+    # The full kind is still representable on the read-state model.
+    state = PivotFilterState(kind=PivotFilterKind.LABEL, supported=False)
+    assert state.kind is PivotFilterKind.LABEL
 
 
 def test_pivot_field_filters_and_refresh_result_round_trip() -> None:
@@ -459,7 +462,7 @@ def test_pivot_field_filters_and_refresh_result_round_trip() -> None:
         all_items_visible=False,
         visible_items=["South"],
         hidden_items=["North"],
-        filter=PivotFilterSpec(kind=PivotFilterKind.MANUAL, visible_items=["South"]),
+        filter=PivotFilterState(kind=PivotFilterKind.MANUAL, visible_items=["South"]),
     )
     assert filters.hidden_items == ["North"]
 

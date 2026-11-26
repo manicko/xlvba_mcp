@@ -777,18 +777,16 @@ def test_validate_validation_spec_requires_both_operands_for_between() -> None:
 
 
 def test_validate_conditional_format_spec_rejects_unsupported_types() -> None:
+    # U3: color_scale/data_bar/icon_set/unsupported are rejected at the pydantic
+    # request layer and never reach validation or COM.
     for rule_type in (
         ConditionalFormatType.COLOR_SCALE,
         ConditionalFormatType.DATA_BAR,
         ConditionalFormatType.ICON_SET,
         ConditionalFormatType.UNSUPPORTED,
     ):
-        with pytest.raises(ExcelVbaMcpError) as exc_info:
-            validate_conditional_format_spec(
-                ConditionalFormatSpec(type=rule_type, formula1="1"), "add"
-            )
-        assert exc_info.value.code is ErrorCode.INVALID_RANGE
-        assert "not supported" in str(exc_info.value)
+        with pytest.raises(ValidationError):
+            ConditionalFormatSpec(type=rule_type, formula1="1")
 
 
 def test_validate_conditional_format_spec_requires_identity_for_modify_and_delete() -> None:
@@ -1297,18 +1295,10 @@ def test_set_conditional_formatting_delete_removes_the_rule() -> None:
 
 
 def test_set_conditional_formatting_rejects_unsupported_type() -> None:
-    wb = _fake_workbook()
-
-    with pytest.raises(ExcelVbaMcpError) as exc_info:
-        RangesAdapter().set_conditional_formatting(
-            wb,
-            "Data",
-            "A1:A3",
-            ConditionalFormatSpec(type=ConditionalFormatType.DATA_BAR, formula1="1"),
-        )
-
-    assert exc_info.value.code is ErrorCode.INVALID_RANGE
-    assert wb.sheet("Data").cf_rules_for("$A$1:$A$3") == []
+    # U3: data_bar is rejected at the pydantic request layer; the adapter is never
+    # reached and no rule is written.
+    with pytest.raises(ValidationError):
+        ConditionalFormatSpec(type=ConditionalFormatType.DATA_BAR, formula1="1")
 
 
 def test_set_conditional_formatting_reports_unsupported_rules_in_range() -> None:
@@ -1530,18 +1520,10 @@ async def test_service_set_conditional_formatting_guard_chain(tmp_path: Path) ->
 async def test_service_set_conditional_formatting_validates_before_the_gates(
     tmp_path: Path,
 ) -> None:
-    rig = Rig(tmp_path)
-    info = await rig.open(read_only=True)
-
-    with pytest.raises(ExcelVbaMcpError) as exc_info:
-        await rig.service.set_conditional_formatting(
-            info.workbook_id,
-            "Data",
-            "A1:A3",
-            ConditionalFormatSpec(type=ConditionalFormatType.COLOR_SCALE, formula1="1"),
-        )
-
-    assert exc_info.value.code is ErrorCode.INVALID_RANGE
+    # U3: color_scale is rejected at the pydantic request layer — before the
+    # service is called and before any snapshot/approval gate.
+    with pytest.raises(ValidationError):
+        ConditionalFormatSpec(type=ConditionalFormatType.COLOR_SCALE, formula1="1")
 
 
 # ---------------------------------------------------------------------------

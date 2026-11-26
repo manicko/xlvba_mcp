@@ -2740,7 +2740,7 @@ def _find_cf_rule(
             f"No conditional-format rule has priority {priority}.",
             context={"priority": priority, "priorities": [rule.priority for rule in before]},
         )
-    if match.type is not spec.type:
+    if match.type.value != spec.type.value:
         raise InvalidRangeError(
             "The rule at the requested priority has a different type; a conditional-format "
             "rule type is never silently converted.",
@@ -2883,7 +2883,7 @@ def _normalize_cf_formula(value: str | None) -> str | None:
 def _cf_rule_matches(rule: ConditionalFormatRule, spec: ConditionalFormatSpec) -> bool:
     """Return whether a re-read rule matches the requested specification."""
 
-    if rule.type is not spec.type:
+    if rule.type.value != spec.type.value:
         return False
     if spec.formula1 is not None and _normalize_cf_formula(rule.formula1) != (
         _normalize_cf_formula(spec.formula1)

@@ -85,12 +85,19 @@ from excel_vba_mcp.domain.models import (
     PivotFieldInfo,
     PivotFieldProperties,
     PivotFilterSpec,
+    PivotFilterState,
     PivotInventory,
     PivotRefreshResult,
     PivotTableInfo,
     WorkbookInfo,
 )
-from excel_vba_mcp.domain.statuses import OperationClass, PivotAggregation, PivotFieldOrientation
+from excel_vba_mcp.domain.statuses import (
+    OperationClass,
+    PivotAggregation,
+    PivotFieldOrientation,
+    PivotFilterKind,
+    PivotFilterRequestKind,
+)
 from excel_vba_mcp.security.approval import ApprovalKey, ApprovalPolicy
 from excel_vba_mcp.security.audit import AuditLogger
 
@@ -1036,11 +1043,16 @@ def _unsupported_filter_dto(
 ) -> PivotFieldFilters:
     """Build the explicit unsupported result for a non-manual filter request."""
 
+    kind = (
+        PivotFilterKind(spec.kind.value)
+        if isinstance(spec.kind, PivotFilterRequestKind)
+        else PivotFilterKind.UNSUPPORTED
+    )
     return PivotFieldFilters(
         pivot_table=pivot_table,
         field=field,
-        filter=PivotFilterSpec(
-            kind=spec.kind,
+        filter=PivotFilterState(
+            kind=kind,
             visible_items=[],
             supported=False,
             unsupported_reason=reason,

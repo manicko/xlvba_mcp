@@ -102,6 +102,203 @@ def code_from_hresult(hresult: int, default: ErrorCode | None = None) -> ErrorCo
     return _HRESULT_TO_CODE.get(hresult & 0xFFFFFFFF, default)
 
 
+# ---------------------------------------------------------------------------
+# Structured error envelope (U2; plan_03 §7): category / retry / next actions.
+#
+# These are PURE functions of the error code (and, for ``actions_for``, the
+# context): no COM, no schema bump, no new ``ErrorCode`` members. ``to_dict``
+# calls them so every error carries ``errorCategory`` / ``isRetryable`` /
+# ``suggestedNextActions`` in addition to the original five keys.
+#
+# ``isRetryable`` is conservative (D-U10): only a transient COM busy/rejected
+# result is retryable. ``STALE_TARGET`` / ``REVISION_CONFLICT`` are NOT
+# retryable (a blind replay could re-apply a partially-applied mutation) and a
+# job ``interrupted_unknown`` is never retryable.
+# ---------------------------------------------------------------------------
+
+# errorCategory taxonomy (plan_03 §7.2). Every ``ErrorCode`` member is mapped so
+# ``category_for`` never needs a fallback for a real code.
+_CATEGORY_BY_CODE: dict[ErrorCode, str] = {
+    # permission_denied — policy/approval/trust denial; not fixable by retry.
+    ErrorCode.ACCESS_VBOM_DISABLED: "permission_denied",
+    ErrorCode.VBA_PROJECT_LOCKED: "permission_denied",
+    ErrorCode.MACRO_BLOCKED: "permission_denied",
+    ErrorCode.PATH_NOT_ALLOWED: "permission_denied",
+    ErrorCode.APPROVAL_DENIED: "permission_denied",
+    # missing_prerequisite — a required precondition is absent.
+    ErrorCode.SNAPSHOT_FAILED: "missing_prerequisite",
+    ErrorCode.WORKBOOK_READ_ONLY: "missing_prerequisite",
+    ErrorCode.BACKGROUND_SAFETY_NOT_VERIFIED: "missing_prerequisite",
+    ErrorCode.REVISION_CONFLICT: "missing_prerequisite",
+    ErrorCode.STALE_TARGET: "missing_prerequisite",
+    ErrorCode.MISSING_REFERENCE: "missing_prerequisite",
+    # unsupported_feature — capability absent on this build/config.
+    ErrorCode.UNSUPPORTED_PIVOT_SOURCE: "unsupported_feature",
+    ErrorCode.INTERACTIVE_UI_NOT_SUPPORTED: "unsupported_feature",
+    ErrorCode.COMPILE_INDETERMINATE: "unsupported_feature",
+    ErrorCode.COMPILE_ERROR: "unsupported_feature",
+    ErrorCode.PROTECTED_TARGET: "unsupported_feature",
+    ErrorCode.LISTOBJECT_INTERSECTION: "unsupported_feature",
+    ErrorCode.AMBIGUOUS_FILTER: "unsupported_feature",
+    ErrorCode.MACRO_RUNTIME_ERROR: "unsupported_feature",
+    ErrorCode.REFRESH_FAILED: "unsupported_feature",
+    # transient_com_failure — Excel/VBE busy; retry after backoff.
+    ErrorCode.COM_BUSY: "transient_com_failure",
+    ErrorCode.RPC_E_CALL_REJECTED: "transient_com_failure",
+    # deadline — soft deadline exceeded; op left running.
+    ErrorCode.MACRO_TIMEOUT: "deadline",
+    # suspected_stall — deadline + possible modal; agent-directed recovery.
+    ErrorCode.EXCEL_HUNG: "suspected_stall",
+    ErrorCode.MODAL_UI_BLOCKED: "suspected_stall",
+    # not_found — caller addressed a missing identity.
+    ErrorCode.WORKBOOK_NOT_FOUND: "not_found",
+    ErrorCode.MACRO_NOT_FOUND: "not_found",
+    ErrorCode.NOT_FOUND: "not_found",
+    # validation — caller argument/schema error (also the pydantic path).
+    ErrorCode.INVALID_RANGE: "validation",
+}
+
+# Only a transient COM busy/rejected result is retryable (plan_03 §7.3, D-U10).
+_RETRYABLE_CODES: frozenset[ErrorCode] = frozenset(
+    {ErrorCode.COM_BUSY, ErrorCode.RPC_E_CALL_REJECTED}
+)
+
+# Job-state string keys (not ``ErrorCode`` members) that can appear in a job
+# result and must still classify truthfully (plan_03 §7.2/§7.3).
+_JOB_CATEGORY: dict[str, str] = {
+    "expired": "deadline",
+    "interrupted_unknown": "interrupted_unknown",
+}
+_JOB_ACTIONS: dict[str, list[str]] = {
+    "expired": [
+        "excel_recover if still stalled",
+        "never auto-replay; inspect macro_get_last_result",
+    ],
+    "interrupted_unknown": ["never resubmit; report status"],
+}
+
+# suggestedNextActions per code (plan_03 §7.3). Static, conservative text; the
+# ``context`` is accepted for signature symmetry / future context-aware hints.
+_ACTIONS_BY_CODE: dict[ErrorCode, list[str]] = {
+    ErrorCode.COM_BUSY: ["wait retry_after_s (if present) then retry the same read"],
+    ErrorCode.RPC_E_CALL_REJECTED: ["wait retry_after_s (if present) then retry the same read"],
+    ErrorCode.SNAPSHOT_FAILED: ["snapshot_create(workbook_id)", "retry mutation"],
+    ErrorCode.WORKBOOK_READ_ONLY: ["re-open with read_only=false (mode=execute)"],
+    ErrorCode.APPROVAL_DENIED: ["open in full mode or supply grant/allowlist entry", "retry"],
+    ErrorCode.PATH_NOT_ALLOWED: ["use a path under details.allowed_roots"],
+    ErrorCode.BACKGROUND_SAFETY_NOT_VERIFIED: [
+        "macro_classify_background(...background_safe=true) after review",
+        "retry macro_run",
+    ],
+    ErrorCode.INTERACTIVE_UI_NOT_SUPPORTED: ["remove interactive-UI tokens (out of scope)"],
+    ErrorCode.UNSUPPORTED_PIVOT_SOURCE: ["use a supported source (database)"],
+    ErrorCode.COMPILE_INDETERMINATE: ["accept indeterminate compile"],
+    ErrorCode.STALE_TARGET: [
+        "re-read source/hash via vba_read_component",
+        "the prior mutation MAY have partially applied — re-read state; do NOT blind-replay",
+    ],
+    ErrorCode.REVISION_CONFLICT: [
+        "re-read source/hash via vba_read_component",
+        "the prior mutation MAY have partially applied — re-read state; do NOT blind-replay",
+    ],
+    ErrorCode.EXCEL_HUNG: [
+        "excel_recover",
+        "re-open workbook",
+        "do not replay the interrupted mutation",
+    ],
+    ErrorCode.MODAL_UI_BLOCKED: [
+        "excel_recover",
+        "re-open workbook",
+        "do not replay the interrupted mutation",
+    ],
+    ErrorCode.MACRO_TIMEOUT: [
+        "excel_recover if still stalled",
+        "never auto-replay; inspect macro_get_last_result",
+    ],
+    ErrorCode.WORKBOOK_NOT_FOUND: ["verify workbook_id / object name / procedure"],
+    ErrorCode.NOT_FOUND: ["verify workbook_id / object name / procedure"],
+    ErrorCode.MACRO_NOT_FOUND: ["verify workbook_id / object name / procedure"],
+    ErrorCode.INVALID_RANGE: ["fix arguments to match input schema"],
+    ErrorCode.ACCESS_VBOM_DISABLED: [
+        "enable Trust access to the VBA project object model in Excel Trust Center"
+    ],
+    ErrorCode.VBA_PROJECT_LOCKED: ["unlock the VBA project (protection is never bypassed)"],
+    ErrorCode.MISSING_REFERENCE: [
+        "repair the broken VBA reference (VBA Editor > Tools > References)"
+    ],
+    ErrorCode.COMPILE_ERROR: ["fix the VBA compile error reported by vba_get_compile_diagnostics"],
+    ErrorCode.MACRO_RUNTIME_ERROR: ["inspect macro_get_last_result and fix the macro error"],
+    ErrorCode.REFRESH_FAILED: ["verify the pivot source is database; retry the refresh"],
+    ErrorCode.PROTECTED_TARGET: ["use a writable target (the component/range is protected)"],
+    ErrorCode.LISTOBJECT_INTERSECTION: ["use the table tools for ListObject targets"],
+    ErrorCode.AMBIGUOUS_FILTER: ["supply a filter that resolves to exactly one target"],
+    ErrorCode.MACRO_BLOCKED: ["open in execute mode / adjust macro policy"],
+}
+
+# Fallback category/actions for an unrecognized string key (never a real code).
+_DEFAULT_CATEGORY = "validation"
+_DEFAULT_ACTIONS = ["inspect the error details and correct the request"]
+
+
+def _code_key(code: ErrorCode | str) -> str:
+    """Normalize a code (``ErrorCode`` or job-state string) to its string key."""
+
+    return code.value if isinstance(code, ErrorCode) else str(code)
+
+
+def category_for(code: ErrorCode | str) -> str:
+    """Return the ``errorCategory`` for ``code`` (plan_03 §7.2).
+
+    Pure and total: every :class:`ErrorCode` member is mapped; the job-state
+    strings ``expired`` / ``interrupted_unknown`` classify as ``deadline`` /
+    ``interrupted_unknown``; anything unrecognized falls back to ``validation``.
+    """
+
+    key = _code_key(code)
+    if key in _JOB_CATEGORY:
+        return _JOB_CATEGORY[key]
+    try:
+        member = ErrorCode(key)
+    except ValueError:
+        return _DEFAULT_CATEGORY
+    return _CATEGORY_BY_CODE.get(member, _DEFAULT_CATEGORY)
+
+
+def retryable_for(code: ErrorCode | str) -> bool:
+    """Return whether ``code`` is conservatively retryable (plan_03 §7.3, D-U10).
+
+    Only ``COM_BUSY`` / ``RPC_E_CALL_REJECTED`` are retryable; every other code
+    (including ``STALE_TARGET`` / ``REVISION_CONFLICT`` and any job state) is not.
+    """
+
+    key = _code_key(code)
+    if key in _JOB_CATEGORY:
+        return False
+    try:
+        member = ErrorCode(key)
+    except ValueError:
+        return False
+    return member in _RETRYABLE_CODES
+
+
+def actions_for(code: ErrorCode | str, context: dict[str, Any] | None = None) -> list[str]:
+    """Return ``suggestedNextActions`` for ``code`` (plan_03 §7.3).
+
+    Pure: the text is static per code (the ``context`` is accepted for signature
+    symmetry and future context-aware hints, and never mutated).
+    """
+
+    del context  # accepted for signature symmetry; actions are static per code
+    key = _code_key(code)
+    if key in _JOB_ACTIONS:
+        return list(_JOB_ACTIONS[key])
+    try:
+        member = ErrorCode(key)
+    except ValueError:
+        return list(_DEFAULT_ACTIONS)
+    return list(_ACTIONS_BY_CODE.get(member, _DEFAULT_ACTIONS))
+
+
 class ExcelVbaMcpError(Exception):
     """Base error carrying a stable ``code`` and optional HRESULT context.
 
@@ -136,7 +333,13 @@ class ExcelVbaMcpError(Exception):
         return format_hresult(self.hresult) if self.hresult is not None else None
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-serializable representation (no COM objects)."""
+        """Return a JSON-serializable representation (no COM objects).
+
+        Additive (U2; plan_03 §7): the original five keys (``code``, ``message``,
+        ``hresult``, ``hresult_hex``, ``context``) are preserved and three
+        machine-readable keys are added — ``errorCategory``, ``isRetryable`` and
+        ``suggestedNextActions``. No schema bump; no new ``ErrorCode`` members.
+        """
 
         return {
             "code": self.code.value,
@@ -144,6 +347,9 @@ class ExcelVbaMcpError(Exception):
             "hresult": self.hresult,
             "hresult_hex": self.hresult_hex,
             "context": self.context,
+            "errorCategory": category_for(self.code),
+            "isRetryable": retryable_for(self.code),
+            "suggestedNextActions": actions_for(self.code, self.context),
         }
 
     def __str__(self) -> str:  # pragma: no cover - trivial

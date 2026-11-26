@@ -38,6 +38,7 @@ from excel_vba_mcp.domain.statuses import (
     PivotAggregation,
     PivotFieldOrientation,
     PivotFilterKind,
+    PivotFilterRequestKind,
     ValidationOperator,
 )
 from excel_vba_mcp.domain.test_spec import (
@@ -355,7 +356,7 @@ def test_pivot_steps_validate() -> None:
     assert aggregation.function is PivotAggregation.SUM
     filt = suite.cases[0].steps[3]
     assert isinstance(filt.filter_spec, PivotFilterSpec)
-    assert filt.filter_spec.kind is PivotFilterKind.MANUAL
+    assert filt.filter_spec.kind is PivotFilterRequestKind.MANUAL
 
 
 # ---------------------------------------------------------------------------
