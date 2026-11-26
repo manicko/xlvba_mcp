@@ -190,7 +190,10 @@ from excel_vba_mcp.security.path_policy import PathPolicy
 from excel_vba_mcp.storage.artifact_store import ARTIFACT_ROOT_NAME, ArtifactStore
 from excel_vba_mcp.storage.job_store import JobStore
 from excel_vba_mcp.storage.owned_pid_store import (
+    STATE_CREATING,
     OwnedPidStore,
+    OwnedProcessRecord,
+    build_creating_record,
     build_owned_record,
     default_owned_pid_dir,
 )
@@ -1122,6 +1125,120 @@ def _exe_matches(expected: str | None, actual: str | None) -> bool:
     return _exe_basename(expected) == _exe_basename(actual)
 
 
+def _reconcile_creating_record(
+    record: OwnedProcessRecord,
+    *,
+    store: OwnedPidStore,
+    pid_alive: Callable[[int], bool],
+    create_time: Callable[[int], int | None],
+    image_name: Callable[[int], str | None],
+    terminate_verified: Callable[[int], bool],
+    current_session_id: Callable[[], int | None] | None,
+) -> str | None:
+    """Reconcile a ``state="creating"`` marker (crash in the create->assign window).
+
+    The owned Excel may not have existed / been assigned to the job when the server
+    died, so the excel pid may be unknown (``0``). Apply the lifecycle conservatively:
+
+    * **Owner alive + identity match** => a launch is in progress under a live owner;
+      **refuse** a second launch.
+    * **Owner dead + excel pid unknown (0)** => an unidentifiable orphan may exist;
+      **refuse** a second launch (never pid-kill) and keep the marker.
+    * **Owner dead + known excel pid not alive** => the launch left no orphan; clear
+      and proceed.
+    * **Owner dead + known excel alive + verified** (image ``EXCEL.EXE`` + create-time
+      match + same session) => reap exactly that orphan, confirm, clear, proceed.
+    * **Owner dead + known excel alive but unverified / cross-session** => **refuse**
+      (never kill an unverified / cross-session process), keep the marker.
+    """
+
+    owner = record.owner
+    excel = record.excel
+
+    owner_pid_alive = owner.pid > 0 and pid_alive(owner.pid)
+    owner_create_ok = (
+        owner.create_time_filetime is None
+        or create_time(owner.pid) == owner.create_time_filetime
+    )
+    owner_exe_ok = _exe_matches(owner.exe, image_name(owner.pid))
+    if owner.pid > 0 and owner_pid_alive and owner_create_ok and owner_exe_ok:
+        return (
+            f"a server launch is in progress (creating) under live owner pid "
+            f"{owner.pid}; refusing to start a second Excel instance — an "
+            "operator/agent decision is required"
+        )
+
+    # Owner is dead. Unknown excel pid => an unidentifiable orphan may exist.
+    if excel.pid <= 0:
+        logger.warning(
+            "creating marker found with a dead owner (pid %d) and no excel pid; an "
+            "unidentifiable orphan may exist — refusing a second launch",
+            owner.pid,
+        )
+        return (
+            "a prior server crashed while creating its owned Excel (no verified excel "
+            "pid was recorded); refusing to start a second Excel because an "
+            "unidentifiable orphan may exist — an operator/agent decision is required"
+        )
+
+    if not pid_alive(excel.pid):
+        # The known owned pid did not survive the crash: no orphan to reap.
+        store.clear()
+        return None
+
+    excel_is_excel = _exe_basename(image_name(excel.pid) or "") == "excel.exe"
+    if not excel_is_excel:
+        logger.warning(
+            "creating marker excel pid %d is alive but not EXCEL.EXE (pid reuse); "
+            "clearing marker and proceeding",
+            excel.pid,
+        )
+        store.clear()
+        return None
+
+    excel_create_ok = (
+        excel.create_time_filetime is not None
+        and create_time(excel.pid) == excel.create_time_filetime
+    )
+    if not excel_create_ok:
+        return (
+            f"prior owned Excel pid {excel.pid} is alive (EXCEL.EXE) but its identity "
+            "could not be verified (create-time mismatch/unknown); refusing to start a "
+            "second Excel and refusing to kill an unverified process — an "
+            "operator/agent decision is required"
+        )
+
+    current_sess = current_session_id() if current_session_id is not None else None
+    if (
+        excel.session_id is not None
+        and current_sess is not None
+        and excel.session_id != current_sess
+    ):
+        return (
+            f"prior owned Excel pid {excel.pid} is alive in Windows session "
+            f"{excel.session_id} but this server is in session {current_sess}; "
+            "refusing to kill a cross-session process — an operator/agent decision "
+            "is required"
+        )
+
+    terminated = terminate_verified(excel.pid)
+    still_alive = pid_alive(excel.pid)
+    if terminated and not still_alive:
+        logger.warning(
+            "reaped verified orphaned owned Excel pid %d left by a creating-window "
+            "crash (owner pid %d dead); clearing marker and proceeding",
+            excel.pid,
+            owner.pid,
+        )
+        store.clear()
+        return None
+    return (
+        f"verified orphaned owned Excel pid {excel.pid} could not be terminated "
+        f"(terminated={terminated}, still_alive={still_alive}); refusing to start a "
+        "second Excel — an operator/agent decision is required"
+    )
+
+
 def _reconcile_prior_owned_pid(
     store: OwnedPidStore,
     *,
@@ -1168,6 +1285,21 @@ def _reconcile_prior_owned_pid(
     record = store.read_record()
     if record is None:
         return None
+
+    # A ``creating`` marker was written before DispatchEx (the owned Excel did not
+    # exist / was not yet assigned to the job). A crash in that window leaves no
+    # verified excel pid, so reconcile conservatively (refuse a second launch; reap
+    # only a verified identity; never a pid-only kill).
+    if record.state == STATE_CREATING:
+        return _reconcile_creating_record(
+            record,
+            store=store,
+            pid_alive=pid_alive,
+            create_time=create_time,
+            image_name=image_name,
+            terminate_verified=terminate_verified,
+            current_session_id=current_session_id,
+        )
 
     owner = record.owner
     excel = record.excel
@@ -1269,10 +1401,15 @@ async def _start_worker_guarded(runtime: _Runtime, store: OwnedPidStore) -> str 
     """Reconcile-then-start the worker, returning a refusal or ``None``.
 
     Reconciles the prior ownership record (refuse a live owner; reap a verified
-    orphan; clear a stale marker). When startup may proceed the worker is started
-    and the freshly launched owned pid + owner identity is persisted for the next
-    startup reconcile. A ``worker.start()`` failure propagates to the caller (which
-    degrades gracefully + safe-shuts the worker); it is not a reconcile refusal.
+    orphan; clear a stale marker). When startup may proceed a ``state="creating"``
+    marker is persisted **before** the launch (before ``DispatchEx`` inside
+    ``worker.start``) so a crash in the create->assign window is recoverable: the next
+    start refuses a second launch (an unidentifiable orphan may exist) and reaps only a
+    verified identity — never a pid-only kill. On success the marker is overwritten
+    with the full ``running`` record (owned pid + owner identity); on a fail-closed
+    start (no orphan by construction) it is cleared so a clean restart is not blocked.
+    A ``worker.start()`` failure propagates to the caller (which degrades gracefully +
+    safe-shuts the worker); it is not a reconcile refusal.
     """
 
     adapter = ExcelAppAdapter
@@ -1286,11 +1423,27 @@ async def _start_worker_guarded(runtime: _Runtime, store: OwnedPidStore) -> str 
     )
     if refusal is not None:
         return refusal
-    await runtime.worker.start()
+    # Persist a creating marker BEFORE the owned Excel exists (before DispatchEx),
+    # so a crash in the create->assign window leaves a durable record to reconcile.
+    owner_pid = os.getpid()
+    o_ct, o_exe, o_sess = adapter._capture_process_identity(owner_pid)
+    store.write_record(
+        build_creating_record(
+            owner_pid=owner_pid,
+            owner_create_time=o_ct,
+            owner_exe=o_exe,
+            owner_session_id=o_sess,
+        )
+    )
+    try:
+        await runtime.worker.start()
+    except Exception:
+        # Fail-closed start (e.g. job-assign failure) leaves no orphan by
+        # construction; clear the creating marker so a clean restart is not blocked.
+        store.clear()
+        raise
     new_pid = runtime.worker.get_status().owned_pid
     if new_pid is not None:
-        owner_pid = os.getpid()
-        o_ct, o_exe, o_sess = adapter._capture_process_identity(owner_pid)
         e_ct, e_exe, e_sess = adapter._capture_process_identity(new_pid)
         store.write_record(
             build_owned_record(
@@ -1304,6 +1457,9 @@ async def _start_worker_guarded(runtime: _Runtime, store: OwnedPidStore) -> str 
                 excel_session_id=e_sess,
             )
         )
+    else:
+        # Started but no owned pid tracked: nothing to reconcile later.
+        store.clear()
     return None
 
 

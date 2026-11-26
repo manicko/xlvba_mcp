@@ -40,8 +40,10 @@ from excel_vba_mcp.security.audit import AuditLogger
 from excel_vba_mcp.security.path_policy import PathPolicy
 from excel_vba_mcp.server import _reconcile_prior_owned_pid, _start_worker_guarded
 from excel_vba_mcp.storage.owned_pid_store import (
+    STATE_CREATING,
     OwnedPidStore,
     OwnedProcessRecord,
+    build_creating_record,
     build_owned_record,
 )
 
@@ -1199,3 +1201,197 @@ def test_job_protected_false_when_handle_reduced_to_int() -> None:
 
     adapter._job_handle = _FakeHandle()
     assert adapter.job_protected is True
+
+
+# ---------------------------------------------------------------------------
+# Verify A mitigation: state="creating" record + reconcile (create->assign crash)
+# ---------------------------------------------------------------------------
+def _write_creating(
+    store: OwnedPidStore,
+    *,
+    owner_pid: int,
+    owner_ct: int | None,
+    excel_pid: int = 0,
+    excel_ct: int | None = None,
+    excel_sess: int | None = 1,
+) -> None:
+    if excel_pid <= 0:
+        store.write_record(
+            build_creating_record(
+                owner_pid=owner_pid,
+                owner_create_time=owner_ct,
+                owner_exe=_PY_EXE,
+                owner_session_id=1,
+            )
+        )
+    else:
+        store.write_record(
+            build_owned_record(
+                owner_pid=owner_pid,
+                excel_pid=excel_pid,
+                owner_create_time=owner_ct,
+                owner_exe=_PY_EXE,
+                owner_session_id=1,
+                excel_create_time=excel_ct,
+                excel_exe=_EXCEL_EXE,
+                excel_session_id=excel_sess,
+                state=STATE_CREATING,
+            )
+        )
+
+
+def test_reconcile_creating_refuses_when_owner_dead_and_pid_unknown(tmp_path: Path) -> None:
+    store = OwnedPidStore(tmp_path)
+    _write_creating(store, owner_pid=100, owner_ct=111)  # excel pid unknown (0)
+    terminated: list[int] = []
+
+    reason = _reconcile(
+        store, alive={}, create={}, image={}, terminated=terminated
+    )
+
+    assert reason is not None, "an unidentifiable orphan may exist => refuse"
+    assert terminated == [], "never pid-kill on an unknown excel pid"
+    assert store.read() == 0, "the creating marker is kept for an operator decision"
+
+
+def test_reconcile_creating_reaps_verified_orphan(tmp_path: Path) -> None:
+    store = OwnedPidStore(tmp_path)
+    _write_creating(store, owner_pid=100, owner_ct=111, excel_pid=200, excel_ct=222)
+    terminated: list[int] = []
+
+    reason = _reconcile(
+        store,
+        alive={100: False, 200: True},
+        create={100: 111, 200: 222},
+        image={100: _PY_EXE, 200: _EXCEL_EXE},
+        terminated=terminated,
+        current_session_id=lambda: 1,
+    )
+
+    assert reason is None
+    assert terminated == [200], "a verified orphan is reaped exactly"
+    assert store.read() is None, "the marker is cleared after the confirmed reap"
+
+
+def test_reconcile_creating_refuses_unverified_orphan(tmp_path: Path) -> None:
+    store = OwnedPidStore(tmp_path)
+    _write_creating(store, owner_pid=100, owner_ct=111, excel_pid=200, excel_ct=222)
+    terminated: list[int] = []
+
+    reason = _reconcile(
+        store,
+        alive={100: False, 200: True},
+        create={100: 111, 200: 999},  # create-time mismatch => unverified
+        image={100: _PY_EXE, 200: _EXCEL_EXE},
+        terminated=terminated,
+    )
+
+    assert reason is not None, "an unverified EXCEL.EXE is refused, not killed"
+    assert terminated == [], "never kill on create-time mismatch"
+    assert store.read() == 200
+
+
+def test_reconcile_creating_refuses_when_owner_alive(tmp_path: Path) -> None:
+    store = OwnedPidStore(tmp_path)
+    _write_creating(store, owner_pid=100, owner_ct=111)
+
+    reason = _reconcile(
+        store,
+        alive={100: True},
+        create={100: 111},
+        image={100: _PY_EXE},
+    )
+
+    assert reason is not None, "a live owner mid-launch => refuse a second launch"
+
+
+def test_reconcile_creating_clears_when_known_excel_dead(tmp_path: Path) -> None:
+    store = OwnedPidStore(tmp_path)
+    _write_creating(store, owner_pid=100, owner_ct=111, excel_pid=200, excel_ct=222)
+
+    reason = _reconcile(
+        store,
+        alive={100: False, 200: False},  # known excel did not survive
+        create={100: 111, 200: 222},
+        image={100: _PY_EXE, 200: _EXCEL_EXE},
+    )
+
+    assert reason is None
+    assert store.read() is None, "a known-dead excel leaves no orphan => clear+proceed"
+
+
+def test_owned_pid_store_round_trips_creating_unknown_pid(tmp_path: Path) -> None:
+    store = OwnedPidStore(tmp_path)
+    store.write_record(
+        build_creating_record(
+            owner_pid=100, owner_create_time=111, owner_exe=_PY_EXE, owner_session_id=1
+        )
+    )
+    record = store.read_record()
+    assert record is not None
+    assert record.state == STATE_CREATING
+    assert record.excel.pid == 0, "a creating record has an unknown (0) excel pid"
+    assert record.owner.pid == 100
+
+
+class _CreatingCheckWorker:
+    """Worker that records the store state at ``start`` time (creating marker)."""
+
+    def __init__(self, store: OwnedPidStore, *, owned_pid: int | None = 7777) -> None:
+        self.store = store
+        self.owned_pid = owned_pid
+        self.state_at_start: str | None = None
+        self.started = False
+
+    async def start(self) -> None:
+        rec = self.store.read_record()
+        self.state_at_start = rec.state if rec is not None else None
+        self.started = True
+
+    def get_status(self) -> Any:
+        return SimpleNamespace(owned_pid=self.owned_pid)
+
+
+async def test_start_worker_guarded_writes_creating_before_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = OwnedPidStore(tmp_path)
+    _patch_adapter_probes(monkeypatch, alive={}, create={}, image={})
+    worker = _CreatingCheckWorker(store)
+    runtime = SimpleNamespace(worker=worker)
+
+    refusal = await _start_worker_guarded(runtime, store)  # type: ignore[arg-type]
+
+    assert refusal is None
+    assert worker.started is True
+    assert worker.state_at_start == STATE_CREATING, "creating marker precedes start"
+    final = store.read_record()
+    assert final is not None and final.state != STATE_CREATING
+    assert final.excel.pid == 7777, "the running record replaces the creating marker"
+
+
+class _FailingStartWorker:
+    def __init__(self) -> None:
+        self.started = False
+
+    async def start(self) -> None:
+        self.started = True
+        raise RuntimeError("boom")
+
+    def get_status(self) -> Any:
+        return SimpleNamespace(owned_pid=None)
+
+
+async def test_start_worker_guarded_clears_creating_on_start_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = OwnedPidStore(tmp_path)
+    _patch_adapter_probes(monkeypatch, alive={}, create={}, image={})
+    worker = _FailingStartWorker()
+    runtime = SimpleNamespace(worker=worker)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await _start_worker_guarded(runtime, store)  # type: ignore[arg-type]
+
+    assert worker.started is True
+    assert store.read() is None, "a fail-closed start clears the creating marker"

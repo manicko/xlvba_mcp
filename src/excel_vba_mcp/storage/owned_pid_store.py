@@ -47,10 +47,12 @@ from excel_vba_mcp.storage.run_repository import _atomic_write_json
 
 __all__ = [
     "SCHEMA_VERSION",
+    "STATE_CREATING",
     "ExcelIdentity",
     "OwnedPidStore",
     "OwnedProcessRecord",
     "OwnerIdentity",
+    "build_creating_record",
     "build_owned_record",
     "default_owned_pid_dir",
 ]
@@ -64,6 +66,11 @@ SCHEMA_VERSION = 1
 #: Record states (the lifecycle phase the marker was written in).
 STATE_RUNNING = "running"
 STATE_RECOVERING = "recovering"
+#: Written BEFORE ``DispatchEx`` (before the owned Excel exists / is assigned to the
+#: job). A crash in the create->assign window leaves this marker with no verified
+#: excel pid, so the next start refuses a second launch (an unidentifiable orphan may
+#: exist) rather than double-launching, and reaps only a verified identity.
+STATE_CREATING = "creating"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -150,8 +157,17 @@ class OwnedProcessRecord:
             return None
         owner_pid = _as_pid(owner_raw.get("pid"))
         excel_pid = _as_pid(excel_raw.get("pid"))
-        if owner_pid is None or excel_pid is None:
+        if owner_pid is None:
             return None
+        state = str(raw.get("state", STATE_RUNNING))
+        if excel_pid is None:
+            # A ``creating`` marker is written before the excel pid is known, so a
+            # missing / zero excel pid is valid there (mapped to 0 = unknown). For
+            # any other state a missing excel pid makes the record unusable.
+            if state == STATE_CREATING and excel_raw.get("pid") in (0, None):
+                excel_pid = 0
+            else:
+                return None
         schema = raw.get("schema_version", SCHEMA_VERSION)
         if isinstance(schema, bool) or not isinstance(schema, int):
             schema = SCHEMA_VERSION
@@ -169,7 +185,7 @@ class OwnedProcessRecord:
                 session_id=_as_int(excel_raw.get("session_id")),
                 image_verified=bool(excel_raw.get("image_verified", False)),
             ),
-            state=str(raw.get("state", STATE_RUNNING)),
+            state=state,
             schema_version=schema,
             updated_at=str(raw.get("updated_at", "")),
         )
@@ -234,6 +250,34 @@ def build_owned_record(
             image_verified=_is_excel_image(excel_exe),
         ),
         state=state,
+    )
+
+
+def build_creating_record(
+    *,
+    owner_pid: int,
+    owner_create_time: int | None,
+    owner_exe: str | None,
+    owner_session_id: int | None,
+) -> OwnedProcessRecord:
+    """Assemble a ``state="creating"`` marker written BEFORE ``DispatchEx``.
+
+    The owned Excel does not exist yet, so the excel pid is unknown (``0``). If the
+    server crashes in the create->assign window this durable marker lets the next
+    start reconcile conservatively: refuse a second launch (an unidentifiable orphan
+    may exist) and reap only a verified identity — never a pid-only kill. The caller
+    overwrites it with a full ``running`` record once the owned pid is known.
+    """
+
+    return OwnedProcessRecord(
+        owner=OwnerIdentity(
+            pid=owner_pid,
+            create_time_filetime=owner_create_time,
+            exe=owner_exe,
+            session_id=owner_session_id,
+        ),
+        excel=ExcelIdentity(pid=0),
+        state=STATE_CREATING,
     )
 
 
