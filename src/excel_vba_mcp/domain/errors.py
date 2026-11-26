@@ -65,6 +65,14 @@ class ErrorCode(StrEnum):
     # ``MACRO_NOT_FOUND`` and from the generic ``COM_BUSY`` fallback so callers
     # can tell "no such object, do not retry" from "Excel busy, retry".
     NOT_FOUND = "NOT_FOUND"
+    # U6-B (plan_05 §5.2): additive envelope codes. ``INTERNAL_ERROR`` is the
+    # guaranteed structured fallback for an unhandled non-domain exception at the
+    # ``call_tool`` boundary (so no bare "Error executing tool" leak reaches a
+    # client); ``CONFIRMATION_REQUIRED`` is a caller-argument gate raised before a
+    # destructive action when a required ``confirm`` flag is missing/false. Neither
+    # is retryable.
+    INTERNAL_ERROR = "INTERNAL_ERROR"
+    CONFIRMATION_REQUIRED = "CONFIRMATION_REQUIRED"
 
 
 # Well-known HRESULT values that map to domain codes (hex shown for readability).
@@ -156,6 +164,9 @@ _CATEGORY_BY_CODE: dict[ErrorCode, str] = {
     ErrorCode.NOT_FOUND: "not_found",
     # validation — caller argument/schema error (also the pydantic path).
     ErrorCode.INVALID_RANGE: "validation",
+    ErrorCode.CONFIRMATION_REQUIRED: "validation",
+    # internal — unhandled non-domain failure at the tool boundary (U6-B).
+    ErrorCode.INTERNAL_ERROR: "internal",
 }
 
 # Only a transient COM busy/rejected result is retryable (plan_03 §7.3, D-U10).
@@ -233,6 +244,12 @@ _ACTIONS_BY_CODE: dict[ErrorCode, list[str]] = {
     ErrorCode.LISTOBJECT_INTERSECTION: ["use the table tools for ListObject targets"],
     ErrorCode.AMBIGUOUS_FILTER: ["supply a filter that resolves to exactly one target"],
     ErrorCode.MACRO_BLOCKED: ["open in execute mode / adjust macro policy"],
+    ErrorCode.INTERNAL_ERROR: [
+        "inspect server logs; the failure was not a domain error"
+    ],
+    ErrorCode.CONFIRMATION_REQUIRED: [
+        "re-call with confirm=true after reviewing what is discarded"
+    ],
 }
 
 # Fallback category/actions for an unrecognized string key (never a real code).
@@ -335,18 +352,21 @@ class ExcelVbaMcpError(Exception):
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation (no COM objects).
 
-        Additive (U2; plan_03 §7): the original five keys (``code``, ``message``,
-        ``hresult``, ``hresult_hex``, ``context``) are preserved and three
-        machine-readable keys are added — ``errorCategory``, ``isRetryable`` and
-        ``suggestedNextActions``. No schema bump; no new ``ErrorCode`` members.
+        Final envelope (U6-B; plan_05 §5.2): the keys are emitted in the order
+        ``errorCode, message, hresult, hresult_hex, details, errorCategory,
+        isRetryable, suggestedNextActions``. ``errorCode`` ← ``code.value`` and
+        ``details`` ← ``context`` (renamed from ``code``/``context``);
+        ``hresult``/``hresult_hex`` stay additive; ``errorCategory`` /
+        ``isRetryable`` / ``suggestedNextActions`` are unchanged pure functions.
+        No schema bump; the new codes are additive.
         """
 
         return {
-            "code": self.code.value,
+            "errorCode": self.code.value,
             "message": self.message,
             "hresult": self.hresult,
             "hresult_hex": self.hresult_hex,
-            "context": self.context,
+            "details": self.context,
             "errorCategory": category_for(self.code),
             "isRetryable": retryable_for(self.code),
             "suggestedNextActions": actions_for(self.code, self.context),
@@ -573,7 +593,7 @@ class WorkbookNotFoundError(ExcelVbaMcpError):
     (the lost-instance case). It is deliberately distinct from ``COM_BUSY`` so a
     client can tell "bad id / lost session" from "Excel is busy".
 
-    Note: ``macro_run`` / ``vba_compile`` still report the lost owned instance as
+    Note: ``macro_run`` / ``vba_compile_diagnostics`` still report the lost owned instance as
     ``EXCEL_HUNG`` (``needs_recovery``) because macro execution requires recovery;
     the plain read/mutation paths report ``WORKBOOK_NOT_FOUND``.
     """

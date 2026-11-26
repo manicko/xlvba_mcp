@@ -1,7 +1,7 @@
 """Job registry MCP tools (Block E — E/F boundary).
 
 Thin, async tool handlers for the minimal in-memory job registry:
-``job_get`` (poll one job's status/result) and ``job_cancel`` (record cancel
+``job_get`` (poll one job's status/result) and ``job_request_cancel`` (record cancel
 intent only). They are deliberately **thin**: each validates its arguments and
 delegates to :class:`~excel_vba_mcp.application.job_registry.JobRegistry`. They
 **never touch COM** (ARCH-009).
@@ -110,7 +110,7 @@ async def job_get(job_id: str) -> JobStatus:
     return registry.status(job_id)
 
 
-async def job_cancel(job_id: str) -> JobStatus:
+async def job_request_cancel(job_id: str) -> JobStatus:
     """Record a job's cancel **intent** (intent-only; never interrupts COM).
 
     The uninterruptible COM call on the single-STA thread runs to completion; this
@@ -130,8 +130,8 @@ async def job_cancel(job_id: str) -> JobStatus:
 
 __all__ = [
     "get_job_registry",
-    "job_cancel",
     "job_get",
+    "job_request_cancel",
     "set_job_registry",
     "start_long_op",
 ]

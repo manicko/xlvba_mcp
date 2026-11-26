@@ -8,7 +8,7 @@ typed error. They prove the Block E contract:
 * the registry OWNS the result: a job's result is retrievable by ``job_id`` even
   after the request handle is abandoned (no awaiter);
 * ``job_get`` transitions ``running -> succeeded`` (and ``expired`` / ``failed``);
-* ``job_cancel`` is intent-only (the op still runs to completion);
+* ``job_request_cancel`` is intent-only (the op still runs to completion);
 * an unknown ``job_id`` is a structured ``NOT_FOUND``;
 * ``poll_after_s`` is clamped to ``[1, 30]``.
 """
@@ -157,9 +157,9 @@ async def test_cancel_unknown_raises_and_terminal_is_noop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# job_cancel is intent-only
+# job_request_cancel is intent-only
 # ---------------------------------------------------------------------------
-async def test_job_cancel_is_intent_only() -> None:
+async def test_job_request_cancel_is_intent_only() -> None:
     worker = BlockingWorker(result="done")
     registry = JobRegistry(worker)
 

@@ -456,7 +456,7 @@ async def test_excel_recover_terminates_and_rebuilds(rig: _Rig) -> None:
     rig.adapter.terminate_owned_handle = lambda: terminated.append(monkey_handle) or True  # type: ignore[method-assign]
 
     workbook_tools.set_session_service(rig.session)  # type: ignore[arg-type]
-    result = await excel_recover()
+    result = await excel_recover(confirm=True)
 
     assert isinstance(result, RecoveryResult)
     assert result.ok is True
@@ -474,7 +474,7 @@ async def test_excel_recover_fails_closed_without_handle(rig: _Rig) -> None:
     rig.adapter._owned_handle = None  # identity/handle unavailable
 
     workbook_tools.set_session_service(rig.session)  # type: ignore[arg-type]
-    result = await excel_recover()
+    result = await excel_recover(confirm=True)
 
     assert result.ok is False
     assert result.recovery_possible is False
@@ -489,14 +489,14 @@ async def test_excel_recover_marks_prior_job_unknown_when_active(rig: _Rig) -> N
     rig.worker.active_operation = "macro_run"
     workbook_tools.set_session_service(rig.session)  # type: ignore[arg-type]
 
-    result = await excel_recover()
+    result = await excel_recover(confirm=True)
 
     assert result.prior_job == "unknown"
 
 
 async def test_excel_recover_is_audited(rig: _Rig) -> None:
     workbook_tools.set_session_service(rig.session)  # type: ignore[arg-type]
-    await excel_recover()
+    await excel_recover(confirm=True)
 
     events = [
         json.loads(line)

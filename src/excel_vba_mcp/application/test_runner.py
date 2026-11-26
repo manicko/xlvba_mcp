@@ -1760,7 +1760,7 @@ class TestRunner:
         raise ExcelVbaMcpError(
             f"Unknown workbook_id {workbook_id!r} (not open).",
             code=ErrorCode.SNAPSHOT_FAILED,
-            context={"workbook_id": workbook_id, "tool": "test_run_suite"},
+            context={"workbook_id": workbook_id, "tool": "test_suite_run"},
         )
 
     def _require_context(self) -> RunContext:

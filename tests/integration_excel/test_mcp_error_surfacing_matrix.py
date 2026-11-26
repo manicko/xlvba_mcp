@@ -352,35 +352,8 @@ def _denial_args(tool: str, wid: str) -> dict[str, Any]:
         },
         "macro_run": {"workbook_id": wid, "macro_name": "modWorkflow.Recalculate"},
         "snapshot_create": {"workbook_id": wid},
-        "snapshot_restore": {"snapshot_id": "no-such-snapshot"},
+        "snapshot_restore": {"snapshot_id": "no-such-snapshot", "confirm": True},
         "snapshot_diff": {"snapshot_id_a": "no-such-a", "snapshot_id_b": "no-such-b"},
-        "test_run_suite": {
-            "suite": {
-                "suite": "fe02",
-                "workbook_id": wid,
-                "cases": [
-                    {
-                        "id": "c1",
-                        "steps": [
-                            {
-                                "action": "range_read_values",
-                                "sheet": "Sheet1",
-                                "range_address": "A1",
-                            }
-                        ],
-                        "assertions": [
-                            {
-                                "type": "range_structure",
-                                "sheet": "Sheet1",
-                                "address": "A1",
-                                "rows": 1,
-                                "cols": 1,
-                            }
-                        ],
-                    }
-                ],
-            }
-        },
         "vba_export_project": {"workbook_id": wid},
         "excel_save": {"workbook_id": wid},
         "excel_close": {"workbook_id": wid, "save_changes": False},
@@ -413,7 +386,6 @@ def _malformed_args(tool: str, wid: str) -> dict[str, Any]:
         "snapshot_create": {"workbook_id": 12345},  # wrong type for 'workbook_id'
         "snapshot_restore": {},  # missing 'snapshot_id'
         "snapshot_diff": {"snapshot_id_a": "a"},  # missing 'snapshot_id_b'
-        "test_run_suite": {},  # missing 'suite'
         "vba_export_project": {"workbook_id": 42},  # wrong type for 'workbook_id'
         "excel_save": {},  # missing 'workbook_id'
         "excel_close": {},  # missing 'workbook_id'
@@ -435,7 +407,6 @@ _MUTATING_TOOLS: tuple[str, ...] = (
     "snapshot_create",
     "snapshot_restore",
     "snapshot_diff",
-    "test_run_suite",
     "vba_export_project",
     "excel_save",
     "excel_close",
@@ -498,9 +469,6 @@ async def test_error_surfacing_matrix(tmp_path: Path) -> None:
             # snapshot_restore/diff fail on the unknown snapshot id, not read-only.
             "snapshot_restore": "SNAPSHOT_FAILED",
             "snapshot_diff": "SNAPSHOT_FAILED",
-            # test_run_suite is read-only-safe (runs against disposable copies and
-            # never mutates the session workbook); it succeeds on a read-only open.
-            "test_run_suite": None,
             # Approval-gated filesystem writes (F-4): auto-allowed in full mode, so
             # they succeed on a read-only session here (restricted-mode denial is
             # asserted elsewhere).
@@ -520,16 +488,16 @@ async def test_error_surfacing_matrix(tmp_path: Path) -> None:
                 assert payload is not None, f"[{tool}] expected success, got {denial.content!r}"
             else:
                 payload = assert_structured_error(denial, tool, f"denial[{expected}]")
-                assert payload["code"] == expected, (
+                assert payload["errorCode"] == expected, (
                     f"[{tool}] denial hit the wrong guard: expected {expected}, "
-                    f"got {payload['code']} (payload={payload!r})"
+                    f"got {payload['errorCode']} (payload={payload!r})"
                 )
-                report.append(f"{tool:32s} denial   code={payload['code']} (expected {expected})")
+                report.append(f"{tool:32s} denial   code={payload['errorCode']} (expected {expected})")
 
             # (b) malformed argument (missing required field / wrong type)
             malformed = await _call(session, tool, _malformed_args(tool, write_wid)[tool])
             malformed_payload = assert_structured_error(malformed, tool, "malformed")
-            report.append(f"{tool:32s} malformed code={malformed_payload['code']}")
+            report.append(f"{tool:32s} malformed code={malformed_payload['errorCode']}")
 
         # (c) model_validator-guarded argument (audit finding C-1 regression).
         # ``RangeWriteRequest`` raises a plain ``ValueError`` from its
@@ -554,11 +522,11 @@ async def test_error_surfacing_matrix(tmp_path: Path) -> None:
         oversized_payload = assert_structured_error(
             oversized, "range_write_values", "model-validator"
         )
-        assert oversized_payload["code"] == "INVALID_RANGE", (
-            f"oversized grid must be a structured INVALID_RANGE, got {oversized_payload['code']!r}"
+        assert oversized_payload["errorCode"] == "INVALID_RANGE", (
+            f"oversized grid must be a structured INVALID_RANGE, got {oversized_payload['errorCode']!r}"
         )
         report.append(
-            f"{'range_write_values':32s} validator code={oversized_payload['code']} "
+            f"{'range_write_values':32s} validator code={oversized_payload['errorCode']} "
             "(json-serializable ctx)"
         )
 
@@ -579,12 +547,12 @@ async def test_error_surfacing_matrix(tmp_path: Path) -> None:
         for tool, args in unknown_id_cases.items():
             unknown = await _call(session, tool, args)
             payload = assert_structured_error(unknown, tool, f"unknown-id[{bogus}]")
-            assert payload["code"] == "WORKBOOK_NOT_FOUND", (
+            assert payload["errorCode"] == "WORKBOOK_NOT_FOUND", (
                 f"[{tool}] unknown workbook_id must be WORKBOOK_NOT_FOUND, "
-                f"got {payload['code']} (payload={payload!r})"
+                f"got {payload['errorCode']} (payload={payload!r})"
             )
             report.append(
-                f"{tool:32s} unknown-id code={payload['code']} (expected WORKBOOK_NOT_FOUND)"
+                f"{tool:32s} unknown-id code={payload['errorCode']} (expected WORKBOOK_NOT_FOUND)"
             )
 
         # (e) Resource errors are structured too (FE-22 / F-5 §6.4): reading a VBA

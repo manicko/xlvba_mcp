@@ -19,6 +19,7 @@ _CRITICAL = [
     "excel_open",
     "excel_close",
     "excel_save",
+    "excel_save_as",
     "excel_get_status",
     "range_write_values",
     "range_read_values",
@@ -34,12 +35,11 @@ _CRITICAL = [
     "sheet_copy",
     "snapshot_restore",
     "excel_recover",
-    "job_cancel",
+    "job_request_cancel",
     "job_get",
-    "vba_compile",
+    "vba_compile_diagnostics",
     "vba_replace_component_source",
     "vba_insert_code",
-    "test_run_suite",
     "test_suite_run",
 ]
 
@@ -53,9 +53,9 @@ _EXAMPLE_TOOLS = [
 
 # Truthful, non-negotiable phrases (R-D1).
 _TRUTH = {
-    "vba_compile": "does NOT compile",
+    "vba_compile_diagnostics": "does NOT compile",
     "macro_classify_background": "never grants run permission",
-    "job_cancel": "intent-only; never interrupts",
+    "job_request_cancel": "intent-only; never interrupts",
 }
 
 _GLOSSARY_TERMS = [
@@ -73,6 +73,8 @@ _GLOSSARY_TERMS = [
     "indeterminate",
     "working copy",
     "snapshot gate",
+    "guarded mutation",
+    "approval gate",
 ]
 
 
@@ -83,7 +85,7 @@ async def _descriptions() -> dict[str, str]:
 
 async def test_tool_count_is_92_exposed() -> None:
     tools = await server.mcp.list_tools()
-    # U2 adds xlvba_environment (91 -> 92).
+    # U7 adds excel_save_as (91 -> 92); U6-A had removed the duplicate test_run_suite.
     assert len(tools) == 92
 
 
@@ -109,10 +111,8 @@ async def test_examples_present() -> None:
 
 async def test_guarded_mutations_use_uniform_guard_sentence() -> None:
     descriptions = await _descriptions()
-    guard = (
-        "Guarded mutation: writable session + snapshot + approval "
-        "(full-access default; restricted requires approval) + postcondition re-read."
-    )
+    # U6-D: the repeated 133-char guard sentence is compressed to a glossary token.
+    guard = "Guarded mutation (see xlvba://glossary)."
     # A representative set of guarded mutations (U3-owned enum tools excluded).
     for name in [
         "sheet_rename",
@@ -134,7 +134,7 @@ async def test_guarded_mutations_use_uniform_guard_sentence() -> None:
         "pivot_table_refresh",
         "pivot_cache_refresh",
     ]:
-        assert guard in descriptions[name], f"{name} missing the uniform R-D3 guard sentence"
+        assert guard in descriptions[name], f"{name} missing the uniform R-D3 guard token"
 
 
 async def test_glossary_resource_registered_and_complete() -> None:

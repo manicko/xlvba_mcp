@@ -27,7 +27,7 @@ from excel_vba_mcp.domain.errors import (
     retryable_for,
 )
 
-_ORIGINAL_KEYS = {"code", "message", "hresult", "hresult_hex", "context"}
+_ORIGINAL_KEYS = {"errorCode", "message", "hresult", "hresult_hex", "details"}
 _NEW_KEYS = {"errorCategory", "isRetryable", "suggestedNextActions"}
 
 
@@ -38,8 +38,19 @@ def test_to_dict_is_additive_and_complete() -> None:
     # Original five keys preserved + three new keys added.
     assert payload.keys() >= _ORIGINAL_KEYS
     assert payload.keys() >= _NEW_KEYS
-    assert payload["code"] == "COM_BUSY"
-    assert payload["context"] == {"workbook_id": "w"}
+    assert payload["errorCode"] == "COM_BUSY"
+    assert payload["details"] == {"workbook_id": "w"}
+    # Final key order is fixed (U6-B; plan_05 §5.2).
+    assert list(payload) == [
+        "errorCode",
+        "message",
+        "hresult",
+        "hresult_hex",
+        "details",
+        "errorCategory",
+        "isRetryable",
+        "suggestedNextActions",
+    ]
     # Must remain JSON-serializable.
     assert json.loads(json.dumps(payload))["errorCategory"] == "transient_com_failure"
 
@@ -97,6 +108,26 @@ def test_approval_denied_is_permission_denied() -> None:
     payload = ExcelVbaMcpError("x", code=ErrorCode.APPROVAL_DENIED).to_dict()
     assert payload["errorCategory"] == "permission_denied"
     assert payload["isRetryable"] is False
+
+
+def test_internal_error_is_internal_not_retryable_with_action() -> None:
+    # U6-B: guaranteed structured fallback for an unhandled non-domain exception.
+    payload = ExcelVbaMcpError("x", code=ErrorCode.INTERNAL_ERROR).to_dict()
+    assert payload["errorCategory"] == "internal"
+    assert payload["isRetryable"] is False
+    assert payload["suggestedNextActions"] == [
+        "inspect server logs; the failure was not a domain error"
+    ]
+
+
+def test_confirmation_required_is_validation_not_retryable_with_action() -> None:
+    # U6-B: caller-argument gate raised before a destructive action.
+    payload = ExcelVbaMcpError("x", code=ErrorCode.CONFIRMATION_REQUIRED).to_dict()
+    assert payload["errorCategory"] == "validation"
+    assert payload["isRetryable"] is False
+    assert payload["suggestedNextActions"] == [
+        "re-call with confirm=true after reviewing what is discarded"
+    ]
 
 
 def test_job_interrupted_unknown_is_never_retryable() -> None:

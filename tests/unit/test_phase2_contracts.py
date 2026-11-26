@@ -541,7 +541,7 @@ def test_phase2_error_subclasses_and_hresult_preservation() -> None:
         assert error.hresult == 0x80040154
         payload = error.to_dict()
         assert payload["hresult_hex"] == "0x80040154"
-        assert json.loads(json.dumps(payload))["context"]["op"] == "range_get"
+        assert json.loads(json.dumps(payload))["details"]["op"] == "range_get"
 
 
 def test_error_from_hresult_still_maps_stage1_codes() -> None:
@@ -620,4 +620,4 @@ def test_stage1_cell_value_reused_in_range_values() -> None:
 def test_stage1_error_base_still_available() -> None:
     error = ExcelVbaMcpError("plain", code=ErrorCode.COM_BUSY)
     assert error.code is ErrorCode.COM_BUSY
-    assert error.to_dict()["code"] == "COM_BUSY"
+    assert error.to_dict()["errorCode"] == "COM_BUSY"

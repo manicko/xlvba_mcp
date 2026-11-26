@@ -1,13 +1,13 @@
 """VBE compile MCP tools (task_020, spec §6.3 / §8.2).
 
-Thin, async tool handlers for the compile surface: ``vba_compile`` and
+Thin, async tool handlers for the compile surface: ``vba_compile_diagnostics`` and
 ``vba_get_compile_diagnostics``. They are deliberately **thin**: each validates
 its arguments, delegates to
 :class:`~excel_vba_mcp.application.compile_service.CompileService` and returns a
 domain DTO. They **never touch COM** (ARCH-009).
 
 On the validated Excel build (16.0.14332) non-activating compilation is
-infeasible, so :func:`vba_compile` always returns
+infeasible, so :func:`vba_compile_diagnostics` always returns
 ``status=COMPILE_INDETERMINATE`` with ``reason=NON_ACTIVATING_COMPILE_UNAVAILABLE``
 and partial, explicitly non-compile diagnostics. It never returns ``compiled`` or
 ``compile_error``.
@@ -60,8 +60,8 @@ def _require_non_empty(value: str, field: str) -> str:
     return value
 
 
-async def vba_compile(workbook_id: str) -> CompileResult:
-    """Return a fail-closed compile result for an open workbook.
+async def vba_compile_diagnostics(workbook_id: str) -> CompileResult:
+    """Return a fail-closed compile diagnostic result for an open workbook.
 
     The call never compiles and never returns ``compiled`` / ``compile_error``. On
     this build it returns ``status=COMPILE_INDETERMINATE`` with reason
@@ -99,6 +99,6 @@ async def vba_get_compile_diagnostics(workbook_id: str) -> CompileDiagnostics:
 __all__ = [
     "get_compile_service",
     "set_compile_service",
-    "vba_compile",
+    "vba_compile_diagnostics",
     "vba_get_compile_diagnostics",
 ]

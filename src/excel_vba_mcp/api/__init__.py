@@ -7,7 +7,7 @@ application layer. This package **never touches COM** (ARCH-009): no
 
 from excel_vba_mcp.api.compile_tools import (
     set_compile_service,
-    vba_compile,
+    vba_compile_diagnostics,
     vba_get_compile_diagnostics,
 )
 from excel_vba_mcp.api.health_tools import ExcelHealth, excel_health
@@ -34,6 +34,7 @@ from excel_vba_mcp.api.workbook_tools import (
     excel_list_workbooks,
     excel_open,
     excel_save,
+    excel_save_as,
     get_workbook_model_service,
     set_workbook_model_service,
     workbook_get_model,
@@ -47,6 +48,7 @@ __all__ = [
     "excel_list_workbooks",
     "excel_open",
     "excel_save",
+    "excel_save_as",
     "get_workbook_model_service",
     "macro_classify_background",
     "macro_get_last_result",
@@ -56,7 +58,7 @@ __all__ = [
     "set_macro_service",
     "set_vba_project_service",
     "set_workbook_model_service",
-    "vba_compile",
+    "vba_compile_diagnostics",
     "vba_export_project",
     "vba_get_compile_diagnostics",
     "vba_get_references",

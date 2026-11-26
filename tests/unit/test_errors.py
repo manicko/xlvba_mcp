@@ -74,20 +74,20 @@ def test_object_not_found_error_carries_code_and_is_registered() -> None:
     assert err._ERROR_BY_CODE[ErrorCode.NOT_FOUND] is ObjectNotFoundError
     error = ObjectNotFoundError()
     assert error.code is ErrorCode.NOT_FOUND
-    assert error.to_dict()["code"] == "NOT_FOUND"
+    assert error.to_dict()["errorCode"] == "NOT_FOUND"
 
 
 def test_workbook_not_found_error_carries_code() -> None:
     error = WorkbookNotFoundError()
     assert error.code is ErrorCode.WORKBOOK_NOT_FOUND
-    assert error.to_dict()["code"] == "WORKBOOK_NOT_FOUND"
+    assert error.to_dict()["errorCode"] == "WORKBOOK_NOT_FOUND"
     assert error.context == {}
 
 
 def test_revision_conflict_error_carries_code() -> None:
     error = RevisionConflictError()
     assert error.code is ErrorCode.REVISION_CONFLICT
-    assert error.to_dict()["code"] == "REVISION_CONFLICT"
+    assert error.to_dict()["errorCode"] == "REVISION_CONFLICT"
 
 
 def test_generic_fallback_default_code_is_still_com_busy() -> None:
@@ -168,8 +168,8 @@ async def test_component_source_resource_surfaces_structured_json() -> None:
 
     # The ResourceError message must be the structured JSON payload (not str(exc)).
     payload = json.loads(str(exc_info.value))
-    assert payload["code"] == "WORKBOOK_NOT_FOUND"
-    assert payload["context"] == {"workbook_id": "__missing__"}
+    assert payload["errorCode"] == "WORKBOOK_NOT_FOUND"
+    assert payload["details"] == {"workbook_id": "__missing__"}
 
 
 async def test_test_run_resource_surfaces_structured_json() -> None:
@@ -184,5 +184,5 @@ async def test_test_run_resource_surfaces_structured_json() -> None:
         test_tools.set_test_runner(None)
 
     payload = json.loads(str(exc_info.value))
-    assert payload["code"] == "SNAPSHOT_FAILED"
-    assert payload["context"] == {"run_id": "__missing__"}
+    assert payload["errorCode"] == "SNAPSHOT_FAILED"
+    assert payload["details"] == {"run_id": "__missing__"}

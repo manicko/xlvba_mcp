@@ -3,9 +3,9 @@
 These tests never touch Excel/COM. They exercise ``ExcelVbaMcpServer.call_tool``
 directly to prove that a domain :class:`ExcelVbaMcpError` raised by a tool reaches
 the client as a ``ToolError`` whose message is the JSON of ``to_dict()`` (stable
-``code`` + ``context``) with no generic "Error executing tool" masking, while a
-non-domain exception still surfaces as ``UnexpectedToolError`` and an unknown tool
-raises ``ToolError``.
+``errorCode`` + ``details``) with no generic "Error executing tool" masking, while a
+non-domain exception still surfaces a guaranteed structured ``INTERNAL_ERROR``
+envelope (U6-B) and an unknown tool raises ``ToolError``.
 """
 
 from __future__ import annotations
@@ -68,16 +68,38 @@ async def test_domain_error_surfaced_as_structured_tool_error() -> None:
     message = str(exc_info.value)
     assert "Error executing tool" not in message
     payload = json.loads(message)
-    assert payload["code"] == "PATH_NOT_ALLOWED"
-    assert payload["context"] == {"path": "C:/secret/x.xlsm"}
+    assert payload["errorCode"] == "PATH_NOT_ALLOWED"
+    assert payload["details"] == {"path": "C:/secret/x.xlsm"}
 
 
-async def test_non_domain_error_surfaced_as_unexpected_tool_error() -> None:
+async def test_non_domain_error_surfaced_as_structured_internal_error() -> None:
+    # U6-B: a non-domain exception must NOT leak as a bare UnexpectedToolError /
+    # "Error executing tool"; it surfaces a guaranteed INTERNAL_ERROR envelope.
     server = _make_server()
     server.add_tool(_raise_runtime_error, name="raise_runtime")
 
-    with pytest.raises(UnexpectedToolError):
+    with pytest.raises(ToolError) as exc_info:
         await server.call_tool("raise_runtime", {})
+
+    assert not isinstance(exc_info.value, UnexpectedToolError)
+    message = str(exc_info.value)
+    assert "Error executing tool" not in message
+    payload = json.loads(message)
+    # All 6 required envelope keys (plus additive hresult/hresult_hex).
+    assert set(payload) >= {
+        "errorCode",
+        "message",
+        "details",
+        "errorCategory",
+        "isRetryable",
+        "suggestedNextActions",
+    }
+    assert payload["errorCode"] == "INTERNAL_ERROR"
+    assert payload["errorCategory"] == "internal"
+    assert payload["isRetryable"] is False
+    assert payload["details"]["reason"] == "unhandled_exception"
+    assert payload["details"]["exception"] == "RuntimeError"
+    assert payload["message"] == "boom"
 
 
 async def test_unknown_tool_raises_tool_error() -> None:
@@ -107,10 +129,10 @@ async def test_model_validator_error_surfaced_structured() -> None:
     assert "Error executing tool" not in message
     # The payload must be valid JSON (no TypeError leak) with a stable code.
     payload = json.loads(message)
-    assert payload["code"] == "INVALID_RANGE"
-    assert payload["context"]["reason"] == "invalid_arguments"
+    assert payload["errorCode"] == "INVALID_RANGE"
+    assert payload["details"]["reason"] == "invalid_arguments"
     # The non-serializable exception must have been stringified, not dropped.
-    ctx_errors = payload["context"]["validation"]
+    ctx_errors = payload["details"]["validation"]
     assert ctx_errors, "validation details must be preserved"
     assert all(isinstance(entry.get("ctx", {}).get("error", ""), str) for entry in ctx_errors)
 

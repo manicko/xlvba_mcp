@@ -553,8 +553,8 @@ async def test_stale_revision_rejected(tmp_path: Path) -> None:
         assert err.context.get("expected_source_hash") == stale_hash
         assert err.context.get("current_source_hash") == actual_hash
         diagnostics = err.to_dict()
-        assert diagnostics["code"] == ErrorCode.REVISION_CONFLICT.value
-        assert diagnostics["context"]["reason"] == "revision_conflict"
+        assert diagnostics["errorCode"] == ErrorCode.REVISION_CONFLICT.value
+        assert diagnostics["details"]["reason"] == "revision_conflict"
 
         after = await rig.service.read_component(info.workbook_id, "modTest")
         assert after.source_hash == actual_hash, "stale mutation must not overwrite the source"
@@ -609,7 +609,7 @@ async def test_mutation_blocked_without_snapshot(tmp_path: Path) -> None:
 
         err = exc_info.value
         assert err.code is ErrorCode.SNAPSHOT_FAILED
-        assert err.to_dict()["code"] == ErrorCode.SNAPSHOT_FAILED.value
+        assert err.to_dict()["errorCode"] == ErrorCode.SNAPSHOT_FAILED.value
 
         after = await rig.service.read_component(info.workbook_id, "modTest")
         assert after.source_hash == current.source_hash, "blocked mutation must not change source"
@@ -683,7 +683,7 @@ async def test_mutation_blocked_without_approval(tmp_path: Path) -> None:
         err = exc_info.value
         assert err.code is ErrorCode.APPROVAL_DENIED
         assert err.context.get("reason") == decision.reason
-        assert err.to_dict()["context"]["reason"] == decision.reason
+        assert err.to_dict()["details"]["reason"] == decision.reason
 
         after = await rig.service.read_component(info.workbook_id, "modTest")
         assert after.source_hash == current.source_hash, "denied mutation must not change source"
@@ -748,10 +748,10 @@ async def test_failed_mutation_keeps_snapshot_and_diagnostics(tmp_path: Path) ->
         assert "component_type" in err.context
 
         diagnostics = err.to_dict()
-        assert diagnostics["code"] == ErrorCode.PROTECTED_TARGET.value
+        assert diagnostics["errorCode"] == ErrorCode.PROTECTED_TARGET.value
         assert diagnostics["message"]
-        assert diagnostics["context"]["reason"] == "non_replaceable_component"
-        assert diagnostics["context"]["component"] == "ThisWorkbook"
+        assert diagnostics["details"]["reason"] == "non_replaceable_component"
+        assert diagnostics["details"]["component"] == "ThisWorkbook"
 
         # The snapshot survives the failed mutation.
         assert rig.snapshot.has_snapshot(info.workbook_id)

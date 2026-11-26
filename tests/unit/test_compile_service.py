@@ -388,7 +388,7 @@ async def test_compile_submits_executing_diagnostic_section(tmp_path: Path) -> N
     await rig.service.compile_project(info.workbook_id)
 
     submit = rig.worker.submits[-1]
-    assert submit["name"] == "vba_compile"
+    assert submit["name"] == "vba_compile_diagnostics"
     assert submit["section"] == "diagnostic"
     assert submit["op_class"] is OperationClass.EXECUTING
 
@@ -514,7 +514,7 @@ async def test_get_last_diagnostics_collects_once_when_absent(tmp_path: Path) ->
     diagnostics = await rig.service.get_last_diagnostics(info.workbook_id)
 
     assert diagnostics.is_compile is False
-    compile_submits = [s for s in rig.worker.submits if s["name"] == "vba_compile"]
+    compile_submits = [s for s in rig.worker.submits if s["name"] == "vba_compile_diagnostics"]
     assert len(compile_submits) == 1
 
 

@@ -1,7 +1,7 @@
 """Unit tests for the job registry MCP tool wrappers (Block E).
 
 These tests never open Excel and never import COM. They drive the thin
-``job_get`` / ``job_cancel`` tool handlers against a real
+``job_get`` / ``job_request_cancel`` tool handlers against a real
 :class:`~excel_vba_mcp.application.job_registry.JobRegistry` backed by a
 pure-Python fake worker, and assert the server registers both tools.
 """
@@ -17,7 +17,7 @@ import pytest
 
 from excel_vba_mcp.api.job_tools import (
     get_job_registry,
-    job_cancel,
+    job_request_cancel,
     job_get,
     set_job_registry,
 )
@@ -119,9 +119,9 @@ async def test_job_get_unknown_id_is_not_found() -> None:
 
 
 # ---------------------------------------------------------------------------
-# job_cancel happy path + errors
+# job_request_cancel happy path + errors
 # ---------------------------------------------------------------------------
-async def test_job_cancel_records_intent_only() -> None:
+async def test_job_request_cancel_records_intent_only() -> None:
     worker = BlockingWorker()
     registry = JobRegistry(worker)
     set_job_registry(registry)
@@ -130,7 +130,7 @@ async def test_job_cancel_records_intent_only() -> None:
     while not worker.started.is_set():
         await asyncio.sleep(0.005)
 
-    status = await job_cancel(handle.job_id)
+    status = await job_request_cancel(handle.job_id)
     assert status.cancel_requested is True
     assert status.status is JobState.RUNNING
 
@@ -139,18 +139,18 @@ async def test_job_cancel_records_intent_only() -> None:
     await registry.join(handle.job_id, timeout=2.0)
 
 
-async def test_job_cancel_empty_arg_rejected() -> None:
+async def test_job_request_cancel_empty_arg_rejected() -> None:
     set_job_registry(JobRegistry(ImmediateWorker()))
 
     with pytest.raises(ExcelVbaMcpError):
-        await job_cancel("")
+        await job_request_cancel("")
 
 
-async def test_job_cancel_unknown_id_is_not_found() -> None:
+async def test_job_request_cancel_unknown_id_is_not_found() -> None:
     set_job_registry(JobRegistry(ImmediateWorker()))
 
     with pytest.raises(ExcelVbaMcpError) as excinfo:
-        await job_cancel("does-not-exist")
+        await job_request_cancel("does-not-exist")
     assert excinfo.value.code is ErrorCode.NOT_FOUND
 
 
@@ -162,7 +162,7 @@ async def test_server_registers_job_tools() -> None:
 
     tools = {tool.name for tool in await server.mcp.list_tools()}
     assert "job_get" in tools
-    assert "job_cancel" in tools
+    assert "job_request_cancel" in tools
 
 
 async def _start_and_finish(registry: JobRegistry) -> str:

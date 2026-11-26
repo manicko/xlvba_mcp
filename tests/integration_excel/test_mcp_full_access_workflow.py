@@ -308,7 +308,7 @@ def error_code(result: CallToolResult) -> str:
     assert result.is_error, f"expected an error result, got: {result.content!r}"
     assert result.content, "error result carried no content"
     payload = json.loads(result.content[0].text)
-    code = payload["code"]
+    code = payload["errorCode"]
     assert isinstance(code, str)
     return code
 
@@ -788,7 +788,11 @@ async def test_persistence_roundtrip(tmp_path: Path) -> None:
         await _call(session, "excel_close", {"workbook_id": workbook_id, "save_changes": True})
 
         restored = structured(
-            await _call(session, "snapshot_restore", {"snapshot_id": edited_snapshot_id})
+            await _call(
+                session,
+                "snapshot_restore",
+                {"snapshot_id": edited_snapshot_id, "confirm": True},
+            )
         )
         workbook_id2 = restored["workbook_id"]
         assert workbook_id2 and workbook_id2 != workbook_id, f"expected a fresh id: {restored}"

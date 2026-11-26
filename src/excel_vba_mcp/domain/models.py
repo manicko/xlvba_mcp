@@ -84,13 +84,52 @@ class TimestampedModel(DomainModel):
 
 
 class WorkbookInfo(DomainModel):
-    """Workbook identity and top-level metadata (spec Appendix A, §7.1)."""
+    """Workbook identity and top-level metadata (spec Appendix A, §7.1).
+
+    Two-path model (U6-E; plan_05 §5.4):
+
+    - ``path`` is the **working copy** actually opened by the server — the
+      materialized file under the server ``work/`` directory (``wb.FullName``).
+      All reads/writes and mutations target this copy; the original is never
+      touched.
+    - ``source_path`` is the **original, allowlisted** path the working copy was
+      materialized from. It is ``None`` when the workbook has no on-disk source
+      (for example a snapshot restored from a baseline that itself had no
+      source).
+
+    ``original_name`` is intentionally **absent**: it would be redundant with
+    ``name`` (the file name is identical for the working copy and its source),
+    so no separate field is exposed.
+
+    Examples:
+
+    - New open of ``C:/data/report.xlsm``: ``path`` =
+      ``<temp>/excel_vba_mcp/work/<id>.xlsm``, ``source_path`` =
+      ``C:/data/report.xlsm``, ``name`` = ``report.xlsm``.
+    - Writable working copy: identical to the open above; edits land in ``path``
+      and ``source_path`` still points at the untouched original.
+    - Separate source/current: after ``excel_save`` the working copy at ``path``
+      diverges from ``source_path`` (which remains the pristine original) until
+      the change is deliberately persisted.
+    """
 
     workbook_id: str = Field(description="Stable server-assigned workbook id.")
     name: str
     format: str = Field(description="File format, e.g. 'xlsm'.")
-    path: str = Field(description="Actual working path of the opened workbook.")
-    source_path: str | None = Field(default=None, description="Original allowlisted path.")
+    path: str = Field(
+        description=(
+            "Actual working path of the opened workbook (the materialized "
+            "working copy, wb.FullName); the original is never modified."
+        )
+    )
+    source_path: str | None = Field(
+        default=None,
+        description=(
+            "Original allowlisted path the working copy was copied from; None "
+            "when the workbook has no on-disk source. There is no separate "
+            "original_name (redundant with name)."
+        ),
+    )
     read_only: bool
     has_vba: bool
     excel_version: str
@@ -1441,3 +1480,44 @@ class PivotRefreshResult(DomainModel):
     refresh_date_after: datetime | None = None
     status: PivotRefreshStatus = PivotRefreshStatus.FAILED
     error: dict[str, Any] | None = None
+
+
+class SaveAsResult(TimestampedModel):
+    """Result of ``excel_save_as`` (U7; plan_05 §5.5, §9).
+
+    Fail-closed: ``outcome`` is ``"ok"`` only after the final size + SHA-256 of
+    the target were verified. An interrupted or unprovable write reports
+    ``"unknown"`` / ``"error"`` (never success) and, when a previous target was
+    preserved, carries its ``backup_path`` (a single ``<target>.bak``). The
+    session stays bound to its working copy (``wb.Save`` + a pure-filesystem
+    copy, never ``wb.SaveAs``): ``workbook_id`` / working copy / source are
+    unchanged by a Save As.
+    """
+
+    workbook_id: str
+    target_path: str = Field(
+        description="Canonical target path written (== source_path on a source-overwrite)."
+    )
+    source_path: str = Field(
+        description="Canonical original source path of the open working copy."
+    )
+    source_overwritten: bool = Field(
+        description=(
+            "True when the original source file was overwritten "
+            "(overwrite_source=True and the source hash matched)."
+        )
+    )
+    overwrote_existing: bool = Field(
+        description="True when a pre-existing target file was replaced (a .bak was written)."
+    )
+    backup_path: str | None = Field(
+        default=None,
+        description="Path of the single <target>.bak preserved before an overwrite, or None.",
+    )
+    sha256: str = Field(description="SHA-256 of the written target (verified).")
+    size: int = Field(description="Size in bytes of the written target (verified).")
+    outcome: Literal["ok", "unknown", "error"] = Field(
+        description="'ok' only after the final size+SHA-256 verify; 'unknown'/'error' fail-closed."
+    )
+    mode: SessionMode = Field(description="Session mode of the bound working copy.")
+    notes: list[str] = Field(default_factory=list)

@@ -22,6 +22,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict
 
 from excel_vba_mcp.api.workbook_tools import get_session_service
+from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 
 __all__ = ["RecoveryResult", "excel_recover"]
 
@@ -43,7 +44,11 @@ class RecoveryResult(BaseModel):
     approval_source: str | None = None
 
 
-async def excel_recover(reason: str = "agent_directed") -> RecoveryResult:
+async def excel_recover(
+    reason: str = "agent_directed",
+    *,
+    confirm: bool = False,
+) -> RecoveryResult:
     """Recover the owned Excel process (agent-directed; fail-closed; originals safe).
 
     Terminates the wedged owned ``EXCEL.EXE`` **through the held process handle**
@@ -55,8 +60,17 @@ async def excel_recover(reason: str = "agent_directed") -> RecoveryResult:
     when the agent calls it. An interrupted mutation is reported as
     ``prior_job="unknown"`` and is **never** auto-retried.
 
+    This is destructive to the open working copies, so it is **gated by
+    ``confirm``**: a missing or ``False`` ``confirm`` raises
+    ``CONFIRMATION_REQUIRED`` **before** any termination and the session service
+    is never called. It discards working copies only (originals are never
+    modified) and does **not** roll back external side effects of any macro that
+    already ran.
+
     Args:
         reason: Short label recorded in the audit entry / outcome.
+        confirm: Must be ``True`` to proceed; otherwise the call is rejected
+            with ``CONFIRMATION_REQUIRED`` before any destructive action.
 
     Returns:
         A :class:`RecoveryResult` with ``ok`` / ``terminated`` / ``confirmed`` /
@@ -64,6 +78,20 @@ async def excel_recover(reason: str = "agent_directed") -> RecoveryResult:
         ``what_lost`` (destructive to working copies only; originals safe).
     """
 
+    if not confirm:
+        raise ExcelVbaMcpError(
+            "excel_recover requires confirm=true: it terminates the owned Excel "
+            "process, discards the open working copies, and does NOT roll back "
+            "external side effects of any macro that already ran.",
+            code=ErrorCode.CONFIRMATION_REQUIRED,
+            context={
+                "tool": "excel_recover",
+                "discard": (
+                    "the owned Excel process and all open working copies "
+                    "(originals are never modified)"
+                ),
+            },
+        )
     session = get_session_service()
     outcome = await session.recover_owned_process(reason=reason)
     return RecoveryResult.model_validate(outcome)

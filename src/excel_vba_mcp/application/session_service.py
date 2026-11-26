@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import hashlib
 import os
 import shutil
 import tempfile
@@ -52,9 +53,16 @@ from excel_vba_mcp.domain.errors import (
     ErrorCode,
     ExcelHungError,
     ExcelVbaMcpError,
+    ProtectedTargetError,
+    StaleTargetError,
     WorkbookNotFoundError,
 )
-from excel_vba_mcp.domain.models import SessionPolicy, SessionStatus, WorkbookInfo
+from excel_vba_mcp.domain.models import (
+    SaveAsResult,
+    SessionPolicy,
+    SessionStatus,
+    WorkbookInfo,
+)
 from excel_vba_mcp.domain.statuses import (
     AccessMode,
     OperationClass,
@@ -92,10 +100,28 @@ class _SessionRecord:
     dirty: bool
     info: WorkbookInfo
     lock: asyncio.Lock
+    # Source identity captured at open (U7; plan_05 §9): the streaming SHA-256
+    # and byte size of the canonical original, taken AFTER path validation and
+    # BEFORE the working copy is materialized. ``save_as_workbook`` re-verifies
+    # both before any source-overwrite so a drifted source is fail-closed.
+    source_sha256: str
+    source_size: int
 
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _sha256_file(path: Path) -> tuple[str, int]:
+    """Return ``(sha256_hex, size_bytes)`` of ``path`` (streaming, never whole-file)."""
+
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+            size += len(chunk)
+    return digest.hexdigest(), size
 
 
 class SessionService:
@@ -303,6 +329,11 @@ class SessionService:
                 )
 
             workbook_id = str(uuid4())
+            # Capture source identity AFTER path validation and BEFORE the working
+            # copy is materialized (U7; plan_05 §9): a streaming SHA-256 + byte
+            # size of the canonical original, re-verified at Save As so a source
+            # that drifted or was replaced since open is fail-closed.
+            source_sha256, source_size = _sha256_file(canonical)
             working_path = self._materialize_working_copy(canonical, workbook_id)
 
             try:
@@ -332,6 +363,8 @@ class SessionService:
             dirty=False,
             info=info,
             lock=lock,
+            source_sha256=source_sha256,
+            source_size=source_size,
         )
         # The lock is intentionally still held for the workbook lifetime; it is
         # released by close_workbook. Register bookkeeping now.
@@ -536,6 +569,338 @@ class SessionService:
             result={"workbook_id": workbook_id, "saved": True},
         )
         return info
+
+    # ------------------------------------------------------------------
+    # Save As (U7; plan_05 §5.5, §9) — new target file, session stays bound
+    # ------------------------------------------------------------------
+
+    async def save_as_workbook(
+        self,
+        workbook_id: str,
+        path: str,
+        *,
+        overwrite_existing: bool = False,
+        overwrite_source: bool = False,
+        timeout_s: float = _DEFAULT_TIMEOUT_S,
+    ) -> SaveAsResult:
+        """Save an open workbook's working copy to a (possibly new) target path.
+
+        Fail-closed Save As (plan_05 §5.5, §9): the working copy is flushed in
+        place with ``wb.Save()`` on the STA worker, then copied to the target by
+        a pure-filesystem atomic temp→``os.replace`` on the event loop. The
+        session is **never rebound** — ``wb.SaveAs`` is never called (it would
+        repoint ``FullName`` and break ``_find_open_workbook`` / original
+        protection); ``workbook_id`` / ``working_path`` / ``canonical`` are
+        unchanged and a later ``excel_save`` still writes the working copy.
+
+        The source identity (streaming SHA-256 + size) captured at
+        :meth:`open_workbook` is re-verified before any source-overwrite, so a
+        source that was replaced or modified since open is rejected. A single
+        ``<target>.bak`` preserves the previous target across an overwrite.
+
+        Args:
+            workbook_id: The id returned by :meth:`open_workbook`.
+            path: Destination path; validated against the allowlist (MUTATING).
+            overwrite_existing: Replace an existing target (writes a ``.bak``).
+            overwrite_source: Allow the target to be the original source itself
+                (requires the source hash to still match; writes a ``.bak``).
+            timeout_s: Soft per-call ceiling for the STA ``wb.Save()`` flush.
+
+        Returns:
+            A :class:`SaveAsResult` whose ``outcome`` is ``"ok"`` only after the
+            final size + SHA-256 of the target were verified; ``"unknown"`` /
+            ``"error"`` fail-closed (never success), with ``backup_path`` when a
+            previous target was preserved.
+
+        Raises:
+            PathNotAllowedError: If ``path`` is outside the allowlisted roots.
+            ProtectedTargetError: If the target is the working copy, the source
+                (without ``overwrite_source``), or an existing target (without
+                ``overwrite_existing``).
+            StaleTargetError: If the source was replaced or modified since open.
+            ApprovalDeniedError: If the MUTATING approval is denied.
+            WorkbookNotFoundError: If the workbook is no longer open.
+        """
+
+        record = self._require_record(workbook_id)
+
+        # Path gate: allowlist + extension + symlink/UNC/device (no writes).
+        canonical_t = self._path_policy.validate_path(path, OperationClass.MUTATING)
+        # The working copy is the live session file; Save As must never target it.
+        if os.path.normcase(str(canonical_t)) == os.path.normcase(record.working_path):
+            raise ProtectedTargetError(
+                "The Save As target is the open working copy; choose a different path.",
+                context={
+                    "reason": "target_is_working_copy",
+                    "target_path": str(canonical_t),
+                },
+            )
+
+        # Approval MUTATING on the target canonical (== source canonical when
+        # T==S, so a single check covers both).
+        self._require_approval(
+            self._approval_key(str(canonical_t), "excel_save_as"),
+            OperationClass.MUTATING,
+        )
+
+        # Re-validate the stored source canonical and re-hash it (fail-closed).
+        re_canonical = self._path_policy.validate_path(record.canonical, OperationClass.READ_ONLY)
+        if os.path.normcase(str(re_canonical)) != os.path.normcase(record.canonical):
+            raise StaleTargetError(
+                "The original source path was replaced since the workbook was opened.",
+                context={
+                    "reason": "source_replaced",
+                    "stored_source": record.canonical,
+                    "current_source": str(re_canonical),
+                },
+            )
+        source_sha256, source_size = _sha256_file(re_canonical)
+        if source_sha256 != record.source_sha256 or source_size != record.source_size:
+            raise StaleTargetError(
+                "The original source file was modified since the workbook was opened.",
+                context={
+                    "reason": "source_modified_since_open",
+                    "expected_sha256": record.source_sha256,
+                    "actual_sha256": source_sha256,
+                },
+            )
+
+        same = os.path.normcase(str(canonical_t)) == os.path.normcase(record.canonical)
+        exists = canonical_t.exists()
+
+        # Decision matrix (plan_05 §5.5).
+        if same and not overwrite_source:
+            raise ProtectedTargetError(
+                "The target is the original source; pass overwrite_source=true to replace it.",
+                context={"reason": "source_protected", "target_path": str(canonical_t)},
+            )
+        if not same and exists and not overwrite_existing:
+            raise ProtectedTargetError(
+                "The target already exists; pass overwrite_existing=true to replace it.",
+                context={"reason": "target_exists", "target_path": str(canonical_t)},
+            )
+
+        # 1. Flush the working copy in place (never wb.SaveAs).
+        await self._flush_working_copy(record, timeout_s)
+
+        # 2-6. Pure-filesystem atomic copy + single .bak + final verify.
+        write = self._atomic_save_as_copy(
+            working_path=record.working_path,
+            canonical_t=canonical_t,
+            target_exists=exists,
+        )
+
+        result = SaveAsResult(
+            workbook_id=workbook_id,
+            target_path=str(canonical_t),
+            source_path=record.canonical,
+            source_overwritten=same,
+            overwrote_existing=exists,
+            backup_path=write["backup_path"],
+            sha256=write["sha256"],
+            size=write["size"],
+            outcome=write["outcome"],
+            mode=record.mode,
+            notes=write["notes"],
+            created_at=_utc_now(),
+            updated_at=_utc_now(),
+        )
+        self._record_audit(
+            tool="excel_save_as",
+            operation_class="mutating",
+            params={
+                "workbook_id": workbook_id,
+                "target_path": str(canonical_t),
+                "overwrite_existing": overwrite_existing,
+                "overwrite_source": overwrite_source,
+            },
+            workbook={"canonical_path": record.canonical},
+            result={
+                "target_path": str(canonical_t),
+                "sha256": write["sha256"],
+                "size": write["size"],
+                "backup_path": write["backup_path"],
+                "source_overwritten": same,
+                "outcome": write["outcome"],
+            },
+        )
+        return result
+
+    async def _flush_working_copy(self, record: _SessionRecord, timeout_s: float) -> None:
+        """Flush the working copy in place via ``wb.Save()`` on the STA worker."""
+
+        app_adapter = self._app_adapter
+
+        def flush_fn() -> None:
+            wb = _find_open_workbook(app_adapter, record.working_path)
+            if wb is None:
+                raise WorkbookNotFoundError(
+                    "The workbook is no longer open in the owned instance.",
+                    context={"workbook_id": record.workbook_id},
+                )
+            with app_adapter.alerts_suppressed():
+                wb.Save()
+
+        flush_fn.__name__ = "save_as_flush"
+        # Await the single-STA FIFO submit so the flush completes before the
+        # pure-filesystem copy runs on the event loop.
+        await self._worker.submit(
+            flush_fn,
+            timeout=timeout_s,
+            section="save",
+            op_class=OperationClass.MUTATING,
+        )
+
+    def _atomic_save_as_copy(
+        self,
+        *,
+        working_path: str,
+        canonical_t: Path,
+        target_exists: bool,
+    ) -> dict[str, Any]:
+        """Atomic temp→replace copy with a single ``.bak`` and final verify.
+
+        Pure filesystem (no COM); runs on the event loop. Never reports success
+        from "no exception": ``outcome="ok"`` only after the staged copy and the
+        final target both match the working copy by size + SHA-256. Any
+        interruption after the backup boundary yields ``outcome="unknown"`` with
+        ``backup_path`` (no auto-resume); a clean pre-backup failure yields
+        ``outcome="error"`` with the destination untouched. If a ``.bak`` from a
+        prior interrupted save already exists, it is never overwritten: the
+        destination is left untouched and the outcome is ``"unknown"`` with
+        ``backup_path`` set (no auto-resume).
+        """
+
+        working = Path(working_path)
+        working_sha, working_size = _sha256_file(working)
+        notes: list[str] = []
+        backup_path: str | None = None
+        descriptor = -1
+        temp_path: Path | None = None
+        backup_created = False
+        try:
+            canonical_t.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temp_name = tempfile.mkstemp(
+                prefix=f".{canonical_t.name}.", suffix=".tmp", dir=str(canonical_t.parent)
+            )
+            temp_path = Path(temp_name)
+            # Copy working -> temp, flush + fsync.
+            with os.fdopen(descriptor, "wb") as out_handle:
+                descriptor = -1
+                with working.open("rb") as in_handle:
+                    shutil.copyfileobj(in_handle, out_handle, length=1 << 20)
+                out_handle.flush()
+                os.fsync(out_handle.fileno())
+            # Verify the staged copy matches the working copy (size + sha).
+            staged_sha, staged_size = _sha256_file(temp_path)
+            if staged_size != working_size or staged_sha != working_sha:
+                notes.append("staged copy verification failed; destination untouched")
+                return {
+                    "outcome": "error",
+                    "sha256": working_sha,
+                    "size": working_size,
+                    "backup_path": None,
+                    "notes": notes,
+                }
+            # Preserve the current target (single .bak, overwritten each save).
+            if target_exists:
+                backup_path = f"{canonical_t}.bak"
+                if Path(backup_path).exists():
+                    # A prior interrupted save left a .bak behind. Never overwrite
+                    # it (it may be the only recoverable copy) and never replace the
+                    # destination; fail closed with an unknown outcome (no auto-resume).
+                    notes.append(
+                        "prior .bak exists from an interrupted save; "
+                        "refusing to overwrite the backup or the destination "
+                        "(no auto-resume)"
+                    )
+                    return {
+                        "outcome": "unknown",
+                        "sha256": working_sha,
+                        "size": working_size,
+                        "backup_path": backup_path,
+                        "notes": notes,
+                    }
+                self._copy_and_fsync(canonical_t, Path(backup_path))
+                backup_created = True
+                notes.append("previous target preserved at .bak")
+            # Atomic publish (same volume).
+            os.replace(temp_path, canonical_t)
+            temp_path = None
+            # Final verify of the published target.
+            final_sha, final_size = _sha256_file(canonical_t)
+            if final_size != working_size or final_sha != working_sha:
+                notes.append("final target verification failed")
+                rolled_back = self._rollback_from_backup(canonical_t, backup_path)
+                notes.append("rolled back from .bak" if rolled_back else "rollback unavailable")
+                return {
+                    "outcome": "unknown",
+                    "sha256": final_sha,
+                    "size": final_size,
+                    "backup_path": backup_path,
+                    "notes": notes,
+                }
+            notes.append("target verified (size + sha256)")
+            return {
+                "outcome": "ok",
+                "sha256": final_sha,
+                "size": final_size,
+                "backup_path": backup_path,
+                "notes": notes,
+            }
+        except OSError as exc:
+            # Interruption / unprovable write: never report success. If the backup
+            # boundary was crossed the destination state is ambiguous -> unknown.
+            notes.append(f"save-as interrupted: {exc.__class__.__name__}")
+            outcome = "unknown" if backup_created else "error"
+            return {
+                "outcome": outcome,
+                "sha256": working_sha,
+                "size": working_size,
+                "backup_path": backup_path,
+                "notes": notes,
+            }
+        finally:
+            if descriptor >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+            if temp_path is not None:
+                with contextlib.suppress(OSError):
+                    temp_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _copy_and_fsync(source: Path, destination: Path) -> None:
+        """Copy ``source``→``destination`` (overwriting) with flush + fsync."""
+
+        with source.open("rb") as in_handle, destination.open("wb") as out_handle:
+            shutil.copyfileobj(in_handle, out_handle, length=1 << 20)
+            out_handle.flush()
+            os.fsync(out_handle.fileno())
+
+    @staticmethod
+    def _rollback_from_backup(canonical_t: Path, backup_path: str | None) -> bool:
+        """Best-effort restore of ``canonical_t`` from ``backup_path`` (never raises)."""
+
+        if not backup_path:
+            return False
+        backup = Path(backup_path)
+        if not backup.is_file():
+            return False
+        try:
+            descriptor, temp_name = tempfile.mkstemp(
+                prefix=f".{canonical_t.name}.", suffix=".tmp", dir=str(canonical_t.parent)
+            )
+            temp_path = Path(temp_name)
+            with os.fdopen(descriptor, "wb") as out_handle:
+                descriptor = -1
+                with backup.open("rb") as in_handle:
+                    shutil.copyfileobj(in_handle, out_handle, length=1 << 20)
+                out_handle.flush()
+                os.fsync(out_handle.fileno())
+            os.replace(temp_path, canonical_t)
+            return True
+        except OSError:
+            return False
 
     # ------------------------------------------------------------------
     # Status / listing (no COM)

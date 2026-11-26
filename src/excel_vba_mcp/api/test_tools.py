@@ -2,22 +2,19 @@
 
 Thin, async MCP tool handlers for immutable workbook snapshots
 (``snapshot_create``, ``snapshot_list``, ``snapshot_restore``, ``snapshot_diff``)
-and for the bounded declarative test runner (``test_run_suite``,
-``test_get_run``, ``test_suite_run``). They are deliberately **thin**: each
+and for the bounded declarative test runner (``test_suite_run``,
+``test_get_run``). They are deliberately **thin**: each
 validates its arguments, delegates to an application service and returns a domain
 DTO. They **never touch COM** (ARCH-009): no ``pythoncom`` / ``win32com`` import
 lives in this module.
 
-``test_run_suite`` / ``test_suite_run`` accept the suite as a
-:class:`~excel_vba_mcp.domain.test_spec.TestSuiteSpec`, so the closed action /
-assertion vocabularies are validated by Pydantic at the protocol boundary —
-before any Excel call. The runner then isolates every case on a disposable copy of
-one baseline snapshot. ``test_suite_run`` is the explicit Phase 2 (task_053)
-entry point: it accepts the suite either as a
-:class:`~excel_vba_mcp.domain.test_spec.TestSuiteSpec` instance or as a plain
-JSON-style mapping (the shape an MCP caller sends) and validates it here, so an
-unknown Range/Pivot action or assertion is rejected **before** any Excel call.
-``test_run_suite`` stays the canonical runner entry point.
+``test_suite_run`` is the single canonical test entry point. It accepts the suite
+either as a :class:`~excel_vba_mcp.domain.test_spec.TestSuiteSpec` instance or as a
+plain JSON-style mapping (the shape an MCP caller sends) and validates it here, so
+the closed action / assertion vocabularies are checked by Pydantic at the protocol
+boundary — before any Excel call — and an unknown Range/Pivot action or assertion
+is rejected up front. The runner then isolates every case on a disposable copy of
+one baseline snapshot.
 
 The handlers need configured services. Like
 :mod:`excel_vba_mcp.api.workbook_tools`, the active services are published here via
@@ -122,15 +119,26 @@ async def snapshot_list() -> list[SnapshotManifest]:
 async def snapshot_restore(
     snapshot_id: str,
     workbook_id: str | None = None,
+    *,
+    confirm: bool = False,
 ) -> WorkbookInfo:
     """Restore a working session from an immutable snapshot.
 
     Closes the current working copy without saving (when ``workbook_id`` is
     given) and opens a fresh working copy from the snapshot baseline.
 
+    This is destructive to the current working copy, so it is **gated by
+    ``confirm``**: a missing or ``False`` ``confirm`` raises
+    ``CONFIRMATION_REQUIRED`` **before** any close/termination and the snapshot
+    service is never called. The snapshot restores files only — it does **not**
+    undo external macro side effects (database writes, emails, network calls,
+    files, printing).
+
     Args:
         snapshot_id: The snapshot to restore.
         workbook_id: The currently-open working copy to discard (no save).
+        confirm: Must be ``True`` to proceed; otherwise the call is rejected
+            with ``CONFIRMATION_REQUIRED`` before any destructive action.
 
     Returns:
         A :class:`WorkbookInfo` describing the freshly opened working copy.
@@ -139,6 +147,20 @@ async def snapshot_restore(
     _require_non_empty(snapshot_id, "snapshot_id")
     if workbook_id is not None:
         _require_non_empty(workbook_id, "workbook_id")
+    if not confirm:
+        raise ExcelVbaMcpError(
+            "snapshot_restore requires confirm=true: it discards the current "
+            "working copy without saving and does NOT undo external macro side "
+            "effects.",
+            code=ErrorCode.CONFIRMATION_REQUIRED,
+            context={
+                "tool": "snapshot_restore",
+                "discard": (
+                    "the current working copy (unsaved changes) when workbook_id "
+                    "is given"
+                ),
+            },
+        )
     service = get_snapshot_service()
     return await service.restore_snapshot(snapshot_id, workbook_id=workbook_id)
 
@@ -160,8 +182,12 @@ async def snapshot_diff(snapshot_id_a: str, snapshot_id_b: str) -> SnapshotDiff:
     return await service.diff_snapshots(snapshot_id_a, snapshot_id_b)
 
 
-async def test_run_suite(suite: TestSuiteSpec) -> TestRunResult:
-    """Run a bounded declarative test suite on disposable copies of a workbook.
+async def _run_suite_blocking(suite: TestSuiteSpec) -> TestRunResult:
+    """Run a validated declarative suite on disposable copies of a workbook.
+
+    This is the single blocking execution core shared by :func:`test_suite_run`
+    (both the direct and the ``background=True`` paths). It is private: the only
+    public test entry point is :func:`test_suite_run`.
 
     Every case starts from its own disposable working copy of one immutable
     baseline snapshot, so one case's failure cannot contaminate the next. Steps
@@ -170,11 +196,10 @@ async def test_run_suite(suite: TestSuiteSpec) -> TestRunResult:
     back by the snapshot (spec §9.4).
 
     Args:
-        suite: The declarative suite. Actions and assertions are restricted to the
-            closed vocabularies of
+        suite: The already-validated declarative suite. Actions and assertions are
+            restricted to the closed vocabularies of
             :class:`~excel_vba_mcp.domain.test_spec.TestAction` /
-            :class:`~excel_vba_mcp.domain.test_spec.AssertionType`; anything else
-            is rejected before any Excel call.
+            :class:`~excel_vba_mcp.domain.test_spec.AssertionType`.
 
     Returns:
         A :class:`~excel_vba_mcp.domain.models.TestRunResult` with per-case and
@@ -199,10 +224,9 @@ async def test_suite_run(
     here with ``extra="forbid"`` and the closed Range/Pivot action / assertion
     vocabularies, so an unknown action or assertion — or an unsupported payload
     such as arbitrary code, a shell command or an unbounded COM expression — is
-    rejected **before** any Excel call. The run then behaves exactly like
-    :func:`test_run_suite`: one immutable baseline snapshot, one disposable working
-    copy per case, steps dispatched to the existing application services, and
-    external macro side effects not rolled back.
+    rejected **before** any Excel call. The run then uses one immutable baseline
+    snapshot, one disposable working copy per case, steps dispatched to the
+    existing application services, and external macro side effects not rolled back.
 
     Args:
         suite: The declarative suite document (or an already-built
@@ -226,12 +250,12 @@ async def test_suite_run(
     spec = suite if isinstance(suite, TestSuiteSpec) else _parse_suite(suite)
     if background:
         return start_long_op(
-            partial(test_run_suite, spec),
+            partial(_run_suite_blocking, spec),
             timeout=600.0,
             section="test",
             op_class=OperationClass.EXECUTING,
         )
-    return await test_run_suite(spec)
+    return await _run_suite_blocking(spec)
 
 
 def _parse_suite(document: dict[str, Any]) -> TestSuiteSpec:
@@ -253,7 +277,7 @@ async def test_get_run(run_id: str) -> TestRunResult:
     """Return a previously persisted test run.
 
     Args:
-        run_id: The ``test_run_id`` reported by :func:`test_run_suite`.
+        run_id: The ``test_run_id`` reported by :func:`test_suite_run`.
 
     Returns:
         The persisted :class:`~excel_vba_mcp.domain.models.TestRunResult`.
@@ -274,6 +298,5 @@ __all__ = [
     "snapshot_list",
     "snapshot_restore",
     "test_get_run",
-    "test_run_suite",
     "test_suite_run",
 ]

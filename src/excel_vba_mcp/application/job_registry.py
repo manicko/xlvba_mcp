@@ -26,7 +26,7 @@ interrupted_unknown}``.
 * ``interrupted_unknown`` — a persisted non-terminal job reconciled at startup
   (Block F); never ``succeeded``, never auto-retried.
 
-``job_cancel`` is **intent-only**: it sets ``cancel_requested`` on the job but
+``job_request_cancel`` is **intent-only**: it sets ``cancel_requested`` on the job but
 **cannot** interrupt the uninterruptible COM call on the STA thread — the job
 still runs to a terminal state.
 

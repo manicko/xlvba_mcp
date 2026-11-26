@@ -214,9 +214,9 @@ def test_error_preserves_hresult_and_hex() -> None:
     assert error.hresult == 0x8001010A
     assert error.hresult_hex == "0x8001010A"
     payload = error.to_dict()
-    assert payload["code"] == "COM_BUSY"
+    assert payload["errorCode"] == "COM_BUSY"
     assert payload["hresult_hex"] == "0x8001010A"
-    assert payload["context"]["operation"] == "macro_run"
+    assert payload["details"]["operation"] == "macro_run"
     # to_dict must be JSON serializable.
     assert json.loads(json.dumps(payload))["hresult"] == 0x8001010A
 

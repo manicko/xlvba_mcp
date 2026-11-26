@@ -25,7 +25,12 @@ from excel_vba_mcp.application.job_registry import RunningJob
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.workbook_model_service import WorkbookModelService
 from excel_vba_mcp.domain.errors import ExcelVbaMcpError
-from excel_vba_mcp.domain.models import SessionStatus, WorkbookInfo, WorkbookModel
+from excel_vba_mcp.domain.models import (
+    SaveAsResult,
+    SessionStatus,
+    WorkbookInfo,
+    WorkbookModel,
+)
 from excel_vba_mcp.domain.statuses import OperationClass, SessionMode
 
 # The active session service, published by the server lifespan. ``None`` before
@@ -159,6 +164,44 @@ async def excel_save(workbook_id: str) -> WorkbookInfo:
     return await service.save_workbook(workbook_id)
 
 
+async def excel_save_as(
+    workbook_id: str,
+    path: str,
+    *,
+    overwrite_existing: bool = False,
+    overwrite_source: bool = False,
+) -> SaveAsResult:
+    """Save an open workbook's working copy to a (possibly new) target path.
+
+    Thin, no-COM handler (U7; plan_05 §5.5): validates arguments and delegates to
+    :meth:`SessionService.save_as_workbook`. The session stays bound to its
+    working copy — this never rebinds the open workbook. Fail-closed: an existing
+    target needs ``overwrite_existing=true``; the original source needs
+    ``overwrite_source=true`` and an unchanged source hash; ``outcome="ok"`` only
+    after the final size + SHA-256 verify.
+
+    Args:
+        workbook_id: The id returned by :func:`excel_open`.
+        path: Destination path; validated against the allowlist (MUTATING).
+        overwrite_existing: Replace an existing target (writes a ``.bak``).
+        overwrite_source: Allow the target to be the original source itself
+            (requires the source hash to still match; writes a ``.bak``).
+
+    Returns:
+        A :class:`SaveAsResult` (fail-closed ``outcome``).
+    """
+
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(path, "path")
+    service = get_session_service()
+    return await service.save_as_workbook(
+        workbook_id,
+        path,
+        overwrite_existing=overwrite_existing,
+        overwrite_source=overwrite_source,
+    )
+
+
 async def excel_get_status(workbook_id: str | None = None) -> SessionStatus:
     """Return session / workbook status without touching COM.
 
@@ -210,6 +253,7 @@ __all__ = [
     "excel_list_workbooks",
     "excel_open",
     "excel_save",
+    "excel_save_as",
     "get_session_service",
     "get_workbook_model_service",
     "set_session_service",

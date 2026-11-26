@@ -195,7 +195,7 @@ class CompileService:
                 )
             return _collect_probe(wb, app_adapter)
 
-        compile_fn.__name__ = "vba_compile"
+        compile_fn.__name__ = "vba_compile_diagnostics"
         try:
             payload = await self._worker.submit(
                 compile_fn,
@@ -258,7 +258,7 @@ class CompileService:
         if adapter is None:  # pragma: no cover - defensive
             raise ExcelVbaMcpError(
                 "The session service does not expose an Excel application adapter.",
-                context={"tool": "vba_compile"},
+                context={"tool": "vba_compile_diagnostics"},
             )
         return adapter
 
@@ -273,7 +273,7 @@ class CompileService:
             "RPC_E_CALL_REJECTED",
         )
         self._audit.record(
-            tool="vba_compile",
+            tool="vba_compile_diagnostics",
             operation_class="executing",
             params={
                 "workbook_id": workbook_id,
@@ -349,7 +349,7 @@ class CompileService:
         """Record a truthful audit entry (never claims a compile ran)."""
 
         self._audit.record(
-            tool="vba_compile",
+            tool="vba_compile_diagnostics",
             operation_class="executing",
             params={
                 "workbook_id": workbook_id,

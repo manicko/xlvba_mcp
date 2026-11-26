@@ -52,7 +52,10 @@ from excel_vba_mcp.api import (
     vba_tools,
     workbook_tools,
 )
-from excel_vba_mcp.api.compile_tools import vba_compile, vba_get_compile_diagnostics
+from excel_vba_mcp.api.compile_tools import (
+    vba_compile_diagnostics,
+    vba_get_compile_diagnostics,
+)
 from excel_vba_mcp.api.control_tools import (
     control_get,
     control_set_on_action,
@@ -60,7 +63,7 @@ from excel_vba_mcp.api.control_tools import (
 )
 from excel_vba_mcp.api.environment_tools import xlvba_environment
 from excel_vba_mcp.api.health_tools import excel_health
-from excel_vba_mcp.api.job_tools import job_cancel, job_get
+from excel_vba_mcp.api.job_tools import job_get, job_request_cancel
 from excel_vba_mcp.api.macro_tools import (
     macro_classify_background,
     macro_get_last_result,
@@ -141,7 +144,6 @@ from excel_vba_mcp.api.test_tools import (
     snapshot_list,
     snapshot_restore,
     test_get_run,
-    test_run_suite,
     test_suite_run,
 )
 from excel_vba_mcp.api.vba_tools import (
@@ -161,6 +163,7 @@ from excel_vba_mcp.api.workbook_tools import (
     excel_list_workbooks,
     excel_open,
     excel_save,
+    excel_save_as,
     workbook_get_model,
 )
 from excel_vba_mcp.application.compile_service import CompileService
@@ -246,12 +249,29 @@ _DESC_CLOSE = (
 _DESC_SAVE = (
     "Purpose: Save an open workbook's working copy in place. "
     "Use when: you want to persist mutations to the working-copy file. "
-    "Do not use when: you need a new output path — there is no save-as "
+    "Do not use when: you need a new output path — use excel_save_as instead "
     "(see xlvba://glossary / docs 09). "
     "Preconditions: an open, writable workbook_id. "
     "Behavior: writes the working copy in place (no path argument). "
     "Result: WorkbookInfo. "
     "Next actions: snapshot_create if you plan further mutations."
+)
+_DESC_SAVE_AS = (
+    "Purpose: Save an open workbook's working copy to a (possibly new) target path without "
+    "rebinding the session. Use when: you need the working copy written to a different/new "
+    "file (Save As), including overwriting the original source. Do not use when: you only need "
+    "to persist the working copy in place — use excel_save; the target is the open working "
+    "copy (rejected); the source changed since open (STALE_TARGET). Preconditions: an open "
+    "workbook_id; MUTATING approval on the target Approval gate (see xlvba://glossary). "
+    "Parameters: workbook_id, path, overwrite_existing=false, overwrite_source=false. "
+    "Behavior: flushes the working copy with wb.Save on the STA worker, then a pure-filesystem "
+    "atomic temp->replace copy (never wb.SaveAs, so the session stays bound to its working "
+    "copy and workbook_id/working copy/source are unchanged); a single <target>.bak preserves "
+    "any previous target; an existing target needs overwrite_existing=true, the original "
+    "source needs overwrite_source=true plus a matching source hash; skips the snapshot gate "
+    "(Save As does not mutate the open working copy). Result: SaveAsResult (outcome 'ok' only "
+    "after a final size+SHA-256 verify; 'unknown'/'error' fail-closed with backup_path). Next "
+    "actions: excel_save to persist the working copy; snapshot_create before further mutations."
 )
 _DESC_STATUS = (
     "Purpose: Return session/workbook status (busy, read-only, dirty, active operation). "
@@ -280,6 +300,10 @@ _DESC_EXCEL_RECOVER = (
     "(TerminateProcess + WaitForSingleObject), discards the working copies and "
     "rebuilds a fresh hidden instance; auto-allowed in full and restricted mode, "
     "audited, pid-scoped; fail-closed if no live handle is held. "
+    "Discards the open working copies (originals are never modified) and does not "
+    "roll back external side effects of any macro that already ran. "
+    "Requires `confirm=true`; a missing/false confirm is rejected with "
+    "CONFIRMATION_REQUIRED before any termination. "
     "Result: a recovery report; an interrupted operation is reported "
     "prior_job='unknown' and is never auto-retried. "
     "Next actions: re-open the workbook (the old workbook_id is invalid)."
@@ -295,28 +319,13 @@ _DESC_SNAPSHOT_RESTORE = (
     "Preconditions: an existing snapshot_id (and workbook_id when closed). "
     "Behavior: closes the current working copy without saving — unsaved changes "
     "are discarded — then opens the snapshot baseline; does NOT undo external "
-    "macro side effects. "
+    "macro side effects (database writes, emails, network calls, files, printing). "
+    "Requires `confirm=true`; a missing/false confirm is rejected with "
+    "CONFIRMATION_REQUIRED before the working copy is closed. "
     "Result: WorkbookInfo. "
     "Next actions: snapshot_create to re-baseline before further mutations."
 )
 _DESC_SNAPSHOT_DIFF = "Compare two snapshots by manifest metadata and file hash."
-_DESC_TEST_RUN_SUITE = (
-    "Purpose: Run a bounded declarative test suite on disposable copies of an open "
-    "workbook (legacy typed-spec blocking runner). "
-    "Use when: you already hold a TestSuiteSpec and want a blocking run. "
-    "Do not use when: you have raw JSON or need background=true — use "
-    "test_suite_run. "
-    "Preconditions: suite.workbook_id must be an open workbook (call excel_open "
-    "first); a baseline snapshot is created automatically unless "
-    "baseline='use_existing'. "
-    "Parameters: suite:TestSuiteSpec; actions/assertions come from closed "
-    "allowlists, so no arbitrary Python/shell/COM/VBA can be expressed. "
-    "Behavior: every case starts from its own disposable working copy of one "
-    "immutable baseline snapshot; a failed compile step blocks the case's macro "
-    "steps; external macro side effects are NOT rolled back. "
-    "Result: TestRunResult (per-case and per-step statuses). "
-    "Next actions: test_get_run to read a persisted run by run_id."
-)
 _DESC_TEST_GET_RUN = (
     "Return a previously persisted test run by run_id (statuses, per-case steps, "
     "assertions, artifact references). Read-only: it never touches Excel."
@@ -326,8 +335,6 @@ _DESC_TEST_SUITE_RUN = (
     "new use). "
     "Use when: you have a suite object or a plain JSON-style mapping, or you need "
     "background=true. "
-    "Do not use when: you hold a typed TestSuiteSpec and want a blocking run — use "
-    "test_run_suite. "
     "Preconditions: suite.workbook_id must be an open workbook (call excel_open "
     "first); a baseline snapshot is created automatically unless "
     "baseline='use_existing'. "
@@ -373,38 +380,32 @@ _DESC_VBA_SEARCH_CODE = (
     "Search every VBA component's code for a substring or regular expression (bounded results)."
 )
 _DESC_VBA_REPLACE_COMPONENT_SOURCE = (
-    "Purpose: Replace the entire code module of a Standard/Class VBA component. "
-    "Use when: you need to rewrite a component's source wholesale. "
-    "Do not use when: you only add code at a position — use vba_insert_code; "
-    "Document modules and UserForms are rejected. "
-    "Preconditions: writable session + snapshot + approval (full-access default; "
-    "restricted requires approval) + postcondition re-read. "
-    "Parameters: workbook_id; component; new_source; expected_source_hash — obtain "
-    "it from vba_read_component / vba_list_components (the normalized source hash, "
-    "not the snapshot export file hash). "
-    "Behavior: the revision check runs before and inside the STA worker "
-    "(see xlvba://glossary); a mismatch raises REVISION_CONFLICT. "
-    "Result: VbaMutationResult (post-mutation component state). "
-    "Next actions: vba_read_component to confirm the new source hash. "
-    "Example: {\"workbook_id\": \"<id>\", \"component\": \"Module1\", "
+    "Purpose: Replace the entire code module of a Standard/Class VBA component. Use when: you "
+    "need to rewrite a component's source wholesale. Do not use when: you only add code at a "
+    "position — use vba_insert_code; Document modules and UserForms are rejected. "
+    "Preconditions: writable session + snapshot + approval Approval gate (see "
+    "xlvba://glossary) + postcondition re-read. Parameters: workbook_id; component; "
+    "new_source; expected_source_hash — obtain it from vba_read_component / "
+    "vba_list_components (the normalized source hash, not the snapshot export file hash). "
+    "Behavior: the revision check runs before and inside the STA worker (see "
+    "xlvba://glossary); a mismatch raises REVISION_CONFLICT. Result: VbaMutationResult "
+    "(post-mutation component state). Next actions: vba_read_component to confirm the new "
+    "source hash. Example: {\"workbook_id\": \"<id>\", \"component\": \"Module1\", "
     "\"new_source\": \"Sub Hello()\\n  MsgBox \\\"hi\\\"\\nEnd Sub\", "
     "\"expected_source_hash\": \"<hash from vba_read_component>\"}"
 )
 _DESC_VBA_INSERT_CODE = (
-    "Purpose: Insert VBA code at a semantic position in a Standard/Class component. "
-    "Use when: you add a procedure or declaration without rewriting the module. "
-    "Do not use when: you replace the whole module — use "
-    "vba_replace_component_source. "
-    "Preconditions: writable session + snapshot + approval (full-access default; "
-    "restricted requires approval) + postcondition re-read. "
-    "Parameters: position is 'declarations', 'before_procedure:<name>' or "
+    "Purpose: Insert VBA code at a semantic position in a Standard/Class component. Use when: "
+    "you add a procedure or declaration without rewriting the module. Do not use when: you "
+    "replace the whole module — use vba_replace_component_source. Preconditions: writable "
+    "session + snapshot + approval Approval gate (see xlvba://glossary) + postcondition "
+    "re-read. Parameters: position is 'declarations', 'before_procedure:<name>' or "
     "'after_procedure:<name>'; expected_source_hash from vba_read_component / "
-    "vba_list_components. "
-    "Behavior: same revision guard as replace (REVISION_CONFLICT on mismatch). "
-    "Result: VbaMutationResult. "
-    "Next actions: vba_read_component to confirm the new source hash."
+    "vba_list_components. Behavior: same revision guard as replace (REVISION_CONFLICT on "
+    "mismatch). Result: VbaMutationResult. Next actions: vba_read_component to confirm the new "
+    "source hash."
 )
-_DESC_VBA_COMPILE = (
+_DESC_VBA_COMPILE_DIAGNOSTICS = (
     "Purpose: Return a fail-closed compile diagnostic for an open workbook — "
     "diagnostic only, does NOT compile. "
     "Use when: you need the compile/protection/inventory diagnostic snapshot. "
@@ -483,10 +484,10 @@ _DESC_JOB_GET = (
     "was exceeded and the op was left running (not confirmed hung) — see "
     "xlvba://glossary. "
     "Result: JobStatus. "
-    "Next actions: job_cancel to record cancel intent; excel_recover to actually "
+    "Next actions: job_request_cancel to record cancel intent; excel_recover to actually "
     "stop a wedged op."
 )
-_DESC_JOB_CANCEL = (
+_DESC_JOB_REQUEST_CANCEL = (
     "Purpose: Record a job's cancel intent. "
     "Use when: you want to signal a long op to stop at its next checkpoint. "
     "Do not use when: you expect it to interrupt the running COM call — it is "
@@ -505,44 +506,32 @@ _DESC_SHEETS_LIST = (
 )
 _DESC_SHEET_GET = "Return one sheet's SheetInfo by name (Sheets vs Worksheets aware)."
 _DESC_SHEET_ADD = (
-    "Purpose: Add a worksheet. "
-    "Use when: you need a new sheet in an open workbook. "
-    "Do not use when: you need a non-worksheet sheet — only 'worksheet' is "
-    "supported (others rejected). "
-    "Preconditions: writable session + snapshot + approval (full-access default; "
-    "restricted requires approval) + postcondition re-read. "
-    "Parameters: workbook_id; name; sheet_type='worksheet' (default). "
-    "Behavior: creates the sheet and returns its DTO. "
-    "Result: SheetInfo. "
-    "Next actions: range_write_values / table_create to populate it."
+    "Purpose: Add a worksheet. Use when: you need a new sheet in an open workbook. Do not use "
+    "when: you need a non-worksheet sheet — only 'worksheet' is supported (others rejected). "
+    "Preconditions: writable session + snapshot + approval Approval gate (see "
+    "xlvba://glossary) + postcondition re-read. Parameters: workbook_id; name; "
+    "sheet_type='worksheet' (default). Behavior: creates the sheet and returns its DTO. "
+    "Result: SheetInfo. Next actions: range_write_values / table_create to populate it."
 )
 _DESC_SHEET_RENAME = (
-    "Rename a sheet; CodeName is never changed. Guarded mutation: writable "
-    "session + snapshot + approval (full-access default; restricted requires "
-    "approval) + postcondition re-read."
+    "Rename a sheet; CodeName is never changed. Guarded mutation (see xlvba://glossary)."
 )
 _DESC_SHEET_COPY = (
-    "Purpose: Copy a sheet and return the new sheet's DTO. "
-    "Use when: you need an in-workbook duplicate of an existing sheet. "
-    "Do not use when: you need a cross-workbook copy or an arbitrary position — "
-    "neither is supported. "
-    "Preconditions: writable session + snapshot + approval (full-access default; "
-    "restricted requires approval) + postcondition re-read. "
-    "Parameters: workbook_id; name (source sheet). "
-    "Behavior: the copy's name is generated by Excel (typically '<name> (2)'). "
-    "Result: SheetInfo. "
-    "Next actions: sheet_rename to give the copy a deliberate name."
+    "Purpose: Copy a sheet and return the new sheet's DTO. Use when: you need an in-workbook "
+    "duplicate of an existing sheet. Do not use when: you need a cross-workbook copy or an "
+    "arbitrary position — neither is supported. Preconditions: writable session + snapshot + "
+    "approval Approval gate (see xlvba://glossary) + postcondition re-read. Parameters: "
+    "workbook_id; name (source sheet). Behavior: the copy's name is generated by Excel "
+    "(typically '<name> (2)'). Result: SheetInfo. Next actions: sheet_rename to give the copy "
+    "a deliberate name."
 )
 _DESC_SHEET_DELETE = (
-    "Delete a sheet (destructive). Guarded mutation: writable session + snapshot "
-    "+ approval (full-access default; restricted requires approval) + postcondition "
-    "re-read. Rejected when it would leave no visible worksheet."
+    "Delete a sheet (destructive). Guarded mutation (see xlvba://glossary). Rejected when it "
+    "would leave no visible worksheet."
 )
 _DESC_SHEET_SET_VISIBILITY = (
-    "Set a sheet's visibility (xlSheetVisible / xlSheetHidden). Guarded mutation: "
-    "writable session + snapshot + approval (full-access default; restricted "
-    "requires approval) + postcondition re-read. Hiding the last visible worksheet "
-    "is rejected."
+    "Set a sheet's visibility (xlSheetVisible / xlSheetHidden). Guarded mutation (see "
+    "xlvba://glossary). Hiding the last visible worksheet is rejected."
 )
 _DESC_TABLES_LIST = (
     "List every Excel Table (ListObject) of an open workbook with name, sheet, "
@@ -559,72 +548,55 @@ _DESC_TABLE_READ_ROWS = (
     "date/Excel error) and the response is size-limited (truncated flag)."
 )
 _DESC_TABLE_APPEND_ROWS = (
-    "Purpose: Append rows through ListRows.Add (table structure preserved). "
-    "Use when: you want to add records to the end of an Excel Table. "
-    "Do not use when: you need to update or delete existing rows — use "
-    "table_update_rows / table_delete_rows. "
-    "Preconditions: writable session + snapshot + approval (full-access default; "
-    "restricted requires approval) + postcondition re-read. "
-    "Parameters: workbook_id; name; rows is a non-empty list of {header: value} "
-    "objects; headers must match the table columns (case-insensitive). "
-    "Behavior: appends the rows and returns the new row count. "
-    "Result: TableMutationResult. "
-    "Next actions: table_read_rows to verify the appended data."
+    "Purpose: Append rows through ListRows.Add (table structure preserved). Use when: you want "
+    "to add records to the end of an Excel Table. Do not use when: you need to update or "
+    "delete existing rows — use table_update_rows / table_delete_rows. Preconditions: writable "
+    "session + snapshot + approval Approval gate (see xlvba://glossary) + postcondition "
+    "re-read. Parameters: workbook_id; name; rows is a non-empty list of {header: value} "
+    "objects; headers must match the table columns (case-insensitive). Behavior: appends the "
+    "rows and returns the new row count. Result: TableMutationResult. Next actions: "
+    "table_read_rows to verify the appended data."
 )
 _DESC_TABLE_INSERT_ROW = (
-    "Insert one data row at a 1-based position via ListRows.Add. Guarded mutation: "
-    "writable session + snapshot + approval (full-access default; restricted "
-    "requires approval) + postcondition re-read."
+    "Insert one data row at a 1-based position via ListRows.Add. Guarded mutation (see "
+    "xlvba://glossary)."
 )
 _DESC_TABLE_UPDATE_ROWS = (
-    "Purpose: Update rows by explicit index or an unambiguous where filter. "
-    "Use when: you need to change values in existing Table rows. "
-    "Do not use when: you need to add rows — use table_append_rows; to delete rows "
-    "use table_delete_rows. "
-    "Preconditions: writable session + snapshot + approval (full-access default; "
-    "restricted requires approval) + postcondition re-read. "
-    "Parameters: updates=[{index|where, values}] — exactly one selector per entry; "
-    "a where that matches zero or multiple rows is rejected with AMBIGUOUS_FILTER "
-    "(no auto-guess). "
-    "Behavior: applies each update and re-reads the postcondition. "
-    "Result: TableMutationResult. "
-    "Next actions: table_read_rows to verify. "
-    "Example: {\"workbook_id\": \"<id>\", \"name\": \"Sales\", \"updates\": "
-    "[{\"index\": 3, \"values\": {\"Amount\": 250}}, {\"where\": {\"SKU\": "
-    "\"A-1\"}, \"values\": {\"Amount\": 99}}]}"
+    "Purpose: Update rows by explicit index or an unambiguous where filter. Use when: you need "
+    "to change values in existing Table rows. Do not use when: you need to add rows — use "
+    "table_append_rows; to delete rows use table_delete_rows. Preconditions: writable session "
+    "+ snapshot + approval Approval gate (see xlvba://glossary) + postcondition re-read. "
+    "Parameters: updates=[{index|where, values}] — exactly one selector per entry; a where "
+    "that matches zero or multiple rows is rejected with AMBIGUOUS_FILTER (no auto-guess). "
+    "Behavior: applies each update and re-reads the postcondition. Result: "
+    "TableMutationResult. Next actions: table_read_rows to verify. Example: {\"workbook_id\": "
+    "\"<id>\", \"name\": \"Sales\", \"updates\": [{\"index\": 3, \"values\": {\"Amount\": "
+    "250}}, {\"where\": {\"SKU\": \"A-1\"}, \"values\": {\"Amount\": 99}}]}"
 )
 _DESC_TABLE_DELETE_ROWS = (
-    "Purpose: Delete rows by explicit indices or an unambiguous where filter. "
-    "Use when: you need to remove rows from an Excel Table. "
-    "Do not use when: you need to change row values — use table_update_rows. "
-    "Preconditions: writable session + snapshot + approval (full-access default; "
-    "restricted requires approval) + postcondition re-read. "
-    "Parameters: indices (explicit 1-based) or where (object) — exactly one "
-    "selector; a where that matches zero or multiple rows is rejected with "
-    "AMBIGUOUS_FILTER (no auto-guess). "
-    "Behavior: deletes the matched rows and re-reads the postcondition. "
-    "Result: TableMutationResult. "
-    "Next actions: table_read_rows to verify."
+    "Purpose: Delete rows by explicit indices or an unambiguous where filter. Use when: you "
+    "need to remove rows from an Excel Table. Do not use when: you need to change row values — "
+    "use table_update_rows. Preconditions: writable session + snapshot + approval Approval "
+    "gate (see xlvba://glossary) + postcondition re-read. Parameters: indices (explicit "
+    "1-based) or where (object) — exactly one selector; a where that matches zero or multiple "
+    "rows is rejected with AMBIGUOUS_FILTER (no auto-guess). Behavior: deletes the matched "
+    "rows and re-reads the postcondition. Result: TableMutationResult. Next actions: "
+    "table_read_rows to verify."
 )
 _DESC_TABLE_ADD_COLUMN = (
-    "Add a column via ListColumns.Add(Position) with a unique header. Guarded "
-    "mutation: writable session + snapshot + approval (full-access default; "
-    "restricted requires approval) + postcondition re-read."
+    "Add a column via ListColumns.Add(Position) with a unique header. Guarded mutation (see "
+    "xlvba://glossary)."
 )
 _DESC_TABLE_DELETE_COLUMN = (
-    "Delete the column identified by a unique header. Guarded mutation: writable "
-    "session + snapshot + approval (full-access default; restricted requires "
-    "approval) + postcondition re-read."
+    "Delete the column identified by a unique header. Guarded mutation (see xlvba://glossary)."
 )
 _DESC_TABLE_CREATE = (
-    "Create a ListObject on a sheet over an A1 range or defined name. Guarded "
-    "mutation: writable session + snapshot + approval (full-access default; "
-    "restricted requires approval) + postcondition re-read."
+    "Create a ListObject on a sheet over an A1 range or defined name. Guarded mutation (see "
+    "xlvba://glossary)."
 )
 _DESC_TABLE_RESIZE = (
-    "Resize a table to a new A1 range via ListObject.Resize. Guarded mutation: "
-    "writable session + snapshot + approval (full-access default; restricted "
-    "requires approval) + postcondition re-read."
+    "Resize a table to a new A1 range via ListObject.Resize. Guarded mutation (see "
+    "xlvba://glossary)."
 )
 _DESC_RANGE_GET = (
     "Resolve an explicit worksheet + A1-style address to Range metadata "
@@ -651,39 +623,28 @@ _DESC_RANGE_READ_FORMULAS = (
     "are rejected."
 )
 _DESC_RANGE_WRITE_VALUES = (
-    "Purpose: Write typed cell values to a bounded Range. "
-    "Use when: you need to set cell values (constants) in a sheet. "
-    "Do not use when: you need formulas — a leading '=' is stored as text here; "
-    "use range_write_formulas. "
-    "Preconditions: this tool does NOT snapshot — call snapshot_create first; then "
-    "writable session + snapshot + approval (full-access default; restricted "
-    "requires approval) + postcondition re-read. "
-    "Parameters: {rows, cols, values}; rows≤100000, cols≤512, cells≤100000; "
-    "address is the top-left anchor; a string beginning with '=' is stored as "
-    "text, not a formula. "
-    "Behavior: the payload shape is validated against the target before any "
-    "mutation (a wrong-sized payload is rejected with no change); cell writes "
-    "inside an Excel Table are allowed only when the table row/column structure is "
-    "unchanged. "
-    "Result: RangeMutationResult. "
-    "Next actions: range_read_values to verify. "
-    "Example: {\"workbook_id\": \"<id>\", \"sheet\": \"Sheet1\", \"address\": "
-    "\"A1\", \"payload\": {\"rows\": 1, \"cols\": 2, \"values\": [[1, 2]]}}"
+    "Purpose: Write typed cell values to a bounded Range. Use when: you need to set cell "
+    "values (constants) in a sheet. Do not use when: you need formulas — a leading '=' is "
+    "stored as text here; use range_write_formulas. Preconditions: this tool does NOT snapshot "
+    "— call snapshot_create first; then writable session + snapshot + approval Approval gate "
+    "(see xlvba://glossary) + postcondition re-read. Parameters: {rows, cols, values}; "
+    "rows≤100000, cols≤512, cells≤100000; address is the top-left anchor; a string beginning "
+    "with '=' is stored as text, not a formula. Behavior: the payload shape is validated "
+    "against the target before any mutation (a wrong-sized payload is rejected with no "
+    "change); cell writes inside an Excel Table are allowed only when the table row/column "
+    "structure is unchanged. Result: RangeMutationResult. Next actions: range_read_values to "
+    "verify. Example: {\"workbook_id\": \"<id>\", \"sheet\": \"Sheet1\", \"address\": \"A1\", "
+    "\"payload\": {\"rows\": 1, \"cols\": 2, \"values\": [[1, 2]]}}"
 )
 _DESC_RANGE_WRITE_FORMULAS = (
-    "Purpose: Write formulas (Formula2 primary, Formula fallback) to a bounded "
-    "Range. "
-    "Use when: you need to set formula strings beginning with '='. "
-    "Do not use when: you need literal '=' text — use range_write_values (which "
-    "stores a leading '=' as text). "
-    "Preconditions: writable session + snapshot + approval (full-access default; "
-    "restricted requires approval) + postcondition re-read. "
-    "Parameters: every entry must be a formula string beginning with '='; a bare "
-    "constant belongs in range_write_values. "
-    "Behavior: cell writes inside an Excel Table are allowed only when the table "
-    "row/column structure is unchanged. "
-    "Result: RangeMutationResult. "
-    "Next actions: range_read_formulas to verify."
+    "Purpose: Write formulas (Formula2 primary, Formula fallback) to a bounded Range. Use "
+    "when: you need to set formula strings beginning with '='. Do not use when: you need "
+    "literal '=' text — use range_write_values (which stores a leading '=' as text). "
+    "Preconditions: writable session + snapshot + approval Approval gate (see "
+    "xlvba://glossary) + postcondition re-read. Parameters: every entry must be a formula "
+    "string beginning with '='; a bare constant belongs in range_write_values. Behavior: cell "
+    "writes inside an Excel Table are allowed only when the table row/column structure is "
+    "unchanged. Result: RangeMutationResult. Next actions: range_read_formulas to verify."
 )
 _DESC_RANGE_GET_FORMAT = (
     "Read bounded, tri-state formatting for a Range: number_format, font "
@@ -693,51 +654,40 @@ _DESC_RANGE_GET_FORMAT = (
     "unsupported); a mixed range is never flattened. Read-only."
 )
 _DESC_RANGE_SET_FORMAT = (
-    "Apply a partial formatting update to a Range. Only the fields explicitly "
-    "set in the patch are written; absent fields are left untouched. Values and "
-    "enums are validated before any mutation; a null clears to automatic only "
-    "where Excel allows. Guarded mutation: writable session + snapshot + approval "
-    "(full-access default; restricted requires approval) + postcondition re-read."
+    "Apply a partial formatting update to a Range. Only the fields explicitly set in the patch "
+    "are written; absent fields are left untouched. Values and enums are validated before any "
+    "mutation; a null clears to automatic only where Excel allows. Guarded mutation (see "
+    "xlvba://glossary)."
 )
 _DESC_RANGE_COPY = (
-    "Copy a Range to an explicit destination (same workbook, no clipboard). The "
-    "destination is mandatory; an overlapping source/destination, a shape-"
-    "mismatched destination or a destination intersecting merged cells is "
-    "rejected. Structural copies that intersect an Excel Table (ListObject) are "
-    "rejected and routed to the table tools. Guarded mutation: writable session "
-    "+ snapshot + approval (full-access default; restricted requires approval) + "
-    "postcondition re-read."
+    "Copy a Range to an explicit destination (same workbook, no clipboard). The destination is "
+    "mandatory; an overlapping source/destination, a shape-mismatched destination or a "
+    "destination intersecting merged cells is rejected. Structural copies that intersect an "
+    "Excel Table (ListObject) are rejected and routed to the table tools. Guarded mutation "
+    "(see xlvba://glossary)."
 )
 _DESC_RANGE_INSERT = (
-    "Insert cells at an explicit address and shift them in an explicit direction "
-    "('right' or 'down'). An omitted/unknown shift is rejected (never guessed). "
-    "Rejected for a protected sheet, an Excel Table (ListObject) intersection, a "
-    "dynamic-array spill range, or merged cells without allow_merged. Guarded "
-    "mutation: writable session + snapshot + approval (full-access default; "
-    "restricted requires approval) + postcondition re-read."
+    "Insert cells at an explicit address and shift them in an explicit direction ('right' or "
+    "'down'). An omitted/unknown shift is rejected (never guessed). Rejected for a protected "
+    "sheet, an Excel Table (ListObject) intersection, a dynamic-array spill range, or merged "
+    "cells without allow_merged. Guarded mutation (see xlvba://glossary)."
 )
 _DESC_RANGE_DELETE = (
-    "Delete cells at an explicit address and shift the remainder in an explicit "
-    "direction ('left' or 'up'). An omitted/unknown shift is rejected (never "
-    "guessed). Rejected for a protected sheet, an Excel Table (ListObject) "
-    "intersection, a dynamic-array spill range, or merged cells without "
-    "allow_merged. Guarded mutation: writable session + snapshot + approval "
-    "(full-access default; restricted requires approval) + postcondition re-read."
+    "Delete cells at an explicit address and shift the remainder in an explicit direction "
+    "('left' or 'up'). An omitted/unknown shift is rejected (never guessed). Rejected for a "
+    "protected sheet, an Excel Table (ListObject) intersection, a dynamic-array spill range, "
+    "or merged cells without allow_merged. Guarded mutation (see xlvba://glossary)."
 )
 _DESC_RANGE_MERGE = (
-    "Merge a Range into one cell (or one cell per row with across=true). Merging "
-    "discards non-anchor data: the preflight reports the affected cells and the "
-    "merge is blocked unless allow_data_loss=true is passed after review. "
-    "Rejected for a protected sheet, an Excel Table (ListObject) intersection or "
-    "a spill range. Guarded mutation: writable session + snapshot + approval "
-    "(full-access default; restricted requires approval) + postcondition re-read."
+    "Merge a Range into one cell (or one cell per row with across=true). Merging discards "
+    "non-anchor data: the preflight reports the affected cells and the merge is blocked unless "
+    "allow_data_loss=true is passed after review. Rejected for a protected sheet, an Excel "
+    "Table (ListObject) intersection or a spill range. Guarded mutation (see xlvba://glossary)."
 )
 _DESC_RANGE_UNMERGE = (
-    "Unmerge every merged area intersecting an explicit target. Rejected when no "
-    "merged area intersects the target, for a protected sheet, or for an Excel "
-    "Table (ListObject) intersection. Guarded mutation: writable session + "
-    "snapshot + approval (full-access default; restricted requires approval) + "
-    "postcondition re-read."
+    "Unmerge every merged area intersecting an explicit target. Rejected when no merged area "
+    "intersects the target, for a protected sheet, or for an Excel Table (ListObject) "
+    "intersection. Guarded mutation (see xlvba://glossary)."
 )
 _DESC_RANGE_GET_VALIDATION = (
     "Read the data-validation rule of a Range (type, Formula1/Formula2, operator, "
@@ -747,13 +697,11 @@ _DESC_RANGE_GET_VALIDATION = (
     "instead of being flattened. Read-only."
 )
 _DESC_RANGE_SET_VALIDATION = (
-    "Add or modify the data-validation rule of a Range (list, whole number, "
-    "decimal, date, time, text length, custom). Formula1/Formula2 are opaque "
-    "strings bounded at 255 characters and are never evaluated; a missing operand, "
-    "an over-long formula or an unsupported type is rejected before any mutation. "
-    "An existing rule is modified so unspecified properties are preserved. Guarded "
-    "mutation: writable session + snapshot + approval (full-access default; "
-    "restricted requires approval) + postcondition re-read."
+    "Add or modify the data-validation rule of a Range (list, whole number, decimal, date, "
+    "time, text length, custom). Formula1/Formula2 are opaque strings bounded at 255 "
+    "characters and are never evaluated; a missing operand, an over-long formula or an "
+    "unsupported type is rejected before any mutation. An existing rule is modified so "
+    "unspecified properties are preserved. Guarded mutation (see xlvba://glossary)."
 )
 _DESC_RANGE_GET_CONDITIONAL_FORMATTING = (
     "Read the conditional-formatting rules applying to a Range in ascending "
@@ -785,34 +733,25 @@ _DESC_NAME_GET = (
     "'worksheet'; worksheet scope also requires the owning sheet)."
 )
 _DESC_NAME_CREATE = (
-    "Purpose: Create a defined name in an explicit scope. "
-    "Use when: you need a named range or constant in an open workbook. "
-    "Do not use when: you need to change an existing name — use name_update. "
-    "Preconditions: writable session + snapshot + approval (full-access default; "
-    "restricted requires approval) + postcondition re-read. "
-    "Parameters: workbook_id; name; refers_to (may be given with or without a "
-    "leading '=', normalized); scope ('workbook' or 'worksheet' + owning sheet). "
-    "Behavior: duplicate and cross-scope conflicts are rejected. "
-    "Result: DefinedNameInfo. "
-    "Next actions: names_list to confirm."
+    "Purpose: Create a defined name in an explicit scope. Use when: you need a named range or "
+    "constant in an open workbook. Do not use when: you need to change an existing name — use "
+    "name_update. Preconditions: writable session + snapshot + approval Approval gate (see "
+    "xlvba://glossary) + postcondition re-read. Parameters: workbook_id; name; refers_to (may "
+    "be given with or without a leading '=', normalized); scope ('workbook' or 'worksheet' + "
+    "owning sheet). Behavior: duplicate and cross-scope conflicts are rejected. Result: "
+    "DefinedNameInfo. Next actions: names_list to confirm."
 )
 _DESC_NAME_UPDATE = (
-    "Purpose: Update a defined name's RefersTo in an explicit scope (scope is "
-    "preserved). "
-    "Use when: you need to repoint an existing defined name. "
-    "Do not use when: the name does not exist yet — use name_create. "
-    "Preconditions: writable session + snapshot + approval (full-access default; "
-    "restricted requires approval) + postcondition re-read. "
-    "Parameters: refers_to may be given with or without a leading '=' "
-    "(normalized). "
-    "Behavior: scope is preserved; the postcondition is re-read. "
-    "Result: DefinedNameInfo. "
-    "Next actions: name_get to confirm."
+    "Purpose: Update a defined name's RefersTo in an explicit scope (scope is preserved). Use "
+    "when: you need to repoint an existing defined name. Do not use when: the name does not "
+    "exist yet — use name_create. Preconditions: writable session + snapshot + approval "
+    "Approval gate (see xlvba://glossary) + postcondition re-read. Parameters: refers_to may "
+    "be given with or without a leading '=' (normalized). Behavior: scope is preserved; the "
+    "postcondition is re-read. Result: DefinedNameInfo. Next actions: name_get to confirm."
 )
 _DESC_NAME_DELETE = (
-    "Delete a defined name in an explicit scope. Guarded mutation: writable "
-    "session + snapshot + approval (full-access default; restricted requires "
-    "approval) + postcondition re-read. Returns the pre-delete name."
+    "Delete a defined name in an explicit scope. Guarded mutation (see xlvba://glossary). "
+    "Returns the pre-delete name."
 )
 _DESC_SHAPES_LIST = (
     "List every drawing shape of an open workbook (all worksheets) with name, "
@@ -822,10 +761,8 @@ _DESC_SHAPES_LIST = (
 )
 _DESC_SHAPE_GET = "Return one shape's ShapeInfo by name (case-insensitive)."
 _DESC_SHAPE_SET_ON_ACTION = (
-    "Assign OnAction to a shape (the macro is NOT executed). Guarded mutation: "
-    "writable session + snapshot + approval (full-access default; restricted "
-    "requires approval) + postcondition re-read. An empty macro_name clears the "
-    "assignment."
+    "Assign OnAction to a shape (the macro is NOT executed). Guarded mutation (see "
+    "xlvba://glossary). An empty macro_name clears the assignment."
 )
 _DESC_CONTROLS_LIST = (
     "List every Form Control and ActiveX control of an open workbook. Form "
@@ -835,10 +772,8 @@ _DESC_CONTROLS_LIST = (
 )
 _DESC_CONTROL_GET = "Return one control's ControlEntry by name (case-insensitive)."
 _DESC_CONTROL_SET_ON_ACTION = (
-    "Assign OnAction to a Form Control (the macro is NOT executed; ActiveX "
-    "controls are rejected). Guarded mutation: writable session + snapshot + "
-    "approval (full-access default; restricted requires approval) + postcondition "
-    "re-read."
+    "Assign OnAction to a Form Control (the macro is NOT executed; ActiveX controls are "
+    "rejected). Guarded mutation (see xlvba://glossary)."
 )
 _DESC_WORKBOOK_GET_MODEL = (
     "Return the aggregated Stage 1 workbook model: sheets, tables, names, shapes, "
@@ -879,24 +814,20 @@ _DESC_PIVOT_FIELDS_LIST = (
 )
 _DESC_PIVOT_TABLE_REFRESH = (
     "Refresh one PivotTable via PivotTable.RefreshTable (table-scoped, no "
-    "Workbook.RefreshAll). The cache source type is checked first; external, "
-    "OLAP and Data Model sources return unsupported_source and are not "
-    "refreshed. The result reports every table sharing the cache "
-    "(affected_pivot_tables), the RefreshDate before/after and a refreshed "
-    "status confirmed by Excel's truth signal (the RefreshTable Boolean and/or "
-    "an advanced RefreshDate), never by the absence of a COM exception. "
-    "Guarded mutation: writable session + snapshot + approval (full-access "
-    "default; restricted requires approval) + postcondition re-read."
+    "Workbook.RefreshAll). The cache source type is checked first; external, OLAP and Data "
+    "Model sources return unsupported_source and are not refreshed. The result reports every "
+    "table sharing the cache (affected_pivot_tables), the RefreshDate before/after and a "
+    "refreshed status confirmed by Excel's truth signal (the RefreshTable Boolean and/or an "
+    "advanced RefreshDate), never by the absence of a COM exception. Guarded mutation (see "
+    "xlvba://glossary)."
 )
 _DESC_PIVOT_CACHE_REFRESH = (
-    "Refresh one PivotCache via PivotCache.Refresh (cache-scoped). A cache is "
-    "shared N:1 with PivotTables, so affected_pivot_tables reports every table "
-    "using the cache. Only a database/Table-backed cache is refreshed; "
-    "external/OLAP/Data Model sources return unsupported_source. PivotCache."
-    "Refresh returns no Boolean, so success is confirmed by the shared "
-    "RefreshDate advancing. Never touches Workbook.RefreshAll or unrelated "
-    "connections/queries. Guarded mutation: writable session + snapshot + approval "
-    "(full-access default; restricted requires approval) + postcondition re-read."
+    "Refresh one PivotCache via PivotCache.Refresh (cache-scoped). A cache is shared N:1 with "
+    "PivotTables, so affected_pivot_tables reports every table using the cache. Only a "
+    "database/Table-backed cache is refreshed; external/OLAP/Data Model sources return "
+    "unsupported_source. PivotCache.Refresh returns no Boolean, so success is confirmed by the "
+    "shared RefreshDate advancing. Never touches Workbook.RefreshAll or unrelated "
+    "connections/queries. Guarded mutation (see xlvba://glossary)."
 )
 _DESC_PIVOT_FIELD_SET_LAYOUT = (
     "Set one PivotField's orientation bucket, or remove it. orientation is limited "
@@ -913,38 +844,30 @@ _DESC_PIVOT_FIELD_SET_LAYOUT = (
 )
 _DESC_PIVOT_FIELD_SET_POSITION = (
     "Set one PivotField's 1-based position within its current orientation "
-    "(row/column/page/data). Out-of-range positions and hidden (unplaced) "
-    "fields are rejected before any COM mutation; the resulting orientation "
-    "order is recorded in the audit entry. External/OLAP/Data Model sources are "
-    "rejected with unsupported_source. The returned PivotFieldInfo is the "
-    "post-mutation state re-read from the PivotTable. Guarded mutation: writable "
-    "session + snapshot + approval (full-access default; restricted requires "
-    "approval) + postcondition re-read."
+    "(row/column/page/data). Out-of-range positions and hidden (unplaced) fields are rejected "
+    "before any COM mutation; the resulting orientation order is recorded in the audit entry. "
+    "External/OLAP/Data Model sources are rejected with unsupported_source. The returned "
+    "PivotFieldInfo is the post-mutation state re-read from the PivotTable. Guarded mutation "
+    "(see xlvba://glossary)."
 )
 _DESC_PIVOT_FIELD_SET_AGGREGATION = (
-    "Add or update one data field's aggregation. An existing data field on the "
-    "same source field is updated in place (DataFields[i].Function); a source "
-    "field without a data field is added with PivotTable.AddDataField "
-    "(assigning Orientation=xlDataField does not create one). Only the eleven "
-    "accepted aggregation codes are allowed; legacy codes (9, -4114, -4153, "
-    "-4154) are rejected. caption must be unique when supplied (duplicates are "
-    "pre-validated here and rejected by Excel). External/OLAP/Data Model "
-    "sources are rejected with unsupported_source. The returned PivotFieldInfo "
-    "is the post-mutation state re-read from the PivotTable. Guarded mutation: "
-    "writable session + snapshot + approval (full-access default; restricted "
-    "requires approval) + postcondition re-read."
+    "Add or update one data field's aggregation. An existing data field on the same source "
+    "field is updated in place (DataFields[i].Function); a source field without a data field "
+    "is added with PivotTable.AddDataField (assigning Orientation=xlDataField does not create "
+    "one). Only the eleven accepted aggregation codes are allowed; legacy codes (9, -4114, "
+    "-4153, -4154) are rejected. caption must be unique when supplied (duplicates are "
+    "pre-validated here and rejected by Excel). External/OLAP/Data Model sources are rejected "
+    "with unsupported_source. The returned PivotFieldInfo is the post-mutation state re-read "
+    "from the PivotTable. Guarded mutation (see xlvba://glossary)."
 )
 _DESC_PIVOT_FIELD_SET_PROPERTIES = (
-    "Set bounded PivotField properties (caption / number_format / "
-    "show_all_items). Only the properties explicitly set on the patch are "
-    "written: caption and number_format target the data field (a source field "
-    "without one is rejected) and show_all_items targets the source PivotField. "
-    "An empty patch, a blank caption/number format or a duplicate caption is "
-    "rejected before any COM mutation. External/OLAP/Data Model sources are "
-    "rejected with unsupported_source. The returned PivotFieldInfo is the "
-    "post-mutation state re-read from the PivotTable. Guarded mutation: writable "
-    "session + snapshot + approval (full-access default; restricted requires "
-    "approval) + postcondition re-read."
+    "Set bounded PivotField properties (caption / number_format / show_all_items). Only the "
+    "properties explicitly set on the patch are written: caption and number_format target the "
+    "data field (a source field without one is rejected) and show_all_items targets the source "
+    "PivotField. An empty patch, a blank caption/number format or a duplicate caption is "
+    "rejected before any COM mutation. External/OLAP/Data Model sources are rejected with "
+    "unsupported_source. The returned PivotFieldInfo is the post-mutation state re-read from "
+    "the PivotTable. Guarded mutation (see xlvba://glossary)."
 )
 
 _DESC_PIVOT_FIELD_GET_FILTERS = (
@@ -967,13 +890,12 @@ _DESC_PIVOT_FIELD_APPLY_FILTER = (
     "approval + audit + postcondition."
 )
 _DESC_PIVOT_FIELD_CLEAR_FILTERS = (
-    "Clear PivotField filters with an explicit scope. scope='field' (default; "
-    "requires field) calls PivotField.ClearAllFilters on that field; scope='table' "
-    "calls PivotTable.ClearAllFilters for the whole PivotTable and returns a "
-    "table-level result whose field is empty. External/OLAP/Data Model sources are "
-    "rejected with unsupported_source. The result is confirmed by a post-mutation "
-    "re-read. Guarded mutation: writable session + snapshot + approval "
-    "(full-access default; restricted requires approval) + postcondition re-read."
+    "Clear PivotField filters with an explicit scope. scope='field' (default; requires field) "
+    "calls PivotField.ClearAllFilters on that field; scope='table' calls "
+    "PivotTable.ClearAllFilters for the whole PivotTable and returns a table-level result "
+    "whose field is empty. External/OLAP/Data Model sources are rejected with "
+    "unsupported_source. The result is confirmed by a post-mutation re-read. Guarded mutation "
+    "(see xlvba://glossary)."
 )
 
 # Read-only MCP resource descriptions (spec §6.6). The URIs are per-workbook
@@ -1015,7 +937,24 @@ _DESC_ENVIRONMENT = (
     "null (no 4-part source); excel.available=false when the worker is down. "
     "Result: EnvironmentReport (server, excel, capabilities, policy, "
     "glossary_uri, workbooks). "
-    "Next actions: excel_open / snapshot_create as the policy requires."
+    "Next actions: excel_open / snapshot_create as the policy requires. "
+    "Capabilities (this server provides): VBA project access, macros, pivot "
+    "tables (database-source; manual filters), background jobs, recovery, and "
+    "non-activating compile diagnostics — NOT compilation (sourced from "
+    "EnvironmentCapabilities). "
+    "Routing is capability-based advice only: this server does NOT detect whether "
+    "any other MCP server is installed or connected. "
+    "Prefer xlvba when the task needs the working-copy lifecycle, session-aware "
+    "operations, snapshot/guarded mutation, VBA/macro management, pivot/cache "
+    "diagnostics, background jobs, Excel health/recovery, or policy-aware "
+    "execution. "
+    "Use excel-mcp when it exposes an equivalent supported operation that does "
+    "NOT need xlvba's session/snapshot/working-copy/recovery guarantees. "
+    "Matrix: working copy or session binding -> xlvba; snapshot + guarded "
+    "mutation -> xlvba; VBA/macro/pivot-cache/background/recovery -> xlvba; "
+    "plain cell/range/sheet op with no session guarantee needed -> excel-mcp. "
+    "Examples: 'read one cell from a disposable file' -> excel-mcp; 'edit a "
+    "cell, snapshot, then recover the owned Excel process' -> xlvba."
 )
 _DESC_RES_GLOSSARY = (
     "Read-only glossary (Markdown) of the server's jargon: R13, BG06, preflight, "
@@ -1743,7 +1682,7 @@ def _configure_logging() -> None:
 # Truthful MCP ``ToolAnnotations`` (U3; plan_03 §11). Derived from each tool's
 # access class; emitted on every ``add_tool`` call. These are hints only (client
 # display is best-effort; Kilo approval is name-glob based) — they never change
-# enforcement. ``macro_run`` and ``vba_compile`` are intentionally NOT read-only.
+# enforcement. ``macro_run`` and ``vba_compile_diagnostics`` are intentionally NOT read-only.
 _ANN_READ_ONLY = frozenset(
     {
         "excel_get_status",
@@ -1857,6 +1796,12 @@ def _register_tools(server: MCPServer) -> None:
         excel_save, name="excel_save", description=_DESC_SAVE, annotations=_annotations("excel_save")
     )
     server.add_tool(
+        excel_save_as,
+        name="excel_save_as",
+        description=_DESC_SAVE_AS,
+        annotations=_annotations("excel_save_as"),
+    )
+    server.add_tool(
         excel_get_status,
         name="excel_get_status",
         description=_DESC_STATUS,
@@ -1903,12 +1848,6 @@ def _register_tools(server: MCPServer) -> None:
         name="snapshot_diff",
         description=_DESC_SNAPSHOT_DIFF,
         annotations=_annotations("snapshot_diff"),
-    )
-    server.add_tool(
-        test_run_suite,
-        name="test_run_suite",
-        description=_DESC_TEST_RUN_SUITE,
-        annotations=_annotations("test_run_suite"),
     )
     server.add_tool(
         test_suite_run,
@@ -1977,10 +1916,10 @@ def _register_tools(server: MCPServer) -> None:
         annotations=_annotations("vba_insert_code"),
     )
     server.add_tool(
-        vba_compile,
-        name="vba_compile",
-        description=_DESC_VBA_COMPILE,
-        annotations=_annotations("vba_compile"),
+        vba_compile_diagnostics,
+        name="vba_compile_diagnostics",
+        description=_DESC_VBA_COMPILE_DIAGNOSTICS,
+        annotations=_annotations("vba_compile_diagnostics"),
     )
     server.add_tool(
         vba_get_compile_diagnostics,
@@ -2013,10 +1952,10 @@ def _register_tools(server: MCPServer) -> None:
         job_get, name="job_get", description=_DESC_JOB_GET, annotations=_annotations("job_get")
     )
     server.add_tool(
-        job_cancel,
-        name="job_cancel",
-        description=_DESC_JOB_CANCEL,
-        annotations=_annotations("job_cancel"),
+        job_request_cancel,
+        name="job_request_cancel",
+        description=_DESC_JOB_REQUEST_CANCEL,
+        annotations=_annotations("job_request_cancel"),
     )
     server.add_tool(
         sheets_list,
@@ -2398,6 +2337,25 @@ def _find_domain_cause(exc: BaseException) -> ExcelVbaMcpError | None:
     return None
 
 
+def _originating_cause(exc: BaseException) -> BaseException:
+    """Return the deepest ``__cause__`` in ``exc``'s chain (cycle-safe).
+
+    The MCP SDK wraps an unhandled tool exception in
+    ``UnexpectedToolError("Error executing tool <name>")``; the real failure is
+    the originating cause at the bottom of the ``__cause__`` chain. Used by the
+    ``call_tool`` INTERNAL_ERROR fallback so the synthesized envelope reports the
+    actual failure text and exception class, never the SDK wrapper's
+    "Error executing tool" message (U6-B; plan_05 §5.2 / N1).
+    """
+
+    seen: set[int] = set()
+    current: BaseException = exc
+    while current.__cause__ is not None and id(current) not in seen:
+        seen.add(id(current))
+        current = current.__cause__
+    return current
+
+
 def _jsonable_validation_errors(error: ValidationError) -> list[dict[str, Any]]:
     """Return ``error.errors()`` as a JSON-serializable list (audit finding C-1).
 
@@ -2471,14 +2429,16 @@ class ExcelVbaMcpServer(MCPServer[_Runtime]):
     ``ToolError("Error executing tool <name>: ...")`` with no ``code``. This
     subclass catches that wrapper, locates the underlying domain error in the
     ``__cause__`` chain and re-raises a ``ToolError`` whose message is the JSON of
-    ``to_dict()`` so real MCP clients can observe the stable ``code`` and
-    structured ``context``. When the cause is a pydantic ``ValidationError`` (the
+    ``to_dict()`` so real MCP clients can observe the stable ``errorCode`` and
+    structured ``details``. When the cause is a pydantic ``ValidationError`` (the
     caller's arguments do not match the input schema) it is translated into an
     ``ExcelVbaMcpError`` (code ``INVALID_RANGE``, matching the tool modules'
     malformed-argument code) so **every** tool failure reaches the client
     structured (audit finding G-9 / F-5: no unstructured ``UnexpectedToolError``
-    leak). Any other exception is re-raised unchanged (the SDK still reports it as
-    an unexpected tool failure).
+    leak). Any other (non-domain, non-validation) exception is synthesized into a
+    guaranteed ``INTERNAL_ERROR`` envelope from the originating cause (U6-B;
+    plan_05 §5.2 / N1) so no bare "Error executing tool" text ever reaches a
+    client.
     """
 
     async def call_tool(
@@ -2498,7 +2458,26 @@ class ExcelVbaMcpServer(MCPServer[_Runtime]):
                 # receives a structured payload.
                 cause = _validation_error_as_domain(exc)
                 if cause is None:
-                    raise
+                    # Neither a domain nor a validation cause: an unhandled non-domain
+                    # exception. Synthesize a guaranteed structured INTERNAL_ERROR
+                    # envelope so no bare "Error executing tool" leak reaches the
+                    # client (U6-B; plan_05 §5.2 / N1). The caught ``exc`` is the
+                    # SDK's ``UnexpectedToolError`` whose own message is
+                    # "Error executing tool <name>"; use the originating (deepest)
+                    # ``__cause__`` so the message is the real failure text and the
+                    # reported exception class is the actual one, never the wrapper.
+                    origin = _originating_cause(exc)
+                    fallback = ExcelVbaMcpError(
+                        str(origin),
+                        code=ErrorCode.INTERNAL_ERROR,
+                        context={
+                            "reason": "unhandled_exception",
+                            "exception": origin.__class__.__name__,
+                        },
+                    )
+                    raise ToolError(
+                        json.dumps(fallback.to_dict(), ensure_ascii=False)
+                    ) from exc
             raise ToolError(json.dumps(cause.to_dict(), ensure_ascii=False)) from cause
 
 
@@ -2646,6 +2625,10 @@ _GLOSSARY_MD = """# xlvba glossary
 - **indeterminate** — the compile probe never returns compiled/compile_error.
 - **working copy** — the opened, mutable copy; originals are never touched.
 - **snapshot gate** — the in-memory `_latest_snapshot` checked by `require_snapshot`.
+- **guarded mutation** — a write tool that requires a writable session, a snapshot,
+  an approval gate, and a postcondition re-read before it reports success.
+- **approval gate** — the policy check that auto-allows in full-access mode and
+  requires an explicit grant in restricted mode; a denial is `APPROVAL_DENIED`.
 """
 
 
