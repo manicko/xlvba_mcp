@@ -42,7 +42,7 @@ excel_save_as(workbook_id: str, path: str, *,
 ## 5. Atomic write + backup
 1. `wb.Save()` on the single-STA worker (flush working copy).
 2. Stage temp on target FS (`mkstemp(dir=target.parent)`) → copy → flush+fsync → verify staged size+sha == working.
-3. If target exists: if `<target>.bak` already exists (prior interrupted save) → **stop**, `outcome="unknown"`, preserve `.bak`, do not replace destination (no auto-resume). Else copy target→`<target>.bak` (single backup, overwritten each save) flush+fsync.
+3. If target exists: if `<target>.bak` already exists (prior interrupted save) → **deterministic pre-mutation rejection** `PROTECTED_TARGET` / `reason=backup_exists` (isError), `.bak` and destination left untouched (no auto-resume). The backup is created/overwritten only when no prior `.bak` exists.
 4. `os.replace(tmp, target)` (same volume → atomic).
 5. Verify final size+sha; only then `outcome="ok"`.
 6. `finally` unlink leftover temp.

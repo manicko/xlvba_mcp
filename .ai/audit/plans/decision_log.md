@@ -251,3 +251,8 @@ Capability-based routing in `xlvba_environment` (no other-server detection). Gua
 
 ## Implementation outcome (2026-11-26)
 U6-B/A/C/E/U7/U6-D all implemented + Validator-ACCEPT; alignment pass fixed integration envelope keys + docs/08; unit 1152 passed; integration collects; final Auditor spot-check ACCEPT. Full model-in-the-loop benchmark remains (no runtime here). Deferred: PDF export, `xlvba_job_list`, outputSchema field reduction.
+
+## Stage 1 outcome (2026-11-26)
+- Save As live integration (Excel 16.0, PID 27704): 9 scenarios PASS; scenario-6 `.bak` conflict defect fixed (deterministic `PROTECTED_TARGET/backup_exists`); candidate real-agent run PASS.
+- Comparative baseline-vs-candidate model-in-the-loop benchmark: **BLOCKED** (only candidate server reachable; Kilo global config read-restricted; no baseline routing). No proxy substituted.
+- **Stage 1 = FAIL (blocked on comparative benchmark). Stage 2 NOT started.** Remediation: run the comparative benchmark where both variants are routable, then repeat Stage 1D.
