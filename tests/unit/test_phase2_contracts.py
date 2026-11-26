@@ -588,6 +588,8 @@ def test_stage1_status_enums_unchanged() -> None:
         "not_found",
         "timeout",
         "needs_recovery",
+        # Block E (additive): deadline-exceeded macro, no live-pid kill.
+        "suspected_stalled",
     }
     assert {m.value for m in CellValueKind} == {
         "string",

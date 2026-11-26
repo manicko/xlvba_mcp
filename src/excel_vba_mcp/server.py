@@ -23,7 +23,7 @@ import logging
 import os
 import sys
 import tempfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -39,6 +39,7 @@ from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
 from excel_vba_mcp.api import (
     compile_tools,
     control_tools,
+    job_tools,
     macro_tools,
     name_tools,
     pivot_tools,
@@ -57,6 +58,7 @@ from excel_vba_mcp.api.control_tools import (
     controls_list,
 )
 from excel_vba_mcp.api.health_tools import excel_health
+from excel_vba_mcp.api.job_tools import job_cancel, job_get
 from excel_vba_mcp.api.macro_tools import (
     macro_classify_background,
     macro_get_last_result,
@@ -103,6 +105,7 @@ from excel_vba_mcp.api.range_tools import (
     range_write_formulas,
     range_write_values,
 )
+from excel_vba_mcp.api.recovery_tools import excel_recover
 from excel_vba_mcp.api.shape_tools import (
     shape_get,
     shape_set_on_action,
@@ -160,6 +163,7 @@ from excel_vba_mcp.api.workbook_tools import (
 )
 from excel_vba_mcp.application.compile_service import CompileService
 from excel_vba_mcp.application.controls_service import ControlsService
+from excel_vba_mcp.application.job_registry import JobRegistry
 from excel_vba_mcp.application.macro_service import BackgroundSafetyRegistry, MacroService
 from excel_vba_mcp.application.names_service import NamesService
 from excel_vba_mcp.application.pivot_tables_service import PivotTablesService
@@ -184,6 +188,8 @@ from excel_vba_mcp.security.approval import ApprovalPolicy
 from excel_vba_mcp.security.audit import AuditLogger
 from excel_vba_mcp.security.path_policy import PathPolicy
 from excel_vba_mcp.storage.artifact_store import ARTIFACT_ROOT_NAME, ArtifactStore
+from excel_vba_mcp.storage.job_store import JobStore
+from excel_vba_mcp.storage.owned_pid_store import OwnedPidStore
 from excel_vba_mcp.storage.run_repository import RunRepository
 from excel_vba_mcp.storage.snapshot_store import SnapshotStore
 
@@ -196,12 +202,15 @@ _ENV_WORK_DIR = "EXCEL_VBA_MCP_WORK_DIR"
 _ENV_SNAPSHOT_DIR = "EXCEL_VBA_MCP_SNAPSHOT_DIR"
 _ENV_ARTIFACT_DIR = "EXCEL_VBA_MCP_ARTIFACT_DIR"
 _ENV_RUN_DIR = "EXCEL_VBA_MCP_RUN_DIR"
+_ENV_JOB_DIR = "EXCEL_VBA_MCP_JOB_DIR"
 
 # Tool descriptions surfaced over MCP (kept explicit for a stable contract).
 _DESC_OPEN = (
     "Open an allowlisted workbook as a hidden working copy. mode='inspect' "
     "disables macros; mode='execute' applies macro-by-UI (allowed by default; "
-    "restricted mode requires approval). The original file is never modified."
+    "restricted mode requires approval). The original file is never modified. "
+    "background=true returns {status:'running', job_id, poll_after_s} promptly; "
+    "retrieve the WorkbookInfo with job_get."
 )
 _DESC_CLOSE = (
     "Close an open workbook. Defaults to NOT saving; set save_changes=true to persist changes."
@@ -213,6 +222,18 @@ _DESC_HEALTH = (
     "Return worker/session health (state, accepting, owned Excel pid, active "
     "operation, needs_recovery) without forcing a re-run or touching COM. "
     "Read-only: use it to check whether the session needs recovery."
+)
+_DESC_EXCEL_RECOVER = (
+    "Recover the owned Excel process (agent-directed). The server never "
+    "auto-terminates a live pid on a deadline; call this only when recovery is "
+    "justified. Terminates the wedged owned EXCEL.EXE through the held process "
+    "handle (TerminateProcess + WaitForSingleObject), discards the working copies "
+    "and rebuilds a fresh hidden instance. Auto-allowed (RECOVERY class) in full "
+    "and restricted mode, audited, pid-scoped (never a wildcard); destructive to "
+    "working copies only, originals are never modified. Fail-closed: if no live, "
+    "identity-verified handle is held it is refused and a server restart is the "
+    "fallback. An interrupted operation is reported prior_job='unknown' and is "
+    "never auto-retried."
 )
 _DESC_SNAPSHOT_CREATE = (
     "Create an immutable snapshot of a workbook (SaveCopyAs for open books, file "
@@ -246,7 +267,9 @@ _DESC_TEST_SUITE_RUN = (
     "call, so an unknown action/assertion or an arbitrary-code/unbounded payload "
     "is rejected up front. Behaves like test_run_suite: one immutable baseline "
     "snapshot, one disposable working copy per case, Range/Pivot steps dispatched "
-    "to the existing services; external macro side effects are NOT rolled back."
+    "to the existing services; external macro side effects are NOT rolled back. "
+    "background=true returns {status:'running', job_id, poll_after_s} promptly; "
+    "retrieve the TestRunResult with job_get."
 )
 _DESC_VBA_PROJECT_INFO = (
     "Return the VBA project summary: name, protection/lock state, component "
@@ -309,7 +332,9 @@ _DESC_MACRO_RUN = (
     "background_safe for the current workbook hash (BG06) and passes the "
     "interactive-UI preflight (R13); otherwise a truthful blocked result is "
     "returned and the macro is NOT dispatched. Never dismisses a dialog or reports "
-    "a waiting macro as passed."
+    "a waiting macro as passed. background=true returns "
+    "{status:'running', job_id, poll_after_s} promptly; retrieve the result with "
+    "job_get."
 )
 _DESC_MACRO_GET_LAST_RESULT = (
     "Return the cached last macro run result (status, duration, return value, "
@@ -322,6 +347,19 @@ _DESC_MACRO_CLASSIFY_BACKGROUND = (
     "background_safe here. The classification is bound to (workbook hash, source "
     "hash, procedure) and is invalidated on VBA source change; a heuristic or "
     "interactive-UI procedure cannot be classified background_safe (R13 veto)."
+)
+_DESC_JOB_GET = (
+    "Return one job's status/result by job_id (poll; never touches COM). Long ops "
+    "return {status:'running', job_id, poll_after_s} promptly; re-call job_get no "
+    "sooner than poll_after_s. status is one of queued/running/succeeded/failed/"
+    "expired/unknown/interrupted_unknown; the result is available once terminal. "
+    "interrupted_unknown (outcome='unknown', retryable=false) is a job left "
+    "non-terminal by a prior process: it is never completed and never auto-retried."
+)
+_DESC_JOB_CANCEL = (
+    "Record a job's cancel intent (intent-only; never interrupts the running COM "
+    "call). The single-STA operation runs to completion; a poller observes "
+    "cancel_requested on the job status."
 )
 _DESC_SHEETS_LIST = (
     "List every sheet of an open workbook (all types: Worksheet / Chart / Macro "
@@ -582,7 +620,9 @@ _DESC_PIVOT_TABLES_LIST = (
     "Workbook.PivotTables is not a usable inventory on the target build. Each "
     "PivotTable reports its name, sheet, cache index, TableRange1/TableRange2 "
     "addresses, source type and supported/unsupported status; shared caches are "
-    "reported once with their affected tables. Read-only."
+    "reported once with their affected tables. Read-only. background=true returns "
+    "{status:'running', job_id, poll_after_s} promptly; retrieve the inventory "
+    "with job_get."
 )
 _DESC_PIVOT_TABLE_GET = (
     "Return one PivotTable's metadata by its stable Name: sheet, index, cache "
@@ -744,6 +784,8 @@ class _Runtime:
     artifacts: ArtifactStore
     runs: RunRepository
     runner: TestRunner
+    jobs: JobRegistry
+    job_store: JobStore
     path_policy: PathPolicy
     approval: ApprovalPolicy
     audit: AuditLogger
@@ -771,6 +813,10 @@ def _configured_roots() -> dict[str, str]:
     roots[ARTIFACT_ROOT_NAME] = str(
         _resolve_runtime_path(_ENV_ARTIFACT_DIR, _default_artifact_dir())
     )
+    # Log the resolved allowlist at startup so an operator can confirm which roots
+    # are actually in force — including the cwd+tempdir fallback when
+    # ``EXCEL_VBA_MCP_ROOTS`` is unset (otherwise the fallback is silent).
+    logger.info("Allowed roots: %s", roots)
     return roots
 
 
@@ -784,7 +830,9 @@ def _build_runtime(config: Config) -> _Runtime:
 
     path_policy = PathPolicy(_configured_roots())
     app_adapter = ExcelAppAdapter()
-    worker = ExcelComWorker(app_adapter)
+    # The server-wide liveness ceiling is the authority that clamps every per-call
+    # COM deadline (Block E); open_timeout_s is the per-op-class open authority.
+    worker = ExcelComWorker(app_adapter, liveness_ceiling_s=config.server.liveness_ceiling_s)
     # The sole production ApprovalPolicy: full-access by default (mutations and
     # executions authorized without per-action grants), restricted as an explicit
     # opt-in. Grants/allowlist are wired separately (task_014).
@@ -797,6 +845,7 @@ def _build_runtime(config: Config) -> _Runtime:
         approval,
         audit,
         work_dir=_resolve_runtime_path(_ENV_WORK_DIR, _default_work_dir()),
+        open_timeout_s=config.server.open_timeout_s,
     )
     snapshot = SnapshotService(
         SnapshotStore(_resolve_runtime_path(_ENV_SNAPSHOT_DIR, _default_snapshot_dir())),
@@ -855,6 +904,24 @@ def _build_runtime(config: Config) -> _Runtime:
         audit,
     )
     runs = RunRepository(_resolve_runtime_path(_ENV_RUN_DIR, _default_run_dir()))
+    # Job persistence (Block F): a RUNNING marker is written at job start and the
+    # record is finalized on terminal. The store reconciles any non-terminal record
+    # left by a prior process to interrupted_unknown (never completed, never
+    # retried). The in-memory registry (Block E) owns the live result; the store
+    # makes a completed result retrievable by job_id after a restart.
+    job_store = JobStore(_resolve_runtime_path(_ENV_JOB_DIR, _default_job_dir()))
+    if job_store.reconciled:
+        logger.warning(
+            "Reconciled %d interrupted job(s) to interrupted_unknown at startup.",
+            len(job_store.reconciled),
+        )
+    # Minimal in-memory job registry (Block E): wraps the single-STA submit FIFO
+    # and owns the result so a client timeout/disconnect never drops it. The full
+    # JobStore + startup reconcile are Block F.
+    jobs = JobRegistry(worker, store=job_store)
+    # Let a successful recovery finalize this session's in-flight jobs to
+    # INTERRUPTED_UNKNOWN (Block F recovery wiring).
+    session.set_job_registry(jobs)
     runner = TestRunner(
         worker,
         session,
@@ -891,6 +958,8 @@ def _build_runtime(config: Config) -> _Runtime:
         artifacts=artifacts,
         runs=runs,
         runner=runner,
+        jobs=jobs,
+        job_store=job_store,
         path_policy=path_policy,
         approval=approval,
         audit=audit,
@@ -917,6 +986,10 @@ def _default_run_dir() -> Path:
     return Path(tempfile.gettempdir()) / "excel_vba_mcp" / "runs"
 
 
+def _default_job_dir() -> Path:
+    return Path(tempfile.gettempdir()) / "excel_vba_mcp" / "jobs"
+
+
 @asynccontextmanager
 async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
     """Own the Excel runtime: start the worker, publish it, tear it down.
@@ -941,10 +1014,28 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         params={"access_mode": config.server.access_mode.value},
         result={"version": __version__},
     )
+    # Startup reconcile (Block A #4): if a prior owned Excel pid is still alive,
+    # do NOT launch a second Excel — surface it and require an operator/agent
+    # decision (recover/adopt or restart). Never silently start a second instance.
+    pid_store = OwnedPidStore(runtime.session.work_dir)
+    refusal: str | None = None
+    start_error: Exception | None = None
     try:
-        await runtime.worker.start()
+        refusal = await _start_worker_guarded(
+            runtime, pid_store, pid_alive=ExcelAppAdapter._pid_alive
+        )
     except Exception as exc:  # noqa: BLE001 - degrade gracefully, never crash stdio
-        logger.warning("Excel worker failed to start: %s", exc)
+        start_error = exc
+    if refusal is not None:
+        logger.error("Excel worker startup refused: %s", refusal)
+        runtime.audit.record(
+            tool="server_startup_recovery",
+            operation_class="config",
+            params={"reason": refusal},
+            result={"started": False},
+        )
+    elif start_error is not None:
+        logger.warning("Excel worker failed to start: %s", start_error)
         await _safe_shutdown(runtime.worker)
     else:
         workbook_tools.set_session_service(runtime.session)
@@ -960,6 +1051,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         control_tools.set_controls_service(runtime.controls)
         compile_tools.set_compile_service(runtime.compile)
         macro_tools.set_macro_service(runtime.macro)
+        job_tools.set_job_registry(runtime.jobs)
         workbook_tools.set_workbook_model_service(runtime.model)
     try:
         yield runtime
@@ -978,6 +1070,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         control_tools.set_controls_service(None)
         compile_tools.set_compile_service(None)
         macro_tools.set_macro_service(None)
+        job_tools.set_job_registry(None)
         await _safe_shutdown(runtime.worker)
         runtime.audit.close()
 
@@ -989,6 +1082,65 @@ async def _safe_shutdown(worker: ExcelComWorker) -> None:
         await worker.shutdown()
     except Exception as exc:  # noqa: BLE001 - shutdown is best-effort
         logger.warning("Excel worker shutdown error: %s", exc)
+
+
+def _reconcile_prior_owned_pid(
+    store: OwnedPidStore,
+    *,
+    pid_alive: Callable[[int], bool],
+) -> str | None:
+    """Decide whether it is safe to start the worker (Block A #4).
+
+    Reads the persisted prior owned pid; if it is still alive the server **must
+    not** start a second Excel — a human-readable refusal reason is returned so the
+    lifespan surfaces it (log + audit) and skips ``worker.start()``. When the prior
+    pid is dead (or absent) the stale marker is cleared and ``None`` is returned so
+    startup proceeds normally.
+
+    Pure and side-effect-free except for clearing a dead marker, so it is unit
+    tested without launching Excel (the ``pid_alive`` probe is injected).
+
+    Returns:
+        ``None`` when startup may proceed, or a refusal reason string when a prior
+        owned Excel pid is still alive.
+    """
+
+    prior_pid = store.read()
+    if prior_pid is not None and pid_alive(prior_pid):
+        return (
+            f"prior owned Excel pid {prior_pid} is still alive; refusing to start a "
+            "second Excel instance — an operator/agent decision is required "
+            "(recover/adopt the existing instance, or restart the server)"
+        )
+    store.clear()
+    return None
+
+
+async def _start_worker_guarded(
+    runtime: _Runtime,
+    store: OwnedPidStore,
+    *,
+    pid_alive: Callable[[int], bool],
+) -> str | None:
+    """Reconcile-then-start the worker (Block A #4), returning a refusal or ``None``.
+
+    When a prior owned Excel pid is still alive the worker is **not** started and a
+    refusal reason is returned (the caller surfaces it and skips publishing services),
+    so a second Excel is never silently launched. Otherwise the worker is started and
+    the freshly launched owned pid is persisted for the next startup reconcile.
+
+    A ``worker.start()`` failure propagates to the caller (which degrades gracefully +
+    safe-shuts the worker); it is not a reconcile refusal.
+    """
+
+    refusal = _reconcile_prior_owned_pid(store, pid_alive=pid_alive)
+    if refusal is not None:
+        return refusal
+    await runtime.worker.start()
+    new_pid = runtime.worker.get_status().owned_pid
+    if new_pid is not None:
+        store.write(new_pid)
+    return None
 
 
 def _configure_logging() -> None:
@@ -1010,6 +1162,7 @@ def _register_tools(server: MCPServer) -> None:
     server.add_tool(excel_get_status, name="excel_get_status", description=_DESC_STATUS)
     server.add_tool(excel_list_workbooks, name="excel_list_workbooks", description=_DESC_LIST)
     server.add_tool(excel_health, name="excel_health", description=_DESC_HEALTH)
+    server.add_tool(excel_recover, name="excel_recover", description=_DESC_EXCEL_RECOVER)
     server.add_tool(snapshot_create, name="snapshot_create", description=_DESC_SNAPSHOT_CREATE)
     server.add_tool(snapshot_list, name="snapshot_list", description=_DESC_SNAPSHOT_LIST)
     server.add_tool(snapshot_restore, name="snapshot_restore", description=_DESC_SNAPSHOT_RESTORE)
@@ -1062,6 +1215,8 @@ def _register_tools(server: MCPServer) -> None:
         name="macro_get_last_result",
         description=_DESC_MACRO_GET_LAST_RESULT,
     )
+    server.add_tool(job_get, name="job_get", description=_DESC_JOB_GET)
+    server.add_tool(job_cancel, name="job_cancel", description=_DESC_JOB_CANCEL)
     server.add_tool(sheets_list, name="sheets_list", description=_DESC_SHEETS_LIST)
     server.add_tool(sheet_get, name="sheet_get", description=_DESC_SHEET_GET)
     server.add_tool(sheet_add, name="sheet_add", description=_DESC_SHEET_ADD)

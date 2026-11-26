@@ -286,6 +286,36 @@ class ApprovalPolicy:
 
         return self.check(key, operation_class=OperationClass.MUTATING)
 
+    def check_recovery(self, key: ApprovalKey) -> ApprovalDecision:
+        """Authorize the agent-directed ``excel_recover`` RECOVERY operation.
+
+        The RECOVERY class is **auto-allowed in BOTH** :attr:`AccessMode.FULL` and
+        :attr:`AccessMode.RESTRICTED` (report_07 §5, plan_02 Work item A): recovery
+        is autonomous (no human approval) and is **pid-scoped** — the caller passes a
+        ``key`` whose ``canonical_path`` is the owned-pid identity (e.g.
+        ``"pid:<owned_pid>"``), never a workbook wildcard. It discards **working
+        copies only**; originals are never modified. The decision is still
+        **audited** by the caller (the recovery service records an audit entry).
+
+        This is deliberately distinct from :meth:`check` for ``MUTATING`` /
+        ``EXECUTING`` operations, which stay deny-by-default in RESTRICTED: a
+        mutating op is **not** a recovery and is never auto-allowed here.
+
+        Args:
+            key: The pid-scoped recovery identity (audit only; recovery is always
+                allowed). ``canonical_path`` should encode the owned pid.
+
+        Returns:
+            An allowed :class:`ApprovalDecision` (source ``POLICY``).
+        """
+
+        return ApprovalDecision(
+            allowed=True,
+            source=ApprovalSource.POLICY,
+            grant_id=None,
+            reason="recovery is auto-allowed (agent-directed, pid-scoped, originals safe)",
+        )
+
 
 def _grant_is_live(
     grant: ApprovalGrant,

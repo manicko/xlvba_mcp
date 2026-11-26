@@ -107,6 +107,13 @@ def test_models_have_no_com_object_fields() -> None:
     _assert_json_native(dumped)
 
 
+def test_workbook_info_has_no_original_name_field() -> None:
+    # Block C: ``source_path`` is the original allowlisted path; ``original_name``
+    # must stay absent (no duplicate/confusing field).
+    assert "original_name" not in WorkbookInfo.model_fields
+    assert "source_path" in WorkbookInfo.model_fields
+
+
 def _assert_json_native(value: object) -> None:
     if isinstance(value, dict):
         for child in value.values():
@@ -246,6 +253,11 @@ def test_session_needs_recovery_state() -> None:
     assert WorkbookSessionState.NEEDS_RECOVERY.value == "running/needs_recovery"
 
 
+def test_session_deadline_exceeded_state_value() -> None:
+    # Block E (additive): pin the wire value of the deadline-exceeded state.
+    assert WorkbookSessionState.DEADLINE_EXCEEDED.value == "running/deadline_exceeded"
+
+
 def test_macro_status_values() -> None:
     assert {member.value for member in MacroRunStatus} == {
         "success",
@@ -254,4 +266,6 @@ def test_macro_status_values() -> None:
         "not_found",
         "timeout",
         "needs_recovery",
+        # Block E (additive): deadline-exceeded macro, no live-pid kill.
+        "suspected_stalled",
     }

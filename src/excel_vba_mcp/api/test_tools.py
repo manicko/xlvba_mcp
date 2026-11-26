@@ -27,14 +27,18 @@ read via ``get_snapshot_service`` / ``get_test_runner``.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
 from pydantic import ValidationError
 
+from excel_vba_mcp.api.job_tools import start_long_op
+from excel_vba_mcp.application.job_registry import RunningJob
 from excel_vba_mcp.application.snapshot_service import SnapshotDiff, SnapshotService
 from excel_vba_mcp.application.test_runner import TestRunner
 from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import TestRunResult, WorkbookInfo
+from excel_vba_mcp.domain.statuses import OperationClass
 from excel_vba_mcp.domain.test_spec import TestSuiteSpec
 from excel_vba_mcp.storage.snapshot_store import SnapshotManifest
 
@@ -182,7 +186,11 @@ async def test_run_suite(suite: TestSuiteSpec) -> TestRunResult:
     return await runner.run_suite(suite)
 
 
-async def test_suite_run(suite: TestSuiteSpec | dict[str, Any]) -> TestRunResult:
+async def test_suite_run(
+    suite: TestSuiteSpec | dict[str, Any],
+    *,
+    background: bool = False,
+) -> TestRunResult | RunningJob:
     """Validate and run a declarative suite (task_053 explicit entry point).
 
     Accepts the suite either as a
@@ -199,10 +207,15 @@ async def test_suite_run(suite: TestSuiteSpec | dict[str, Any]) -> TestRunResult
     Args:
         suite: The declarative suite document (or an already-built
             :class:`TestSuiteSpec`).
+        background: When ``True`` (Block F), schedule the run on the job registry
+            and return ``{status: "running", job_id, poll_after_s}`` promptly
+            instead of blocking; retrieve the :class:`TestRunResult` with
+            ``job_get``. Default ``False`` (unchanged blocking behaviour).
 
     Returns:
         A :class:`~excel_vba_mcp.domain.models.TestRunResult` with per-case and
-        per-step statuses. The run is persisted and can be read back with
+        per-step statuses, or a :class:`RunningJob` handle when
+        ``background=True``. The run is persisted and can be read back with
         :func:`test_get_run`.
 
     Raises:
@@ -211,6 +224,13 @@ async def test_suite_run(suite: TestSuiteSpec | dict[str, Any]) -> TestRunResult
     """
 
     spec = suite if isinstance(suite, TestSuiteSpec) else _parse_suite(suite)
+    if background:
+        return start_long_op(
+            partial(test_run_suite, spec),
+            timeout=600.0,
+            section="test",
+            op_class=OperationClass.EXECUTING,
+        )
     return await test_run_suite(spec)
 
 

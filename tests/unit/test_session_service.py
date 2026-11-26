@@ -161,7 +161,12 @@ class FakeWorker:
         op_class: OperationClass = OperationClass.READ_ONLY,
     ) -> Any:
         self.submits.append(
-            {"name": getattr(fn, "__name__", "?"), "section": section, "op_class": op_class}
+            {
+                "name": getattr(fn, "__name__", "?"),
+                "section": section,
+                "op_class": op_class,
+                "timeout": timeout,
+            }
         )
         return fn()
 
@@ -253,6 +258,31 @@ async def test_open_materializes_working_copy_and_assigns_id(tmp_path: Path) -> 
     # list_workbooks reflects the open workbook (no extra COM).
     listed = await service.list_workbooks()
     assert [w.workbook_id for w in listed] == [info.workbook_id]
+
+
+@pytest.mark.anyio
+async def test_open_uses_configured_open_timeout_deadline(tmp_path: Path) -> None:
+    """Block E: the open path's effective deadline is the configured open_timeout_s."""
+
+    original = tmp_path / "Book.xlsm"
+    original.write_bytes(b"original-bytes")
+    path_policy = PathPolicy({str(tmp_path): str(tmp_path)})
+    worker = FakeWorker()
+    service = SessionService(
+        worker,
+        _adapter_with(FakeApp()),
+        path_policy,
+        ApprovalPolicy(),
+        AuditLogger(tmp_path / "audit.jsonl"),
+        work_dir=tmp_path / "work",
+        open_timeout_s=0.2,
+    )
+
+    await service.open_workbook(str(original), mode=SessionMode.INSPECT, read_only=True)
+
+    open_submit = next(s for s in worker.submits if s["section"] == "open")
+    # 0.2s (configured), NOT the 300s default.
+    assert open_submit["timeout"] == 0.2
 
 
 async def test_open_inspect_sets_force_disable_automation_security(tmp_path: Path) -> None:

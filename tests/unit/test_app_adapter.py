@@ -92,6 +92,8 @@ def _adapter_with(app: FakeApp) -> ExcelAppAdapter:
     adapter._app = app  # inject without DispatchEx
     adapter._owned_pid = 123
     adapter._owned_caption = app.Caption
+    # A live handle object (never an int) so the same-handle terminate path runs.
+    adapter._owned_handle = object()
     return adapter
 
 
@@ -99,39 +101,45 @@ def _adapter_with(app: FakeApp) -> ExcelAppAdapter:
 # Fakes for the enforced owned-process death (FE-17)
 # ---------------------------------------------------------------------------
 class FakeReaper:
-    """Fake PID-liveness + termination source (no Excel, no Win32, no process).
+    """Fake PID-liveness + handle-termination source (no Excel, no Win32, no process).
 
     ``alive`` is the fake world's answer to "is the owned pid running?"; a
-    successful ``terminate_pid`` flips it to ``False`` so the post-kill
-    verification succeeds. ``on_terminate`` lets a test observe adapter state at
-    the moment the fallback runs.
+    successful ``terminate_and_confirm`` flips it to ``False`` so the post-kill
+    verification succeeds. The terminate is **handle-scoped** (Block A): it records
+    the exact handle object it was asked to terminate and returns ``WAIT_OBJECT_0``
+    (``0``) on success. ``on_terminate`` lets a test observe adapter state at the
+    moment the fallback runs.
     """
 
     def __init__(self, *, alive: bool, kill_succeeds: bool = True) -> None:
         self.alive = alive
         self.kill_succeeds = kill_succeeds
         self.alive_checks: list[int] = []
-        self.terminate_calls: list[int] = []
+        self.terminate_calls: list[object] = []
         self.on_terminate: Callable[[], None] | None = None
 
     def pid_alive(self, pid: int) -> bool:
         self.alive_checks.append(pid)
         return self.alive
 
-    def terminate_pid(self, pid: int) -> bool:
-        self.terminate_calls.append(pid)
+    def terminate_and_confirm(self, handle: object, timeout_ms: int) -> int | None:
+        del timeout_ms
+        self.terminate_calls.append(handle)
         if self.on_terminate is not None:
             self.on_terminate()
         if self.kill_succeeds:
             self.alive = False
-        return self.kill_succeeds
+            return 0  # WAIT_OBJECT_0 (confirmed death)
+        return None
 
 
 def _install_reaper(monkeypatch: pytest.MonkeyPatch, reaper: FakeReaper) -> None:
-    """Point the adapter's PID probes at ``reaper`` (class-level patch)."""
+    """Point the adapter's PID probe + handle-terminate at ``reaper``."""
 
     monkeypatch.setattr(ExcelAppAdapter, "_pid_alive", staticmethod(reaper.pid_alive))
-    monkeypatch.setattr(ExcelAppAdapter, "_terminate_pid", staticmethod(reaper.terminate_pid))
+    monkeypatch.setattr(
+        app_adapter_module, "_terminate_and_confirm", reaper.terminate_and_confirm
+    )
 
 
 def _shrink_reap(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -312,11 +320,14 @@ def test_quit_falls_back_to_a_pid_scoped_kill_when_quit_is_a_noop(
     reaper = FakeReaper(alive=True)
     _install_reaper(monkeypatch, reaper)
     _shrink_reap(monkeypatch)
+    handle = adapter._owned_handle
 
     adapter.quit()
 
     assert app.QuitCalled is True
-    assert reaper.terminate_calls == [123], "the fallback must terminate only the owned pid"
+    assert reaper.terminate_calls == [handle], (
+        "the fallback must terminate through the held handle (same handle, no pid taskkill)"
+    )
     assert adapter.owned_pid is None, "the pid is cleared only after the fallback attempt"
 
 
@@ -347,10 +358,11 @@ def test_quit_clears_the_owned_pid_after_a_failed_fallback(
     reaper = FakeReaper(alive=True, kill_succeeds=False)
     _install_reaper(monkeypatch, reaper)
     _shrink_reap(monkeypatch)
+    handle = adapter._owned_handle
 
     adapter.quit()
 
-    assert reaper.terminate_calls == [123]
+    assert reaper.terminate_calls == [handle]
     assert adapter.owned_pid is None
     assert adapter.owned_caption is None
     assert adapter.app is None

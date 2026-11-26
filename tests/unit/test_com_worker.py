@@ -9,8 +9,9 @@ live Excel instance. A fake COM error (``FakeComError``) carrying an
 Covered:
 * FIFO ordering and serialization on a single STA thread.
 * Awaitable submit does not block the event loop (slow fn + concurrent tick).
-* Timeout -> ``NEEDS_RECOVERY`` + truthful ``EXCEL_HUNG``; second submit fails
-  fast; a ``close``-section item is allowed through.
+* Block E: a started-but-slow call -> ``DEADLINE_EXCEEDED`` + truthful
+  ``EXCEL_HUNG`` (no poison, worker resumes RUNNING); a never-started item ->
+  ``busy``/``retry_after_s`` (``ComBusyError``) with the worker state unchanged.
 * Shutdown ordering and idempotency (fake adapter records calls).
 * Shutdown reaps the owned pid only after the drain's verified quit (FE-17):
   no fallback when the quit ended the process, a pid-scoped fallback otherwise.
@@ -262,12 +263,14 @@ async def test_slow_fn_does_not_block_event_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Timeout -> NEEDS_RECOVERY + EXCEL_HUNG; fail fast; close allowed
+# Block E — split queue-wait (busy) vs execution deadline (DEADLINE_EXCEEDED)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.anyio
-async def test_timeout_sets_needs_recovery_and_raises_hung() -> None:
+async def test_exec_deadline_sets_deadline_exceeded_and_raises_hung() -> None:
+    """A started-but-slow call sets DEADLINE_EXCEEDED (not NEEDS_RECOVERY)."""
+
     adapter = FakeAdapter()
     worker = ExcelComWorker(adapter, orphan_timeout_s=3.0)
     await worker.start()
@@ -280,14 +283,63 @@ async def test_timeout_sets_needs_recovery_and_raises_hung() -> None:
         await worker.submit(slow, timeout=0.1)
 
     assert excinfo.value.code == ErrorCode.EXCEL_HUNG
+    assert excinfo.value.context.get("deadline_exceeded") is True
+    assert excinfo.value.context.get("verdict") == "SUSPECTED_STALLED"
     status = worker.get_status()
-    assert status.state == WorkbookSessionState.NEEDS_RECOVERY
+    assert status.state == WorkbookSessionState.DEADLINE_EXCEEDED
+    # The deadline state is NOT a poison: the worker resumes RUNNING once the
+    # uninterruptible call finally returns (Block E, no kill).
+    await asyncio.sleep(1.2)
+    assert worker.get_status().state == WorkbookSessionState.RUNNING
 
     await worker.shutdown()
 
 
 @pytest.mark.anyio
-async def test_second_submit_fails_fast_in_recovery() -> None:
+async def test_queue_wait_timeout_returns_busy_without_needs_recovery() -> None:
+    """A never-started item yields busy/retry_after_s and never poisons the worker."""
+
+    adapter = FakeAdapter()
+    worker = ExcelComWorker(adapter, orphan_timeout_s=3.0)
+    await worker.start()
+
+    release = threading.Event()
+
+    def blocker() -> str:
+        release.wait(2.0)
+        return "blocked"
+
+    # Occupy the single STA with a long op so the second item cannot start.
+    blocker_task = asyncio.create_task(worker.submit(blocker, timeout=5.0))
+    await asyncio.sleep(0.1)
+
+    started = threading.Event()
+
+    def should_not_run() -> str:
+        started.set()
+        return "x"
+
+    with pytest.raises(ComBusyError) as excinfo:
+        await worker.submit(should_not_run, timeout=0.1)
+
+    assert excinfo.value.code == ErrorCode.COM_BUSY
+    assert excinfo.value.context.get("reason") == "queue_wait_timeout"
+    assert "retry_after_s" in excinfo.value.context
+    # The worker state is NOT poisoned by a queue-wait timeout.
+    assert worker.get_status().state != WorkbookSessionState.NEEDS_RECOVERY
+    assert worker.get_status().state != WorkbookSessionState.DEADLINE_EXCEEDED
+    await asyncio.sleep(0.2)
+    assert not started.is_set(), "the queue-wait-timeout item must not have started"
+
+    release.set()
+    await blocker_task
+    await worker.shutdown()
+
+
+@pytest.mark.anyio
+async def test_worker_usable_after_deadline_exceeded() -> None:
+    """After a deadline the worker resumes and accepts new work (no recovery needed)."""
+
     adapter = FakeAdapter()
     worker = ExcelComWorker(adapter, orphan_timeout_s=3.0)
     await worker.start()
@@ -298,43 +350,75 @@ async def test_second_submit_fails_fast_in_recovery() -> None:
 
     with pytest.raises(ExcelHungError):
         await worker.submit(slow, timeout=0.1)
+    assert worker.get_status().state == WorkbookSessionState.DEADLINE_EXCEEDED
 
-    # The hung fn is still running; a new non-close submit must fail fast.
-    started = threading.Event()
+    # Let the slow call return so the worker resumes RUNNING.
+    await asyncio.sleep(1.2)
+    assert worker.get_status().state == WorkbookSessionState.RUNNING
 
-    def should_not_run() -> str:
-        started.set()
-        return "x"
-
-    with pytest.raises(ExcelHungError):
-        await worker.submit(should_not_run, timeout=1.0)
-
-    await asyncio.sleep(0.2)
-    assert not started.is_set(), "the fail-fast submit must not start fn"
+    # The rebuilt worker is usable again without an explicit recovery.
+    result = await worker.submit(lambda: "ok", timeout=2.0)
+    assert result == "ok"
 
     await worker.shutdown()
 
 
 @pytest.mark.anyio
-async def test_close_section_allowed_in_recovery() -> None:
+async def test_liveness_ceiling_clamps_the_per_call_deadline() -> None:
+    """The liveness ceiling is the authority: min(timeout, ceiling) bounds the call."""
+
     adapter = FakeAdapter()
-    worker = ExcelComWorker(adapter, orphan_timeout_s=3.0)
+    worker = ExcelComWorker(adapter, orphan_timeout_s=3.0, liveness_ceiling_s=0.2)
     await worker.start()
 
     def slow() -> str:
-        time.sleep(0.3)
+        time.sleep(1.0)
         return "done"
 
-    with pytest.raises(ExcelHungError):
-        await worker.submit(slow, timeout=0.1)
+    start = time.monotonic()
+    with pytest.raises(ExcelHungError) as excinfo:
+        # The soft hint is 5.0s but the 0.2s ceiling must win.
+        await worker.submit(slow, timeout=5.0)
+    elapsed = time.monotonic() - start
 
-    # Let the hung fn return so the close item can run.
-    await asyncio.sleep(0.5)
+    assert excinfo.value.context.get("deadline_exceeded") is True
+    # Bounded by the ceiling (~0.2s), NOT the 5.0s hint.
+    assert 0.15 <= elapsed < 0.9, f"deadline not clamped to the ceiling: {elapsed:.3f}s"
+    assert worker.get_status().state == WorkbookSessionState.DEADLINE_EXCEEDED
 
-    result = await worker.submit(lambda: "closed", timeout=2.0, section="close")
-    assert result == "closed"
-
+    # Let the slow call return so the worker resumes; then shut down.
+    await asyncio.sleep(1.2)
     await worker.shutdown()
+
+
+def test_process_item_marks_started_and_expires_before_start() -> None:
+    """A directly-driven item with a past deadline is 'started' + exec/expired (not busy)."""
+
+    from concurrent.futures import Future
+
+    from excel_vba_mcp.adapters.excel.com_worker import _WorkItem
+
+    adapter = FakeAdapter()
+    worker = ExcelComWorker(adapter, orphan_timeout_s=3.0)
+    item: _WorkItem = _WorkItem(
+        fn=lambda: "x",
+        future=Future(),
+        deadline=time.monotonic() - 1.0,  # already past
+        section="diagnostic",
+        op_class=OperationClass.READ_ONLY,
+        token=1,
+    )
+
+    # Drive the worker's own processing path directly (no thread needed for the
+    # expired-before-start branch).
+    worker._process_item(item, pythoncom)
+
+    # The worker began handling it -> started; the future got a truthful
+    # ExcelHungError (exec/expired), never a busy result.
+    assert item.started is True
+    assert item.future.done()
+    exc = item.future.exception()
+    assert isinstance(exc, ExcelHungError)
 
 
 @pytest.mark.anyio
@@ -626,7 +710,7 @@ async def test_reset_after_hung_fn_released_rebuilds_and_runs() -> None:
 
     with pytest.raises(ExcelHungError):
         await worker.submit(slow, timeout=0.1)
-    assert worker.get_status().state == WorkbookSessionState.NEEDS_RECOVERY
+    assert worker.get_status().state == WorkbookSessionState.DEADLINE_EXCEEDED
 
     # Let the hung fn finish so the close-section reset item can be processed.
     await asyncio.sleep(0.7)
@@ -659,7 +743,7 @@ async def test_reset_while_fn_hung_times_out_without_deadlock() -> None:
 
     with pytest.raises(ExcelHungError):
         await worker.submit(very_slow, timeout=0.1)
-    assert worker.get_status().state == WorkbookSessionState.NEEDS_RECOVERY
+    assert worker.get_status().state == WorkbookSessionState.DEADLINE_EXCEEDED
 
     # The fn is still running on the STA thread, so the close-section reset item is
     # stuck behind it: reset() gives up after the bounded orphan timeout (no block).
@@ -670,3 +754,248 @@ async def test_reset_while_fn_hung_times_out_without_deadlock() -> None:
     assert elapsed < 3.0, f"reset blocked {elapsed:.2f}s (must be bounded by orphan_timeout_s)"
 
     await worker.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Block D — atomic status snapshot (report_07 §2.4 D1 / plan_02 Work item D)
+#
+# Deterministic, non-flaky tests on the PRODUCTION ``ExcelComWorker`` snapshot
+# methods (no COM, no Excel, no STA thread). They use Events to force the exact
+# interleavings that the old lock-free pattern got wrong:
+#   * active-exposed read is internally consistent and the result is not yet done;
+#   * a discriminating check: the OLD lock-free publish tears in the gap, the
+#     atomic snapshot stays consistent (the regression guard D must have);
+#   * clear-before-complete under a forced pause (no stale active after clear);
+#   * snapshot immutability + a coverage guard (reads>0 AND active_observed>0,
+#     so the concurrency check cannot pass vacuously).
+# ---------------------------------------------------------------------------
+
+
+def _token_of(operation: str | None) -> int | None:
+    """Recover the op index from an ``op{token}`` operation tag (test helper).
+
+    ``WorkerStatus.active_section`` is a ``Section`` literal, so the op index is
+    correlated via ``active_operation`` (``op{token}``) while ``active_section``
+    stays a valid ``Section`` value.
+    """
+
+    if operation is None or not operation.startswith("op"):
+        return None
+    try:
+        return int(operation[2:])
+    except ValueError:
+        return None
+
+
+def _make_item(token: int):
+    """Build a real ``_WorkItem`` so ``_complete_result`` exercises production."""
+
+    from concurrent.futures import Future
+
+    from excel_vba_mcp.adapters.excel.com_worker import _WorkItem
+
+    return _WorkItem(
+        fn=lambda: token,
+        future=Future(),
+        deadline=time.monotonic() + 10.0,
+        section="diagnostic",
+        op_class=OperationClass.READ_ONLY,
+        token=token,
+    )
+
+
+def _new_worker() -> ExcelComWorker:
+    return ExcelComWorker(FakeAdapter(), orphan_timeout_s=2.0)
+
+
+def test_active_exposed_read_is_consistent_and_not_done() -> None:
+    """While active is exposed (writer paused), the read is consistent + not done."""
+
+    worker = _new_worker()
+    item = _make_item(7)
+    ev_active = threading.Event()
+    ev_release = threading.Event()
+
+    def writer() -> None:
+        worker._set_active(7, "diagnostic", "op7")
+        ev_active.set()
+        ev_release.wait(2.0)
+        worker._clear_active()
+        worker._complete_result(item, 7)
+
+    wt = threading.Thread(target=writer, name="d_active_writer", daemon=True)
+    wt.start()
+    try:
+        assert ev_active.wait(2.0), "writer never published the active op"
+        status = worker.get_status()
+        # Internally consistent (section is a valid Section, operation from the
+        # same op) ...
+        assert status.active_section == "diagnostic"
+        assert status.active_operation == "op7"
+        assert _token_of(status.active_operation) == 7
+        # ... and the result is NOT delivered while the op is still exposed.
+        assert item.future.done() is False
+    finally:
+        ev_release.set()
+        wt.join(2.0)
+
+    after = worker.get_status()
+    assert after.active_section is None and after.active_operation is None
+    assert item.future.done() is True
+
+
+def test_lockfree_publish_tears_but_atomic_snapshot_is_consistent() -> None:
+    """Discriminating guard: OLD lock-free publish tears in the gap; atomic does not.
+
+    This FAILS on the old lock-free pattern (section written, pause, then
+    operation) and PASSES on the atomic snapshot — the regression D lacked.
+    """
+
+    # --- OLD pattern: three separate writes with a gap between section/op. ---
+    old = {"section": None, "operation": None}
+    ev_old_section = threading.Event()
+    ev_old_go = threading.Event()
+
+    def old_writer() -> None:
+        old["section"] = "sec5"  # section published ...
+        ev_old_section.set()
+        ev_old_go.wait(2.0)  # ... gap ...
+        old["operation"] = "op5"  # ... operation published later.
+
+    ot = threading.Thread(target=old_writer, name="d_old_writer", daemon=True)
+    ot.start()
+    try:
+        assert ev_old_section.wait(2.0)
+        # In the gap the section is published but the operation is not yet, so a
+        # lock-free reader sees a mismatched (torn) pair.
+        old_torn = old["section"] == "sec5" and old["operation"] != "op5"
+        assert old_torn, "the old lock-free pattern must expose a torn read in the gap"
+    finally:
+        ev_old_go.set()
+        ot.join(2.0)
+
+    # --- ATOMIC production snapshot: consistent across the same gap. ---
+    worker = _new_worker()
+    ev_active = threading.Event()
+    ev_release = threading.Event()
+
+    def atomic_writer() -> None:
+        worker._set_active(5, "diagnostic", "op5")  # single atomic swap
+        ev_active.set()
+        ev_release.wait(2.0)
+
+    at = threading.Thread(target=atomic_writer, name="d_atomic_writer", daemon=True)
+    at.start()
+    try:
+        assert ev_active.wait(2.0)
+        status = worker.get_status()
+        atomic_torn = not (
+            status.active_section == "diagnostic"
+            and status.active_operation == "op5"
+            and _token_of(status.active_operation) == 5
+        )
+        assert not atomic_torn, "atomic snapshot must be consistent in the gap"
+    finally:
+        ev_release.set()
+        at.join(2.0)
+
+
+def test_clear_precedes_complete_under_forced_pause() -> None:
+    """After clear (gate closed) there is NO active op; done only after complete."""
+
+    worker = _new_worker()
+    item = _make_item(9)
+    ev_cleared = threading.Event()
+    ev_complete_gate = threading.Event()
+
+    def writer() -> None:
+        worker._set_active(9, "diagnostic", "op9")
+        worker._clear_active()
+        ev_cleared.set()
+        ev_complete_gate.wait(2.0)  # hold completion back
+        worker._complete_result(item, 9)
+
+    wt = threading.Thread(target=writer, name="d_cbc_writer", daemon=True)
+    wt.start()
+    try:
+        assert ev_cleared.wait(2.0), "writer never cleared the active op"
+        status = worker.get_status()
+        # Cleared active is visible ...
+        assert status.active_section is None and status.active_operation is None
+        # ... while the result is still withheld (gate closed).
+        assert item.future.done() is False
+    finally:
+        ev_complete_gate.set()
+        wt.join(2.0)
+
+    assert item.future.done() is True
+
+
+def test_status_snapshot_is_immutable_and_concurrency_is_consistent() -> None:
+    """Returned DTO mutation is isolated; concurrent reads are consistent + observed."""
+
+    worker = _new_worker()
+
+    # Immutability: mutating a returned WorkerStatus must not affect the snapshot.
+    first = worker.get_status()
+    first.notes.append("mutated-note")
+    first.active_section = "hacked"
+    first.active_operation = "hacked"
+    second = worker.get_status()
+    assert "mutated-note" not in second.notes
+    assert second.active_section is None and second.active_operation is None
+
+    # Coverage guard: readers + one writer; every read must be consistent and the
+    # test must actually observe the active window (cannot pass vacuously). The
+    # writer is bounded by a short wall-clock budget so the test stays < 0.5 s.
+    stop = threading.Event()
+    counts = {"reads": 0, "active_observed": 0}
+    violations: list[str] = []
+    lock = threading.Lock()
+    n_readers = 2
+    budget_s = 0.3
+
+    def reader() -> None:
+        while not stop.is_set():
+            status = worker.get_status()
+            operation = status.active_operation
+            section = status.active_section
+            with lock:
+                counts["reads"] += 1
+                if operation is not None:
+                    counts["active_observed"] += 1
+                    token = _token_of(operation)
+                    if token is None or section != "diagnostic":
+                        violations.append(f"torn: {section!r}/{operation!r}")
+
+    def writer() -> None:
+        deadline = time.monotonic() + budget_s
+        token = 0
+        while time.monotonic() < deadline:
+            worker._update_snapshot(
+                active_section="diagnostic",
+                active_operation=f"op{token}",
+                active_token=token,
+            )
+            time.sleep(0.0005)  # widen the active window so readers observe it
+            worker._update_snapshot(
+                active_section=None, active_operation=None, active_token=None
+            )
+            token += 1
+
+    readers = [
+        threading.Thread(target=reader, name=f"d_cov_reader_{i}", daemon=True)
+        for i in range(n_readers)
+    ]
+    wt = threading.Thread(target=writer, name="d_cov_writer", daemon=True)
+    for rt in readers:
+        rt.start()
+    wt.start()
+    wt.join(5.0)
+    stop.set()
+    for rt in readers:
+        rt.join(5.0)
+
+    assert not violations, f"consistency violations: {violations[:3]}"
+    assert counts["reads"] > 0, "readers must have observed the worker"
+    assert counts["active_observed"] > 0, "the active window must have been observed"

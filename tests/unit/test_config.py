@@ -14,6 +14,8 @@ from excel_vba_mcp.server import _configured_roots
 _ENV_VAR = "EXCEL_VBA_MCP_LOG_LEVEL"
 _ENV_ACCESS_MODE = "EXCEL_VBA_MCP_ACCESS_MODE"
 _ENV_MACRO_TIMEOUT_S = "EXCEL_VBA_MCP_MACRO_TIMEOUT_S"
+_ENV_OPEN_TIMEOUT_S = "EXCEL_VBA_MCP_OPEN_TIMEOUT_S"
+_ENV_LIVENESS_CEILING_S = "EXCEL_VBA_MCP_LIVENESS_CEILING_S"
 _ENV_ROOTS = "EXCEL_VBA_MCP_ROOTS"
 
 
@@ -125,6 +127,57 @@ def test_invalid_macro_timeout_raises(monkeypatch: pytest.MonkeyPatch, value: st
 
 
 # ---------------------------------------------------------------------------
+# Block E — open / liveness-ceiling configuration
+# ---------------------------------------------------------------------------
+def test_open_timeout_defaults_to_three_hundred_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(_ENV_OPEN_TIMEOUT_S, raising=False)
+
+    config = load_config()
+
+    assert config.server.open_timeout_s == 300.0
+
+
+def test_open_timeout_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(_ENV_OPEN_TIMEOUT_S, "45.5")
+
+    config = load_config()
+
+    assert config.server.open_timeout_s == 45.5
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "not-a-number"])
+def test_invalid_open_timeout_raises(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv(_ENV_OPEN_TIMEOUT_S, value)
+
+    with pytest.raises(ValidationError):
+        load_config()
+
+
+def test_liveness_ceiling_defaults_to_six_hundred_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(_ENV_LIVENESS_CEILING_S, raising=False)
+
+    config = load_config()
+
+    assert config.server.liveness_ceiling_s == 600.0
+
+
+def test_liveness_ceiling_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(_ENV_LIVENESS_CEILING_S, "120")
+
+    config = load_config()
+
+    assert config.server.liveness_ceiling_s == 120.0
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "not-a-number"])
+def test_invalid_liveness_ceiling_raises(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv(_ENV_LIVENESS_CEILING_S, value)
+
+    with pytest.raises(ValidationError):
+        load_config()
+
+
+# ---------------------------------------------------------------------------
 # Roots allowlist environment parsing (F5)
 #
 # ``EXCEL_VBA_MCP_ROOTS`` is consumed by ``server._configured_roots()`` (the
@@ -163,3 +216,37 @@ def test_roots_env_blank_segments_ignored(monkeypatch: pytest.MonkeyPatch) -> No
 
     assert roots["root_0"] == r"C:\only"
     assert "root_1" not in roots
+
+
+# ---------------------------------------------------------------------------
+# Block C — resolved roots are logged at startup (no silent fallback)
+# ---------------------------------------------------------------------------
+def test_configured_roots_logs_resolved_roots(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    first = r"C:\py_exp\mko_treport"
+    monkeypatch.setenv(_ENV_ROOTS, first)
+
+    with caplog.at_level("INFO", logger="excel_vba_mcp.server"):
+        roots = _configured_roots()
+
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Allowed roots:" in logged
+    # The resolved root appears in the log line (dict repr escapes backslashes,
+    # so assert on a path fragment rather than the raw path).
+    assert "mko_treport" in logged
+    assert roots["root_0"] == first
+
+
+def test_configured_roots_logs_fallback_roots(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Unset roots => cwd+tempdir fallback must still be logged (not silent).
+    monkeypatch.setenv(_ENV_ROOTS, "")
+
+    with caplog.at_level("INFO", logger="excel_vba_mcp.server"):
+        _configured_roots()
+
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Allowed roots:" in logged
+    assert "root_0" in logged

@@ -19,8 +19,8 @@ They prove the binding task_022 contract without Excel:
 * a successful/approved/background-safe macro runs and its return value is
   serialized; a missing macro -> ``NOT_FOUND``; a runtime error -> ``RUNTIME_ERROR``;
 * an unsupported argument is rejected (pre-dispatch) as ``UNSUPPORTED_ARGUMENT``;
-* a dispatch timeout -> ``MACRO_TIMEOUT`` (no retry); a modal hang -> owned-PID
-  terminate with ``dismissed=false`` and ``MACRO_RUNTIME_ERROR``;
+* a dispatch deadline -> ``SUSPECTED_STALLED`` with NO live-pid kill and NO
+  auto-recovery (the owned pid is left running; recovery is agent-directed);
 * ``get_last_result`` returns the cache without re-running.
 """
 
@@ -29,7 +29,9 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import json
+import os
 import re
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -431,6 +433,15 @@ class FakeWorker:
         self.accepting = True
         self.reset_fails = False
         self._next_pid = 5000
+        # Block E / U2: a direct ``reap_owned_pid`` regression must be caught, not
+        # just a call to the (removed) ``_terminate_owned_pid`` name.
+        self.reap_calls: list[int] = []
+
+    def reap_owned_pid(self, pid: int) -> bool:  # noqa: ARG002 - fail-recorder
+        """Fail-recorder: reaping the owned pid on a deadline is forbidden (U2)."""
+
+        self.reap_calls.append(pid)
+        raise AssertionError("reap_owned_pid must not be called on a macro deadline (U2)")
 
     async def submit(
         self,
@@ -978,38 +989,70 @@ async def test_run_macro_unsupported_argument_is_blocked(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
-# run_macro: timeout (no retry) and modal-hang (owned-PID terminate)
+# run_macro: deadline (no kill, no auto-recovery) — Block E / C1 / U2
 # ---------------------------------------------------------------------------
-async def test_run_macro_timeout_no_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _patch_no_kill(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Patch EVERY process-kill primitive with a fail-recorder (Block E / U2).
+
+    A regression that re-introduces a direct ``taskkill`` / ``subprocess`` /
+    ``os.kill`` (or a worker ``reap_owned_pid``) must be caught, not just a call
+    to the (removed) ``_terminate_owned_pid`` name. Each patched primitive appends
+    to the returned list and raises if invoked, so a kill attempt both fails the
+    run and is observable in the assertion.
+    """
+
+    calls: list[str] = []
+
+    def _fail(kind: str) -> Any:
+        def _recorder(*_args: Any, **_kwargs: Any) -> Any:
+            calls.append(kind)
+            raise AssertionError(f"{kind} must not be called on a macro deadline (U2)")
+
+        return _recorder
+
+    monkeypatch.setattr(subprocess, "run", _fail("subprocess.run"))
+    monkeypatch.setattr(os, "kill", _fail("os.kill"))
+    return calls
+
+
+async def test_run_macro_deadline_no_kill_no_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     rig = Rig(tmp_path)
     info = await rig.open()
     rig.grant_macro_run("modTest.Echo")
     await rig.classify_safe(info.workbook_id, "modTest.Echo")
     rig.worker.hang_execute = True
 
+    kill_calls = _patch_no_kill(monkeypatch)
     terminated: list[int] = []
     monkeypatch.setattr(macro_service_module, "_owned_modal_present", lambda _pid: False)
+    # ``_terminate_owned_pid`` was removed in Block E; assert it is never called.
     monkeypatch.setattr(
-        macro_service_module, "_terminate_owned_pid", lambda pid: terminated.append(pid) or True
+        macro_service_module,
+        "_terminate_owned_pid",
+        lambda pid: terminated.append(pid) or True,
+        raising=False,
     )
 
     result = await rig.service.run_macro(info.workbook_id, "modTest.Echo")
 
-    assert result.status is MacroRunStatus.TIMEOUT
+    assert result.status is MacroRunStatus.SUSPECTED_STALLED
     assert result.error_code == ErrorCode.MACRO_TIMEOUT.value
     # Exactly one execute submission; no blind retry.
     assert len([s for s in rig.worker.submits if s["section"] == "execute"]) == 1
-    # F2b: the owned PID is terminated on a plain timeout too (behavior change) so
-    # the STA thread frees and the session can recover.
-    assert terminated == [4242]
-    # In-process recovery respawned the hidden instance and reached RUNNING again.
-    assert result.session_recovery == "recovered"
-    assert rig.worker.reset_count == 1
-    assert rig.worker.get_status().state is WorkbookSessionState.RUNNING
-    assert rig.worker.get_status().owned_pid != 4242
+    # U2 / C1: the live owned pid is NOT terminated on a deadline — no kill
+    # primitive (subprocess / os.kill / reap / _terminate_owned_pid) was called.
+    assert terminated == []
+    assert kill_calls == []
+    assert rig.worker.reap_calls == []
+    # No auto-recovery is attempted (recovery is agent-directed, Block A).
+    assert result.session_recovery is None
+    assert rig.worker.reset_count == 0
+    assert rig.worker.get_status().owned_pid == 4242
 
 
-async def test_run_macro_modal_hang_terminates_owned_pid(
+async def test_run_macro_modal_hang_does_not_terminate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     rig = Rig(tmp_path)
@@ -1018,32 +1061,35 @@ async def test_run_macro_modal_hang_terminates_owned_pid(
     await rig.classify_safe(info.workbook_id, "modTest.RaiseError")
     rig.worker.hang_execute = True
 
+    kill_calls = _patch_no_kill(monkeypatch)
     terminated: list[int] = []
     monkeypatch.setattr(macro_service_module, "_owned_modal_present", lambda _pid: True)
     monkeypatch.setattr(
-        macro_service_module, "_terminate_owned_pid", lambda pid: terminated.append(pid) or True
+        macro_service_module,
+        "_terminate_owned_pid",
+        lambda pid: terminated.append(pid) or True,
+        raising=False,
     )
 
     result = await rig.service.run_macro(info.workbook_id, "modTest.RaiseError")
 
-    assert result.status is MacroRunStatus.RUNTIME_ERROR
-    assert result.error_code == ErrorCode.MACRO_RUNTIME_ERROR.value
+    assert result.status is MacroRunStatus.SUSPECTED_STALLED
+    assert result.error_code == ErrorCode.MACRO_TIMEOUT.value
     assert "NOT dismissed" in (result.error_text or "")
-    # ONLY the owned PID was terminated (no wildcard, no dialog dismissal).
-    assert terminated == [4242]
-    # Modal hang also recovers in-process and reports the honest outcome.
-    assert result.session_recovery == "recovered"
-    assert rig.worker.reset_count == 1
-    assert rig.worker.get_status().state is WorkbookSessionState.RUNNING
+    # ONLY the owned PID would have been terminated before; now NOTHING is (C1).
+    assert terminated == []
+    assert kill_calls == []
+    assert rig.worker.reap_calls == []
+    assert result.session_recovery is None
+    assert rig.worker.reset_count == 0
     assert len([s for s in rig.worker.submits if s["section"] == "execute"]) == 1
 
 
-async def test_run_macro_hung_recovery_failure_is_needs_recovery(
+async def test_run_macro_deadline_does_not_recover(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # When the in-process recovery itself fails (reset raises), the honest result
-    # is still returned (never masked, no exception escapes) and session_recovery
-    # is "needs_recovery".
+    # Even if a recovery were attempted it must not be: the deadline path never
+    # terminates the pid and never recovers (agent-directed only).
     rig = Rig(tmp_path)
     info = await rig.open()
     rig.grant_macro_run("modTest.Echo")
@@ -1051,28 +1097,33 @@ async def test_run_macro_hung_recovery_failure_is_needs_recovery(
     rig.worker.hang_execute = True
     rig.worker.reset_fails = True
 
+    kill_calls = _patch_no_kill(monkeypatch)
     terminated: list[int] = []
     monkeypatch.setattr(macro_service_module, "_owned_modal_present", lambda _pid: False)
     monkeypatch.setattr(
-        macro_service_module, "_terminate_owned_pid", lambda pid: terminated.append(pid) or True
+        macro_service_module,
+        "_terminate_owned_pid",
+        lambda pid: terminated.append(pid) or True,
+        raising=False,
     )
 
     result = await rig.service.run_macro(info.workbook_id, "modTest.Echo")
 
-    # The honest timeout result survives the recovery failure.
-    assert result.status is MacroRunStatus.TIMEOUT
+    # The honest deadline result is SUSPECTED_STALLED (never a false success).
+    assert result.status is MacroRunStatus.SUSPECTED_STALLED
     assert result.error_code == ErrorCode.MACRO_TIMEOUT.value
     assert result.status is not MacroRunStatus.SUCCESS
-    assert result.session_recovery == "needs_recovery"
-    # The owned PID was still terminated (freeing the STA thread) before recovery.
-    assert terminated == [4242]
-    assert rig.worker.reset_count == 1
-    assert rig.worker.get_status().state is WorkbookSessionState.NEEDS_RECOVERY
+    assert result.session_recovery is None
+    assert terminated == []
+    assert kill_calls == []
+    assert rig.worker.reap_calls == []
+    assert rig.worker.reset_count == 0
+    assert rig.worker.get_status().owned_pid == 4242
 
 
-def test_default_timeout_is_ninety_seconds() -> None:
-    # F2b: the macro dispatch deadline default is 90s.
-    assert macro_service_module._DEFAULT_TIMEOUT_S == 90.0
+def test_default_macro_timeout_is_ninety_seconds() -> None:
+    # The macro dispatch deadline default is 90s (a soft hint, not a kill).
+    assert macro_service_module._DEFAULT_MACRO_TIMEOUT_S == 90.0
 
 
 async def test_macro_timeout_uses_configured_deadline(tmp_path: Path) -> None:
@@ -1086,7 +1137,7 @@ async def test_macro_timeout_uses_configured_deadline(tmp_path: Path) -> None:
 
     execute = [s for s in rig.worker.submits if s["section"] == "execute"]
     assert len(execute) == 1
-    assert execute[0]["timeout"] == macro_service_module._DEFAULT_TIMEOUT_S
+    assert execute[0]["timeout"] == macro_service_module._DEFAULT_MACRO_TIMEOUT_S
 
 
 async def test_run_macro_explicit_timeout_overrides_config(tmp_path: Path) -> None:

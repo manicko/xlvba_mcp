@@ -19,8 +19,11 @@ Like the other tool modules, the active service is published here via
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
+from excel_vba_mcp.api.job_tools import start_long_op
+from excel_vba_mcp.application.job_registry import RunningJob
 from excel_vba_mcp.application.macro_service import (
     BackgroundSafetyClassification,
     MacroInfo,
@@ -28,6 +31,7 @@ from excel_vba_mcp.application.macro_service import (
 )
 from excel_vba_mcp.domain.errors import ExcelVbaMcpError
 from excel_vba_mcp.domain.models import MacroRunResult
+from excel_vba_mcp.domain.statuses import OperationClass
 
 # The active macro service, published by the server lifespan. ``None`` before
 # startup and after shutdown; the tools raise a clear error if used out of band.
@@ -84,7 +88,9 @@ async def macro_run(
     workbook_id: str,
     macro_name: str,
     args: list[Any] | None = None,
-) -> MacroRunResult:
+    *,
+    background: bool = False,
+) -> MacroRunResult | RunningJob:
     """Run one approved, background-safe macro of an open workbook.
 
     The macro is executed only when it is approved (deny-by-default), classified
@@ -99,15 +105,27 @@ async def macro_run(
             bare ``Procedure`` name.
         args: Positional arguments (``str`` / ``int`` / ``float`` / ``bool`` /
             ``None`` / ``datetime`` and 1-D / 2-D lists of those).
+        background: When ``True`` (Block F), schedule the run on the job registry
+            and return ``{status: "running", job_id, poll_after_s}`` promptly
+            instead of blocking; retrieve the :class:`MacroRunResult` with
+            ``job_get``. Default ``False`` (unchanged blocking behaviour).
 
     Returns:
         A :class:`MacroRunResult` with ``status`` one of ``success`` /
-        ``not_found`` / ``runtime_error`` / ``blocked`` / ``timeout``.
+        ``not_found`` / ``runtime_error`` / ``blocked`` / ``timeout``, or a
+        :class:`RunningJob` handle when ``background=True``.
     """
 
     _require_non_empty(workbook_id, "workbook_id")
     _require_non_empty(macro_name, "macro_name")
     service = get_macro_service()
+    if background:
+        return start_long_op(
+            partial(service.run_macro, workbook_id, macro_name, args),
+            timeout=90.0,
+            section="macro",
+            op_class=OperationClass.EXECUTING,
+        )
     return await service.run_macro(workbook_id, macro_name, args)
 
 

@@ -51,14 +51,12 @@ Safety contract (spec §7.3, §10; addendum BG03/BG04/BG05/BG06/BG09/R13):
 * **No blind retry.** The ``Application.Run`` dispatch is submitted once
   (``section="execute"``, ``op_class=EXECUTING``); a timeout / COM-busy result is
   never replayed.
-* **Honest modal handling (BG04 limitation / BG09; F2b).** If the dispatch
-  exceeds its soft deadline, the owned PID is inspected READ-ONLY for a visible
-  modal. In **both** branches **only the owned Excel PID** is terminated (the
-  dialog is **not** dismissed, recorded ``dismissed=false``) to free the STA
-  thread. A modal is classified ``MACRO_RUNTIME_ERROR``; a plain timeout is
-  classified ``MACRO_TIMEOUT``. The session is then recovered **in-process**
-  (``SessionService.recover_session`` respawns the hidden instance); the result
-  records ``session_recovery`` = ``"recovered"`` / ``"needs_recovery"``. A macro
+* **No live-pid auto-kill (C1 / Block E).** If the dispatch exceeds its soft
+  deadline the run is classified ``SUSPECTED_STALLED`` and the owned Excel PID is
+  **left running** — the server **never** auto-terminates a live pid on a
+  deadline. The READ-ONLY owned-PID modal probe only enriches the diagnostic
+  text; it never dismisses a dialog and never terminates anything. Recovery is
+  **agent-directed** (``excel_recover``, Block A — not in this block); the macro
   is never reported as success while it is blocked and is never auto-replayed.
 * **Hidden / non-activating.** All work runs on the owned ``Visible=False`` Excel
   instance; the service never activates/selects anything, never sends input, and
@@ -67,7 +65,6 @@ Safety contract (spec §7.3, §10; addendum BG03/BG04/BG05/BG06/BG09/R13):
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import hashlib
 import threading
@@ -96,15 +93,16 @@ from excel_vba_mcp.domain.statuses import (
     ProcedureVisibility,
     SessionMode,
     VbaComponentType,
-    WorkbookSessionState,
 )
 from excel_vba_mcp.security.approval import ApprovalKey, ApprovalPolicy
 from excel_vba_mcp.security.audit import AuditLogger
 
-# Default per-call soft ceiling (seconds) for the Application.Run dispatch (F2b).
-# This is the macro-dispatch deadline; it is env-configurable via
-# ``EXCEL_VBA_MCP_MACRO_TIMEOUT_S`` (``ServerConfig.macro_timeout_s``).
-_DEFAULT_TIMEOUT_S = 90.0
+# Default per-call soft ceiling (seconds) for the Application.Run dispatch.
+# This is the macro-dispatch deadline hint; it is env-configurable via
+# ``EXCEL_VBA_MCP_MACRO_TIMEOUT_S`` (``ServerConfig.macro_timeout_s``). On expiry
+# the run is classified ``SUSPECTED_STALLED`` and the owned pid is NOT terminated
+# (Block E / C1: the server never auto-kills a live pid).
+_DEFAULT_MACRO_TIMEOUT_S = 90.0
 
 # Canonical action name for the macro-run approval key.
 _ACTION_MACRO_RUN = "macro_run"
@@ -302,7 +300,7 @@ class MacroService:
         background_safety: Per-workbook-hash ``background_safe`` registry (BG06).
         audit: Append-only JSONL audit trail.
         macro_timeout_s: Soft per-call ceiling (seconds) for the ``Application.Run``
-            dispatch (F2b). Defaults to :data:`_DEFAULT_TIMEOUT_S` (90s); the server
+            dispatch. Defaults to :data:`_DEFAULT_MACRO_TIMEOUT_S` (90s); the server
             threads ``ServerConfig.macro_timeout_s`` here.
     """
 
@@ -314,7 +312,7 @@ class MacroService:
         background_safety: BackgroundSafetyRegistry,
         audit: AuditLogger,
         *,
-        macro_timeout_s: float = _DEFAULT_TIMEOUT_S,
+        macro_timeout_s: float = _DEFAULT_MACRO_TIMEOUT_S,
     ) -> None:
         self._worker = worker
         self._session = session_service
@@ -404,11 +402,13 @@ class MacroService:
                 a bare ``Procedure`` name (resolved against the inventory).
             args: Positional arguments (coerced/validated by the runner).
             timeout_s: Soft per-call ceiling for the ``Application.Run`` dispatch.
-                Defaults to the configured ``macro_timeout_s`` (F2b, 90s).
+                Defaults to the configured ``macro_timeout_s`` (90s). A server-side
+                soft hint only (no client contract).
 
         Returns:
             A :class:`MacroRunResult`. ``status`` is one of ``SUCCESS`` /
-            ``NOT_FOUND`` / ``RUNTIME_ERROR`` / ``BLOCKED`` / ``TIMEOUT``.
+            ``NOT_FOUND`` / ``RUNTIME_ERROR`` / ``BLOCKED`` / ``SUSPECTED_STALLED``
+            (deadline exceeded; the owned pid is left running, never terminated).
 
         Raises:
             ExcelVbaMcpError: If ``workbook_id`` is unknown.
@@ -711,7 +711,7 @@ class MacroService:
         collect_fn.__name__ = "macro_inventory"
         raw = await self._worker.submit(
             collect_fn,
-            timeout=_DEFAULT_TIMEOUT_S,
+            timeout=_DEFAULT_MACRO_TIMEOUT_S,
             section="diagnostic",
             op_class=OperationClass.READ_ONLY,
         )
@@ -837,95 +837,60 @@ class MacroService:
         started_at: datetime,
         approval: Any,
     ) -> MacroRunResult:
-        """Classify a dispatch that exceeded its soft deadline (timeout / modal).
+        """Classify a dispatch that exceeded its soft deadline (no kill, no auto-recovery).
 
-        READ-ONLY owned-PID inspection decides between a modal runtime error (the
-        macro raised a dialog and blocked) and a plain timeout. In **both** branches
-        the **owned** Excel PID alone is terminated (the dialog is **not** dismissed,
-        recorded ``dismissed=false``) to free the STA thread, and then the session is
-        recovered **in-process** (F2b): ``SessionService.recover_session`` /
-        ``ExcelComWorker.reset`` respawns the hidden Excel instance. The result is
-        ``MACRO_RUNTIME_ERROR`` (modal) or ``MACRO_TIMEOUT`` (plain timeout); neither
-        is ever reported as success and neither is retried.
+        Block E / C1: the server **never** auto-terminates a live pid. On a deadline
+        the owned Excel PID is **left running** and the operation is **not**
+        cancelled (an uninterruptible COM call cannot be); recovery is
+        **agent-directed** (``excel_recover``, Block A — not in this block). The
+        READ-ONLY owned-PID modal probe only enriches the diagnostic text — it never
+        dismisses a dialog and never terminates anything.
 
-        Recovery is wrapped so it NEVER raises or masks the honest result:
-        ``session_recovery`` is ``"recovered"`` when the session reaches ``RUNNING``
-        again, else ``"needs_recovery"``. After a recovery the caller's prior
-        ``workbook_id`` is invalid (recovery discards open workbooks); this is stated
-        in ``error_text``. The server process itself is never restarted.
+        The result is ``SUSPECTED_STALLED`` (``error_code`` ``MACRO_TIMEOUT``); it is
+        never reported as success and never retried. ``session_recovery`` is ``None``
+        because no recovery is attempted here.
         """
 
         owned_pid = self._worker.get_status().owned_pid
         modal_present = _owned_modal_present(owned_pid)
 
-        # Terminate ONLY the owned PID FIRST (both branches) so the hung STA fn
-        # raises and the worker thread frees, then recover in-process. Never call
-        # reset from the STA thread; this runs on the event loop.
-        terminated = False
-        if owned_pid is not None:
-            terminated = await asyncio.to_thread(_terminate_owned_pid, owned_pid)
-
         finished_at = _utc_now()
-        result: MacroRunResult
-        extra: dict[str, Any]
-        if modal_present and owned_pid is not None:
-            result = MacroRunResult(
-                run_id=run_id,
-                macro_name=macro_name,
-                status=MacroRunStatus.RUNTIME_ERROR,
-                started_at=started_at,
-                finished_at=finished_at,
-                duration_ms=int(round((finished_at - started_at).total_seconds() * 1000.0)),
-                error_code=ErrorCode.MACRO_RUNTIME_ERROR.value,
-                error_text=(
-                    "Macro raised a modal runtime-error dialog and blocked the call. "
-                    "The automation-OWNED Excel process was terminated; the dialog "
-                    "was NOT dismissed (dismissed=false). The session is being "
-                    "recovered in-process; the prior workbook_id is invalid after "
-                    "recovery (open workbooks are discarded)."
-                ),
-                created_at=started_at,
-                updated_at=finished_at,
+        if modal_present:
+            error_text = (
+                "Macro exceeded the soft deadline (SUSPECTED_STALLED) and a visible "
+                "modal dialog is present on the owned Excel process. The owned Excel "
+                "process was NOT terminated and the dialog was NOT dismissed "
+                "(dismissed=false); the operation is left running. Recovery is "
+                "agent-directed (excel_recover); the macro is never auto-replayed."
             )
-            extra = {
-                "reason": "modal_runtime_error",
-                "dismissed": False,
-                "needs_recovery": True,
-                "owned_pid": owned_pid,
-                "owned_pid_terminated": terminated,
-            }
         else:
-            result = MacroRunResult(
-                run_id=run_id,
-                macro_name=macro_name,
-                status=MacroRunStatus.TIMEOUT,
-                started_at=started_at,
-                finished_at=finished_at,
-                duration_ms=int(round((finished_at - started_at).total_seconds() * 1000.0)),
-                error_code=ErrorCode.MACRO_TIMEOUT.value,
-                error_text=(
-                    "Macro exceeded the soft deadline; the owned Excel process was "
-                    "terminated and the session is being recovered in-process. The "
-                    "macro is never auto-replayed. The prior workbook_id is invalid "
-                    "after recovery (open workbooks are discarded)."
-                ),
-                created_at=started_at,
-                updated_at=finished_at,
+            error_text = (
+                "Macro exceeded the soft deadline (SUSPECTED_STALLED). The owned Excel "
+                "process was NOT terminated and the operation is left running. Recovery "
+                "is agent-directed (excel_recover); the macro is never auto-replayed."
             )
-            extra = {
-                "reason": "timeout",
-                "dismissed": None,
-                "needs_recovery": True,
-                "owned_pid": owned_pid,
-                "owned_pid_terminated": terminated,
-            }
-
-        # Recover in-process (A: immediate). Recovery NEVER raises / masks the result.
-        session_recovery, _recovery_state = await self._recover_after_hung(
-            reason="macro_hung" if modal_present else "macro_timeout"
+        result = MacroRunResult(
+            run_id=run_id,
+            macro_name=macro_name,
+            status=MacroRunStatus.SUSPECTED_STALLED,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_ms=int(round((finished_at - started_at).total_seconds() * 1000.0)),
+            error_code=ErrorCode.MACRO_TIMEOUT.value,
+            error_text=error_text,
+            session_recovery=None,
+            created_at=started_at,
+            updated_at=finished_at,
         )
-        result = result.model_copy(update={"session_recovery": session_recovery})
-        extra["session_recovery"] = session_recovery
+        extra: dict[str, Any] = {
+            "reason": "deadline_exceeded",
+            "verdict": "SUSPECTED_STALLED",
+            "dismissed": False if modal_present else None,
+            "needs_recovery": False,
+            "owned_pid": owned_pid,
+            "owned_pid_terminated": False,
+            "modal_present": modal_present,
+        }
 
         self._record_audit(
             tool="macro_run",
@@ -939,31 +904,12 @@ class MacroService:
                 result,
                 background_safe=True,
                 dismissed=extra.get("dismissed"),
-                needs_recovery=True,
+                needs_recovery=False,
                 extra=extra,
             ),
             extra=None,
         )
         return result
-
-    async def _recover_after_hung(self, *, reason: str) -> tuple[str, WorkbookSessionState | None]:
-        """Recover the session after a hung macro (F2b); never raises.
-
-        Calls ``SessionService.recover_session`` (which respawns the hidden Excel
-        instance via ``ExcelComWorker.reset``). Returns ``("recovered", RUNNING)``
-        when the session reached ``RUNNING`` again, else ``("needs_recovery", state)``
-        — including when recovery raises (the exception is swallowed so the honest
-        macro result is never masked).
-        """
-
-        try:
-            status = await self._session.recover_session(reason=reason)
-        except Exception:  # noqa: BLE001 - recovery must never raise or mask the result
-            return "needs_recovery", None
-        state = getattr(status, "state", None)
-        if state == WorkbookSessionState.RUNNING:
-            return "recovered", state
-        return "needs_recovery", state
 
     def _finish_blocked(
         self,
@@ -1306,30 +1252,6 @@ def _owned_modal_present(pid: int | None) -> bool:
     with contextlib.suppress(Exception):
         win32gui.EnumWindows(_callback, None)
     return found
-
-
-def _terminate_owned_pid(pid: int) -> bool:
-    """Terminate ONLY the automation-owned Excel PID; return ``True`` on success.
-
-    The PID was resolved by the automation as the owned ``DispatchEx`` instance.
-    This is the last-resort cleanup for a macro that popped a modal ``Application.
-    Run`` cannot return from; it ends the owned process and never dismisses the
-    dialog by input (BG04 limitation / BG09). It never uses a wildcard image kill
-    and never touches a process the automation does not own.
-    """
-
-    import subprocess  # noqa: PLC0415
-
-    try:  # pragma: no cover - depends on host
-        completed = subprocess.run(
-            ["taskkill", "/F", "/PID", str(pid)],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        return completed.returncode == 0
-    except Exception:  # noqa: BLE001
-        return False
 
 
 __all__ = [

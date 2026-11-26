@@ -10,6 +10,13 @@ Configuration is loaded from environment variables and validated with Pydantic:
 * ``EXCEL_VBA_MCP_MACRO_TIMEOUT_S`` sets ``ServerConfig.macro_timeout_s`` (the
   soft per-call ceiling, in seconds, for the ``Application.Run`` macro dispatch).
   When unset it defaults to ``90.0``; a non-positive value is invalid.
+* ``EXCEL_VBA_MCP_OPEN_TIMEOUT_S`` sets ``ServerConfig.open_timeout_s`` (the
+  server-side deadline, in seconds, for the ``excel_open`` STA open). When unset
+  it defaults to ``300.0``; a non-positive value is invalid (Block E).
+* ``EXCEL_VBA_MCP_LIVENESS_CEILING_S`` sets ``ServerConfig.liveness_ceiling_s``
+  (the server-wide upper bound, in seconds, applied to every per-call COM
+  deadline). When unset it defaults to ``600.0``; a non-positive value is
+  invalid (Block E).
 
 All variables are validated together: an invalid value for any of them raises a
 Pydantic ``ValidationError`` regardless of whether the others are set.
@@ -31,6 +38,8 @@ LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 _ENV_LOG_LEVEL = "EXCEL_VBA_MCP_LOG_LEVEL"
 _ENV_ACCESS_MODE = "EXCEL_VBA_MCP_ACCESS_MODE"
 _ENV_MACRO_TIMEOUT_S = "EXCEL_VBA_MCP_MACRO_TIMEOUT_S"
+_ENV_OPEN_TIMEOUT_S = "EXCEL_VBA_MCP_OPEN_TIMEOUT_S"
+_ENV_LIVENESS_CEILING_S = "EXCEL_VBA_MCP_LIVENESS_CEILING_S"
 
 
 class ServerConfig(BaseModel):
@@ -46,8 +55,21 @@ class ServerConfig(BaseModel):
         default=90.0,
         gt=0,
         description="Soft per-call ceiling (seconds) for the Application.Run macro dispatch "
-        "(F2b). Exceeding it classifies the run as MACRO_TIMEOUT, terminates only the "
-        "automation-owned Excel PID and recovers the session in-process.",
+        "(F2b). Exceeding it classifies the run as a deadline-exceeded (SUSPECTED_STALLED) "
+        "outcome; the server never auto-terminates a live pid (Block E / C1).",
+    )
+    open_timeout_s: float = Field(
+        default=300.0,
+        gt=0,
+        description="Server-side deadline (seconds) for the excel_open STA open (Block E). "
+        "This is the per-op-class server authority for the open path.",
+    )
+    liveness_ceiling_s: float = Field(
+        default=600.0,
+        gt=0,
+        description="Server-wide upper bound (seconds) applied to every per-call COM "
+        "deadline (Block E). A per-call timeout is clamped to this ceiling so no single "
+        "operation's deadline exceeds the liveness ceiling.",
     )
 
 
@@ -83,4 +105,10 @@ def load_config() -> Config:
     macro_timeout_s = os.environ.get(_ENV_MACRO_TIMEOUT_S)
     if macro_timeout_s is not None:
         present["macro_timeout_s"] = macro_timeout_s
+    open_timeout_s = os.environ.get(_ENV_OPEN_TIMEOUT_S)
+    if open_timeout_s is not None:
+        present["open_timeout_s"] = open_timeout_s
+    liveness_ceiling_s = os.environ.get(_ENV_LIVENESS_CEILING_S)
+    if liveness_ceiling_s is not None:
+        present["liveness_ceiling_s"] = liveness_ceiling_s
     return Config(server=ServerConfig.model_validate(present))

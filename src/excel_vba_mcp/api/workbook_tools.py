@@ -18,11 +18,15 @@ straightforward to unit-test with fake services.
 
 from __future__ import annotations
 
+from functools import partial
+
+from excel_vba_mcp.api.job_tools import start_long_op
+from excel_vba_mcp.application.job_registry import RunningJob
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.workbook_model_service import WorkbookModelService
 from excel_vba_mcp.domain.errors import ExcelVbaMcpError
 from excel_vba_mcp.domain.models import SessionStatus, WorkbookInfo, WorkbookModel
-from excel_vba_mcp.domain.statuses import SessionMode
+from excel_vba_mcp.domain.statuses import OperationClass, SessionMode
 
 # The active session service, published by the server lifespan. ``None`` before
 # startup and after shutdown; the tools raise a clear error if used out of band
@@ -85,7 +89,9 @@ async def excel_open(
     path: str,
     mode: SessionMode = SessionMode.EXECUTE,
     read_only: bool = False,
-) -> WorkbookInfo:
+    *,
+    background: bool = False,
+) -> WorkbookInfo | RunningJob:
     """Open an allowlisted workbook as a hidden working copy.
 
     By default this creates a writable, execution-capable session
@@ -98,14 +104,26 @@ async def excel_open(
             Default ``execute`` so a normal open is writable and
             execution-capable.
         read_only: Open the working copy read-only. Default ``False``.
+        background: When ``True`` (Block F), schedule the open on the job registry
+            and return ``{status: "running", job_id, poll_after_s}`` promptly
+            instead of blocking; retrieve the :class:`WorkbookInfo` with
+            ``job_get``. Default ``False`` (unchanged blocking behaviour).
 
     Returns:
-        A :class:`WorkbookInfo` describing the opened working copy.
+        A :class:`WorkbookInfo` describing the opened working copy, or a
+        :class:`RunningJob` handle when ``background=True``.
     """
 
     _require_non_empty(path, "path")
     session_mode = SessionMode(mode)
     service = get_session_service()
+    if background:
+        return start_long_op(
+            partial(service.open_workbook, path, mode=session_mode, read_only=read_only),
+            timeout=300.0,
+            section="open",
+            op_class=OperationClass.MUTATING,
+        )
     return await service.open_workbook(path, mode=session_mode, read_only=read_only)
 
 

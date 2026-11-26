@@ -22,6 +22,22 @@ Design invariants (ARCH-013 as amended by the background-execution addendum):
   ``Application.Quit`` left it resident, terminates exactly that pid (never a
   wildcard image kill, never a user instance).
 
+Recovery (Block A) is **handle-scoped and fail-closed**:
+
+* At launch :meth:`ExcelAppAdapter.create_hidden` opens a **live** process handle
+  (``PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION``)
+  on the owned ``DispatchEx`` child, verifies the image name is ``EXCEL.EXE`` and
+  **retains the ``PyHANDLE`` object** for the whole ownership session. The handle
+  is **never** reduced to an ``int`` (P7 observed a false ``EXITED`` when it was).
+* Termination is performed **only** through that same held handle
+  (``TerminateProcess`` -> ``WaitForSingleObject`` returning ``WAIT_OBJECT_0``).
+  There is **no** ``taskkill`` / pid-only fallback (a pid re-resolved by
+  ``taskkill`` can hit a reused pid).
+* If the handle cannot be obtained or identity cannot be verified the adapter
+  holds ``owned_handle = None`` and recovery is **unavailable** (fail closed):
+  the server never kills by pid and the documented fallback is a server restart
+  (U8).
+
 ``DisplayAlerts = False`` is **not** a universal dialog blocker: it does not
 suppress ``MsgBox``, ``UserForm.Show``, ``FileDialog``, add-in UI, or arbitrary
 Win32 dialogs. It only suppresses Excel's own built-in alert prompts (e.g. the
@@ -35,7 +51,6 @@ stays safe on non-Windows unit-test environments.
 from __future__ import annotations
 
 import contextlib
-import subprocess
 import time
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
@@ -68,6 +83,53 @@ _REAP_INTERVAL_S = 0.05
 # Bounded re-verification window (seconds) after the pid-scoped fallback kill.
 _REAP_VERIFY_TIMEOUT_S = 0.5
 
+# Win32 process access rights (PROCESS_*). ``win32con`` does not export
+# ``PROCESS_SYNCHRONIZE`` on every pywin32 build, so the rights are spelled as the
+# documented ``LPCTSTR`` numeric values (see Microsoft ``Process Security and
+# Access Rights``). The combination is exactly what PoC P2 (U5) obtained on the
+# real ``DispatchEx`` child in-session.
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_SYNCHRONIZE = 0x00100000
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+# ``WAIT_OBJECT_0`` — ``WaitForSingleObject`` return value proving the process is
+# dead (``win32con.WAIT_OBJECT_0`` is ``0x0``; spelled here to avoid the import).
+_WAIT_OBJECT_0 = 0x0
+
+# Expected owned image name (identity gate, fail-closed).
+_OWNED_IMAGE_NAME = "excel.exe"
+
+
+def _terminate_and_confirm(handle: Any, timeout_ms: int) -> int | None:
+    """Terminate ``handle`` and wait for it to die; return the raw wait result.
+
+    Runs off the STA thread (the handle is a free-thread Win32 kernel object), so
+    it works even while the owning STA thread is blocked in an uninterruptible COM
+    call (PoC P2). ``TerminateProcess`` is followed by ``WaitForSingleObject``; the
+    return value is the raw wait result (``WAIT_OBJECT_0`` == ``0``) so the caller
+    can require a confirmed death and never assume success from the absence of an
+    exception.
+
+    Returns ``None`` when the Win32 layer is unavailable or either call fails, so a
+    missing ``pywin32`` degrades to "not confirmed" rather than a false success.
+    The held ``PyHANDLE`` object is passed through unchanged (never reduced to an
+    ``int`` by this helper).
+    """
+
+    try:
+        import win32api  # type: ignore[import-untyped]  # noqa: PLC0415
+        import win32event  # type: ignore[import-untyped]  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 - non-Windows / pywin32 absent
+        return None
+    try:
+        win32api.TerminateProcess(handle, 0)
+    except Exception:  # noqa: BLE001 - process already dead / access denied
+        return None
+    try:
+        return int(win32event.WaitForSingleObject(handle, int(timeout_ms)))
+    except Exception:  # noqa: BLE001 - wait failed
+        return None
+
 
 class ExcelAppAdapter:
     """Own and mutate a single hidden Excel ``Application`` instance.
@@ -82,6 +144,11 @@ class ExcelAppAdapter:
         self._app: Any = None
         self._owned_pid: int | None = None
         self._owned_caption: str | None = None
+        # Live process handle (a ``PyHANDLE`` object) held for the whole ownership
+        # session; ``None`` when it could not be obtained / identity unverified
+        # (fail closed). NEVER stored as an ``int`` (P7: reducing it breaks
+        # liveness/terminate/confirm and produced a false ``EXITED``).
+        self._owned_handle: Any = None
 
     # ------------------------------------------------------------------
     # Read-only accessors (non-COM bookkeeping)
@@ -104,6 +171,28 @@ class ExcelAppAdapter:
         """Window caption recorded at creation, or ``None`` if not yet created."""
 
         return self._owned_caption
+
+    @property
+    def owned_handle(self) -> Any:
+        """The live owned-process handle (a ``PyHANDLE`` object) or ``None``.
+
+        Held for the entire ownership session and used as the **only** handle for
+        recovery termination/confirmation. ``None`` means recovery is unavailable
+        (fail closed). The returned object is the live kernel handle, never an
+        ``int`` (P7).
+        """
+
+        return self._owned_handle
+
+    @property
+    def recovery_available(self) -> bool:
+        """Whether agent-directed recovery is possible (a live handle is held).
+
+        Fail-closed: ``False`` when no handle was obtained or identity could not be
+        verified, in which case the documented fallback is a server restart (U8).
+        """
+
+        return self._owned_handle is not None and not isinstance(self._owned_handle, int)
 
     # ------------------------------------------------------------------
     # Creation / teardown
@@ -144,6 +233,10 @@ class ExcelAppAdapter:
         self._app = app
         self._owned_caption = self._read_caption(app)
         self._owned_pid = self._pid_from_hwnd(self._read_hwnd(app))
+        # Open and identity-verify a live process handle for the whole ownership
+        # session (Block A). Fail closed: on any failure the handle stays ``None``
+        # and recovery is unavailable (no pid-only kill, server-restart fallback).
+        self._owned_handle = self._open_owned_handle(self._owned_pid)
 
     def quit(self) -> None:
         """Quit the owned instance and enforce the death of its process.
@@ -174,22 +267,26 @@ class ExcelAppAdapter:
             self.reap_owned_pid(owned_pid)
         self._owned_pid = None
         self._owned_caption = None
+        self._owned_handle = None
 
     def reap_owned_pid(self, pid: int) -> bool:
         """Ensure the owned ``pid`` is dead; return whether it is verified gone.
 
         Called by :meth:`quit` (on the STA worker thread) and by the worker's
-        ``shutdown`` last resort (when the daemon STA thread may never have run
-        the drain). ``Application.Quit`` gets a bounded grace period
-        (:data:`_REAP_TIMEOUT_S`); a process still alive afterwards is
-        terminated with ``taskkill /F /PID <pid>`` and re-verified.
+        ``shutdown`` last resort (when the daemon STA thread may never have run the
+        drain). ``Application.Quit`` gets a bounded grace period
+        (:data:`_REAP_TIMEOUT_S`); a process still alive afterwards is terminated
+        **through the held process handle** (:meth:`_terminate_owned_handle`,
+        ``TerminateProcess`` -> ``WaitForSingleObject``) and re-verified.
 
         Only the adapter's own pid is ever passed here, so the blast radius is
-        exactly one process: no user instance is touched and no wildcard image
-        kill is ever used.
+        exactly one process: no user instance is touched and no wildcard image kill
+        is ever used. There is **no** pid-only ``taskkill`` fallback (Block A): when
+        no live handle is held the terminate is **refused** (fail closed) and this
+        returns ``False`` so the caller reports recovery unavailable (U8).
 
-        Best-effort: an unavailable Win32 / ``taskkill`` layer degrades to "not
-        verified" (``False``) and never raises.
+        Best-effort: an unavailable Win32 layer degrades to "not verified"
+        (``False``) and never raises.
         """
 
         if not self._pid_alive(pid):
@@ -203,8 +300,9 @@ class ExcelAppAdapter:
             if time.monotonic() >= deadline:
                 break
 
-        # Grace period expired: terminate only this pid, then re-verify.
-        self._terminate_pid(pid)
+        # Grace period expired: terminate ONLY through the held handle (no pid-only
+        # taskkill fallback), then re-verify by pid liveness.
+        self._terminate_owned_handle()
         deadline = time.monotonic() + _REAP_VERIFY_TIMEOUT_S
         while True:
             if not self._pid_alive(pid):
@@ -212,6 +310,18 @@ class ExcelAppAdapter:
             if time.monotonic() >= deadline:
                 return False
             time.sleep(_REAP_INTERVAL_S)
+
+    def terminate_owned_handle(self) -> bool:
+        """Agent-directed recovery: terminate+confirm via the held handle.
+
+        Public entry point used by the recovery path (``excel_recover``). Returns
+        ``True`` **only** when ``TerminateProcess`` + ``WaitForSingleObject`` on the
+        same held handle confirms death (``WAIT_OBJECT_0``). Fail closed: when no
+        live handle is held this refuses (``False``) and never re-resolves by pid
+        (U8 server-restart fallback).
+        """
+
+        return self._terminate_owned_handle()
 
     def release(self) -> None:
         """Drop all references to the owned proxy without quitting.
@@ -223,6 +333,7 @@ class ExcelAppAdapter:
         self._app = None
         self._owned_pid = None
         self._owned_caption = None
+        self._owned_handle = None
 
     # ------------------------------------------------------------------
     # Workbook operations
@@ -466,29 +577,101 @@ class ExcelAppAdapter:
         except Exception:  # pragma: no cover - platform specific
             return False
 
-    @staticmethod
-    def _terminate_pid(pid: int) -> bool:
-        """Terminate ONLY ``pid`` via ``taskkill /F /PID``; return success.
+    def _terminate_owned_handle(self) -> bool:
+        """Terminate the owned process through the held handle; return confirmed death.
 
-        Last resort once the grace period expired: the pid is the adapter's own
-        ``DispatchEx`` instance, so the blast radius is exactly one process. The
-        invocation mirrors ``macro_service._terminate_owned_pid``. Best-effort:
-        never raises and never falls back to a wildcard image kill.
+        Uses the **same** live ``PyHANDLE`` held for the whole ownership session
+        (:meth:`_open_owned_handle`): ``TerminateProcess`` then
+        ``WaitForSingleObject``; success is reported **only** on ``WAIT_OBJECT_0``
+        (never from the absence of an exception). There is **no** pid-only
+        ``taskkill`` fallback.
+
+        Fail closed (Block A): when no live handle object is held — ``None`` or a
+        reduced ``int`` (P7) — the terminate is **refused** and ``False`` is
+        returned; the caller must not re-resolve by pid. Recovery then reports
+        unavailable and the documented fallback is a server restart (U8).
         """
 
-        if pid <= 0:
+        handle = self._owned_handle
+        if handle is None or isinstance(handle, int):
             return False
+        result = _terminate_and_confirm(handle, int(_REAP_VERIFY_TIMEOUT_S * 1000))
+        return result == _WAIT_OBJECT_0
+
+    @staticmethod
+    def _open_owned_handle(pid: int | None) -> Any:
+        """Open and identity-verify a live process handle for ``pid`` (fail closed).
+
+        Opens ``PROCESS_TERMINATE | PROCESS_SYNCHRONIZE |
+        PROCESS_QUERY_LIMITED_INFORMATION`` on the ``DispatchEx`` child (PoC P2 /
+        U5) and verifies the image name is ``EXCEL.EXE`` before returning the live
+        ``PyHANDLE`` object. The object is retained by the adapter for the whole
+        session and is **never** reduced to an ``int``.
+
+        Returns ``None`` on any failure (no pid, OpenProcess denied, image-name
+        mismatch, non-Windows / no pywin32) so recovery is **unavailable** rather
+        than acting on an unverified process.
+        """
+
+        if pid is None or pid <= 0:
+            return None
+        # Identity gate (fail closed): the target image must be EXCEL.EXE.
+        if not ExcelAppAdapter._pid_is_excel(pid):
+            return None
         try:
-            completed = subprocess.run(
-                ["taskkill", "/F", "/PID", str(pid)],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-        except Exception:  # noqa: BLE001 - best-effort teardown
+            import win32api  # noqa: PLC0415
+        except Exception:  # noqa: BLE001 - non-Windows / pywin32 absent
+            return None
+        desired = _PROCESS_TERMINATE | _PROCESS_SYNCHRONIZE | _PROCESS_QUERY_LIMITED_INFORMATION
+        try:
+            handle = win32api.OpenProcess(desired, False, int(pid))
+        except Exception:  # noqa: BLE001 - access denied / pid gone
+            return None
+        # A falsy handle (0 / NULL) is a failure, not a usable handle: fail closed.
+        return handle if handle else None
+
+    @staticmethod
+    def _pid_is_excel(pid: int) -> bool:
+        """Best-effort identity check: is ``pid`` the ``EXCEL.EXE`` image?
+
+        Uses ``QueryFullProcessImageNameW`` with ``PROCESS_QUERY_LIMITED_INFORMATION``
+        (works for a hidden owned process; no window / no COM). Returns ``False`` on
+        any failure so an unverifiable target is never terminated (fail closed).
+        """
+
+        name = ExcelAppAdapter._image_name_of_pid(pid)
+        if not name:
             return False
-        return completed.returncode == 0
+        base = name.replace("/", "\\").rsplit("\\", 1)[-1].strip().lower()
+        return base == _OWNED_IMAGE_NAME
+
+    @staticmethod
+    def _image_name_of_pid(pid: int) -> str | None:
+        """Return the full image path of ``pid`` via Win32, or ``None`` on failure."""
+
+        if pid <= 0:
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:  # pragma: no cover - non-Windows fallback
+            return None
+        try:
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            if not handle:
+                return None
+            try:
+                size = wintypes.DWORD(32768)
+                buffer = ctypes.create_unicode_buffer(32768)
+                ok = kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size))
+                if not ok:
+                    return None
+                return buffer.value or None
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # pragma: no cover - platform specific
+            return None
 
     @staticmethod
     def _read_with_default(app: Any, name: str, *, default: Any) -> Any:

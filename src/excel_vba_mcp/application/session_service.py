@@ -40,7 +40,7 @@ import tempfile
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
@@ -63,6 +63,10 @@ from excel_vba_mcp.security.approval import ApprovalKey, ApprovalPolicy
 from excel_vba_mcp.security.audit import AuditLogger
 from excel_vba_mcp.security.macro_policy import automation_security_for
 from excel_vba_mcp.security.path_policy import PathPolicy
+from excel_vba_mcp.storage.owned_pid_store import OwnedPidStore
+
+if TYPE_CHECKING:
+    from excel_vba_mcp.application.job_registry import JobRegistry
 
 # Default per-call soft ceilings (seconds) — see task_010 research §Q2.
 _DEFAULT_TIMEOUT_S = 60.0
@@ -101,6 +105,9 @@ class SessionService:
         work_dir: Directory for working copies. Defaults to a ``work/`` folder
             under the system temp directory so the repository is never polluted;
             the server may override it with a configured artifact root.
+        open_timeout_s: Server-side deadline (seconds) for the ``excel_open`` STA
+            open (Block E). This is the per-op-class server authority for the open
+            path; the server threads ``ServerConfig.open_timeout_s`` here.
     """
 
     def __init__(
@@ -112,12 +119,14 @@ class SessionService:
         audit: AuditLogger,
         *,
         work_dir: Path | None = None,
+        open_timeout_s: float = _DEFAULT_TIMEOUT_S,
     ) -> None:
         self._worker = worker
         self._app_adapter = app_adapter
         self._path_policy = path_policy
         self._approval = approval
         self._audit = audit
+        self._open_timeout_s = open_timeout_s
         self._workbook_adapter = WorkbookAdapter()
         self._session_id = str(uuid4())
         self._session_mode: SessionMode = SessionMode.INSPECT
@@ -134,6 +143,14 @@ class SessionService:
         # workbook lifetime; released by close_workbook).
         self._locks: dict[str, asyncio.Lock] = {}
         self._work_dir = work_dir or (Path(tempfile.gettempdir()) / "excel_vba_mcp" / _WORK_SUBDIR)
+        # Startup-reconcile store for the owned Excel pid (Block A): written after a
+        # successful (re)launch and cleared on close, so the next server start can
+        # detect a leftover live instance and refuse to start a second Excel.
+        self._owned_pid_store = OwnedPidStore(self._work_dir)
+        # Optional job registry (Block F): published by the server so a successful
+        # recovery can finalize in-flight jobs to INTERRUPTED_UNKNOWN. ``None`` in
+        # minimal/embedder use (recovery then leaves jobs untouched).
+        self._jobs: JobRegistry | None = None
 
     # ------------------------------------------------------------------
     # Properties (non-COM)
@@ -160,6 +177,16 @@ class SessionService:
 
         return self._accepting
 
+    def set_job_registry(self, jobs: JobRegistry | None) -> None:
+        """Publish the job registry used to finalize jobs on a successful recovery.
+
+        The server calls this once at startup. When set, a successful
+        :meth:`recover_owned_process` marks the session's in-flight jobs as
+        ``INTERRUPTED_UNKNOWN`` (definitive; never completed, never replayed).
+        """
+
+        self._jobs = jobs
+
     # ------------------------------------------------------------------
     # Open
     # ------------------------------------------------------------------
@@ -170,7 +197,7 @@ class SessionService:
         *,
         mode: SessionMode = SessionMode.INSPECT,
         read_only: bool = False,
-        timeout_s: float = _DEFAULT_TIMEOUT_S,
+        timeout_s: float | None = None,
     ) -> WorkbookInfo:
         """Open an allowlisted workbook as a hidden working copy.
 
@@ -183,7 +210,8 @@ class SessionService:
             path: Caller-supplied path; validated against the allowlist.
             mode: ``inspect`` (macros disabled) or ``execute`` (macros by UI).
             read_only: Open the working copy read-only.
-            timeout_s: Soft per-call ceiling for the STA open.
+            timeout_s: Soft per-call ceiling for the STA open. Defaults to the
+                server-configured ``open_timeout_s`` (Block E authority).
 
         Returns:
             A :class:`WorkbookInfo` describing the opened working copy.
@@ -196,6 +224,8 @@ class SessionService:
         """
 
         mode = SessionMode(mode)
+        # Resolve the per-call open deadline to the server authority (Block E).
+        effective_timeout_s = self._open_timeout_s if timeout_s is None else timeout_s
         # Lazy auto-recovery fallback (F2b / strategy C): if the owned session was
         # left in NEEDS_RECOVERY with a dead owned pid (e.g. the process was
         # terminated after a hung macro), self-heal with ONE in-process recovery so
@@ -253,7 +283,7 @@ class SessionService:
                     workbook_id=workbook_id,
                     mode=mode,
                     read_only=read_only,
-                    timeout_s=timeout_s,
+                    timeout_s=effective_timeout_s,
                 )
             except Exception:
                 # Never leak the per-path lock or working copy on a failed open.
@@ -621,6 +651,9 @@ class SessionService:
             self._state = WorkbookSessionState.RUNNING
             self._accepting = True
             self._closed = False
+            # Persist the rebuilt owned pid so the next server start's reconcile
+            # ("no second Excel") stays airtight after a lazy rebuild (Block A).
+            self._persist_owned_pid(after.owned_pid)
             notes.append("owned Excel instance rebuilt (hidden)")
         else:
             failed_state = (
@@ -661,6 +694,229 @@ class SessionService:
         )
         return status
 
+    async def recover_owned_process(
+        self,
+        *,
+        reason: str = "agent_directed",
+        timeout_s: float = _DEFAULT_TIMEOUT_S,
+    ) -> dict[str, Any]:
+        """Agent-directed recovery of the owned Excel process (``excel_recover``).
+
+        This is the Block A recovery path (report_07 §5, plan_02 Work item A). It is
+        **agent-directed** (the agent calls ``excel_recover``; the server never
+        auto-terminates a live pid on a deadline) and **fail-closed**:
+
+        1. **Approve (RECOVERY class).** ``ApprovalPolicy.check_recovery`` is
+           auto-allowed in BOTH full and restricted mode (audited); the key is
+           pid-scoped (``"pid:<owned_pid>"``), never a workbook wildcard.
+        2. **Fail closed** when the worker is closed or no live, identity-verified
+           handle is held (``owned_handle`` is ``None`` / reduced to ``int``): the
+           outcome reports ``recovery_possible=False`` / ``ok=False`` and the
+           documented fallback is a **server restart** (U8). **No pid-only kill.**
+        3. **Terminate + confirm via the SAME held handle**
+           (``ExcelAppAdapter.terminate_owned_handle`` ->
+           ``TerminateProcess`` -> ``WaitForSingleObject`` == ``WAIT_OBJECT_0``).
+        4. **Discard working copies only** (originals are never modified) and
+           **rebuild** the hidden instance via ``worker.reset()`` on the single STA.
+        5. **Interrupted mutation = unknown, never auto-retried:** ``prior_job`` is
+           ``"unknown"`` when an op was in flight / deadline-exceeded /
+           needs-recovery; the caller must not replay it.
+
+        Args:
+            reason: Short label recorded in the audit entry / outcome.
+            timeout_s: Accepted for signature symmetry; the worker's bounded reset
+                join is authoritative.
+
+        Returns:
+            A JSON-serializable dict with the recovery contract fields: ``ok``,
+            ``terminated``, ``confirmed``, ``recovery_possible``, ``process_restarted``,
+            ``prior_job`` (``completed`` / ``failed`` / ``unknown``), ``what_lost``,
+            ``reason``, ``owned_pid`` and ``approval_source``. The payload states it
+            is destructive to **working copies only** and originals are safe.
+        """
+
+        del timeout_s  # the worker's bounded reset join is authoritative
+        worker = self._worker
+        adapter = self._app_adapter
+        before = worker.get_status()
+        owned_pid = getattr(before, "owned_pid", None)
+        worker_state = getattr(before, "state", None)
+        active_operation = getattr(before, "active_operation", None)
+
+        # RECOVERY approval (auto-allowed FULL + RESTRICTED, pid-scoped, audited).
+        recovery_key = ApprovalKey(
+            canonical_path=f"pid:{owned_pid if owned_pid is not None else 'none'}",
+            action="excel_recover",
+        )
+        decision = self._approval.check_recovery(recovery_key)
+        approval_source = decision.source.value if decision.source is not None else None
+
+        # An in-flight / deadline-exceeded / needs-recovery op is UNKNOWN (never
+        # auto-retried); otherwise the prior op completed.
+        prior_job = (
+            "unknown"
+            if active_operation
+            or worker_state
+            in (WorkbookSessionState.DEADLINE_EXCEEDED, WorkbookSessionState.NEEDS_RECOVERY)
+            else "completed"
+        )
+
+        # Fail closed: a closed worker cannot be recovered in-process.
+        if worker_state == WorkbookSessionState.CLOSED:
+            return self._finish_recovery(
+                reason="worker is closed; a server restart is required (U8)",
+                owned_pid=owned_pid,
+                prior_job=prior_job,
+                approval_source=approval_source,
+                discarded=0,
+            )
+
+        # Fail closed: recovery requires a live, identity-verified held handle.
+        if (
+            owned_pid is None
+            or not adapter.recovery_available
+            or adapter.owned_handle is None
+            or isinstance(adapter.owned_handle, int)
+        ):
+            return self._finish_recovery(
+                reason=(
+                    "owned process handle unavailable or identity unverified; "
+                    "recovery unavailable — server restart is the fallback (U8)"
+                ),
+                owned_pid=owned_pid,
+                prior_job=prior_job,
+                approval_source=approval_source,
+                discarded=0,
+            )
+
+        # Recovery is possible: stop accepting, discard working copies (originals
+        # untouched), terminate+confirm via the SAME handle, then rebuild.
+        self._accepting = False
+        self._state = WorkbookSessionState.NEEDS_RECOVERY
+        discarded = self._discard_open_workbooks()
+
+        # Terminate+confirm via the SAME held handle, off the event loop (the handle
+        # is a free-thread kernel object; works while the STA is blocked in COM).
+        terminated = await asyncio.to_thread(adapter.terminate_owned_handle)
+        confirmed = terminated  # success only on WAIT_OBJECT_0
+
+        reset_error: str | None = None
+        try:
+            await worker.reset()
+        except ExcelHungError as exc:
+            reset_error = f"worker reset timed out: {exc}"
+        except Exception as exc:  # noqa: BLE001 - recovery reports, never raises
+            reset_error = f"worker reset failed: {exc.__class__.__name__}: {exc}"
+
+        after = worker.get_status()
+        restarted = (
+            reset_error is None and getattr(after, "state", None) == WorkbookSessionState.RUNNING
+        )
+        new_pid = getattr(after, "owned_pid", None)
+        if restarted:
+            self._state = WorkbookSessionState.RUNNING
+            self._accepting = True
+            self._closed = False
+            self._persist_owned_pid(new_pid)
+            # The owned process is confirmed restarted: any in-flight /
+            # deadline-exceeded job is now definitively INTERRUPTED_UNKNOWN (never
+            # completed, never replayed). Best-effort — must never fail a recovery.
+            self._mark_jobs_interrupted()
+        else:
+            self._state = WorkbookSessionState.NEEDS_RECOVERY
+            self._accepting = False
+
+        outcome: dict[str, Any] = {
+            "ok": restarted,
+            "terminated": terminated,
+            "confirmed": confirmed,
+            "recovery_possible": True,
+            "process_restarted": restarted,
+            "prior_job": prior_job,
+            "what_lost": (f"working copies discarded ({discarded}); originals are never modified"),
+            "reason": reset_error,
+            "owned_pid": new_pid if restarted else owned_pid,
+            "approval_source": approval_source,
+        }
+        self._record_audit(
+            tool="excel_recover",
+            operation_class="recovery",
+            params={"reason": reason, "owned_pid": owned_pid, "discarded_workbooks": discarded},
+            result={
+                "ok": restarted,
+                "terminated": terminated,
+                "confirmed": confirmed,
+                "process_restarted": restarted,
+                "prior_job": prior_job,
+                "owned_pid_after": new_pid if restarted else owned_pid,
+                "reset_error": reset_error,
+            },
+        )
+        return outcome
+
+    def _mark_jobs_interrupted(self) -> None:
+        """Finalize the session's interruptible jobs to INTERRUPTED_UNKNOWN.
+
+        Called only after a **successful** recovery (owned process confirmed
+        restarted). Best-effort: a registry/persistence error must never fail the
+        recovery outcome.
+        """
+
+        jobs = self._jobs
+        if jobs is None:
+            return
+        with contextlib.suppress(Exception):
+            jobs.mark_interrupted(reason="recovery")
+
+    def _persist_owned_pid(self, owned_pid: int | None) -> None:
+        """Persist the current owned pid for the next startup reconcile (Block A).
+
+        Centralized so every rebuild path (``recover_session`` lazy rebuild and
+        ``recover_owned_process``) keeps the on-disk marker fresh; a ``None`` pid is
+        ignored. Best-effort: a persistence error must never fail a recovery.
+        """
+
+        if owned_pid is None:
+            return
+        with contextlib.suppress(Exception):
+            self._owned_pid_store.write(owned_pid)
+
+    def _finish_recovery(
+        self,
+        *,
+        reason: str,
+        owned_pid: int | None,
+        prior_job: str,
+        approval_source: str | None,
+        discarded: int,
+    ) -> dict[str, Any]:
+        """Build + audit a fail-closed ``excel_recover`` outcome (no kill, no reset)."""
+
+        outcome: dict[str, Any] = {
+            "ok": False,
+            "terminated": False,
+            "confirmed": False,
+            "recovery_possible": False,
+            "process_restarted": False,
+            "prior_job": prior_job,
+            "what_lost": "none; originals are never modified",
+            "reason": reason,
+            "owned_pid": owned_pid,
+            "approval_source": approval_source,
+        }
+        self._record_audit(
+            tool="excel_recover",
+            operation_class="recovery",
+            params={"owned_pid": owned_pid, "discarded_workbooks": discarded},
+            result={
+                "ok": False,
+                "recovery_possible": False,
+                "prior_job": prior_job,
+                "reason": reason,
+            },
+        )
+        return outcome
+
     async def close_session(self, *, timeout_s: float = _DEFAULT_TIMEOUT_S) -> SessionStatus:
         """Close the owned Excel session (workbooks + Quit + release); idempotent.
 
@@ -696,6 +952,9 @@ class SessionService:
         after = self._worker.get_status()
         self._closed = True
         self._state = after.state
+        # The owned process is gone: clear the startup-reconcile pid marker so the
+        # next server start does not mistake a dead pid for a live leftover (Block A).
+        self._owned_pid_store.clear()
         self._record_audit(
             tool="close_session",
             operation_class="mutating",

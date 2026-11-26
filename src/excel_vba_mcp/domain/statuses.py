@@ -33,6 +33,11 @@ class WorkbookSessionState(StrEnum):
     STARTING = "starting"
     RUNNING = "running"
     NEEDS_RECOVERY = "running/needs_recovery"
+    # Block E (additive): a single COM call exceeded its execution deadline. The
+    # call is NOT cancelled (an uninterruptible COM call cannot be) and the owned
+    # pid is NOT terminated; the worker resumes RUNNING when the call returns.
+    # Distinct from NEEDS_RECOVERY so a slow-but-alive op is never a poison state.
+    DEADLINE_EXCEEDED = "running/deadline_exceeded"
     BUSY = "busy"
     CLOSING = "closing"
     CLOSED = "closed"
@@ -94,6 +99,10 @@ class MacroRunStatus(StrEnum):
     NOT_FOUND = "not_found"
     TIMEOUT = "timeout"
     NEEDS_RECOVERY = "needs_recovery"
+    # Block E (additive): the macro dispatch exceeded its soft deadline. The owned
+    # Excel pid is NOT terminated and the operation is left running; recovery is
+    # agent-directed (excel_recover, Block A). Never a false success.
+    SUSPECTED_STALLED = "suspected_stalled"
 
 
 class TestRunStatus(StrEnum):
