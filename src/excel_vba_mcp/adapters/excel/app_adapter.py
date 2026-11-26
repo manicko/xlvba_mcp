@@ -21,6 +21,14 @@ Design invariants (ARCH-013 as amended by the background-execution addendum):
   :meth:`ExcelAppAdapter.quit` verifies that the owned process is dead and, if
   ``Application.Quit`` left it resident, terminates exactly that pid (never a
   wildcard image kill, never a user instance).
+* The owned process is additionally placed into a dedicated unnamed
+  ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` job (created *before* ``DispatchEx`` and
+  assigned right after the pid is resolved). The kernel therefore guarantees the
+  owned Excel dies when the server dies (tree-kill / crash) with no orphan and no
+  restart. Assignment is **fail-closed**: on any failure the just-spawned,
+  image-verified Excel is terminated and never handed over. The job handle is held
+  as a live ``PyHANDLE`` (never an ``int``) and closed only after the verified
+  reap.
 
 Recovery (Block A) is **handle-scoped and fail-closed**:
 
@@ -91,6 +99,12 @@ _REAP_VERIFY_TIMEOUT_S = 0.5
 _PROCESS_TERMINATE = 0x0001
 _PROCESS_SYNCHRONIZE = 0x00100000
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+# ``PROCESS_SET_QUOTA`` is the right ``AssignProcessToJobObject`` requires on the
+# target process; combined with ``PROCESS_TERMINATE`` it is the exact access set
+# used to place the owned Excel into the KILL_ON_JOB_CLOSE job (the verify step
+# uses a separate ``PROCESS_QUERY_LIMITED_INFORMATION`` handle because
+# ``IsProcessInJob`` needs query rights).
+_PROCESS_SET_QUOTA = 0x0100
 
 # ``WAIT_OBJECT_0`` — ``WaitForSingleObject`` return value proving the process is
 # dead (``win32con.WAIT_OBJECT_0`` is ``0x0``; spelled here to avoid the import).
@@ -149,6 +163,14 @@ class ExcelAppAdapter:
         # (fail closed). NEVER stored as an ``int`` (P7: reducing it breaks
         # liveness/terminate/confirm and produced a false ``EXITED``).
         self._owned_handle: Any = None
+        # Live job-object handle (a ``PyHANDLE``) held for the whole ownership
+        # session. The job is created with ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``
+        # *before* ``DispatchEx`` and the owned Excel process is assigned into it
+        # right after the pid is resolved, so the kernel guarantees the owned
+        # process dies with the server (no orphan). ``None`` when the Win32 job
+        # layer is unavailable (non-Windows / no pywin32); never reduced to an
+        # ``int`` (the live object is held, not a numeric handle).
+        self._job_handle: Any = None
 
     # ------------------------------------------------------------------
     # Read-only accessors (non-COM bookkeeping)
@@ -194,6 +216,29 @@ class ExcelAppAdapter:
 
         return self._owned_handle is not None and not isinstance(self._owned_handle, int)
 
+    @property
+    def job_handle(self) -> Any:
+        """The live owned-job handle (a ``PyHANDLE`` object) or ``None``.
+
+        Held for the entire ownership session and closed only after the owned
+        process death is confirmed (graceful ``quit`` / ``release``). ``None`` when
+        the Win32 job layer is unavailable. The returned object is the live kernel
+        handle, never an ``int``.
+        """
+
+        return self._job_handle
+
+    @property
+    def job_protected(self) -> bool:
+        """Whether a live job handle is held (KILL_ON_JOB_CLOSE guarantee armed).
+
+        Fail-closed: ``False`` when no job was created or the handle was reduced to
+        an ``int``; in that case the held-handle reap (U8) is the only teardown
+        guarantee.
+        """
+
+        return self._job_handle is not None and not isinstance(self._job_handle, int)
+
     # ------------------------------------------------------------------
     # Creation / teardown
     # ------------------------------------------------------------------
@@ -219,6 +264,13 @@ class ExcelAppAdapter:
         # Imported lazily so module import never requires pywin32 / Windows.
         import win32com.client  # type: ignore[import-untyped]  # noqa: PLC0415
 
+        # Arm the kernel guarantee BEFORE the owned process exists: create the
+        # unnamed ``KILL_ON_JOB_CLOSE`` job first so a crash in the create->assign
+        # window cannot orphan the Excel that ``DispatchEx`` is about to spawn
+        # (shrinks W-A). ``None`` on a host without the Win32 job layer; the
+        # held-handle reap (U8) then remains the only teardown guarantee.
+        self._job_handle = self._create_job_object()
+
         app = win32com.client.DispatchEx("Excel.Application")
         # Set Visible=False before touching anything else.
         try:
@@ -228,6 +280,8 @@ class ExcelAppAdapter:
             # would violate the non-intrusion invariant.
             with contextlib.suppress(Exception):
                 app.Quit()
+            self._close_job_handle(self._job_handle)
+            self._job_handle = None
             raise
 
         self._app = app
@@ -237,6 +291,20 @@ class ExcelAppAdapter:
         # session (Block A). Fail closed: on any failure the handle stays ``None``
         # and recovery is unavailable (no pid-only kill, server-restart fallback).
         self._owned_handle = self._open_owned_handle(self._owned_pid)
+
+        # Place the owned process into the job and verify membership. Fail closed
+        # on any failure: terminate the just-spawned, image-verified Excel and do
+        # NOT hand it over (the worker records the startup failure). This is the
+        # primary kernel guarantee that a server tree-kill / crash reaps the owned
+        # Excel without a restart.
+        if self._job_handle is not None and not self._assign_process_to_job(
+            self._job_handle, self._owned_pid
+        ):
+            self._fail_closed_after_job_assign(self._owned_pid)
+            raise RuntimeError(
+                "Failed to assign the owned Excel process to the job object; "
+                "fail-closed (owned Excel terminated, not handed over)"
+            )
 
     def quit(self) -> None:
         """Quit the owned instance and enforce the death of its process.
@@ -265,6 +333,12 @@ class ExcelAppAdapter:
                 pass
         if owned_pid is not None:
             self.reap_owned_pid(owned_pid)
+        # Close the job AFTER the reap attempt. If the owned process is already
+        # dead this is a no-op; if it somehow survived the reap, the job's
+        # KILL_ON_JOB_CLOSE is the kernel backstop that still reaps exactly that
+        # process. The job handle is never left held.
+        self._close_job_handle(self._job_handle)
+        self._job_handle = None
         self._owned_pid = None
         self._owned_caption = None
         self._owned_handle = None
@@ -334,6 +408,10 @@ class ExcelAppAdapter:
         self._owned_pid = None
         self._owned_caption = None
         self._owned_handle = None
+        # Release the job handle too. Normally ``quit`` already closed it after the
+        # verified reap; this is the idempotent backstop for a bare ``release``.
+        self._close_job_handle(self._job_handle)
+        self._job_handle = None
 
     # ------------------------------------------------------------------
     # Workbook operations
@@ -598,6 +676,268 @@ class ExcelAppAdapter:
         result = _terminate_and_confirm(handle, int(_REAP_VERIFY_TIMEOUT_S * 1000))
         return result == _WAIT_OBJECT_0
 
+    # ------------------------------------------------------------------
+    # Job object (kernel KILL_ON_JOB_CLOSE guarantee) + process identity
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _create_job_object() -> Any:
+        """Create an unnamed ``KILL_ON_JOB_CLOSE`` job; return the live ``PyHANDLE``.
+
+        The job is created *before* ``DispatchEx`` so the kernel guarantee is armed
+        before the owned Excel process exists (shrinking the create->assign window).
+        The job is unnamed and its handle is non-inheritable (the default
+        ``CreateJobObject(None, "")`` security descriptor yields a non-inheritable
+        handle); no BREAKAWAY flags are set, so a child cannot escape the job.
+
+        Returns ``None`` on any failure (non-Windows / pywin32 absent / creation or
+        ``SetInformationJobObject`` error) so the caller degrades to the held-handle
+        reap (U8) rather than crashing; a real Windows host with pywin32 always
+        yields a live handle.
+        """
+
+        try:
+            import win32job  # type: ignore[import-untyped]  # noqa: PLC0415
+        except Exception:  # noqa: BLE001 - non-Windows / pywin32 absent
+            return None
+        try:
+            job = win32job.CreateJobObject(None, "")
+        except Exception:  # noqa: BLE001 - creation denied / no job objects
+            return None
+        if not job:
+            return None
+        try:
+            info = win32job.QueryInformationJobObject(
+                job, win32job.JobObjectExtendedLimitInformation
+            )
+            info["BasicLimitInformation"]["LimitFlags"] = (
+                win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            )
+            win32job.SetInformationJobObject(
+                job, win32job.JobObjectExtendedLimitInformation, info
+            )
+        except Exception:  # noqa: BLE001 - set failed: close, fail closed to None
+            ExcelAppAdapter._close_job_handle(job)
+            return None
+        return job
+
+    @staticmethod
+    def _assign_process_to_job(job: Any, pid: int | None) -> bool:
+        """Assign ``pid`` to ``job`` and verify with ``IsProcessInJob`` (fail closed).
+
+        Opens the process with ``PROCESS_SET_QUOTA | PROCESS_TERMINATE`` (the rights
+        ``AssignProcessToJobObject`` requires) and assigns it, then verifies
+        membership with a separate ``PROCESS_QUERY_LIMITED_INFORMATION`` handle
+        (``IsProcessInJob`` needs query rights). Returns ``True`` **only** when the
+        process is confirmed in the job; any failure returns ``False`` so the caller
+        fails closed (kills the owned Excel, never hands it over).
+        """
+
+        if job is None or isinstance(job, int) or pid is None or pid <= 0:
+            return False
+        try:
+            import win32api  # noqa: PLC0415
+            import win32job  # noqa: PLC0415
+        except Exception:  # noqa: BLE001 - non-Windows / pywin32 absent
+            return False
+        assign_handle = None
+        try:
+            assign_handle = win32api.OpenProcess(
+                _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, int(pid)
+            )
+        except Exception:  # noqa: BLE001 - access denied / pid gone
+            return False
+        if not assign_handle:
+            return False
+        try:
+            win32job.AssignProcessToJobObject(job, assign_handle)
+        except Exception:  # noqa: BLE001 - assign rejected (e.g. nested-job deny)
+            return False
+        finally:
+            with contextlib.suppress(Exception):
+                win32api.CloseHandle(assign_handle)
+        # Verify membership with a query handle (IsProcessInJob requires query
+        # rights the assign handle does not carry).
+        query_handle = None
+        try:
+            query_handle = win32api.OpenProcess(
+                _PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+            )
+            if not query_handle:
+                return False
+            return bool(win32job.IsProcessInJob(query_handle, job))
+        except Exception:  # noqa: BLE001 - query denied / not in job
+            return False
+        finally:
+            with contextlib.suppress(Exception):
+                if query_handle:
+                    win32api.CloseHandle(query_handle)
+
+    @staticmethod
+    def _close_job_handle(job: Any) -> None:
+        """Close a job ``PyHANDLE`` (best-effort); never raises, ignores ``None``/``int``.
+
+        Closing the last handle to a ``KILL_ON_JOB_CLOSE`` job terminates every
+        process still assigned to it, so this is the kernel backstop that reaps the
+        owned Excel if the graceful ``Quit`` left it resident.
+        """
+
+        if job is None or isinstance(job, int):
+            return
+        close = getattr(job, "Close", None)
+        if callable(close):
+            try:
+                close()
+                return
+            except Exception:  # noqa: BLE001 - fall through to Win32 CloseHandle
+                pass
+        try:
+            import win32api  # noqa: PLC0415
+
+            win32api.CloseHandle(job)
+        except Exception:  # noqa: BLE001 - already closed / non-Windows
+            pass
+
+    def _fail_closed_after_job_assign(self, pid: int | None) -> None:
+        """Kill the just-spawned, image-verified Excel and drop the job (fail closed).
+
+        Runs only when job assignment fails: the owned process must not be handed
+        over. Termination is pid-scoped and image-gated (``EXCEL.EXE`` only) via the
+        held handle when available, else a transient verified handle. The job is then
+        closed (its ``KILL_ON_JOB_CLOSE`` is a final kernel backstop) and all owned
+        references are cleared so the caller's startup-failure path holds nothing.
+        """
+
+        if pid is not None and not self._terminate_owned_handle():
+            self._terminate_pid_verified(pid)
+        self._close_job_handle(self._job_handle)
+        self._job_handle = None
+        self._app = None
+        self._owned_pid = None
+        self._owned_caption = None
+        self._owned_handle = None
+
+    @staticmethod
+    def _terminate_pid_verified(pid: int | None) -> bool:
+        """Image-verified, pid-scoped terminate for the fail-closed path.
+
+        Used only when no held handle is available (e.g. the owned handle could not
+        be opened): verify the image is ``EXCEL.EXE``, then open a transient
+        ``PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION``
+        handle, ``TerminateProcess`` -> ``WaitForSingleObject`` and require
+        ``WAIT_OBJECT_0``. Never a wildcard; never terminates an unverified pid.
+        """
+
+        if pid is None or pid <= 0:
+            return False
+        if not ExcelAppAdapter._pid_is_excel(pid):
+            return False
+        try:
+            import win32api  # noqa: PLC0415
+        except Exception:  # noqa: BLE001 - non-Windows / pywin32 absent
+            return False
+        desired = (
+            _PROCESS_TERMINATE
+            | _PROCESS_SYNCHRONIZE
+            | _PROCESS_QUERY_LIMITED_INFORMATION
+        )
+        try:
+            handle = win32api.OpenProcess(desired, False, int(pid))
+        except Exception:  # noqa: BLE001 - access denied / pid gone
+            return False
+        if not handle:
+            return False
+        try:
+            result = _terminate_and_confirm(handle, int(_REAP_VERIFY_TIMEOUT_S * 1000))
+            return result == _WAIT_OBJECT_0
+        finally:
+            with contextlib.suppress(Exception):
+                win32api.CloseHandle(handle)
+
+    @staticmethod
+    def _process_create_time_filetime(pid: int | None) -> int | None:
+        """Creation time of ``pid`` as a 64-bit FILETIME (100 ns since 1601), or ``None``.
+
+        Used by the startup reconcile to tell a live owned Excel apart from a reused
+        pid (pid-reuse => create-time mismatch => never kill). Read-only
+        (``OpenProcess`` + ``GetProcessTimes``); never raises.
+        """
+
+        if pid is None or pid <= 0:
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:  # pragma: no cover - non-Windows fallback
+            return None
+        try:
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(
+                _PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+            )
+            if not handle:
+                return None
+            try:
+                creation = wintypes.FILETIME()
+                exit_time = wintypes.FILETIME()
+                kernel_time = wintypes.FILETIME()
+                user_time = wintypes.FILETIME()
+                ok = kernel32.GetProcessTimes(
+                    handle,
+                    ctypes.byref(creation),
+                    ctypes.byref(exit_time),
+                    ctypes.byref(kernel_time),
+                    ctypes.byref(user_time),
+                )
+                if not ok:
+                    return None
+                return (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # pragma: no cover - platform specific
+            return None
+
+    @staticmethod
+    def _process_session_id(pid: int | None) -> int | None:
+        """The Windows session id of ``pid`` (``ProcessIdToSessionId``), or ``None``.
+
+        Read-only; used by the ownership record so a cross-session pid can never be
+        mistaken for this session's owned Excel. Never raises.
+        """
+
+        if pid is None or pid <= 0:
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:  # pragma: no cover - non-Windows fallback
+            return None
+        try:
+            kernel32 = ctypes.windll.kernel32
+            session = wintypes.DWORD()
+            if not kernel32.ProcessIdToSessionId(int(pid), ctypes.byref(session)):
+                return None
+            return int(session.value)
+        except Exception:  # pragma: no cover - platform specific
+            return None
+
+    @staticmethod
+    def _capture_process_identity(
+        pid: int | None,
+    ) -> tuple[int | None, str | None, int | None]:
+        """Return ``(create_time_filetime, image_name, session_id)`` for ``pid``.
+
+        Read-only convenience bundling the three Win32 identity probes used to
+        build the ownership record and to verify a prior owner / orphan. Each value
+        is ``None`` when it cannot be read (non-Windows / no pywin32 / dead pid).
+        """
+
+        return (
+            ExcelAppAdapter._process_create_time_filetime(pid),
+            ExcelAppAdapter._image_name_of_pid(pid),
+            ExcelAppAdapter._process_session_id(pid),
+        )
+
     @staticmethod
     def _open_owned_handle(pid: int | None) -> Any:
         """Open and identity-verify a live process handle for ``pid`` (fail closed).
@@ -646,10 +986,10 @@ class ExcelAppAdapter:
         return base == _OWNED_IMAGE_NAME
 
     @staticmethod
-    def _image_name_of_pid(pid: int) -> str | None:
+    def _image_name_of_pid(pid: int | None) -> str | None:
         """Return the full image path of ``pid`` via Win32, or ``None`` on failure."""
 
-        if pid <= 0:
+        if pid is None or pid <= 0:
             return None
         try:
             import ctypes

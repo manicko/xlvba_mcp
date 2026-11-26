@@ -16,6 +16,8 @@ on any host. Coverage (plan_02 Work item A; PoC P2/P7):
 from __future__ import annotations
 
 import json
+import sys
+import types
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,7 +39,11 @@ from excel_vba_mcp.security.approval import ApprovalKey, ApprovalPolicy
 from excel_vba_mcp.security.audit import AuditLogger
 from excel_vba_mcp.security.path_policy import PathPolicy
 from excel_vba_mcp.server import _reconcile_prior_owned_pid, _start_worker_guarded
-from excel_vba_mcp.storage.owned_pid_store import OwnedPidStore
+from excel_vba_mcp.storage.owned_pid_store import (
+    OwnedPidStore,
+    OwnedProcessRecord,
+    build_owned_record,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -188,12 +194,177 @@ def test_create_hidden_retains_handle_object(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr("win32com.client.DispatchEx", lambda _prog: _FakeDispatch(), raising=False)
     monkeypatch.setattr(ExcelAppAdapter, "_pid_from_hwnd", staticmethod(lambda _h: 4242))
     monkeypatch.setattr(ExcelAppAdapter, "_open_owned_handle", staticmethod(lambda _pid: handle))
+    # No job layer in this unit path (job behaviour is covered separately).
+    monkeypatch.setattr(ExcelAppAdapter, "_create_job_object", staticmethod(lambda: None))
 
     adapter.create_hidden()
 
     assert adapter.owned_handle is handle
     assert not isinstance(adapter.owned_handle, int)
     assert adapter.recovery_available is True
+    assert adapter.job_handle is None
+    assert adapter.job_protected is False
+
+
+# ---------------------------------------------------------------------------
+# Job object (kernel KILL_ON_JOB_CLOSE guarantee): created before DispatchEx,
+# assign+verify called, fail-closed on assign failure, handle held (not int)
+# ---------------------------------------------------------------------------
+class _FakeJob:
+    """A live, non-int job handle recording Close()."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def Close(self) -> None:  # noqa: N802 - PyHANDLE casing
+        self.closed = True
+
+
+def _patch_create_hidden(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    job: Any,
+    assign_result: bool,
+    handle: Any = None,
+) -> list[tuple[Any, int | None]]:
+    """Patch create_hidden's collaborators; return the recorded assign calls."""
+
+    if handle is None:
+        handle = _FakeHandle()
+
+    class _FakeDispatch:
+        Visible = False
+        Caption = "Excel"
+        Hwnd = 4242
+
+        def __setattr__(self, name: str, value: Any) -> None:
+            object.__setattr__(self, name, value)
+
+    import win32com.client  # noqa: F401
+
+    assign_calls: list[tuple[Any, int | None]] = []
+
+    def _assign(j: Any, pid: int | None) -> bool:
+        assign_calls.append((j, pid))
+        return assign_result
+
+    monkeypatch.setattr("win32com.client.DispatchEx", lambda _p: _FakeDispatch(), raising=False)
+    monkeypatch.setattr(ExcelAppAdapter, "_pid_from_hwnd", staticmethod(lambda _h: 4242))
+    monkeypatch.setattr(ExcelAppAdapter, "_open_owned_handle", staticmethod(lambda _p: handle))
+    monkeypatch.setattr(ExcelAppAdapter, "_create_job_object", staticmethod(lambda: job))
+    monkeypatch.setattr(ExcelAppAdapter, "_assign_process_to_job", staticmethod(_assign))
+    return assign_calls
+
+
+def test_create_hidden_creates_job_before_dispatch_and_assigns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The job is created, the owned pid is assigned into it, and it is held (not int)."""
+
+    adapter = ExcelAppAdapter()
+    job = _FakeJob()
+    order: list[str] = []
+
+    def _create_job() -> Any:
+        order.append("create_job")
+        return job
+
+    class _FakeDispatch:
+        Visible = False
+        Caption = "Excel"
+        Hwnd = 4242
+
+        def __setattr__(self, name: str, value: Any) -> None:
+            object.__setattr__(self, name, value)
+
+    import win32com.client  # noqa: F401
+
+    def _dispatch(_p: str) -> Any:
+        order.append("dispatch")
+        return _FakeDispatch()
+
+    def _assign(j: Any, pid: int | None) -> bool:
+        order.append("assign")
+        return True
+
+    monkeypatch.setattr("win32com.client.DispatchEx", _dispatch, raising=False)
+    monkeypatch.setattr(ExcelAppAdapter, "_pid_from_hwnd", staticmethod(lambda _h: 4242))
+    monkeypatch.setattr(
+        ExcelAppAdapter, "_open_owned_handle", staticmethod(lambda _p: _FakeHandle())
+    )
+    monkeypatch.setattr(ExcelAppAdapter, "_create_job_object", staticmethod(_create_job))
+    monkeypatch.setattr(ExcelAppAdapter, "_assign_process_to_job", staticmethod(_assign))
+
+    adapter.create_hidden()
+
+    # Job created BEFORE DispatchEx (shrink the create->assign window).
+    assert order == ["create_job", "dispatch", "assign"], order
+    assert adapter.job_handle is job
+    assert adapter.job_protected is True
+    assert not isinstance(adapter.job_handle, int)
+
+
+def test_create_hidden_assigns_the_owned_pid_into_the_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = ExcelAppAdapter()
+    job = _FakeJob()
+    calls = _patch_create_hidden(monkeypatch, job=job, assign_result=True)
+
+    adapter.create_hidden()
+
+    assert calls == [(job, 4242)], "the owned pid is assigned into the held job"
+
+
+def test_create_hidden_fails_closed_when_assign_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Assign failure => the Excel is terminated (image-gated) and NOT handed over."""
+
+    adapter = ExcelAppAdapter()
+    job = _FakeJob()
+    handle = _FakeHandle()
+    terminated: list[object] = []
+    _patch_create_hidden(monkeypatch, job=job, assign_result=False, handle=handle)
+    monkeypatch.setattr(
+        app_adapter_module,
+        "_terminate_and_confirm",
+        lambda h, _t: terminated.append(h) or 0,  # WAIT_OBJECT_0
+    )
+
+    with pytest.raises(RuntimeError, match="fail-closed"):
+        adapter.create_hidden()
+
+    assert terminated == [handle], "the owned Excel is terminated via the held handle"
+    assert job.closed is True, "the job handle is closed on the fail-closed path"
+    assert adapter.app is None, "the Excel is NOT handed over"
+    assert adapter.owned_pid is None
+    assert adapter.job_handle is None
+    assert adapter.recovery_available is False
+
+
+def test_assign_process_to_job_fails_closed_on_bad_input() -> None:
+    """No job / no pid => refuse (False), never a partial assign."""
+
+    assert ExcelAppAdapter._assign_process_to_job(None, 4242) is False
+    assert ExcelAppAdapter._assign_process_to_job(_FakeJob(), None) is False
+    assert ExcelAppAdapter._assign_process_to_job(_FakeJob(), 0) is False
+    assert ExcelAppAdapter._assign_process_to_job(123, 4242) is False  # int handle rejected
+
+
+def test_create_job_object_is_non_inheritable_on_windows() -> None:
+    """On a host with the Win32 job layer the created job handle is non-inheritable."""
+
+    try:
+        import win32api
+        import win32job  # noqa: F401
+    except Exception:  # noqa: BLE001 - non-Windows / no pywin32
+        pytest.skip("win32job unavailable")
+
+    job = ExcelAppAdapter._create_job_object()
+    if job is None:
+        pytest.skip("job objects unavailable on this host")
+    try:
+        assert not isinstance(job, int)
+        assert (win32api.GetHandleInformation(job) & 1) == 0, "job handle must be non-inheritable"
+    finally:
+        ExcelAppAdapter._close_job_handle(job)
 
 
 # ---------------------------------------------------------------------------
@@ -343,51 +514,219 @@ async def test_excel_recover_is_audited(rig: _Rig) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Startup reconcile: live prior pid => no second launch; dead => proceed
+# Startup reconcile: identity-based (owner alive+match => refuse; owner dead +
+# verified orphan => reap; pid reuse => never kill on pid-alone)
 # ---------------------------------------------------------------------------
-def test_reconcile_refuses_when_prior_pid_alive(tmp_path: Path) -> None:
-    store = OwnedPidStore(tmp_path)
-    store.write(4242)
+_EXCEL_EXE = r"C:\Program Files\Microsoft Office\Root\Office16\EXCEL.EXE"
+_PY_EXE = r"C:\py_exp\xlvba_mcp\.venv\Scripts\python.exe"
 
-    reason = _reconcile_prior_owned_pid(store, pid_alive=lambda _pid: True)
+
+def _write_record(
+    store: OwnedPidStore,
+    *,
+    owner_pid: int,
+    owner_ct: int | None,
+    excel_pid: int,
+    excel_ct: int | None,
+    excel_exe: str | None = _EXCEL_EXE,
+    owner_exe: str | None = _PY_EXE,
+    owner_sess: int | None = 1,
+    excel_sess: int | None = 1,
+) -> None:
+    store.write_record(
+        build_owned_record(
+            owner_pid=owner_pid,
+            excel_pid=excel_pid,
+            owner_create_time=owner_ct,
+            owner_exe=owner_exe,
+            owner_session_id=owner_sess,
+            excel_create_time=excel_ct,
+            excel_exe=excel_exe,
+            excel_session_id=excel_sess,
+        )
+    )
+
+
+def _reconcile(
+    store: OwnedPidStore,
+    *,
+    alive: dict[int, bool],
+    create: dict[int, int | None],
+    image: dict[int, str | None],
+    terminated: list[int] | None = None,
+    terminate_ok: bool = True,
+    current_session_id: Any = None,
+) -> str | None:
+    def _terminate(pid: int) -> bool:
+        if terminated is not None:
+            terminated.append(pid)
+        if terminate_ok:
+            alive[pid] = False
+        return terminate_ok
+
+    return _reconcile_prior_owned_pid(
+        store,
+        pid_alive=lambda pid: alive.get(pid, False),
+        create_time=lambda pid: create.get(pid),
+        image_name=lambda pid: image.get(pid),
+        terminate_verified=_terminate,
+        current_session_id=current_session_id,
+    )
+
+
+def test_reconcile_refuses_when_owner_alive_and_identity_matches(tmp_path: Path) -> None:
+    store = OwnedPidStore(tmp_path)
+    _write_record(store, owner_pid=100, owner_ct=111, excel_pid=200, excel_ct=222)
+
+    reason = _reconcile(
+        store,
+        alive={100: True, 200: True},
+        create={100: 111, 200: 222},
+        image={100: _PY_EXE, 200: _EXCEL_EXE},
+    )
 
     assert reason is not None
-    assert "4242" in reason
+    assert "100" in reason
     # The marker is left in place so the operator can act on it.
-    assert store.read() == 4242
+    assert store.read() == 200
 
 
-def test_reconcile_proceeds_when_prior_pid_dead(tmp_path: Path) -> None:
+def test_reconcile_reaps_verified_orphan_when_owner_dead(tmp_path: Path) -> None:
     store = OwnedPidStore(tmp_path)
-    store.write(4242)
+    _write_record(store, owner_pid=100, owner_ct=111, excel_pid=200, excel_ct=222)
+    terminated: list[int] = []
 
-    reason = _reconcile_prior_owned_pid(store, pid_alive=lambda _pid: False)
+    reason = _reconcile(
+        store,
+        alive={100: False, 200: True},
+        create={100: 111, 200: 222},
+        image={100: _PY_EXE, 200: _EXCEL_EXE},
+        terminated=terminated,
+        terminate_ok=True,
+    )
+
+    assert reason is None, "a verified orphan is reaped and startup proceeds"
+    assert terminated == [200], "exactly the verified orphan pid is terminated"
+    assert store.read() is None, "the marker is cleared after the confirmed reap"
+
+
+def test_reconcile_refuses_when_orphan_kill_fails(tmp_path: Path) -> None:
+    store = OwnedPidStore(tmp_path)
+    _write_record(store, owner_pid=100, owner_ct=111, excel_pid=200, excel_ct=222)
+    terminated: list[int] = []
+
+    reason = _reconcile(
+        store,
+        alive={100: False, 200: True},
+        create={100: 111, 200: 222},
+        image={100: _PY_EXE, 200: _EXCEL_EXE},
+        terminated=terminated,
+        terminate_ok=False,  # kill failed, orphan still alive
+    )
+
+    assert reason is not None
+    assert terminated == [200]
+    assert store.read() == 200, "a still-alive orphan keeps the marker (no double launch)"
+
+
+def test_reconcile_pid_reuse_create_time_mismatch_does_not_kill(tmp_path: Path) -> None:
+    store = OwnedPidStore(tmp_path)
+    _write_record(store, owner_pid=100, owner_ct=111, excel_pid=200, excel_ct=222)
+    terminated: list[int] = []
+
+    reason = _reconcile(
+        store,
+        alive={100: False, 200: True},
+        create={100: 111, 200: 999},  # excel create-time mismatch => reused pid
+        image={100: _PY_EXE, 200: _EXCEL_EXE},
+        terminated=terminated,
+    )
+
+    assert reason is not None, "an unverifiable EXCEL.EXE is refused, not killed"
+    assert terminated == [], "never kill on pid-alone / create-time mismatch"
+    assert store.read() == 200
+
+
+def test_reconcile_pid_reused_by_non_excel_clears_and_proceeds(tmp_path: Path) -> None:
+    store = OwnedPidStore(tmp_path)
+    _write_record(store, owner_pid=100, owner_ct=111, excel_pid=200, excel_ct=222)
+    terminated: list[int] = []
+
+    reason = _reconcile(
+        store,
+        alive={100: False, 200: True},
+        create={100: 111, 200: 999},
+        image={100: _PY_EXE, 200: r"C:\Windows\NOTEPAD.EXE"},
+        terminated=terminated,
+    )
+
+    assert reason is None, "a non-Excel reuse is not our orphan; proceed"
+    assert terminated == [], "never kill a non-Excel pid"
+    assert store.read() is None, "the stale marker is cleared"
+
+
+def test_reconcile_proceeds_when_prior_excel_dead(tmp_path: Path) -> None:
+    store = OwnedPidStore(tmp_path)
+    _write_record(store, owner_pid=100, owner_ct=111, excel_pid=200, excel_ct=222)
+
+    reason = _reconcile(
+        store,
+        alive={100: False, 200: False},
+        create={100: 111, 200: 222},
+        image={100: _PY_EXE, 200: _EXCEL_EXE},
+    )
 
     assert reason is None
     assert store.read() is None, "a dead prior pid marker is cleared so startup proceeds"
 
 
-def test_reconcile_proceeds_when_no_prior_pid(tmp_path: Path) -> None:
+def test_reconcile_proceeds_when_no_prior_record(tmp_path: Path) -> None:
     store = OwnedPidStore(tmp_path)
 
-    reason = _reconcile_prior_owned_pid(store, pid_alive=lambda _pid: True)
+    reason = _reconcile(store, alive={}, create={}, image={})
 
     assert reason is None
 
 
 def test_owned_pid_store_round_trips(tmp_path: Path) -> None:
     store = OwnedPidStore(tmp_path)
-    assert store.read() is None
-    store.write(1234)
+    assert store.read_record() is None
+    _write_record(store, owner_pid=100, owner_ct=111, excel_pid=1234, excel_ct=222)
+    record = store.read_record()
+    assert record is not None
+    assert isinstance(record, OwnedProcessRecord)
+    assert record.excel.pid == 1234
+    assert record.owner.pid == 100
+    assert record.excel.create_time_filetime == 222
+    # Full owner + excel identity survives the round trip (G2a): exe, session id and
+    # the owner create-time must persist so the reconcile can verify identity.
+    assert record.owner.create_time_filetime == 111
+    assert record.owner.exe == _PY_EXE
+    assert record.excel.exe == _EXCEL_EXE
+    assert record.owner.session_id == 1
+    assert record.excel.session_id == 1
+    assert record.excel.image_verified is True
     assert store.read() == 1234
     store.clear()
     assert store.read() is None
+
+
+def test_owned_pid_store_reads_legacy_pid_only(tmp_path: Path) -> None:
+    store = OwnedPidStore(tmp_path)
+    store.path.write_text('{"owned_pid": 1234, "updated_at": "x"}', encoding="utf-8")
+    record = store.read_record()
+    assert record is not None
+    assert record.excel.pid == 1234
+    assert record.owner.pid == 0, "a legacy record has no owner identity"
+    assert record.excel.create_time_filetime is None
+    assert store.read() == 1234
 
 
 def test_owned_pid_store_ignores_malformed(tmp_path: Path) -> None:
     store = OwnedPidStore(tmp_path)
     store.path.write_text("{not json", encoding="utf-8")
     assert store.read() is None
+    assert store.read_record() is None
 
 
 # ---------------------------------------------------------------------------
@@ -439,39 +778,73 @@ class _StartRecorder:
         return SimpleNamespace(owned_pid=self.owned_pid)
 
 
-async def test_start_worker_guarded_skips_start_when_prior_pid_alive(tmp_path: Path) -> None:
+def _patch_adapter_probes(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    alive: dict[int, bool],
+    create: dict[int, int | None],
+    image: dict[int, str | None],
+    terminate_ok: bool = True,
+) -> None:
+    monkeypatch.setattr(
+        ExcelAppAdapter, "_pid_alive", staticmethod(lambda pid: alive.get(pid, False))
+    )
+    monkeypatch.setattr(
+        ExcelAppAdapter,
+        "_process_create_time_filetime",
+        staticmethod(lambda pid: create.get(pid)),
+    )
+    monkeypatch.setattr(
+        ExcelAppAdapter, "_image_name_of_pid", staticmethod(lambda pid: image.get(pid))
+    )
+    monkeypatch.setattr(
+        ExcelAppAdapter, "_terminate_pid_verified", staticmethod(lambda _pid: terminate_ok)
+    )
+    monkeypatch.setattr(
+        ExcelAppAdapter,
+        "_capture_process_identity",
+        staticmethod(lambda pid: (create.get(pid), image.get(pid), 1)),
+    )
+
+
+async def test_start_worker_guarded_skips_start_when_prior_owner_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = OwnedPidStore(tmp_path)
-    store.write(4242)  # a prior owned pid
+    _write_record(store, owner_pid=100, owner_ct=111, excel_pid=200, excel_ct=222)
+    _patch_adapter_probes(
+        monkeypatch,
+        alive={100: True, 200: True},
+        create={100: 111, 200: 222},
+        image={100: _PY_EXE, 200: _EXCEL_EXE},
+    )
     worker = _StartRecorder()
     runtime = SimpleNamespace(worker=worker)
 
-    refusal = await _start_worker_guarded(
-        runtime,  # type: ignore[arg-type]
-        store,
-        pid_alive=lambda _pid: True,  # prior pid is still alive
-    )
+    refusal = await _start_worker_guarded(runtime, store)  # type: ignore[arg-type]
 
-    assert refusal is not None, "a live prior pid must surface a refusal"
+    assert refusal is not None, "a live prior owner must surface a refusal"
     assert worker.started is False, "second launch prevented: worker.start() not awaited"
 
 
-async def test_start_worker_guarded_starts_and_persists_when_prior_pid_dead(
-    tmp_path: Path,
+async def test_start_worker_guarded_starts_and_persists_when_prior_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = OwnedPidStore(tmp_path)
-    store.write(4242)
+    _write_record(store, owner_pid=100, owner_ct=111, excel_pid=200, excel_ct=222)
+    _patch_adapter_probes(monkeypatch, alive={}, create={}, image={})
     worker = _StartRecorder(owned_pid=7777)
     runtime = SimpleNamespace(worker=worker)
 
-    refusal = await _start_worker_guarded(
-        runtime,  # type: ignore[arg-type]
-        store,
-        pid_alive=lambda _pid: False,  # prior pid is dead
-    )
+    refusal = await _start_worker_guarded(runtime, store)  # type: ignore[arg-type]
 
     assert refusal is None
-    assert worker.started is True, "a dead prior pid must allow the (single) launch"
-    assert store.read() == 7777, "the freshly launched owned pid is persisted"
+    assert worker.started is True, "a dead prior owner must allow the (single) launch"
+    record = store.read_record()
+    assert record is not None and record.excel.pid == 7777, (
+        "the freshly launched owned pid is persisted with owner identity"
+    )
+    assert record.owner.pid != 0, "the owner (this server) identity is recorded"
 
 
 # ---------------------------------------------------------------------------
@@ -557,9 +930,272 @@ def test_create_hidden_with_hwnd_zero_has_no_handle(
             object.__setattr__(self, name, value)
 
     monkeypatch.setattr("win32com.client.DispatchEx", lambda _prog: _ZeroHwndApp(), raising=False)
+    # No job layer in this unit path (job behaviour is covered separately).
+    monkeypatch.setattr(ExcelAppAdapter, "_create_job_object", staticmethod(lambda: None))
 
     adapter.create_hidden()
 
     assert adapter.owned_pid is None
     assert adapter.owned_handle is None
     assert adapter.recovery_available is False
+    assert adapter.job_protected is False
+
+
+# ---------------------------------------------------------------------------
+# G1: the REAL _assign_process_to_job (win32job/win32api faked via sys.modules)
+# ---------------------------------------------------------------------------
+def _install_fake_win32(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    in_job: bool,
+    assign_raises: bool = False,
+) -> dict[str, list[Any]]:
+    """Install fake ``win32api`` / ``win32job`` modules; return a call log.
+
+    ``_assign_process_to_job`` imports both modules at call time, so injecting them
+    into ``sys.modules`` exercises the real production control flow (open assign
+    handle -> assign -> close -> open query handle -> IsProcessInJob) without any
+    real process or job.
+    """
+
+    calls: dict[str, list[Any]] = {"assign": [], "open": [], "close": []}
+
+    fake_api = types.ModuleType("win32api")
+
+    def _open_process(access: int, _inherit: bool, pid: int) -> object:
+        calls["open"].append((access, pid))
+        return object()
+
+    def _close_handle(handle: object) -> None:
+        calls["close"].append(handle)
+
+    fake_api.OpenProcess = _open_process  # type: ignore[attr-defined]
+    fake_api.CloseHandle = _close_handle  # type: ignore[attr-defined]
+
+    fake_job = types.ModuleType("win32job")
+
+    def _assign(job: object, handle: object) -> None:
+        calls["assign"].append((job, handle))
+        if assign_raises:
+            raise OSError("assign denied")
+
+    def _is_in_job(_handle: object, _job: object) -> bool:
+        return in_job
+
+    fake_job.AssignProcessToJobObject = _assign  # type: ignore[attr-defined]
+    fake_job.IsProcessInJob = _is_in_job  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "win32api", fake_api)
+    monkeypatch.setitem(sys.modules, "win32job", fake_job)
+    return calls
+
+
+def test_assign_process_to_job_true_when_isprocessinjob_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _install_fake_win32(monkeypatch, in_job=True)
+    job = object()
+
+    assert ExcelAppAdapter._assign_process_to_job(job, 4242) is True
+    # The owned pid was assigned into the given job, and both handles were closed.
+    assert calls["assign"] and calls["assign"][0][0] is job
+    assert len(calls["close"]) == 2, "assign + query handles are both closed"
+
+
+def test_assign_process_to_job_false_when_isprocessinjob_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_win32(monkeypatch, in_job=False)
+
+    assert ExcelAppAdapter._assign_process_to_job(object(), 4242) is False
+
+
+def test_assign_process_to_job_fails_closed_when_assign_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _install_fake_win32(monkeypatch, in_job=True, assign_raises=True)
+
+    assert ExcelAppAdapter._assign_process_to_job(object(), 4242) is False
+    assert calls["assign"], "AssignProcessToJobObject was attempted before failing"
+
+
+def test_assign_process_to_job_false_when_openprocess_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_api = types.ModuleType("win32api")
+
+    def _deny(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("access denied")
+
+    fake_api.OpenProcess = _deny  # type: ignore[attr-defined]
+    fake_api.CloseHandle = lambda _h: None  # type: ignore[attr-defined]
+    fake_job = types.ModuleType("win32job")
+    monkeypatch.setitem(sys.modules, "win32api", fake_api)
+    monkeypatch.setitem(sys.modules, "win32job", fake_job)
+
+    assert ExcelAppAdapter._assign_process_to_job(object(), 4242) is False
+
+
+# ---------------------------------------------------------------------------
+# G2b: session_id is enforced in the reconcile identity (cross-session guard)
+# ---------------------------------------------------------------------------
+def test_reconcile_refuses_cross_session_orphan(tmp_path: Path) -> None:
+    store = OwnedPidStore(tmp_path)
+    _write_record(
+        store, owner_pid=100, owner_ct=111, excel_pid=200, excel_ct=222, excel_sess=5
+    )
+    terminated: list[int] = []
+
+    reason = _reconcile(
+        store,
+        alive={100: False, 200: True},
+        create={100: 111, 200: 222},
+        image={100: _PY_EXE, 200: _EXCEL_EXE},
+        terminated=terminated,
+        current_session_id=lambda: 7,  # this server is in a different session
+    )
+
+    assert reason is not None
+    assert "session" in reason.lower()
+    assert terminated == [], "never kill a cross-session process"
+    assert store.read() == 200, "the marker is kept for an operator decision"
+
+
+def test_reconcile_reaps_same_session_orphan(tmp_path: Path) -> None:
+    store = OwnedPidStore(tmp_path)
+    _write_record(
+        store, owner_pid=100, owner_ct=111, excel_pid=200, excel_ct=222, excel_sess=5
+    )
+    terminated: list[int] = []
+
+    reason = _reconcile(
+        store,
+        alive={100: False, 200: True},
+        create={100: 111, 200: 222},
+        image={100: _PY_EXE, 200: _EXCEL_EXE},
+        terminated=terminated,
+        current_session_id=lambda: 5,  # same session => safe to reap
+    )
+
+    assert reason is None
+    assert terminated == [200]
+    assert store.read() is None
+
+
+def test_reconcile_unknown_session_falls_back_to_create_time(tmp_path: Path) -> None:
+    store = OwnedPidStore(tmp_path)
+    _write_record(
+        store, owner_pid=100, owner_ct=111, excel_pid=200, excel_ct=222, excel_sess=5
+    )
+    terminated: list[int] = []
+
+    # current_session_id None => the session check is skipped; the create-time /
+    # image gate still governs, so a verified orphan is reaped.
+    reason = _reconcile(
+        store,
+        alive={100: False, 200: True},
+        create={100: 111, 200: 222},
+        image={100: _PY_EXE, 200: _EXCEL_EXE},
+        terminated=terminated,
+        current_session_id=None,
+    )
+
+    assert reason is None
+    assert terminated == [200]
+
+
+# ---------------------------------------------------------------------------
+# G3: _resolve_owned_pid_dir env + default_owned_pid_dir %LOCALAPPDATA%
+# ---------------------------------------------------------------------------
+def test_resolve_owned_pid_dir_honors_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from excel_vba_mcp.server import _resolve_owned_pid_dir
+
+    target = tmp_path / "custom_owned"
+    monkeypatch.setenv("EXCEL_VBA_MCP_OWNED_PID_DIR", str(target))
+    assert _resolve_owned_pid_dir() == target
+
+
+def test_resolve_owned_pid_dir_defaults_to_localappdata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from excel_vba_mcp.server import _resolve_owned_pid_dir
+    from excel_vba_mcp.storage.owned_pid_store import default_owned_pid_dir
+
+    monkeypatch.delenv("EXCEL_VBA_MCP_OWNED_PID_DIR", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    assert default_owned_pid_dir() == tmp_path / "excel-vba-mcp"
+    assert _resolve_owned_pid_dir() == tmp_path / "excel-vba-mcp"
+
+
+def test_default_owned_pid_dir_falls_back_to_temp(monkeypatch: pytest.MonkeyPatch) -> None:
+    import tempfile
+
+    from excel_vba_mcp.storage.owned_pid_store import default_owned_pid_dir
+
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    assert default_owned_pid_dir() == Path(tempfile.gettempdir()) / "excel-vba-mcp"
+
+
+# ---------------------------------------------------------------------------
+# G4: quit() closes the job AFTER reap_owned_pid; release() closes the job
+# ---------------------------------------------------------------------------
+def test_quit_closes_job_after_reap(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = ExcelAppAdapter()
+    order: list[str] = []
+
+    class _App:
+        DisplayAlerts = True
+
+        def Quit(self) -> None:  # noqa: N802 - COM casing
+            order.append("app_quit")
+
+    class _Job:
+        def Close(self) -> None:  # noqa: N802 - PyHANDLE casing
+            order.append("close_job")
+
+    adapter._app = _App()
+    adapter._owned_pid = 4242
+    adapter._owned_handle = _FakeHandle()
+    adapter._job_handle = _Job()
+    monkeypatch.setattr(adapter, "reap_owned_pid", lambda _pid: order.append("reap") or True)
+
+    adapter.quit()
+
+    assert "reap" in order and "close_job" in order, order
+    assert order.index("reap") < order.index("close_job"), (
+        f"the job must close AFTER the reap attempt: {order}"
+    )
+    assert adapter.job_handle is None
+
+
+def test_release_closes_job() -> None:
+    adapter = ExcelAppAdapter()
+    closed: list[bool] = []
+
+    class _Job:
+        def Close(self) -> None:  # noqa: N802 - PyHANDLE casing
+            closed.append(True)
+
+    adapter._job_handle = _Job()
+    adapter.release()
+
+    assert closed == [True]
+    assert adapter.job_handle is None
+
+
+# ---------------------------------------------------------------------------
+# G5: job_protected is False when the job handle is reduced to int
+# ---------------------------------------------------------------------------
+def test_job_protected_false_when_handle_reduced_to_int() -> None:
+    adapter = ExcelAppAdapter()
+
+    adapter._job_handle = 123  # a reduced int, not a live object
+    assert adapter.job_protected is False
+
+    adapter._job_handle = None
+    assert adapter.job_protected is False
+
+    adapter._job_handle = _FakeHandle()
+    assert adapter.job_protected is True

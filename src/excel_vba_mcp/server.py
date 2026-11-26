@@ -189,7 +189,11 @@ from excel_vba_mcp.security.audit import AuditLogger
 from excel_vba_mcp.security.path_policy import PathPolicy
 from excel_vba_mcp.storage.artifact_store import ARTIFACT_ROOT_NAME, ArtifactStore
 from excel_vba_mcp.storage.job_store import JobStore
-from excel_vba_mcp.storage.owned_pid_store import OwnedPidStore
+from excel_vba_mcp.storage.owned_pid_store import (
+    OwnedPidStore,
+    build_owned_record,
+    default_owned_pid_dir,
+)
 from excel_vba_mcp.storage.run_repository import RunRepository
 from excel_vba_mcp.storage.snapshot_store import SnapshotStore
 
@@ -203,6 +207,7 @@ _ENV_SNAPSHOT_DIR = "EXCEL_VBA_MCP_SNAPSHOT_DIR"
 _ENV_ARTIFACT_DIR = "EXCEL_VBA_MCP_ARTIFACT_DIR"
 _ENV_RUN_DIR = "EXCEL_VBA_MCP_RUN_DIR"
 _ENV_JOB_DIR = "EXCEL_VBA_MCP_JOB_DIR"
+_ENV_OWNED_PID_DIR = "EXCEL_VBA_MCP_OWNED_PID_DIR"
 
 # Tool descriptions surfaced over MCP (kept explicit for a stable contract).
 _DESC_OPEN = (
@@ -825,6 +830,20 @@ def _resolve_runtime_path(env_name: str, default: Path) -> Path:
     return Path(raw) if raw else default
 
 
+def _resolve_owned_pid_dir() -> Path:
+    """Resolve the stable per-user directory for the ownership marker.
+
+    Honors ``EXCEL_VBA_MCP_OWNED_PID_DIR`` when set (a non-volatile root); otherwise
+    uses :func:`default_owned_pid_dir` (``%LOCALAPPDATA%\\excel-vba-mcp``). This is
+    deliberately **not** the volatile per-work ``%TEMP%`` working-copy dir so the
+    marker survives a server restart / logoff-logon and the next start can reconcile
+    an orphaned owned Excel precisely.
+    """
+
+    raw = os.environ.get(_ENV_OWNED_PID_DIR, "").strip()
+    return Path(raw) if raw else default_owned_pid_dir()
+
+
 def _build_runtime(config: Config) -> _Runtime:
     """Construct the Excel runtime from environment + typed configuration."""
 
@@ -846,6 +865,7 @@ def _build_runtime(config: Config) -> _Runtime:
         audit,
         work_dir=_resolve_runtime_path(_ENV_WORK_DIR, _default_work_dir()),
         open_timeout_s=config.server.open_timeout_s,
+        owned_pid_dir=_resolve_owned_pid_dir(),
     )
     snapshot = SnapshotService(
         SnapshotStore(_resolve_runtime_path(_ENV_SNAPSHOT_DIR, _default_snapshot_dir())),
@@ -1014,16 +1034,17 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         params={"access_mode": config.server.access_mode.value},
         result={"version": __version__},
     )
-    # Startup reconcile (Block A #4): if a prior owned Excel pid is still alive,
-    # do NOT launch a second Excel — surface it and require an operator/agent
-    # decision (recover/adopt or restart). Never silently start a second instance.
-    pid_store = OwnedPidStore(runtime.session.work_dir)
+    # Startup reconcile (Block A #4 + lifecycle): if a prior owned Excel is still
+    # alive AND owned by a live server (identity match) do NOT launch a second
+    # Excel — surface it and require an operator/agent decision. If the owner is
+    # dead but the owned Excel is a verified orphan, reap exactly that orphan
+    # (pid + create-time + image verified) and proceed. Never a wildcard; never kill
+    # on pid-alone.
+    pid_store = OwnedPidStore(_resolve_owned_pid_dir())
     refusal: str | None = None
     start_error: Exception | None = None
     try:
-        refusal = await _start_worker_guarded(
-            runtime, pid_store, pid_alive=ExcelAppAdapter._pid_alive
-        )
+        refusal = await _start_worker_guarded(runtime, pid_store)
     except Exception as exc:  # noqa: BLE001 - degrade gracefully, never crash stdio
         start_error = exc
     if refusal is not None:
@@ -1084,62 +1105,205 @@ async def _safe_shutdown(worker: ExcelComWorker) -> None:
         logger.warning("Excel worker shutdown error: %s", exc)
 
 
+def _exe_basename(path: str) -> str:
+    return path.replace("/", "\\").rsplit("\\", 1)[-1].strip().lower()
+
+
+def _exe_matches(expected: str | None, actual: str | None) -> bool:
+    """Whether two image paths refer to the same exe (basename, case-insensitive).
+
+    An unknown ``expected`` (legacy record) or an unreadable ``actual`` never blocks
+    the match — the create-time is the strong identity signal; the exe is a
+    secondary confirmation.
+    """
+
+    if expected is None or actual is None:
+        return True
+    return _exe_basename(expected) == _exe_basename(actual)
+
+
 def _reconcile_prior_owned_pid(
     store: OwnedPidStore,
     *,
     pid_alive: Callable[[int], bool],
+    create_time: Callable[[int], int | None],
+    image_name: Callable[[int], str | None],
+    terminate_verified: Callable[[int], bool],
+    current_session_id: Callable[[], int | None] | None = None,
 ) -> str | None:
-    """Decide whether it is safe to start the worker (Block A #4).
+    """Decide whether it is safe to start the worker, reaping a verified orphan.
 
-    Reads the persisted prior owned pid; if it is still alive the server **must
-    not** start a second Excel — a human-readable refusal reason is returned so the
-    lifespan surfaces it (log + audit) and skips ``worker.start()``. When the prior
-    pid is dead (or absent) the stale marker is cleared and ``None`` is returned so
-    startup proceeds normally.
+    Reads the persisted ownership record and applies the lifecycle reconcile:
 
-    Pure and side-effect-free except for clearing a dead marker, so it is unit
-    tested without launching Excel (the ``pid_alive`` probe is injected).
+    * **Owner alive + identity match** (pid + create-time + exe) => the prior server
+      still owns its Excel; **refuse** a second launch (return a reason).
+    * **Owner dead + owned Excel alive + identity verified** (image ``EXCEL.EXE`` +
+      create-time match + **same Windows session**) => the prior server was
+      tree-killed / crashed and left an orphan; **terminate exactly that orphan**
+      (``terminate_verified`` — pid + create-time + image gated, never a wildcard),
+      confirm death, clear the marker and proceed.
+    * **Cross-session orphan** (owner dead, Excel verified, but the record's
+      ``excel.session_id`` differs from ``current_session_id()``) => the orphan lives
+      in a different Windows session; **refuse** (never kill a cross-session process,
+      keep the marker) — an operator/agent decision is required.
+    * **Pid reuse** (owner or excel create-time mismatch, or the excel pid is now a
+      non-Excel process) => **never kill on pid-alone**; clear a stale marker and
+      proceed, or refuse when an alive ``EXCEL.EXE`` cannot be identity-verified.
+
+    Pure except for the injected probes, the orphan termination and clearing a dead
+    marker, so it is unit tested without launching Excel.
+
+    Args:
+        current_session_id: Optional probe returning this server's current Windows
+            session id. When ``None`` (or it returns ``None``) the session check is
+            skipped (unknown session => fall back to the create-time/image gate). A
+            known mismatch blocks the kill conservatively.
 
     Returns:
         ``None`` when startup may proceed, or a refusal reason string when a prior
-        owned Excel pid is still alive.
+        owned Excel is still owned by a live server (or an unverifiable / cross-session
+        Excel is alive and must not be killed / double-launched).
     """
 
-    prior_pid = store.read()
-    if prior_pid is not None and pid_alive(prior_pid):
+    record = store.read_record()
+    if record is None:
+        return None
+
+    owner = record.owner
+    excel = record.excel
+
+    # --- Owner liveness + identity (pid + create-time + exe) ---
+    owner_pid_alive = owner.pid > 0 and pid_alive(owner.pid)
+    owner_create_ok = (
+        owner.create_time_filetime is None
+        or create_time(owner.pid) == owner.create_time_filetime
+    )
+    owner_exe_ok = _exe_matches(owner.exe, image_name(owner.pid))
+    if owner.pid > 0 and owner_pid_alive and owner_create_ok and owner_exe_ok:
         return (
-            f"prior owned Excel pid {prior_pid} is still alive; refusing to start a "
-            "second Excel instance — an operator/agent decision is required "
-            "(recover/adopt the existing instance, or restart the server)"
+            f"prior owned Excel pid {excel.pid} is still owned by live server pid "
+            f"{owner.pid}; refusing to start a second Excel instance — an "
+            "operator/agent decision is required (recover/adopt it, or restart)"
         )
-    store.clear()
-    return None
+
+    # --- Owner is dead (or its pid was reused by a different process) ---
+    if not (excel.pid > 0 and pid_alive(excel.pid)):
+        # Nothing left to reap: a dead owned pid must not block a fresh start.
+        store.clear()
+        return None
+
+    # The owned Excel pid is alive but the owner is dead => likely orphan. Verify
+    # identity before any kill (never kill on pid-alone).
+    excel_is_excel = _exe_basename(image_name(excel.pid) or "") == "excel.exe"
+    if not excel_is_excel:
+        # The recorded pid is now a different (non-Excel) process: pid reuse. Never
+        # kill it; clear the stale marker and proceed.
+        logger.warning(
+            "owned pid marker excel pid %d is alive but not EXCEL.EXE (pid reuse); "
+            "clearing marker and proceeding",
+            excel.pid,
+        )
+        store.clear()
+        return None
+
+    excel_create_ok = (
+        excel.create_time_filetime is not None
+        and create_time(excel.pid) == excel.create_time_filetime
+    )
+    if not excel_create_ok:
+        # An EXCEL.EXE is alive on the recorded pid but its create-time does not
+        # match the record (or is unknown): cannot verify it is our orphan. Never
+        # kill an unverified process and never double-launch — refuse.
+        return (
+            f"prior owned Excel pid {excel.pid} is alive (EXCEL.EXE) but its "
+            "identity could not be verified (create-time mismatch/unknown); "
+            "refusing to start a second Excel and refusing to kill an unverified "
+            "process — an operator/agent decision is required"
+        )
+
+    # Verified orphan: owner dead, image EXCEL.EXE, create-time matches. Before any
+    # kill, enforce the session boundary: if the record's excel session id is known
+    # and differs from this server's current session, the orphan lives in a different
+    # Windows session — never kill cross-session; refuse conservatively (keep marker).
+    current_sess = current_session_id() if current_session_id is not None else None
+    if (
+        excel.session_id is not None
+        and current_sess is not None
+        and excel.session_id != current_sess
+    ):
+        logger.warning(
+            "owned Excel pid %d is in session %d but this server is in session %d; "
+            "refusing to kill a cross-session process",
+            excel.pid,
+            excel.session_id,
+            current_sess,
+        )
+        return (
+            f"prior owned Excel pid {excel.pid} is alive in Windows session "
+            f"{excel.session_id} but this server is in session {current_sess}; "
+            "refusing to kill a cross-session process — an operator/agent decision "
+            "is required"
+        )
+
+    # Verified orphan in the same session: terminate exactly that pid (image-gated)
+    # and confirm death before clearing the marker.
+    terminated = terminate_verified(excel.pid)
+    still_alive = pid_alive(excel.pid)
+    if terminated and not still_alive:
+        logger.warning(
+            "reaped verified orphaned owned Excel pid %d (owner pid %d dead); "
+            "clearing marker and proceeding",
+            excel.pid,
+            owner.pid,
+        )
+        store.clear()
+        return None
+    return (
+        f"verified orphaned owned Excel pid {excel.pid} could not be terminated "
+        f"(terminated={terminated}, still_alive={still_alive}); refusing to start "
+        "a second Excel — an operator/agent decision is required"
+    )
 
 
-async def _start_worker_guarded(
-    runtime: _Runtime,
-    store: OwnedPidStore,
-    *,
-    pid_alive: Callable[[int], bool],
-) -> str | None:
-    """Reconcile-then-start the worker (Block A #4), returning a refusal or ``None``.
+async def _start_worker_guarded(runtime: _Runtime, store: OwnedPidStore) -> str | None:
+    """Reconcile-then-start the worker, returning a refusal or ``None``.
 
-    When a prior owned Excel pid is still alive the worker is **not** started and a
-    refusal reason is returned (the caller surfaces it and skips publishing services),
-    so a second Excel is never silently launched. Otherwise the worker is started and
-    the freshly launched owned pid is persisted for the next startup reconcile.
-
-    A ``worker.start()`` failure propagates to the caller (which degrades gracefully +
-    safe-shuts the worker); it is not a reconcile refusal.
+    Reconciles the prior ownership record (refuse a live owner; reap a verified
+    orphan; clear a stale marker). When startup may proceed the worker is started
+    and the freshly launched owned pid + owner identity is persisted for the next
+    startup reconcile. A ``worker.start()`` failure propagates to the caller (which
+    degrades gracefully + safe-shuts the worker); it is not a reconcile refusal.
     """
 
-    refusal = _reconcile_prior_owned_pid(store, pid_alive=pid_alive)
+    adapter = ExcelAppAdapter
+    refusal = _reconcile_prior_owned_pid(
+        store,
+        pid_alive=adapter._pid_alive,
+        create_time=adapter._process_create_time_filetime,
+        image_name=adapter._image_name_of_pid,
+        terminate_verified=adapter._terminate_pid_verified,
+        current_session_id=lambda: adapter._capture_process_identity(os.getpid())[2],
+    )
     if refusal is not None:
         return refusal
     await runtime.worker.start()
     new_pid = runtime.worker.get_status().owned_pid
     if new_pid is not None:
-        store.write(new_pid)
+        owner_pid = os.getpid()
+        o_ct, o_exe, o_sess = adapter._capture_process_identity(owner_pid)
+        e_ct, e_exe, e_sess = adapter._capture_process_identity(new_pid)
+        store.write_record(
+            build_owned_record(
+                owner_pid=owner_pid,
+                excel_pid=new_pid,
+                owner_create_time=o_ct,
+                owner_exe=o_exe,
+                owner_session_id=o_sess,
+                excel_create_time=e_ct,
+                excel_exe=e_exe,
+                excel_session_id=e_sess,
+            )
+        )
     return None
 
 

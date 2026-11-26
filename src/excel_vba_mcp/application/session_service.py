@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import os
 import shutil
 import tempfile
 from collections.abc import Mapping
@@ -63,7 +64,10 @@ from excel_vba_mcp.security.approval import ApprovalKey, ApprovalPolicy
 from excel_vba_mcp.security.audit import AuditLogger
 from excel_vba_mcp.security.macro_policy import automation_security_for
 from excel_vba_mcp.security.path_policy import PathPolicy
-from excel_vba_mcp.storage.owned_pid_store import OwnedPidStore
+from excel_vba_mcp.storage.owned_pid_store import (
+    OwnedPidStore,
+    build_owned_record,
+)
 
 if TYPE_CHECKING:
     from excel_vba_mcp.application.job_registry import JobRegistry
@@ -107,7 +111,11 @@ class SessionService:
             the server may override it with a configured artifact root.
         open_timeout_s: Server-side deadline (seconds) for the ``excel_open`` STA
             open (Block E). This is the per-op-class server authority for the open
-            path; the server threads ``ServerConfig.open_timeout_s`` here.
+            path.
+        owned_pid_dir: Directory for the startup-reconcile ownership marker. When
+            ``None`` it defaults to ``work_dir`` (isolated temp in tests); the
+            server passes a stable per-user directory so the marker survives a
+            restart / logoff-logon.
     """
 
     def __init__(
@@ -120,6 +128,7 @@ class SessionService:
         *,
         work_dir: Path | None = None,
         open_timeout_s: float = _DEFAULT_TIMEOUT_S,
+        owned_pid_dir: Path | None = None,
     ) -> None:
         self._worker = worker
         self._app_adapter = app_adapter
@@ -145,8 +154,10 @@ class SessionService:
         self._work_dir = work_dir or (Path(tempfile.gettempdir()) / "excel_vba_mcp" / _WORK_SUBDIR)
         # Startup-reconcile store for the owned Excel pid (Block A): written after a
         # successful (re)launch and cleared on close, so the next server start can
-        # detect a leftover live instance and refuse to start a second Excel.
-        self._owned_pid_store = OwnedPidStore(self._work_dir)
+        # detect a leftover live instance and refuse to start a second Excel. The
+        # marker lives in a stable per-user dir (owned_pid_dir) so it survives a
+        # restart; tests pass an isolated temp dir.
+        self._owned_pid_store = OwnedPidStore(owned_pid_dir or self._work_dir)
         # Optional job registry (Block F): published by the server so a successful
         # recovery can finalize in-flight jobs to INTERRUPTED_UNKNOWN. ``None`` in
         # minimal/embedder use (recovery then leaves jobs untouched).
@@ -869,17 +880,33 @@ class SessionService:
             jobs.mark_interrupted(reason="recovery")
 
     def _persist_owned_pid(self, owned_pid: int | None) -> None:
-        """Persist the current owned pid for the next startup reconcile (Block A).
+        """Persist the current owned pid + owner identity for startup reconcile.
 
         Centralized so every rebuild path (``recover_session`` lazy rebuild and
         ``recover_owned_process``) keeps the on-disk marker fresh; a ``None`` pid is
-        ignored. Best-effort: a persistence error must never fail a recovery.
+        ignored. The full owner+excel identity is recorded (create-time + image +
+        session) so the next startup reconcile can verify an orphan before killing
+        it and never kill on pid-alone. Best-effort: a persistence error must never
+        fail a recovery.
         """
 
         if owned_pid is None:
             return
         with contextlib.suppress(Exception):
-            self._owned_pid_store.write(owned_pid)
+            owner_pid = os.getpid()
+            o_ct, o_exe, o_sess = ExcelAppAdapter._capture_process_identity(owner_pid)
+            e_ct, e_exe, e_sess = ExcelAppAdapter._capture_process_identity(owned_pid)
+            record = build_owned_record(
+                owner_pid=owner_pid,
+                excel_pid=owned_pid,
+                owner_create_time=o_ct,
+                owner_exe=o_exe,
+                owner_session_id=o_sess,
+                excel_create_time=e_ct,
+                excel_exe=e_exe,
+                excel_session_id=e_sess,
+            )
+            self._owned_pid_store.write_record(record)
 
     def _finish_recovery(
         self,
