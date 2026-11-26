@@ -76,7 +76,7 @@ related:
   `controls_list`, `control_get`, `control_set_on_action`.
 - **VBA.** Инвентаризация проекта и компонентов, чтение исходников, поиск по коду, экспорт проекта,
   чтение ссылок, а также защищённые (guarded) замена и вставка исходников.
-- **Диагностика компиляции (fail-closed).** `vba_compile` и `vba_get_compile_diagnostics`
+- **Диагностика компиляции (fail-closed).** `vba_compile_diagnostics` и `vba_get_compile_diagnostics`
   возвращают частичные диагностические данные, но никогда не сообщают ложный успех.
 - **Макросы (под гейтом).** `macro_list`, `macro_run`, `macro_get_last_result`,
   `macro_classify_background`; запуск требует execute-режима, классификации `background_safe`
@@ -85,10 +85,9 @@ related:
   также действует approval-гейт.
 - **Снапшоты.** `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff`
   с манифестом и SHA-256.
-- **Декларативный тестовый раннер.** `test_run_suite`, `test_suite_run`, `test_get_run`
-  с закрытым словарём действий и проверок. `test_suite_run` — канон для нового кода (принимает
-  mapping и `background`); `test_run_suite` — устаревший typed-spec блокирующий раннер (без
-  `background`).
+- **Декларативный тестовый раннер.** `test_suite_run`, `test_get_run`
+  с закрытым словарём действий и проверок. `test_suite_run` — единственная каноническая точка входа
+  (принимает mapping или typed-spec, плюс `background`).
 - **Аудит и безопасность.** Журнал `audit.jsonl` (append-only), allowlist путей и
   политика доступа: полный доступ по умолчанию, режим `restricted` (deny-by-default approval)
   как явный opt-in.
@@ -123,9 +122,9 @@ related:
 4. **Снапшот перед изменением.** `snapshot_create` (для открытой книги используется
    `Workbook.SaveCopyAs`, для закрытой — копирование файла).
 5. **Экспорт VBA.** `vba_export_project` с сохранением манифеста и хэшей файлов.
-6. **Запуск декларативного теста.** `test_suite_run` (или `test_run_suite`) → при необходимости
+6. **Запуск декларативного теста.** `test_suite_run` → при необходимости
    `test_get_run` для чтения сохранённого прогона.
-7. **Диагностика состояния компиляции.** `vba_compile` / `vba_get_compile_diagnostics` —
+7. **Диагностика состояния компиляции.** `vba_compile_diagnostics` / `vba_get_compile_diagnostics` —
    получение статуса и частичных диагностических данных без запуска UI.
 
 Пошаговые примеры с аргументами приведены в [Рабочие процессы и примеры](07-workflows-and-examples.md).
@@ -139,7 +138,7 @@ related:
   В режиме `full` (по умолчанию) грант не нужен (мутации и execute-режим авторизованы); в режиме
   `restricted` действует deny-by-default и мутирующие/исполняющие операции отклоняются с
   `APPROVAL_DENIED`.
-- Не сообщает об успешной компиляции на валидированной сборке: `vba_compile` всегда возвращает
+- Не сообщает об успешной компиляции на валидированной сборке: `vba_compile_diagnostics` всегда возвращает
   `status=indeterminate` (`reason=NON_ACTIVATING_COMPILE_UNAVAILABLE`).
 - Не выполняет макросы без классификации `background_safe`, привязанной к текущему хэшу книги и
   ревизии исходников VBA; классификацию задаёт `macro_classify_background`. Интерактивные макросы

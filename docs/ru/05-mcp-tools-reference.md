@@ -60,7 +60,7 @@ related:
    `COM_BUSY`/`RPC_E_CALL_REJECTED` зарезервированы только для реальной конкуренции за COM.
    `MACRO_BLOCKED` — только для Office macro-security / не-execute контекстов. Потерянный
    owned-экземпляр Excel на обычных путях чтения/мутации сообщается как `WORKBOOK_NOT_FOUND`, а в
-   `macro_run` / `vba_compile` — как `EXCEL_HUNG` (`needs_recovery`), где требуется восстановление —
+   `macro_run` / `vba_compile_diagnostics` — как `EXCEL_HUNG` (`needs_recovery`), где требуется восстановление —
    кроме `macro_run`, который при зависании/таймауте восстанавливает сессию сам (F2b).
    В таблицах инструментов `COM_BUSY` у mutating-строки означает реальную конкуренцию, а не отказ
    approval, плохой id или конфликт ревизий.
@@ -78,28 +78,27 @@ related:
 
 | Класс | Кол-во | Поведение |
 |-------|--------|-----------|
-| `read-only` | 41 | Разрешён автоматически; не меняет книгу. Может писать файлы снапшотов, экспорта, артефактов и in-memory состояние классификации. |
+| `read-only` | 44 | Разрешён автоматически; не меняет книгу. Может писать файлы снапшотов, экспорта, артефактов и in-memory состояние классификации. |
 | `mutating` | 41 | Guarded: writable-сессия → снапшот → approval → проверки → postcondition + аудит. |
-| `executing` | 3 | Запускает код (`macro_run`, `test_run_suite`, `test_suite_run`); дополнительно gated approval (в режиме `restricted`) и `background_safe`. |
+| `executing` | 2 | Запускает код (`macro_run`, `test_suite_run`); дополнительно gated approval (в режиме `restricted`) и `background_safe`. |
 | `mixed` | 2 | `excel_open` и `excel_close`: класс зависит от параметров (`read_only`, `mode`, `save_changes`). |
+| `recovery` | 1 | `excel_recover`: agent-directed восстановление owned-процесса; allow-by-default в **обоих** режимах (`full` и `restricted`), аудируется, pid-scoped, originals-safe. |
 | `config` (bookkeeping) | 1 | `macro_classify_background`: меняет только in-memory состояние классификации (без изменения книги); ungated bookkeeping, границей безопасности остаётся `macro_run`. |
-| `executing` | 3 | Выполняет код (`macro_run`, `test_run_suite`, `test_suite_run`); дополнительно гейтится approval (в режиме `restricted`) и `background_safe`. |
-| `mixed` | 2 | `excel_open` и `excel_close`: класс зависит от параметров (`read_only`, `mode`, `save_changes`). |
 
 Важно различать «инструмент реализован» и «инструмент доступен через MCP». Все 41
-`mutating` и 3 `executing` инструмента существуют и описаны в справочнике. В режиме `full`
+`mutating` и 2 `executing` инструмента существуют и описаны в справочнике. В режиме `full`
 (по умолчанию) approval-гейт их авторизует (снапшот перед мутацией всё равно требуется); только в
 режиме `restricted` они отклоняются с `APPROVAL_DENIED`. Требование `background_safe` для
 `macro_run` действует в обоих режимах.
 
-**`vba_compile` — `read-only`, а не `executing`.** `vba_compile` отправляет свою STA-пробу с
+**`vba_compile_diagnostics` — `read-only`, а не `executing`.** `vba_compile_diagnostics` отправляет свою STA-пробу с
 `op_class=EXECUTING`, но этот тег управляет только **правом на повтор** (проба никогда слепо не
 повторяется после busy/timeout) и **аудиторской меткой `operation_class`** — он не управляет
 approval-гейтом. `CompileService` создаётся без `ApprovalPolicy` и никогда не вызывает approval-гейт,
-поэтому `vba_compile` **не гейтится approval**: он работает в обоих режимах (`full` и `restricted`),
+поэтому `vba_compile_diagnostics` **не гейтится approval**: он работает в обоих режимах (`full` и `restricted`),
 не мутирует и не активирует UI, никогда не меняет книгу и не показывает окна.
-`vba_get_compile_diagnostics` только читает кэш. Поэтому `vba_compile` учитывается как `read-only`
-и **не** входит в три `executing`-инструмента (`macro_run`, `test_run_suite`, `test_suite_run`),
+`vba_get_compile_diagnostics` только читает кэш. Поэтому `vba_compile_diagnostics` учитывается как `read-only`
+и **не** входит в два `executing`-инструмента (`macro_run`, `test_suite_run`),
 у которых класс `EXECUTING` действительно гейтит approval и выполняет пользовательский код.
 
 ## Сокращения
@@ -119,11 +118,12 @@ approval-гейтом. `CompileService` создаётся без `ApprovalPolic
 
 | Группа | Кол-во | Инструменты | Класс доступа |
 |--------|--------|-------------|----------------|
-| Workbook/session | 6 | `excel_open`, `excel_close`, `excel_save`, `excel_get_status`, `excel_list_workbooks`, `excel_health` | mixed / mutating / read-only |
+| Workbook/session | 7 | `excel_open`, `excel_close`, `excel_save`, `excel_get_status`, `excel_list_workbooks`, `excel_health`, `excel_recover` | mixed / mutating / read-only / recovery |
 | Snapshots | 4 | `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff` | read-only + 2 mutating |
-| Test runner | 3 | `test_run_suite`, `test_suite_run`, `test_get_run` | executing + read-only |
+| Test runner | 2 | `test_suite_run`, `test_get_run` | executing + read-only |
+| Jobs | 2 | `job_get`, `job_request_cancel` | read-only |
 | VBA | 9 | `vba_project_info`, `vba_list_components`, `vba_list_procedures`, `vba_read_component`, `vba_export_project`, `vba_get_references`, `vba_search_code`, `vba_replace_component_source`, `vba_insert_code` | read-only + 2 mutating |
-| Compile | 2 | `vba_compile`, `vba_get_compile_diagnostics` | read-only (см. примечание о классах доступа) |
+| Compile | 2 | `vba_compile_diagnostics`, `vba_get_compile_diagnostics` | read-only (см. примечание о классах доступа) |
 | Macros | 4 | `macro_list`, `macro_run`, `macro_get_last_result`, `macro_classify_background` | read-only + 1 executing + 1 config (bookkeeping) |
 | Sheets | 7 | `sheets_list`, `sheet_get`, `sheet_add`, `sheet_rename`, `sheet_copy`, `sheet_delete`, `sheet_set_visibility` | read-only + 5 mutating |
 | Tables | 11 | `tables_list`, `table_get`, `table_read_rows`, `table_append_rows`, `table_insert_row`, `table_update_rows`, `table_delete_rows`, `table_add_column`, `table_delete_column`, `table_create`, `table_resize` | read-only + 8 mutating |
@@ -134,9 +134,10 @@ approval-гейтом. `CompileService` создаётся без `ApprovalPolic
 | Controls | 3 | `controls_list`, `control_get`, `control_set_on_action` | read-only + 1 mutating |
 | Workbook model | 1 | `workbook_get_model` | read-only |
 | Health | 1 | `server_health` | read-only |
-| **Итого** | **88** | — | 41 read-only, 41 mutating, 3 executing, 2 mixed, 1 config (bookkeeping) |
+| Environment | 1 | `xlvba_environment` | read-only |
+| **Итого** | **91** | — | 44 read-only, 41 mutating, 2 executing, 2 mixed, 1 recovery, 1 config (bookkeeping) |
 
-Сумма по группам: 6 + 4 + 3 + 9 + 2 + 4 + 7 + 11 + 13 + 16 + 5 + 3 + 3 + 1 + 1 = **88**.
+Сумма по группам: 7 + 4 + 2 + 2 + 9 + 2 + 4 + 7 + 11 + 13 + 16 + 5 + 3 + 3 + 1 + 1 + 1 = **91**.
 
 ## Workbook/session
 
@@ -166,18 +167,16 @@ approval-гейтом. `CompileService` создаётся без `ApprovalPolic
 
 | Инструмент | Назначение | Параметры | Возврат | Побочные эффекты | Ошибки | Доступ |
 |------------|------------|-----------|---------|------------------|--------|--------|
-| `test_run_suite` | Запускает декларативный тестовый набор на одноразовых копиях книги (устаревший typed-spec блокирующий раннер). | `suite:TestSuiteSpec` | `TestRunResult` | Базовый снапшот, рабочие копии на каждый кейс, артефакты, `runs/`, аудит | `INVALID_RANGE`, `APPROVAL_DENIED` (restricted), `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED`, `EXCEL_HUNG` | executing |
-| `test_suite_run` | Явная точка входа (канон для нового кода): принимает набор объектом или JSON-подобным mapping, плюс `background`. | `suite:TestSuiteSpec` или `object`, `background:boolean=false?` | `TestRunResult` или `RunningJob` | То же, что `test_run_suite` | `INVALID_RANGE`, `APPROVAL_DENIED` (restricted), `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED` | executing |
+| `test_suite_run` | Каноническая точка входа: принимает набор объектом или JSON-подобным mapping, плюс `background`. | `suite:TestSuiteSpec` или `object`, `background:boolean=false?` | `TestRunResult` или `RunningJob` | Базовый снапшот, рабочие копии на каждый кейс, артефакты, `runs/`, аудит | `INVALID_RANGE`, `APPROVAL_DENIED` (restricted), `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED` | executing |
 | `test_get_run` | Возвращает сохранённый прогон по `run_id`. | `run_id:string` | `TestRunResult` | — | `ExcelVbaMcpError` (не найден) | read-only |
 
-Оба запускающих инструмента открывают рабочую копию в режиме `execute`. В режиме `full`
+Раннер открывает рабочую копию в режиме `execute`. В режиме `full`
 (по умолчанию) это авторизовано; в режиме `restricted` каждый кейс получает `blocked`
 (`APPROVAL_DENIED`), а набор — `blocked`. Шаг `macro_run` по неклассифицированной процедуре
 блокируется с `BACKGROUND_SAFETY_NOT_VERIFIED` в любом режиме.
 
-**Маршрутизация тест-инструментов.** `test_suite_run` — канон для нового кода (принимает
-mapping и `background`); `test_run_suite` — устаревший typed-spec блокирующий раннер и **не**
-принимает `background`. `test_suite_run` принимает `background=true`, чтобы promptly вернуть
+**Маршрутизация тест-инструментов.** `test_suite_run` — единственная каноническая точка входа
+(принимает mapping или typed-spec, плюс `background`). `test_suite_run` принимает `background=true`, чтобы promptly вернуть
 `RunningJob`; опрос — через `job_get`.
 
 ## VBA
@@ -210,10 +209,10 @@ Document-модули и UserForms отклоняются с `PROTECTED_TARGET`
 
 | Инструмент | Назначение | Параметры | Возврат | Побочные эффекты | Ошибки | Доступ |
 |------------|------------|-----------|---------|------------------|--------|--------|
-| `vba_compile` | Fail-closed результат компиляции; на валидированной сборке всегда `indeterminate`. | `workbook_id:string` | `CompileResult` | — (не запускает UI) | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
+| `vba_compile_diagnostics` | Fail-closed результат компиляции; на валидированной сборке всегда `indeterminate`. | `workbook_id:string` | `CompileResult` | — (не запускает UI) | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
 | `vba_get_compile_diagnostics` | Последние диагностические данные без повторного запуска. | `workbook_id:string` | `CompileDiagnostics` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
 
-STA-проба `vba_compile` помечается `op_class=EXECUTING` только для повтора/аудита; сам инструмент
+STA-проба `vba_compile_diagnostics` помечается `op_class=EXECUTING` только для повтора/аудита; сам инструмент
 `read-only` и не гейтится approval (см. примечание о классах доступа).
 
 ## Macros
@@ -785,7 +784,7 @@ edit→macro→edit→macro: шаг `macro_run` может нести необя
 ошибкой компиляции. Возврат — `TestRunResult` с per-case/per-step статусами; прогон
 сохраняется (`runs/`), читается через `test_get_run`.
 
-### vba_compile
+### vba_compile_diagnostics
 
 ```json
 { "workbook_id": "1f0c…" }
@@ -828,12 +827,12 @@ Fail-closed ответ:
 3. **`vba_list_components` / `vba_read_component` до `vba_replace_component_source` и
    `vba_insert_code`.** Нужны имя компонента и актуальный `source_hash` для
    `expected_source_hash`.
-4. **`vba_compile` до `vba_get_compile_diagnostics` — только чтобы «засеять» кэш.**
+4. **`vba_compile_diagnostics` до `vba_get_compile_diagnostics` — только чтобы «засеять» кэш.**
    Без первого вызова диагностика собирается заново; это не меняет результат
    (`is_compile=false`).
 5. **`macro_list` до `macro_run`.** Позволяет узнать точное имя `Module.Procedure` и
    статус `background_safe` до запуска.
-6. **`test_get_run` после `test_run_suite` / `test_suite_run`.** `run_id` берётся из
+6. **`test_get_run` после `test_suite_run`.** `run_id` берётся из
    `TestRunResult.test_run_id`; инструмент только читает сохранённый прогон.
 
 Дополнительно: `excel_close` (без сохранения) и `excel_save` несовместимы с последующими
@@ -855,7 +854,7 @@ Fail-closed ответ:
 | `range_delete` | Удаляет ячейки со сдвигом | Разрушительно, гейтится | Всегда задавать `shift` явно; проверять пересечение с таблицами |
 | `range_merge` | Объединяет ячейки, отбрасывая данные вне якоря | Может потерять данные | Просматривать `preconditions` и передавать `allow_data_loss=true` только после ревью |
 | `name_delete` | Удаляет определённое имя | Может сломать формулы | Проверять `names_list` и зависимости; полагаться на снапшот |
-| `vba_replace_component_source` | Полностью заменяет код модуля | `MUTATING`, гейтится | Передавать точный `expected_source_hash`; проверять `vba_compile` после |
+| `vba_replace_component_source` | Полностью заменяет код модуля | `MUTATING`, гейтится | Передавать точный `expected_source_hash`; проверять `vba_compile_diagnostics` после |
 | `vba_insert_code` | Вставляет код в модуль | `MUTATING`, гейтится | Указывать точную `position`; не вставлять код «наугад» |
 | `shape_set_on_action` | Назначает макрос фигуре | `MUTATING`, гейтится | Проверять `shapes_list`; пустой `macro_name` снимает назначение |
 | `control_set_on_action` | Назначает макрос Form Control | `MUTATING`, гейтится | Работать только с Form Control; ActiveX не поддерживается |
@@ -875,7 +874,7 @@ Fail-closed ответ:
 
 ## Известные ограничения инструментов
 
-1. **Компиляция всегда `indeterminate`.** `vba_compile` не может подтвердить компиляцию на
+1. **Компиляция всегда `indeterminate`.** `vba_compile_diagnostics` не может подтвердить компиляцию на
    валидированной сборке; `is_compile=false`.
 2. **Макросы требуют классификации `background_safe`.** `BackgroundSafetyRegistry` стартует
    пустым (fail-closed); классифицируйте процедуру через `macro_classify_background`.

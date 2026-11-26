@@ -433,7 +433,7 @@ sequenceDiagram
 - **Нет GUI.** Нет видимого окна, нет `.Activate`/`.Select`, нет `SendKeys`, нет
   интерактивных диалогов. `DisplayAlerts=False` не блокирует `MsgBox`, `UserForm.Show`,
   `FileDialog`, UI надстроек и Win32-диалоги.
-- **Компиляция fail-closed.** `vba_compile` на валидированной сборке всегда возвращает
+- **Компиляция fail-closed.** `vba_compile_diagnostics` на валидированной сборке всегда возвращает
   `status=indeterminate` и `reason=NON_ACTIVATING_COMPILE_UNAVAILABLE`; он никогда не
   сообщает `compiled`/`compile_error` и не показывает UI. Частичные диагностические данные
   (`is_compile=false`) — это не компиляция.

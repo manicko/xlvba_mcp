@@ -83,11 +83,11 @@ behavior as unproven until tested on a copy.
 | No import/export, print, PDF or email | No CSV import/export, PDF export, print, email or file-conversion tool. `vba_export_project` exports VBA source only. | Verified |
 | No events | No tool registers, lists or edits workbook/worksheet events. ActiveX event procedures are only inferred for reading. | Verified |
 | No approval-grant tool | Approval grants and allowlist entries cannot be granted or edited over MCP. `background_safe` classification **is** available through `macro_classify_background`. | Verified |
-| Compile is always `indeterminate` | On the validated build `vba_compile` returns `status="indeterminate"`, `reason="NON_ACTIVATING_COMPILE_UNAVAILABLE"`, `diagnostics.is_compile=false`. It never returns `compiled` or `compile_error`. | Verified on 16.0.14332; suspected on other builds |
+| Compile is always `indeterminate` | On the validated build `vba_compile_diagnostics` returns `status="indeterminate"`, `reason="NON_ACTIVATING_COMPILE_UNAVAILABLE"`, `diagnostics.is_compile=false`. It never returns `compiled` or `compile_error`. | Verified on 16.0.14332; suspected on other builds |
 | Macros require `background_safe` classification | `macro_run` runs only a procedure classified `background_safe` for the current workbook hash and VBA source revision. An unclassified procedure returns `BACKGROUND_SAFETY_NOT_VERIFIED`; an interactive one returns `INTERACTIVE_UI_NOT_SUPPORTED`. | Verified |
 | `EXCEL_VBA_MCP_LOG_LEVEL` is parsed but not applied | Logging is configured at import time with a fixed `INFO` level on `stderr`; the variable has no effect in this revision. | Verified |
 | ActiveX event mapping is inferred | The probable event procedure is inferred from `<sheet_code_name>_<control>_<Event>` naming. It is never click-tested and may be absent or wrong. | Suspected / not verified |
-| Session recovery is agent-directed via `excel_recover` | `excel_health` surfaces `needs_recovery` / `running/deadline_exceeded`; the agent calls `excel_recover` (allow-by-default in both modes, audited, pid-scoped, fail-closed, originals-safe) to terminate the wedged owned process and rebuild the instance. The single automatic path is a `macro_run` hang/timeout (F2b), which reports `session_recovery` and discards open workbooks. If recovery is refused the fallback is restarting the server. | Verified |
+| Session recovery is agent-directed via `excel_recover` | `excel_health` surfaces `needs_recovery` / `running/deadline_exceeded`; the agent calls `excel_recover` with `confirm=true` (allow-by-default in both modes, audited, pid-scoped, fail-closed, originals-safe) to terminate the wedged owned process and rebuild the instance; a missing/false `confirm` is rejected with `CONFIRMATION_REQUIRED` before any termination. The single automatic path is a `macro_run` hang/timeout (F2b), which reports `session_recovery` and discards open workbooks. If recovery is refused the fallback is restarting the server. | Verified |
 | `pywinauto` is not a dependency | `pywinauto` was removed from `pyproject.toml` and `uv.lock`; VBE compile UI diagnostics use `comtypes` `IUIAutomation` (read-only). Do not expect a `pywinauto` API. | Verified |
 | Missing manual fixtures | `LockedProject.xlsm` and `TableNamesProject.xlsm` are not committed; the related tests skip with explicit reasons. | Verified |
 | Non-`.xlsm` formats are allowed but not validated | The path allowlist accepts the extensions above, but only `.xlsm` is validated on the target build. | Suspected / not verified |
@@ -109,7 +109,7 @@ behavior as unproven until tested on a copy.
 ## VBA and COM limitations
 
 - **VBOM trust is required.** Without "Trust access to the VBA project object
-  model", every VBA/VBIDE tool and `vba_compile` returns
+  model", every VBA/VBIDE tool and `vba_compile_diagnostics` returns
   `ACCESS_VBOM_DISABLED`.
 - **Locked projects are never bypassed.** A password-protected project returns
   `VBA_PROJECT_LOCKED`; the server never attempts to unlock it.
@@ -229,14 +229,28 @@ These behaviors follow from the session model in
 
 - **Originals are never modified.** `excel_open` copies the source into `work/`
   and opens only the copy.
+- **Two paths per workbook.** `WorkbookInfo.path` is the materialized **working
+  copy** actually opened (`wb.FullName`); `WorkbookInfo.source_path` is the
+  **original** allowlisted path it was copied from (`null` when there is no
+  on-disk source). There is no `original_name` field — it would be redundant with
+  `name`, which is identical for the working copy and its source.
 - **Edits live in the working copy.** `excel_close` deletes it; a later
   `excel_open` re-copies the untouched original. Use
   `snapshot_create` → `excel_close` → `snapshot_restore` to persist and return to
   an earlier state.
 - **Saves are explicit.** `excel_close` does not save by default; `excel_save` or
-  `excel_close(save_changes=true)` writes the working copy only.
+  `excel_close(save_changes=true)` writes the working copy only. `excel_save_as` writes the
+  working copy to a new (or the original) path via an atomic copy + single `<target>.bak`
+  without rebinding the session; it is fail-closed (`PROTECTED_TARGET` / `STALE_TARGET`,
+  `outcome="ok"` only after a final size+SHA-256 verify) and never uses `wb.SaveAs`.
+- **Destructive recovery/restore require `confirm=true`.** `snapshot_restore` and
+  `excel_recover` reject a missing/false `confirm` with `CONFIRMATION_REQUIRED`
+  **before** anything is closed or terminated. `snapshot_restore` discards the
+  current working copy (unsaved changes); `excel_recover` discards the open
+  working copies. Originals are never modified in either case.
 - **Snapshots restore files, not external effects.** A snapshot never undoes
-  database writes, emails, network calls, files or printing.
+  database writes, emails, network calls, files or printing; `excel_recover` does
+  not roll back external side effects of any macro that already ran.
 - **One workbook per path.** A per-path lock serializes opens; reopening the same
   canonical path is rejected while it is open.
 

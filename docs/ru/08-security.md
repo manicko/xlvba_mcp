@@ -96,7 +96,7 @@ VBOM на управляемой машине. Когда это происхо�
 Чтение или редактирование VBA требует, чтобы **«Trust access to the VBA project object model»**
 (VBOM) было включено в Excel Trust Center → Macro Settings. Это **ручная, поперационная** настройка.
 
-- Если доверие VBOM выключено, каждый инструмент VBA/VBIDE и `vba_compile` возвращает
+- Если доверие VBOM выключено, каждый инструмент VBA/VBIDE и `vba_compile_diagnostics` возвращает
   `ACCESS_VBOM_DISABLED`; модель книги по-прежнему возвращает свои не-VBA секции с
   `vba_access = "vbom_disabled"`.
 - Сервер никогда не включает VBOM, не редактирует реестр и не пытается обойти настройку. Решение

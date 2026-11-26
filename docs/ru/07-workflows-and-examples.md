@@ -455,7 +455,7 @@ allowlist, поэтому каждый вызов `MUTATING`/`EXECUTING` отк�
 
 Запишите новое значение через `range_write_values` (или `table_update_rows`), затем снова вызовите
 `macro_run` для второй процедуры. Каждый защищённый шаг независим; последовательность — ровно то, что
-выражает декларативный `test_run_suite` с шагами `macro_run`, несущими необязательное поле
+выражает декларативный `test_suite_run` с шагами `macro_run`, несущими необязательное поле
 `background_safe`.
 
 **Ожидаемый результат.** Каждый `macro_run` возвращает `success` (или `blocked` с
@@ -541,9 +541,8 @@ allowlist, поэтому каждый вызов `MUTATING`/`EXECUTING` отк�
 }
 ```
 
-Вызовите `test_suite_run`, передав этот объект как аргумент `suite`. `test_suite_run` — канон
-для нового кода (принимает mapping и `background`); `test_run_suite` принимает ту же форму
-набора, но это устаревший typed-spec блокирующий раннер **без** параметра `background`.
+Вызовите `test_suite_run`, передав этот объект как аргумент `suite`. `test_suite_run` — единственная
+каноническая точка входа для тестов (принимает mapping или typed-spec, плюс `background`).
 Словари закрыты:
 
 Закрытые словари содержат **37 действий** и **29 проверок**, определённых в
@@ -588,7 +587,7 @@ allowlist, поэтому каждый вызов `MUTATING`/`EXECUTING` отк�
 { "workbook_id": "<workbook_id>" }
 ```
 
-Вызовите `vba_compile`. На валидированной сборке результат fail-closed:
+Вызовите `vba_compile_diagnostics`. На валидированной сборке результат fail-closed:
 
 ```json
 {
@@ -614,7 +613,7 @@ allowlist, поэтому каждый вызов `MUTATING`/`EXECUTING` отк�
 
 **Ограничения.**
 
-- `vba_compile` никогда не возвращает `compiled` или `compile_error`; `diagnostics.is_compile`
+- `vba_compile_diagnostics` никогда не возвращает `compiled` или `compile_error`; `diagnostics.is_compile`
   всегда `false`. Чистый результат `indeterminate` **не** является доказательством того, что проект
   компилируется.
 - Возможные причины: `NON_ACTIVATING_COMPILE_UNAVAILABLE`, `ACCESS_VBOM_DISABLED`,
@@ -632,10 +631,10 @@ JSON `to_dict()`: стабильный `code` и объект `context` (нап�
 |-----|---------------|------------------|------------|
 | `PATH_NOT_ALLOWED` | `excel_open`, `vba_export_project` | Путь вне `EXCEL_VBA_MCP_ROOTS`, device/UNC-путь, traversal, побег через symlink или запрещённое расширение. `context.reason` называет категорию (`outside_roots`, `extension_not_allowed`, `unc_denied`, `symlink_escape`, `root_mismatch`, `traversal`, `empty_path`, `device_path_denied`); `context.allowed_roots` перечисляет загруженные корни. | Поместите книгу внутрь разрешённого корня или расширьте `EXCEL_VBA_MCP_ROOTS` и перезапустите сервер; используйте обычный путь и разрешённое расширение. См. [Конфигурация](03-configuration.md). |
 | `LISTOBJECT_INTERSECTION` | `range_write_values`, `range_write_formulas`, `range_copy`, `range_insert`, `range_delete`, `range_merge`, `range_unmerge` | Цель пересекает таблицу Excel (ListObject). `context.tables` перечисляет пересекающиеся таблицы. | Используйте инструменты Tables (`table_append_rows`, `table_update_rows`, `table_add_column` и так далее) вместо структурных операций диапазона. |
-| `ACCESS_VBOM_DISABLED` | `vba_*`, `macro_list`, `vba_compile` | Excel не может читать объектную модель проекта VBA; доверие VBOM в Trust Center выключено. | Включите **Trust access to the VBA project object model** в Excel Trust Center → Macro Settings, закройте Excel и повторите. Корпоративная политика может это блокировать. |
-| `APPROVAL_DENIED` | `excel_open` (writable/execute), любой мутирующий инструмент, `macro_run`, `test_run_suite` | Сервер работает в режиме `restricted` (`EXCEL_VBA_MCP_ACCESS_MODE=restricted`), и ни одна запись allowlist или живой грант не совпадает. | Сбросьте `EXCEL_VBA_MCP_ACCESS_MODE` (или задайте `full`) для поведения полного доступа по умолчанию; сервер в режиме restricted предоставляет через MCP только работу для чтения. |
+| `ACCESS_VBOM_DISABLED` | `vba_*`, `macro_list`, `vba_compile_diagnostics` | Excel не может читать объектную модель проекта VBA; доверие VBOM в Trust Center выключено. | Включите **Trust access to the VBA project object model** в Excel Trust Center → Macro Settings, закройте Excel и повторите. Корпоративная политика может это блокировать. |
+| `APPROVAL_DENIED` | `excel_open` (writable/execute), любой мутирующий инструмент, `macro_run`, `test_suite_run` | Сервер работает в режиме `restricted` (`EXCEL_VBA_MCP_ACCESS_MODE=restricted`), и ни одна запись allowlist или живой грант не совпадает. | Сбросьте `EXCEL_VBA_MCP_ACCESS_MODE` (или задайте `full`) для поведения полного доступа по умолчанию; сервер в режиме restricted предоставляет через MCP только работу для чтения. |
 | `BACKGROUND_SAFETY_NOT_VERIFIED` | `macro_run` (в `MacroRunResult.error_code`, статус `blocked`) | Процедура не классифицирована `background_safe` для текущего хэша книги и ревизии исходников VBA. | Макрос **не** был запущен. Классифицируйте его через `macro_classify_background` (переклассифицируйте после любого изменения исходников VBA) и повторите. Не повторяйте слепо. |
-| `INTERACTIVE_UI_NOT_SUPPORTED` | `macro_run`, `macro_classify_background`, `test_run_suite` | Процедура ссылается на интерактивный UI, эвристична или была классифицирована `background_safe`, будучи небезопасной. | Осмотрите процедуру и удалите интерактивный UI либо оставьте её неклассифицированной. Не обходите preflight. |
+| `INTERACTIVE_UI_NOT_SUPPORTED` | `macro_run`, `macro_classify_background`, `test_suite_run` | Процедура ссылается на интерактивный UI, эвристична или была классифицирована `background_safe`, будучи небезопасной. | Осмотрите процедуру и удалите интерактивный UI либо оставьте её неклассифицированной. Не обходите preflight. |
 | `COM_BUSY` | Любой мутирующий инструмент; `vba_replace_component_source`/`vba_insert_code` | Реальная конкуренция за COM (сервер занят). Отказ approval — отдельный код (`APPROVAL_DENIED`), конфликт ревизий `source_hash` VBA — `REVISION_CONFLICT`, отсутствующая фигура/элемент — `NOT_FOUND`. | Прочитайте `context.reason`; повторите чтение после завершения операции. Не повторяйте мутацию слепо. |
 | `REVISION_CONFLICT` | `vba_replace_component_source` / `vba_insert_code` | Устаревший `expected_source_hash` (`context.reason="revision_conflict"`); токен защиты — нормализованный `source_hash` из `vba_read_component`, а не хэш файла экспорта снапшота. | Перечитайте компонент через `vba_read_component` и передайте текущий `expected_source_hash`. |
 | `NOT_FOUND` | `shape_get`, `shape_set_on_action`, `control_get`, `control_set_on_action` | Фигура или элемент с указанным `name` не существует (F6); `context.name` несёт запрошенное имя. Реальная конкуренция за COM по-прежнему сообщается как `COM_BUSY`. | Перечислите объекты (`shapes_list` / `controls_list`) и используйте точное имя. Не повторяйте — это ошибка вызывающей стороны. |
@@ -695,7 +694,7 @@ JSON `to_dict()`: стабильный `code` и объект `context` (нап�
 | Делать снапшот перед любым мутирующим рабочим процессом. | Пропускать снапшот перед мутацией. |
 | Использовать инструменты Tables для структуры таблицы. | Использовать `range_insert`/`range_delete` над ListObject. |
 | Сохранять `expected_source_hash` из `vba_read_component`. | Редактировать VBA без токена ревизии. |
-| Считать `indeterminate`-компиляцию «неизвестно», а не «пройдено». | Считать чистый `vba_compile` доказательством компиляции. |
+| Считать `indeterminate`-компиляцию «неизвестно», а не «пройдено». | Считать чистый `vba_compile_diagnostics` доказательством компиляции. |
 | Читать `context.reason` при каждом отказе. | Слепо повторять заблокированный макрос или отклонённую мутацию. |
 
 Связанные документы: [Обзор](01-overview.md), [Возможности Excel](06-excel-capabilities.md),

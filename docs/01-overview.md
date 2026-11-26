@@ -76,7 +76,7 @@ and of Excel capabilities in [Excel Capabilities](06-excel-capabilities.md).
   `controls_list`, `control_get`, `control_set_on_action`.
 - **VBA.** Project and component inventory, source reading, code search, project export,
   reference reading, plus guarded source replacement and insertion.
-- **Compile diagnostics (fail-closed).** `vba_compile` and `vba_get_compile_diagnostics`
+- **Compile diagnostics (fail-closed).** `vba_compile_diagnostics` and `vba_get_compile_diagnostics`
   return partial diagnostic data but never report a false success.
 - **Macros (under a gate).** `macro_list`, `macro_run`, `macro_get_last_result` and
   `macro_classify_background`; running requires an execute-mode session, a `background_safe`
@@ -85,10 +85,9 @@ and of Excel capabilities in [Excel Capabilities](06-excel-capabilities.md).
   in `restricted` mode the approval gate also applies.
 - **Snapshots.** `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff`
   with a manifest and SHA-256.
-- **Declarative test runner.** `test_run_suite`, `test_suite_run`, `test_get_run`
-  with a closed vocabulary of actions and assertions. `test_suite_run` is canonical for
-  new use (accepts a mapping and `background`); `test_run_suite` is the legacy typed-spec
-  blocking runner (no `background`).
+- **Declarative test runner.** `test_suite_run`, `test_get_run`
+  with a closed vocabulary of actions and assertions. `test_suite_run` is the single canonical
+  entry point (accepts a mapping or a typed spec, plus `background`).
 - **Audit and security.** The `audit.jsonl` journal (append-only), a path allowlist and an
   access-mode policy: full access by default, restricted mode (deny-by-default approval) as an
   explicit opt-in.
@@ -124,9 +123,9 @@ described in [Architecture](04-architecture.md).
 4. **Snapshot before a change.** `snapshot_create` (for an open workbook `Workbook.SaveCopyAs`
    is used, for a closed one a file copy).
 5. **Export VBA.** `vba_export_project` with a manifest and file hashes saved.
-6. **Run a declarative test.** `test_suite_run` (or `test_run_suite`) → if needed
+6. **Run a declarative test.** `test_suite_run` → if needed
    `test_get_run` to read a persisted run.
-7. **Diagnose compile state.** `vba_compile` / `vba_get_compile_diagnostics` —
+7. **Diagnose compile state.** `vba_compile_diagnostics` / `vba_get_compile_diagnostics` —
    obtaining status and partial diagnostic data without launching the UI.
 
 Step-by-step examples with arguments are in [Workflows and Examples](07-workflows-and-examples.md).
@@ -140,7 +139,7 @@ Step-by-step examples with arguments are in [Workflows and Examples](07-workflow
   default `full` access mode no grant is needed (mutations and execute mode are authorized); in
   `restricted` mode the deny-by-default gate refuses `MUTATING`/`EXECUTING` operations with
   `APPROVAL_DENIED`.
-- It does not report a successful compile on the validated build: `vba_compile` always returns
+- It does not report a successful compile on the validated build: `vba_compile_diagnostics` always returns
   `status=indeterminate` (`reason=NON_ACTIVATING_COMPILE_UNAVAILABLE`).
 - It does not run macros without a `background_safe` classification bound to the current workbook
   hash and VBA source revision; classify a procedure with `macro_classify_background`. Interactive

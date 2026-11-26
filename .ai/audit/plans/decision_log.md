@@ -220,3 +220,34 @@
 - **U5 (deferred product contracts):** DELIVERED as documents only (`plan_03a`); `save_as`/export and `xlvba_job_list` NOT implemented (require product approval).
 - **Verification:** unit 1127 passed; ruff clean; integration collects; final Auditor spot-check ACCEPT (no blocking inconsistencies). Full model-in-the-loop 28-task benchmark specified (`.ai/tmp/benchmark_tasks.yaml`) + deterministic proxy run (28/28 first-tool, 29/29 arg feasibility); model-in-the-loop run remains (no agent runtime here).
 - **Unresolved (product):** token/outputSchema reduction; `save_as`/`job_list`; Kilo forwarding of outputSchema/annotations/resources; real 4-part Excel build.
+
+---
+
+# decision_log — Remaining Usability & Save As (plan_05)
+
+- **Revision:** baseline `40c8b4d`; final working tree (U6-A..E + U7 + U6-D).
+- **Scope:** naming, error envelope, routing, confirm, Save As. Backward compatibility NOT required; lazy loading excluded.
+
+## D-R1 — Additive error codes — CONFIRMED
+Add `INTERNAL_ERROR` (hatch fallback, category internal, not retryable) + `CONFIRMATION_REQUIRED` (missing/false confirm, category validation, not retryable). Extend totality maps. SCHEMA_VERSION=1.
+
+## D-R2 — Error envelope keys at the MCP boundary — CONFIRMED
+`errorCode, errorCategory, message, isRetryable, suggestedNextActions, details` (+ additive `hresult`/`hresult_hex`). Text-JSON only (SDK ToolError is text-only); no error `structuredContent`; hatch closed so non-domain errors never leak "Error executing tool".
+
+## D-R3 — Canonical names, no aliases — CONFIRMED
+`vba_compile_diagnostics`, `job_request_cancel`, `test_suite_run` (sole test entry; `test_run_suite` removed). `TestAction.VBA_COMPILE` untouched.
+
+## D-R4 — Save As = one `excel_save_as`, fail-closed — CONFIRMED
+`(workbook_id, path, *, overwrite_existing=False, overwrite_source=False)`. Session stays bound (flush `wb.Save()` + atomic copy; never `wb.SaveAs`). Source overwrite only via `overwrite_source` + hash match; existing dest only via `overwrite_existing`; drift → `STALE_TARGET`; missing flags → `PROTECTED_TARGET`.
+
+## D-R5 — Source identity + atomic + single `.bak` — CONFIRMED
+Capture `source_sha256`+size at open before materialize; re-hash + normcase/realpath compare at Save As. Atomic temp→replace; single `<target>.bak` (never overwritten if pre-existing → `unknown`, no auto-resume). `outcome="ok"` only after final verify.
+
+## D-R6 — Confirm flags — CONFIRMED
+`snapshot_restore`/`excel_recover` require `confirm=true` (agent intent, not human approval); reject before action; descriptions state discard vs preserve + external-side-effect caveat.
+
+## D-R7 — Routing + compression — CONFIRMED
+Capability-based routing in `xlvba_environment` (no other-server detection). Guard/approval boilerplate → glossary tokens; safety text kept.
+
+## Implementation outcome (2026-11-26)
+U6-B/A/C/E/U7/U6-D all implemented + Validator-ACCEPT; alignment pass fixed integration envelope keys + docs/08; unit 1152 passed; integration collects; final Auditor spot-check ACCEPT. Full model-in-the-loop benchmark remains (no runtime here). Deferred: PDF export, `xlvba_job_list`, outputSchema field reduction.

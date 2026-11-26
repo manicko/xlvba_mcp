@@ -279,7 +279,7 @@ polls `job_get(job_id)`. Lifecycle:
 wired, a `RUNNING` marker is written at start and the record is finalized on every terminal state;
 after a restart a persisted non-terminal job is reconciled to `interrupted_unknown`
 (`outcome="unknown"`, `retryable=false`) — **never** `succeeded`, **never** auto-retried. A
-successful `excel_recover` also finalizes in-flight jobs to `interrupted_unknown`. `job_cancel`
+successful `excel_recover` also finalizes in-flight jobs to `interrupted_unknown`. `job_request_cancel`
 records cancel intent only and never interrupts the uninterruptible COM call.
 
 The agent-directed `excel_recover` tool and the `DEADLINE_EXCEEDED` / `SUSPECTED_STALLED` signals
@@ -507,7 +507,7 @@ and the split between implemented controls and operator responsibilities, is in
 - **No GUI.** No visible window, no `.Activate`/`.Select`, no `SendKeys`, no interactive
   dialogs. `DisplayAlerts=False` does not block `MsgBox`, `UserForm.Show`, `FileDialog`,
   add-in UI or Win32 dialogs.
-- **Compile fails closed.** On the validated build `vba_compile` always returns
+- **Compile fails closed.** On the validated build `vba_compile_diagnostics` always returns
   `status=indeterminate` and `reason=NON_ACTIVATING_COMPILE_UNAVAILABLE`; it never reports
   `compiled`/`compile_error` and never shows UI. Partial diagnostics (`is_compile=false`) are
   not a compile.

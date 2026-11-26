@@ -163,7 +163,7 @@ uv run excel-vba-mcp
 - Никогда не протекалайте COM-объекты через границу; воркер пересекают только DTO.
 - Сбои валидации аргументов сопоставляются с `INVALID_RANGE` и `reason=invalid_arguments`
   (см. `server._validation_error_as_domain`).
-- **Никогда не заявляйте об успехе при `indeterminate`-компиляции.** `vba_compile` возвращает
+- **Никогда не заявляйте об успехе при `indeterminate`-компиляции.** `vba_compile_diagnostics` возвращает
   `status="indeterminate"` с `diagnostics.is_compile=false` на валидированной сборке.
 
 ## Подход к тестированию

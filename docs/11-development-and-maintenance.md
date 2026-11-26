@@ -176,7 +176,7 @@ adapter method + a service method + a thin handler + registration + tests + docs
 - Never leak COM objects across the boundary; only DTOs cross the worker.
 - Argument-validation failures map to `INVALID_RANGE` with
   `reason=invalid_arguments` (see `server._validation_error_as_domain`).
-- **Never claim success on an indeterminate compile.** `vba_compile` returns
+- **Never claim success on an indeterminate compile.** `vba_compile_diagnostics` returns
   `status="indeterminate"` with `diagnostics.is_compile=false` on the validated
   build.
 

@@ -102,7 +102,7 @@ Reading or editing VBA requires **"Trust access to the VBA project object
 model"** (VBOM) to be enabled in Excel Trust Center → Macro Settings. This is a
 **manual, per-machine** setting.
 
-- If VBOM trust is off, every VBA/VBIDE tool and `vba_compile` returns
+- If VBOM trust is off, every VBA/VBIDE tool and `vba_compile_diagnostics` returns
   `ACCESS_VBOM_DISABLED`; the workbook model still returns its non-VBA sections
   with `vba_access = "vbom_disabled"`.
 - The server never enables VBOM, never edits the registry, and never attempts to
