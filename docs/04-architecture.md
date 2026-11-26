@@ -256,6 +256,22 @@ sequenceDiagram
 - **Bookkeeping without COM.** `excel_get_status`, `excel_list_workbooks` and `excel_health`
   read only in-memory session records and never submit work to the STA thread.
 
+### Working copies & modes (footguns)
+
+- **`excel_open` is writable by default.** The default `mode="execute"`, `read_only=False`
+  opens a **writable, execution-capable** session. `mode="inspect"` only disables macros
+  (`AutomationSecurity = ForceDisable`); it does **not** imply read-only. A plain
+  `excel_open` (no arguments) therefore yields a session that can mutate the working copy and
+  run macros — pass `mode="inspect"` **and** `read_only=True` for a strictly read-only session.
+  The inspect-is-writable combination (`mode="inspect"`, `read_only=False`) is classified
+  `MUTATING`, not `READ_ONLY`.
+- **Open performs a double read of the source (double I/O).** `excel_open` first copies the
+  original into `work/` with `shutil.copy2`
+  (`application/session_service.py`, `_materialize_working_copy`) and then Excel opens that
+  copy. The source bytes are thus read twice — once for the file copy and once by Excel — so
+  opening a very large workbook incurs roughly double the source I/O. The original is still
+  never modified; only the working copy is opened and written.
+
 ## Snapshots and rollback
 
 - **Two creation branches.**
