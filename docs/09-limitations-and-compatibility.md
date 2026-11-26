@@ -188,6 +188,29 @@ work; the mechanisms themselves are described in [Architecture](04-architecture.
 | Opaque single COM call = `inconclusive` | A single uninterruptible COM call that exceeds its deadline is reported `EXCEL_HUNG` / `SUSPECTED_STALLED` (never a fabricated completion percentage); the outcome is `inconclusive`, not a false `succeeded`. | Verified |
 | Host-specific integration skips | Integration tests that need a live Excel/COM or a specific Office build skip with an explicit reason when the host/build differs (for example missing fixtures, non-`.xlsm`, or a non-validated build). | Verified |
 
+## Tool-schema footprint (U4)
+
+`tools/list` is dominated by `outputSchema` (~75% of the payload). The oversized return DTOs
+(`WorkbookModel`, `SheetInfo`, the test-suite DSL) are **not slimmed**, for the following
+source-verified reasons:
+
+- **Schemas are already internally deduplicated.** The MCP SDK derives each tool's `outputSchema`
+  from its return DTO via pydantic, which emits every nested model once under `$defs` and references
+  it with `$ref`. There is no duplicated inline `$defs` to remove.
+- **Repetition is across per-tool documents, not within one schema.** `SheetInfo` is returned by
+  seven tools and the test DSL is the input of two tools, but each tool advertises a standalone,
+  self-contained JSON Schema. The protocol has no shared-`$defs` / cross-tool `$ref` mechanism, so
+  the repeated definitions cannot be factored into one shared definition.
+- **The advertised schema and `structuredContent` come from the same DTO.** Reducing the schema would
+  require removing DTO fields or stripping field descriptions — both out of scope (no field removal;
+  `structuredContent` must stay identical; descriptions unchanged). `structured_output=False`, a
+  search tool and `defer_loading` are rejected (plan_03 §10).
+
+Net effect: the `outputSchema` footprint is irreducible without removing fields, so no DTO is
+changed and `structuredContent` is preserved by construction. The consumer-inventory caveat
+(plan_03 §18.3) — no in-repo inventory of clients parsing specific nested fields — is the reason the
+`$ref` dedupe/field-removal trade-off is not taken.
+
 ## Verified vs suspected
 
 | Category | Items |

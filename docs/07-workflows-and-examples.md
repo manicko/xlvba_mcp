@@ -38,7 +38,7 @@ The capabilities behind these workflows are classified in
 | `<workbook_id>` | Server-assigned identifier of an open working copy, returned by `excel_open`. It is **not** a file path. Replace it in every subsequent call. |
 | JSON blocks | Show the tool **arguments** object exactly as it is sent over MCP. A block is not the full JSON-RPC envelope. |
 | `xlvba_` prefix | Clients expose published names with a server prefix. In Kilo, for example, `excel_open` is called as `xlvba_excel_open`. This document uses the published names without the prefix; add your client's prefix. |
-| **Approval-gated (restricted mode)** | The call is a mutating or executing operation. In the default `full` access mode it is authorized (a baseline snapshot is still required before a mutation); in `restricted` mode it is refused with `APPROVAL_DENIED` unless an in-process allowlist entry or live grant matches. See [Architecture](04-architecture.md). |
+| **Approval-gated (restricted mode)** | The call is a mutating or executing operation. In the default `full` access mode it is authorized (a baseline snapshot is still required before a mutation); in `restricted` mode it is refused with `APPROVAL_DENIED` unless an in-process allowlist entry or live grant matches. See [Architecture](04-architecture.md). The planned read-only `xlvba_environment` tool reports the active access mode, policy and build without touching COM. |
 | Read-only | No workbook change; auto-allowed by the approval policy. |
 
 Paths are Windows paths. A workbook path must be inside `EXCEL_VBA_MCP_ROOTS`
@@ -536,8 +536,10 @@ unclassified procedure is `blocked` (`BACKGROUND_SAFETY_NOT_VERIFIED`) in either
 }
 ```
 
-Call `test_suite_run` with this object as the `suite` argument (`test_run_suite` is equivalent
-and takes the same shape). The vocabularies are closed:
+Call `test_suite_run` with this object as the `suite` argument. `test_suite_run` is the
+canonical entry point for new use (it accepts a mapping and `background`); `test_run_suite`
+takes the same suite shape but is the legacy typed-spec blocking runner and has **no**
+`background` parameter. The vocabularies are closed:
 
 The closed vocabularies contain **37 actions** and **29 assertions**, defined in
 `src/excel_vba_mcp/domain/test_spec.py` and summarized in

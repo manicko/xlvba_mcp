@@ -36,7 +36,11 @@ and resources that an MCP client (for example, Kilo or Claude Desktop) invokes.
 Key facts:
 
 - Package: `excel-vba-mcp`, version `0.1.0` (Proprietary license).
-- The server registers **91 tools** and **4 read-only resources**.
+- The server registers **91 tools** (91 exposed) and **5 read-only resources** (four
+  per-workbook URI templates plus the static `xlvba://glossary`). A read-only
+  `xlvba_environment` tool (access mode / policy / build / capabilities) is planned; the
+  request enums for `range_set_conditional_formatting`, `pivot_field_set_layout` and
+  `pivot_field_apply_filter` will be pruned to match runtime behavior (forward reference).
 - Transport — MCP over STDIO: protocol messages go to `stdout`, diagnostics and
   tracebacks go to `stderr`.
 - The Excel instance is created via `win32com.client.DispatchEx` and stays `Visible=False`
@@ -82,7 +86,9 @@ and of Excel capabilities in [Excel Capabilities](06-excel-capabilities.md).
 - **Snapshots.** `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff`
   with a manifest and SHA-256.
 - **Declarative test runner.** `test_run_suite`, `test_suite_run`, `test_get_run`
-  with a closed vocabulary of actions and assertions.
+  with a closed vocabulary of actions and assertions. `test_suite_run` is canonical for
+  new use (accepts a mapping and `background`); `test_run_suite` is the legacy typed-spec
+  blocking runner (no `background`).
 - **Audit and security.** The `audit.jsonl` journal (append-only), a path allowlist and an
   access-mode policy: full access by default, restricted mode (deny-by-default approval) as an
   explicit opt-in.

@@ -18,10 +18,17 @@ related:
 
 ## Назначение
 
-Справочник описывает **все 88 инструментов** MCP-сервера `xlvba`: назначение, параметры,
+Справочник описывает **все 91 инструмент** MCP-сервера `xlvba`: назначение, параметры,
 возвращаемое значение, побочные эффекты, типовые ошибки и класс доступа. Документ
 основан на фактических схемах инструментов, полученных с живого `MCPServer`, и на исходных
 модулях `api/*`, `application/*` и `adapters/*`.
+
+> **Плановые ссылки (ещё не опубликованы):** будет добавлен read-only инструмент
+> `xlvba_environment` (режим доступа / политика / сборка / возможности), а enum-схемы
+> запросов для `range_set_conditional_formatting`, `pivot_field_set_layout` и
+> `pivot_field_apply_filter` будут **сокращены (pruned)** — advertised-контракт сузится до
+> того, что рантайм уже принимает (сокращаемые значения и так отклоняются сегодня). До этого
+> число инструментов остаётся **91 опубликовано**.
 
 Документ не пересказывает архитектуру — она описана в [Архитектура](04-architecture.md).
 Настройки — в [Конфигурация](03-configuration.md), модель безопасности — в
@@ -159,14 +166,19 @@ approval-гейтом. `CompileService` создаётся без `ApprovalPolic
 
 | Инструмент | Назначение | Параметры | Возврат | Побочные эффекты | Ошибки | Доступ |
 |------------|------------|-----------|---------|------------------|--------|--------|
-| `test_run_suite` | Запускает декларативный тестовый набор на одноразowych копиях книги. | `suite:TestSuiteSpec` | `TestRunResult` | Базовый снапшот, рабочие копии на каждый кейс, артефакты, `runs/`, аудит | `INVALID_RANGE`, `APPROVAL_DENIED` (restricted), `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED`, `EXCEL_HUNG` | executing |
-| `test_suite_run` | Явная точка входа: принимает набор объектом или JSON-подобным mapping. | `suite:TestSuiteSpec` или `object` | `TestRunResult` | То же, что `test_run_suite` | `INVALID_RANGE`, `APPROVAL_DENIED` (restricted), `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED` | executing |
+| `test_run_suite` | Запускает декларативный тестовый набор на одноразовых копиях книги (устаревший typed-spec блокирующий раннер). | `suite:TestSuiteSpec` | `TestRunResult` | Базовый снапшот, рабочие копии на каждый кейс, артефакты, `runs/`, аудит | `INVALID_RANGE`, `APPROVAL_DENIED` (restricted), `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED`, `EXCEL_HUNG` | executing |
+| `test_suite_run` | Явная точка входа (канон для нового кода): принимает набор объектом или JSON-подобным mapping, плюс `background`. | `suite:TestSuiteSpec` или `object`, `background:boolean=false?` | `TestRunResult` или `RunningJob` | То же, что `test_run_suite` | `INVALID_RANGE`, `APPROVAL_DENIED` (restricted), `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED` | executing |
 | `test_get_run` | Возвращает сохранённый прогон по `run_id`. | `run_id:string` | `TestRunResult` | — | `ExcelVbaMcpError` (не найден) | read-only |
 
 Оба запускающих инструмента открывают рабочую копию в режиме `execute`. В режиме `full`
 (по умолчанию) это авторизовано; в режиме `restricted` каждый кейс получает `blocked`
 (`APPROVAL_DENIED`), а набор — `blocked`. Шаг `macro_run` по неклассифицированной процедуре
 блокируется с `BACKGROUND_SAFETY_NOT_VERIFIED` в любом режиме.
+
+**Маршрутизация тест-инструментов.** `test_suite_run` — канон для нового кода (принимает
+mapping и `background`); `test_run_suite` — устаревший typed-spec блокирующий раннер и **не**
+принимает `background`. `test_suite_run` принимает `background=true`, чтобы promptly вернуть
+`RunningJob`; опрос — через `job_get`.
 
 ## VBA
 
@@ -857,6 +869,7 @@ Fail-closed ответ:
 | `excel://workbooks/{workbook_id}/vba/components` | `workbook_vba_components` | `application/json` | Инвентарь VBA-компонентов + `vba_access` |
 | `excel://workbooks/{workbook_id}/vba/components/{component_name}` | `workbook_vba_component_source` | `text/plain` | Исходный текст одного VBA-компонента |
 | `excel://test-runs/{run_id}` | `test_run_summary` | `application/json` | Сохранённый декларативный тестовый прогон |
+| `xlvba://glossary` | `glossary` | `text/markdown` | Статический глоссарий терминов (R13, BG06, preflight, truth signal, fail-closed, RECOVERY, STA, Stage 1, normalized source hash, SUSPECTED_STALLED, interrupted_unknown, indeterminate, working copy, snapshot gate) |
 
 Ресурсы доступны только для чтения: они не мутируют книгу и не выполняют VBA.
 
@@ -916,6 +929,6 @@ Fail-closed ответ:
 14. **`macro_policy.classify_operation` неавторитетен (мёртвая/иллюстративная таблица).**
     Функция `classify_operation` в `security/macro_policy.py` сохранена для иллюстрации и **не**
     подключена к пути рантайм-энфорсмента; живой класс операции каждого инструмента определён
-    по-сервисному. Её таблица устарела (предшествует текущему каталогу из 88 инструментов) и не
+    по-сервисному. Её таблица устарела (предшествует текущему каталогу из 91 инструмента) и не
     должна читаться как авторитетная классификация инструментов — используйте этот справочник
     или код сервисов.

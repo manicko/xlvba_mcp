@@ -36,7 +36,11 @@ related:
 Ключевые факты:
 
 - Пакет: `excel-vba-mcp`, версия `0.1.0` (лицензия Proprietary).
-- Сервер регистрирует **88 инструментов** и **4 read-only ресурса**.
+- Сервер регистрирует **91 инструмент** (91 опубликовано) и **5 read-only ресурсов** (четыре
+  per-workbook URI-шаблона плюс статический `xlvba://glossary`). Плановый read-only инструмент
+  `xlvba_environment` (режим доступа / политика / сборка / возможности) ещё не добавлен; enum-схемы
+  запросов для `range_set_conditional_formatting`, `pivot_field_set_layout` и
+  `pivot_field_apply_filter` будут сокращены (pruned) до поведения рантайма (плановые ссылки).
 - Транспорт — MCP поверх STDIO: сообщения протокола идут в `stdout`, диагностика и
   трассировки — в `stderr`.
 - Экземпляр Excel создаётся через `win32com.client.DispatchEx` и остаётся `Visible=False`
@@ -82,7 +86,9 @@ related:
 - **Снапшоты.** `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff`
   с манифестом и SHA-256.
 - **Декларативный тестовый раннер.** `test_run_suite`, `test_suite_run`, `test_get_run`
-  с закрытым словарём действий и проверок.
+  с закрытым словарём действий и проверок. `test_suite_run` — канон для нового кода (принимает
+  mapping и `background`); `test_run_suite` — устаревший typed-spec блокирующий раннер (без
+  `background`).
 - **Аудит и безопасность.** Журнал `audit.jsonl` (append-only), allowlist путей и
   политика доступа: полный доступ по умолчанию, режим `restricted` (deny-by-default approval)
   как явный opt-in.

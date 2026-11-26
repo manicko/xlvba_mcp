@@ -23,6 +23,13 @@ return value, side effects, typical errors and access class. The document is bas
 actual tool schemas obtained from a live `MCPServer` and on the source modules `api/*`,
 `application/*` and `adapters/*`.
 
+> **Forward references (planned, not yet exposed):** a read-only `xlvba_environment`
+> tool (access mode / policy / build / capabilities) will be added, and the request
+> enums for `range_set_conditional_formatting`, `pivot_field_set_layout` and
+> `pivot_field_apply_filter` will be **pruned** so the advertised request contract
+> matches what the runtime accepts (the pruned values are already rejected today; only
+> the advertised schema narrows). Until then the tool count stays **91 exposed**.
+
 This document does not restate the architecture — that is covered in
 [Architecture](04-architecture.md). Settings are in [Configuration](03-configuration.md),
 the security model is in [Architecture](04-architecture.md), and limits are in
@@ -170,17 +177,22 @@ has died while the bookkeeping still says `running`/`accepting`.
 
 | Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
 |------|---------|------------|---------|--------------|--------|--------|
-| `test_run_suite` | Runs a declarative test suite against disposable copies of the workbook. | `suite:TestSuiteSpec, background:boolean=false?` | `TestRunResult` or `RunningJob` | Baseline snapshot, a working copy per case, artifacts, `runs/`, audit | `INVALID_RANGE`, `APPROVAL_DENIED` (restricted mode), `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED`, `EXCEL_HUNG` | executing |
-| `test_suite_run` | Explicit entry point: accepts a suite object or a JSON-like mapping. | `suite:TestSuiteSpec` or `object`, `background:boolean=false?` | `TestRunResult` or `RunningJob` | Same as `test_run_suite` | `INVALID_RANGE`, `APPROVAL_DENIED` (restricted mode), `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED` | executing |
+| `test_run_suite` | Runs a declarative test suite against disposable copies of the workbook (legacy typed-spec blocking runner). | `suite:TestSuiteSpec` | `TestRunResult` | Baseline snapshot, a working copy per case, artifacts, `runs/`, audit | `INVALID_RANGE`, `APPROVAL_DENIED` (restricted mode), `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED`, `EXCEL_HUNG` | executing |
+| `test_suite_run` | Explicit entry point (canonical for new use): accepts a suite object or a JSON-like mapping, plus `background`. | `suite:TestSuiteSpec` or `object`, `background:boolean=false?` | `TestRunResult` or `RunningJob` | Same as `test_run_suite` | `INVALID_RANGE`, `APPROVAL_DENIED` (restricted mode), `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED` | executing |
 | `test_get_run` | Returns a persisted run by `run_id`. | `run_id:string` | `TestRunResult` | — | `ExcelVbaMcpError` (not found) | read-only |
+
+**Test-tool routing.** `test_suite_run` is canonical for new use (accepts a mapping and
+`background`); `test_run_suite` is the legacy typed-spec blocking runner and does **not**
+accept `background`. Each description's "Do not use when" points at the other.
 
 Both runners open the working copy in `execute` mode. In the default `full` mode this is
 authorized; in `restricted` mode every case gets `blocked` (`APPROVAL_DENIED`) and the suite is
 `blocked`. A `macro_run` step on an unclassified procedure is blocked with
 `BACKGROUND_SAFETY_NOT_VERIFIED` in either mode.
 
-`test_suite_run` (and `test_run_suite`) accept `background=true` to return a `RunningJob` handle
+`test_suite_run` accepts `background=true` to return a `RunningJob` handle
 promptly instead of blocking; poll with `job_get` (see [Background jobs](#background-jobs)).
+`test_run_suite` is blocking only.
 
 ## Jobs
 
@@ -835,7 +847,8 @@ The tool never returns `compiled` or `compile_error`, and never shows or activat
 ## Background jobs
 
 Four long-running tools accept `background=true`: `excel_open`, `macro_run`, `test_suite_run`
-(and `test_run_suite`) and `pivot_tables_list`. With `background=true` the tool schedules the
+and `pivot_tables_list` (`test_run_suite` is blocking only and has no `background` parameter).
+With `background=true` the tool schedules the
 operation on the in-process job registry and returns a prompt `RunningJob` handle well within the
 client wall-clock:
 
