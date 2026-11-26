@@ -680,6 +680,24 @@ class SessionService:
                 context={"reason": "target_exists", "target_path": str(canonical_t)},
             )
 
+        # A pre-existing ``<target>.bak`` (from a prior interrupted save) is a
+        # DETERMINISTIC conflict detected before the destination is replaced, not
+        # an indeterminate interruption. Reject it pre-mutation (no temp, no
+        # replace; the existing ``.bak`` and the destination are left untouched)
+        # so the caller gets an actionable isError instead of ``outcome="unknown"``
+        # (no auto-resume).
+        if exists and Path(f"{canonical_t}.bak").exists():
+            raise ExcelVbaMcpError(
+                "A backup already exists for the target; refusing to overwrite it "
+                "(no auto-resume).",
+                code=ErrorCode.PROTECTED_TARGET,
+                context={
+                    "reason": "backup_exists",
+                    "target_path": str(canonical_t),
+                    "backup_path": f"{canonical_t}.bak",
+                },
+            )
+
         # 1. Flush the working copy in place (never wb.SaveAs).
         await self._flush_working_copy(record, timeout_s)
 
@@ -765,10 +783,11 @@ class SessionService:
         final target both match the working copy by size + SHA-256. Any
         interruption after the backup boundary yields ``outcome="unknown"`` with
         ``backup_path`` (no auto-resume); a clean pre-backup failure yields
-        ``outcome="error"`` with the destination untouched. If a ``.bak`` from a
-        prior interrupted save already exists, it is never overwritten: the
-        destination is left untouched and the outcome is ``"unknown"`` with
-        ``backup_path`` set (no auto-resume).
+        ``outcome="error"`` with the destination untouched. A pre-existing ``.bak``
+        from a prior interrupted save is rejected earlier in
+        :meth:`save_as_workbook` (deterministic ``PROTECTED_TARGET`` /
+        ``backup_exists``) before this method runs, so it is never overwritten
+        here and never reaches the destination.
         """
 
         working = Path(working_path)
@@ -805,22 +824,6 @@ class SessionService:
             # Preserve the current target (single .bak, overwritten each save).
             if target_exists:
                 backup_path = f"{canonical_t}.bak"
-                if Path(backup_path).exists():
-                    # A prior interrupted save left a .bak behind. Never overwrite
-                    # it (it may be the only recoverable copy) and never replace the
-                    # destination; fail closed with an unknown outcome (no auto-resume).
-                    notes.append(
-                        "prior .bak exists from an interrupted save; "
-                        "refusing to overwrite the backup or the destination "
-                        "(no auto-resume)"
-                    )
-                    return {
-                        "outcome": "unknown",
-                        "sha256": working_sha,
-                        "size": working_size,
-                        "backup_path": backup_path,
-                        "notes": notes,
-                    }
                 self._copy_and_fsync(canonical_t, Path(backup_path))
                 backup_created = True
                 notes.append("previous target preserved at .bak")

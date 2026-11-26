@@ -22,13 +22,13 @@ The 14-case decision matrix (plan_05 §9 / §8):
 9. path outside the allowlisted roots -> PATH_NOT_ALLOWED
 10. permission/disk failure (pre-backup) -> outcome error, destination untouched
 11. interruption (post-backup) -> outcome unknown + backup_path, no success
-12. second save with an existing ``.bak`` -> fails closed (unknown), ``.bak``
-    preserved (no auto-resume)
+12. second save with an existing ``.bak`` -> deterministic PROTECTED_TARGET
+    (backup_exists), ``.bak`` preserved (no auto-resume)
 13. session identity unchanged + a later excel_save writes the working copy
     (target hash unchanged)
 14. source replaced (re-canonical differs) -> STALE_TARGET/source_replaced
-15. pre-existing ``.bak`` (prior interrupted save) -> not overwritten, dest
-    untouched, outcome unknown + ``backup_path``
+15. pre-existing ``.bak`` (prior interrupted save) -> deterministic
+    PROTECTED_TARGET (backup_exists), not overwritten, dest untouched
 """
 
 from __future__ import annotations
@@ -46,6 +46,7 @@ from excel_vba_mcp.application import session_service as session_service_module
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.domain.errors import (
     ErrorCode,
+    ExcelVbaMcpError,
     PathNotAllowedError,
     ProtectedTargetError,
     StaleTargetError,
@@ -400,7 +401,7 @@ async def test_interruption_after_backup_is_unknown(
 
 
 # ---------------------------------------------------------------------------
-# 12. Second save with an existing .bak fails closed (single .bak preserved)
+# 12. Second save with an existing .bak -> deterministic PROTECTED_TARGET
 # ---------------------------------------------------------------------------
 async def test_second_save_with_existing_backup_fails_closed(tmp_path: Path) -> None:
     service, _app, original, _pp = _make_service(tmp_path)
@@ -412,12 +413,16 @@ async def test_second_save_with_existing_backup_fails_closed(tmp_path: Path) -> 
     assert Path(first.backup_path).read_bytes() == b"version-1"
     assert target.read_bytes() == b"original-working-bytes"
 
-    # Second save: a .bak already exists, so the save fails closed (unknown)
-    # without overwriting the .bak or replacing the destination (no auto-resume).
-    second = await service.save_as_workbook(wid, str(target), overwrite_existing=True)
-    assert second.outcome == "unknown"
-    assert second.backup_path == first.backup_path
-    assert Path(second.backup_path).read_bytes() == b"version-1"
+    # Second save: a .bak already exists, so the save is rejected pre-mutation
+    # with a deterministic PROTECTED_TARGET (backup_exists) error without
+    # overwriting the .bak or replacing the destination (no auto-resume).
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        await service.save_as_workbook(wid, str(target), overwrite_existing=True)
+    assert exc_info.value.code is ErrorCode.PROTECTED_TARGET
+    assert exc_info.value.context.get("reason") == "backup_exists"
+    assert exc_info.value.context.get("backup_path") == f"{target}.bak"
+    # The pre-existing .bak and the destination are both untouched.
+    assert Path(first.backup_path).read_bytes() == b"version-1"
     assert target.read_bytes() == b"original-working-bytes"
 
 
@@ -477,7 +482,7 @@ async def test_source_replaced_is_stale(tmp_path: Path, monkeypatch: pytest.Monk
 
 
 # ---------------------------------------------------------------------------
-# 15. Pre-existing .bak (prior interrupted save) -> not overwritten, unknown
+# 15. Pre-existing .bak (prior interrupted save) -> deterministic PROTECTED_TARGET
 # ---------------------------------------------------------------------------
 async def test_preexisting_backup_is_not_overwritten(tmp_path: Path) -> None:
     service, _app, original, _pp = _make_service(tmp_path)
@@ -489,11 +494,14 @@ async def test_preexisting_backup_is_not_overwritten(tmp_path: Path) -> None:
     backup = Path(f"{target}.bak")
     backup.write_bytes(b"prior-interrupted-backup")
 
-    result = await service.save_as_workbook(wid, str(target), overwrite_existing=True)
-
-    # Fail closed: the pre-existing .bak is preserved verbatim and the
-    # destination is not replaced.
-    assert result.outcome == "unknown"
-    assert result.backup_path == f"{target}.bak"
+    # Deterministic, actionable error (isError), not an indeterminate unknown:
+    # the pre-existing .bak is a conflict detected before the destination is
+    # replaced. The .bak is preserved verbatim and the destination is not replaced.
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        await service.save_as_workbook(wid, str(target), overwrite_existing=True)
+    assert exc_info.value.code is ErrorCode.PROTECTED_TARGET
+    assert exc_info.value.context.get("reason") == "backup_exists"
+    assert exc_info.value.context.get("backup_path") == f"{target}.bak"
+    assert exc_info.value.context.get("target_path") == str(target.resolve())
     assert backup.read_bytes() == b"prior-interrupted-backup"
     assert target.read_bytes() == b"current-target"

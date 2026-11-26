@@ -1412,7 +1412,10 @@ def unsupported_filter_reason(spec: PivotFilterSpec) -> str | None:
     unsupported and is **never** silently converted into a manual filter.
     """
 
-    if not isinstance(spec.kind, PivotFilterRequestKind) or spec.kind is not PivotFilterRequestKind.MANUAL:
+    if (
+        not isinstance(spec.kind, PivotFilterRequestKind)
+        or spec.kind is not PivotFilterRequestKind.MANUAL
+    ):
         kind = getattr(spec.kind, "value", repr(spec.kind))
         return f"{_FILTERS_ADD_UNSUPPORTED} Requested kind: {kind!r}."
     if not spec.supported:
@@ -1428,7 +1431,11 @@ def _unsupported_filter_result(
 ) -> PivotFieldFilters:
     """Build the explicit ``unsupported`` result (no Excel mutation)."""
 
-    kind = PivotFilterKind(spec.kind.value) if isinstance(spec.kind, PivotFilterRequestKind) else PivotFilterKind.UNSUPPORTED
+    kind = (
+        PivotFilterKind(spec.kind.value)
+        if isinstance(spec.kind, PivotFilterRequestKind)
+        else PivotFilterKind.UNSUPPORTED
+    )
     return PivotFieldFilters(
         pivot_table=pivot_table,
         field=field,

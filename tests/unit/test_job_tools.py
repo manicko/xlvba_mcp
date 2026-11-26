@@ -17,8 +17,8 @@ import pytest
 
 from excel_vba_mcp.api.job_tools import (
     get_job_registry,
-    job_request_cancel,
     job_get,
+    job_request_cancel,
     set_job_registry,
 )
 from excel_vba_mcp.application.job_registry import JobRegistry, JobState

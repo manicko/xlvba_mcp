@@ -492,7 +492,9 @@ async def test_error_surfacing_matrix(tmp_path: Path) -> None:
                     f"[{tool}] denial hit the wrong guard: expected {expected}, "
                     f"got {payload['errorCode']} (payload={payload!r})"
                 )
-                report.append(f"{tool:32s} denial   code={payload['errorCode']} (expected {expected})")
+                report.append(
+                    f"{tool:32s} denial   code={payload['errorCode']} (expected {expected})"
+                )
 
             # (b) malformed argument (missing required field / wrong type)
             malformed = await _call(session, tool, _malformed_args(tool, write_wid)[tool])
@@ -523,7 +525,8 @@ async def test_error_surfacing_matrix(tmp_path: Path) -> None:
             oversized, "range_write_values", "model-validator"
         )
         assert oversized_payload["errorCode"] == "INVALID_RANGE", (
-            f"oversized grid must be a structured INVALID_RANGE, got {oversized_payload['errorCode']!r}"
+            "oversized grid must be a structured INVALID_RANGE, "
+            f"got {oversized_payload['errorCode']!r}"
         )
         report.append(
             f"{'range_write_values':32s} validator code={oversized_payload['errorCode']} "

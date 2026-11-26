@@ -1784,7 +1784,10 @@ def _annotations(name: str) -> ToolAnnotations:
 def _register_tools(server: MCPServer) -> None:
     """Register the base workbook/session tools on ``server``."""
     server.add_tool(
-        excel_open, name="excel_open", description=_DESC_OPEN, annotations=_annotations("excel_open")
+        excel_open,
+        name="excel_open",
+        description=_DESC_OPEN,
+        annotations=_annotations("excel_open"),
     )
     server.add_tool(
         excel_close,
@@ -1793,7 +1796,10 @@ def _register_tools(server: MCPServer) -> None:
         annotations=_annotations("excel_close"),
     )
     server.add_tool(
-        excel_save, name="excel_save", description=_DESC_SAVE, annotations=_annotations("excel_save")
+        excel_save,
+        name="excel_save",
+        description=_DESC_SAVE,
+        annotations=_annotations("excel_save"),
     )
     server.add_tool(
         excel_save_as,
@@ -1934,7 +1940,10 @@ def _register_tools(server: MCPServer) -> None:
         annotations=_annotations("macro_list"),
     )
     server.add_tool(
-        macro_run, name="macro_run", description=_DESC_MACRO_RUN, annotations=_annotations("macro_run")
+        macro_run,
+        name="macro_run",
+        description=_DESC_MACRO_RUN,
+        annotations=_annotations("macro_run"),
     )
     server.add_tool(
         macro_classify_background,
