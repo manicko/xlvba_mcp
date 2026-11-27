@@ -24,9 +24,8 @@ _CRITICAL = [
     "range_write_formulas",
     "macro_run",
     "macro_classify_background",
-    "table_update_rows",
+    "table",
     "table_delete_rows",
-    "table_append_rows",
     "name_create",
     "name_update",
     "sheet",
@@ -43,7 +42,7 @@ _CRITICAL = [
 # Tools that must carry exactly one request example (R-D8).
 _EXAMPLE_TOOLS = [
     "range_write_values",
-    "table_update_rows",
+    "table",
     "vba_replace_component_source",
     "test_suite_run",
 ]
@@ -85,8 +84,10 @@ async def test_tool_count_is_92_exposed() -> None:
     # B2 (WP1) consolidated the six workbook verbs into workbook + workbook_read
     # (excel_save_as stays standalone): 92 -> 88. B3 (WP2) consolidates the six
     # non-destructive sheet verbs into sheet + sheet_read (sheet_delete stays
-    # standalone): 88 -> 84. B12 finalizes the count.
-    assert len(tools) == 84
+    # standalone): 88 -> 84. B4 (WP3) consolidates the nine non-destructive table
+    # verbs into table + table_read (table_delete_rows and table_delete_column stay
+    # standalone): 84 -> 77. B12 finalizes the count.
+    assert len(tools) == 77
 
 
 async def test_critical_tools_follow_template() -> None:
@@ -117,9 +118,7 @@ async def test_guarded_mutations_use_uniform_guard_sentence() -> None:
     for name in [
         "sheet",
         "sheet_delete",
-        "table_add_column",
-        "table_create",
-        "table_resize",
+        "table",
         "name_delete",
         "shape_set_on_action",
         "control_set_on_action",

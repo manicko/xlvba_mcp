@@ -1,9 +1,11 @@
 """Excel Table (ListObject) MCP tools (task_026, spec §7.6 / §6.5).
 
-Thin, async tool handlers for the table surface: ``tables_list``, ``table_get``,
-``table_read_rows``, ``table_append_rows``, ``table_insert_row``,
-``table_update_rows``, ``table_delete_rows``, ``table_add_column``,
-``table_delete_column``, ``table_create`` and ``table_resize``. They are
+Thin, async tool handlers for the table surface: the ``table`` /
+``table_read`` flat-signature dispatchers (WP3) over the per-verb handlers
+``tables_list``, ``table_get``, ``table_read_rows``, ``table_append_rows``,
+``table_insert_row``, ``table_update_rows``, ``table_delete_rows``,
+``table_add_column``, ``table_delete_column``, ``table_create`` and
+``table_resize``. They are
 deliberately **thin**: each validates its arguments, delegates to
 :class:`~excel_vba_mcp.application.tables_service.TablesService` and returns a
 domain DTO. They **never touch COM** (ARCH-009): no ``pythoncom`` /
@@ -23,11 +25,11 @@ Like the other tool modules, the active service is published here via
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from excel_vba_mcp.adapters.excel.tables_adapter import TableMutationResult, TableRows
 from excel_vba_mcp.application.tables_service import TablesService
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import TableInfo
 
 # The active tables service, published by the server lifespan. ``None`` before
@@ -380,9 +382,137 @@ async def table_resize(workbook_id: str, name: str, new_range: str) -> TableMuta
     return await service.resize_table(workbook_id, name, new_range)
 
 
+async def table(
+    action: Literal[
+        "create",
+        "resize",
+        "append-rows",
+        "insert-row",
+        "update-rows",
+        "add-column",
+    ],
+    workbook_id: str | None = None,
+    sheet: str | None = None,
+    range_or_name: str | None = None,
+    style: str | None = None,
+    name: str | None = None,
+    new_range: str | None = None,
+    rows: list[dict[str, Any]] | None = None,
+    at: int | None = None,
+    values: dict[str, Any] | None = None,
+    updates: list[dict[str, Any]] | None = None,
+    header: str | None = None,
+    position: int | None = None,
+) -> TableMutationResult:
+    """Table mutation dispatch: create, resize, append-rows, insert-row,
+    update-rows or add-column (WP3).
+
+    Thin flat-signature dispatcher (option (a) — flat args + handler
+    validation): routes to the existing :func:`table_create` / :func:`table_resize`
+    / :func:`table_append_rows` / :func:`table_insert_row` /
+    :func:`table_update_rows` / :func:`table_add_column` handlers unchanged and
+    forwards only the validated arguments. Per-action required parameters are
+    enforced by the target handler (``create`` needs ``sheet`` + ``range_or_name``;
+    ``resize`` needs ``name`` + ``new_range``; ``append-rows`` needs ``name`` +
+    ``rows``; ``insert-row`` needs ``name`` + ``at``; ``update-rows`` needs
+    ``name`` + ``updates``; ``add-column`` needs ``name`` + ``header``) so a
+    missing required argument surfaces as a structured :class:`ExcelVbaMcpError`
+    rather than a crash. An unknown ``action`` raises a structured
+    :class:`ExcelVbaMcpError`. ``delete-column`` is intentionally **not** an
+    action here — use the standalone :func:`table_delete_column`.
+
+    Args:
+        action: ``create``, ``resize``, ``append-rows``, ``insert-row``,
+            ``update-rows`` or ``add-column``.
+        workbook_id: The id returned by ``open``; required for every action.
+        sheet: The worksheet that will own the table (``create``).
+        range_or_name: An A1 range address or workbook defined name (``create``).
+        style: Optional ``TableStyle`` name (``create``).
+        name: The table name (``resize`` / ``append-rows`` / ``insert-row`` /
+            ``update-rows`` / ``add-column``).
+        new_range: The new A1 range address (``resize``).
+        rows: A non-empty list of ``{header: value}`` objects (``append-rows``).
+        at: 1-based insert position (``insert-row``).
+        values: Optional ``{header: value}`` object for the new row (``insert-row``).
+        updates: A non-empty list of update objects (``update-rows``).
+        header: The new column header, must be unique (``add-column``).
+        position: Optional 1-based column index (``add-column``).
+
+    Returns:
+        A :class:`TableMutationResult`.
+    """
+
+    if action == "create":
+        return await table_create(
+            workbook_id or "", sheet or "", range_or_name or "", style=style
+        )
+    if action == "resize":
+        return await table_resize(workbook_id or "", name or "", new_range or "")
+    if action == "append-rows":
+        return await table_append_rows(workbook_id or "", name or "", rows or [])
+    if action == "insert-row":
+        return await table_insert_row(
+            workbook_id or "", name or "", at or 0, values
+        )
+    if action == "update-rows":
+        return await table_update_rows(workbook_id or "", name or "", updates or [])
+    if action == "add-column":
+        return await table_add_column(
+            workbook_id or "", name or "", header or "", position
+        )
+    raise ExcelVbaMcpError(
+        f"Unknown table action {action!r}; expected 'create', 'resize', "
+        "'append-rows', 'insert-row', 'update-rows' or 'add-column'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "table", "action": action},
+    )
+
+
+async def table_read(
+    action: Literal["list", "get", "read-rows"],
+    workbook_id: str | None = None,
+    name: str | None = None,
+    offset: int = 0,
+    limit: int | None = None,
+) -> list[TableInfo] | TableInfo | TableRows:
+    """Table read dispatch: ``list``, ``get`` or ``read-rows`` (WP3).
+
+    Thin flat-signature dispatcher (option (a)): routes to the existing
+    :func:`tables_list` / :func:`table_get` / :func:`table_read_rows` handlers
+    unchanged. ``list`` requires only ``workbook_id``; ``get`` / ``read-rows``
+    also require ``name`` (enforced by the target handler). An unknown
+    ``action`` raises a structured :class:`ExcelVbaMcpError`.
+
+    Args:
+        action: ``list`` (every table), ``get`` (one table by name) or
+            ``read-rows`` (a bounded slice of data rows).
+        workbook_id: The id returned by ``open``; required for every action.
+        name: The table name; required for ``get`` / ``read-rows``.
+        offset: 0-based data-row index of the first row (``read-rows``).
+        limit: Optional cap on the number of rows (``read-rows``).
+
+    Returns:
+        A list of :class:`TableInfo` (``list``), a single :class:`TableInfo`
+        (``get``) or a :class:`TableRows` slice (``read-rows``).
+    """
+
+    if action == "list":
+        return await tables_list(workbook_id or "")
+    if action == "get":
+        return await table_get(workbook_id or "", name or "")
+    if action == "read-rows":
+        return await table_read_rows(workbook_id or "", name or "", offset, limit)
+    raise ExcelVbaMcpError(
+        f"Unknown table_read action {action!r}; expected 'list', 'get' or 'read-rows'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "table_read", "action": action},
+    )
+
+
 __all__ = [
     "get_tables_service",
     "set_tables_service",
+    "table",
     "table_add_column",
     "table_append_rows",
     "table_create",
@@ -390,6 +520,7 @@ __all__ = [
     "table_delete_rows",
     "table_get",
     "table_insert_row",
+    "table_read",
     "table_read_rows",
     "table_resize",
     "table_update_rows",

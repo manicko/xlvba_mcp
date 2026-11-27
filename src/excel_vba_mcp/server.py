@@ -122,17 +122,10 @@ from excel_vba_mcp.api.sheet_tools import (
     sheet_read,
 )
 from excel_vba_mcp.api.table_tools import (
-    table_add_column,
-    table_append_rows,
-    table_create,
+    table,
     table_delete_column,
     table_delete_rows,
-    table_get,
-    table_insert_row,
-    table_read_rows,
-    table_resize,
-    table_update_rows,
-    tables_list,
+    table_read,
 )
 from excel_vba_mcp.api.test_tools import (
     snapshot_create,
@@ -662,6 +655,50 @@ _DESC_TABLE_CREATE = (
 _DESC_TABLE_RESIZE = (
     "Resize a table to a new A1 range via ListObject.Resize. Guarded mutation (see "
     "xlvba://glossary)."
+)
+_DESC_TABLE = (
+    "Purpose: Create, resize, append to, insert into, update or add a column to an "
+    "Excel Table through one mutation tool. "
+    "Use when: you need a new ListObject, a resized table, appended/inserted rows, "
+    "updated row values, or a new column. "
+    "Do not use when: you need to delete rows — use table_delete_rows; you need to "
+    "delete a column — use table_delete_column; you need to read the table "
+    "inventory/data — use table_read. "
+    "Preconditions: an open workbook_id; writable session + snapshot + approval "
+    "Approval gate (see xlvba://glossary) + postcondition re-read. "
+    "Parameters: action='create'|'resize'|'append-rows'|'insert-row'|'update-rows'|"
+    "'add-column'; workbook_id; sheet + range_or_name + style (create); name + "
+    "new_range (resize); name + rows (append-rows); name + at + values (insert-row); "
+    "name + updates (update-rows); name + header + position (add-column). "
+    "Behavior: create makes a ListObject over an A1 range or defined name; resize "
+    "requires the header row; append-rows preserves structure; insert-row inserts at "
+    "a 1-based position; update-rows applies {index|where, values} with an "
+    "ambiguous where rejected (no auto-guess); add-column requires a unique header. "
+    "Guarded mutation (see xlvba://glossary). "
+    "Result: TableMutationResult. "
+    "Next actions: table_read action='read-rows' to verify. "
+    "Example: {\"action\": \"append-rows\", \"workbook_id\": \"<id>\", \"name\": "
+    "\"Sales\", \"rows\": [{\"Amount\": 100}]}"
+)
+_DESC_TABLE_READ = (
+    "Purpose: Read the table inventory or data of an open workbook without mutating "
+    "it. "
+    "Use when: you need every Excel Table, one table's metadata by name, or a typed "
+    "slice of a table's data rows. "
+    "Do not use when: you need to create/resize/append/insert/update/add-column — use "
+    "table; you need to delete rows — use table_delete_rows; you need to delete a "
+    "column — use table_delete_column. "
+    "Preconditions: an open workbook_id; name is required for get / read-rows. "
+    "Parameters: action='list'|'get'|'read-rows'; workbook_id; name (get / "
+    "read-rows); offset + limit (read-rows). "
+    "Behavior: read-only; list returns one entry per ListObject with range/totals/"
+    "style/row count/columns; get returns one TableInfo; read-rows returns typed "
+    "values (str/int/float/bool/null/ISO date/Excel error) with a truncated flag. "
+    "Result: list[TableInfo] (list), TableInfo (get) or TableRows (read-rows). "
+    "Next actions: table action='append-rows' to add records; range_read_values to "
+    "read cells. "
+    "Example: {\"action\": \"read-rows\", \"workbook_id\": \"<id>\", \"name\": "
+    "\"Sales\", \"offset\": 0, \"limit\": 50}"
 )
 _DESC_RANGE_GET = (
     "Resolve an explicit worksheet + A1-style address to Range metadata "
@@ -1767,9 +1804,7 @@ _ANN_READ_ONLY = frozenset(
         "macro_get_last_result",
         "job_get",
         "sheet_read",
-        "tables_list",
-        "table_get",
-        "table_read_rows",
+        "table_read",
         "pivot_tables_list",
         "pivot_table_get",
         "pivot_cache_get",
@@ -1798,6 +1833,7 @@ _ANN_DESTRUCTIVE = frozenset(
         "excel_recover",
         "snapshot_restore",
         "table_delete_rows",
+        "table_delete_column",
         "name_delete",
         "range_delete",
         "vba_replace_component_source",
@@ -1815,8 +1851,7 @@ _ANN_IDEMPOTENT = frozenset(
         "range_unmerge",
         "range_set_validation",
         "range_set_conditional_formatting",
-        "table_update_rows",
-        "table_resize",
+        "table_read",
         "sheet_read",
         "pivot_table_refresh",
         "pivot_cache_refresh",
@@ -2031,40 +2066,16 @@ def _register_tools(server: MCPServer) -> None:
         annotations=_annotations("sheet_delete"),
     )
     server.add_tool(
-        tables_list,
-        name="tables_list",
-        description=_DESC_TABLES_LIST,
-        annotations=_annotations("tables_list"),
+        table,
+        name="table",
+        description=_DESC_TABLE,
+        annotations=_annotations("table"),
     )
     server.add_tool(
-        table_get,
-        name="table_get",
-        description=_DESC_TABLE_GET,
-        annotations=_annotations("table_get"),
-    )
-    server.add_tool(
-        table_read_rows,
-        name="table_read_rows",
-        description=_DESC_TABLE_READ_ROWS,
-        annotations=_annotations("table_read_rows"),
-    )
-    server.add_tool(
-        table_append_rows,
-        name="table_append_rows",
-        description=_DESC_TABLE_APPEND_ROWS,
-        annotations=_annotations("table_append_rows"),
-    )
-    server.add_tool(
-        table_insert_row,
-        name="table_insert_row",
-        description=_DESC_TABLE_INSERT_ROW,
-        annotations=_annotations("table_insert_row"),
-    )
-    server.add_tool(
-        table_update_rows,
-        name="table_update_rows",
-        description=_DESC_TABLE_UPDATE_ROWS,
-        annotations=_annotations("table_update_rows"),
+        table_read,
+        name="table_read",
+        description=_DESC_TABLE_READ,
+        annotations=_annotations("table_read"),
     )
     server.add_tool(
         table_delete_rows,
@@ -2073,28 +2084,10 @@ def _register_tools(server: MCPServer) -> None:
         annotations=_annotations("table_delete_rows"),
     )
     server.add_tool(
-        table_add_column,
-        name="table_add_column",
-        description=_DESC_TABLE_ADD_COLUMN,
-        annotations=_annotations("table_add_column"),
-    )
-    server.add_tool(
         table_delete_column,
         name="table_delete_column",
         description=_DESC_TABLE_DELETE_COLUMN,
         annotations=_annotations("table_delete_column"),
-    )
-    server.add_tool(
-        table_create,
-        name="table_create",
-        description=_DESC_TABLE_CREATE,
-        annotations=_annotations("table_create"),
-    )
-    server.add_tool(
-        table_resize,
-        name="table_resize",
-        description=_DESC_TABLE_RESIZE,
-        annotations=_annotations("table_resize"),
     )
     server.add_tool(
         pivot_tables_list,
