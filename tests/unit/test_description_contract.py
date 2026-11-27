@@ -7,11 +7,16 @@ touches Excel/COM and never starts the worker.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 import excel_vba_mcp.server as server
 
 pytestmark = pytest.mark.anyio
+
+_FIXTURE = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "wp0_baseline.json"
 
 # Workflow-critical tools that must follow the §5.1 template (Purpose / Use when /
 # Do not use when / Preconditions / Parameters / Behavior / Result / Next actions).
@@ -84,7 +89,7 @@ async def _descriptions() -> dict[str, str]:
     return {tool.name: (tool.description or "") for tool in tools}
 
 
-async def test_tool_count_is_92_exposed() -> None:
+async def test_tool_count_is_final_exposed() -> None:
     tools = await server.mcp.list_tools()
     # B2 (WP1) consolidated the six workbook verbs into workbook + workbook_read
     # (excel_save_as stays standalone): 92 -> 88. B3 (WP2) consolidates the six
@@ -106,6 +111,24 @@ async def test_tool_count_is_92_exposed() -> None:
     # vba_insert_code, vba_export_project and vba_compile_diagnostics stay
     # standalone: 47 -> 41. B12 finalizes the count.
     assert len(tools) == 41
+
+
+async def test_single_switchover_no_legacy_names_or_aliases() -> None:
+    # H2 (no dual-run): production tools/list is the final surface only. No old
+    # (pre-consolidation) tool name is registered and no ``meta.deprecated`` alias
+    # is exposed. The retired old names are exactly the ledger old_names that are
+    # not themselves a final target.
+    data = json.loads(_FIXTURE.read_text(encoding="utf-8"))
+    targets = {row["target"]["tool"] for row in data["ledger"]}
+    retired = {row["old_name"] for row in data["ledger"]} - targets
+
+    tools = await server.mcp.list_tools()
+    names = {tool.name for tool in tools}
+
+    assert not (names & retired), f"legacy names still registered: {sorted(names & retired)}"
+    for tool in tools:
+        meta = getattr(tool, "meta", None)
+        assert not meta, f"{tool.name} exposes a non-empty meta (possible deprecated alias)"
 
 
 async def test_critical_tools_follow_template() -> None:
