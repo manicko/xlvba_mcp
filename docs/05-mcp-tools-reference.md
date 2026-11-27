@@ -253,13 +253,21 @@ changes. `test` is a mixed-profile tool (`run-suite` executes, `get-run` reads) 
 `destructive=true` because `run-suite` can dispatch `macro_run` steps with external side effects.
 `test` accepts `background=true` to return a `RunningJob` promptly.
 
+**Headless UI limitation (R13).** Neither `macro_run` nor the declarative test runner can run a
+procedure that shows UI. A procedure containing `MsgBox`, `InputBox`, `UserForm.Show`, `FileDialog`
+or any other R13 token is vetoed by the interactive-UI preflight **before** dispatch and returns
+`INTERACTIVE_UI_NOT_SUPPORTED` (the macro is not started). This is expected behavior, not a defect:
+the server owns a hidden, non-activating Excel instance with no GUI, so a modal would block the
+single STA worker indefinitely. The veto is deliberate and is not weakened; remove the interactive
+tokens (out of scope for this server) or run the procedure in an interactive Excel session instead.
+
 ## Sheets / tables / names
 
 | Tool | Actions | Purpose | Parameters | Returns | Side effects | Errors | R/D/I |
 |------|---------|---------|------------|---------|--------------|--------|-------|
-| `sheet` | `add`, `rename`, `copy`, `set-visibility` | Adds, renames, copies a sheet; sets visibility. | `action`, `workbook_id`, `name?`, `new_name?`, `sheet_type?=worksheet`, `visible?` | `SheetInfo` | New/renamed/copied sheet; visibility; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/F/F |
-| `sheet_read` | `list`, `get` | All sheets, or one sheet by name. | `action`, `workbook_id`, `name?` | `list[SheetInfo]` / `SheetInfo` | — | `COM_BUSY` (not found) | T/F/T |
-| `sheet_delete` | (standalone) | Deletes a sheet (destructive). | `workbook_id`, `name` | `SheetInfo` | Sheet deletion; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/T/F |
+| `sheet` | `add`, `rename`, `copy`, `set-visibility` | Adds, renames, copies a sheet; sets visibility. | `action`, `workbook_id`, `name?`, `new_name?`, `sheet_type?=worksheet`, `visible?`, `target_name?` | `SheetInfo` | New/renamed/copied sheet; visibility; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `NOT_FOUND`, `INVALID_RANGE`, `COM_BUSY` | F/F/F |
+| `sheet_read` | `list`, `get` | All sheets, or one sheet by name. | `action`, `workbook_id`, `name?` | `list[SheetInfo]` / `SheetInfo` | — | `NOT_FOUND` | T/F/T |
+| `sheet_delete` | (standalone) | Deletes a sheet (destructive). | `workbook_id`, `name` | `SheetInfo` | Sheet deletion; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `NOT_FOUND`, `COM_BUSY` | F/T/F |
 | `table` | `create`, `resize`, `append-rows`, `insert-row`, `update-rows`, `add-column` | Creates/resizes a table; appends/inserts/updates rows; adds a column. | `action`, `workbook_id`, `sheet?`, `range_or_name?`, `name?`, `new_range?`, `rows?`, `at?`, `values?`, `updates?`, `header?`, `position?`, `style?` | `TableMutationResult` | Table rows/columns/range; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/F/F |
 | `table_read` | `list`, `get`, `read-rows` | All tables, one table, or a bounded slice of rows. | `action`, `workbook_id`, `name?`, `offset?=0`, `limit?` | `list[TableInfo]` / `TableInfo` / `TableRows` | — | `COM_BUSY` | T/F/T |
 | `table_delete_rows` | (standalone) | Deletes rows by indices or an unambiguous `where` (XOR guard). | `workbook_id`, `name`, `indices?`, `where?` | `TableMutationResult` | Table rows; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/T/F |
@@ -288,6 +296,14 @@ explicit index or an unambiguous `where`; `table_delete_rows` requires exactly o
 `range_write` is not idempotent because `set-conditional-formatting(mode="add")` appends a rule
 (renumbering priorities). Structural operations that intersect an Excel Table (ListObject) are
 rejected with `LISTOBJECT_INTERSECTION` and must be performed through the table tools.
+
+**Cell cap (100,000).** A valid range whose `rows * cols` exceeds `MAX_RANGE_CELLS` (100,000) is
+rejected with an explicit limit-specific error — never silently truncated and never reported as a
+generic `INVALID_RANGE` for a well-formed address. (The dedicated limit error code is delivered by a
+separate work package; the rejection is already explicit today — oversized valid ranges fail rather
+than return clipped data.) Read large areas in chunks via `offset` / `limit`; a range clipped by the
+`offset`/`limit` window is reported with `truncated=true`, which is distinct from an over-cap
+rejection.
 
 ## Pivot
 

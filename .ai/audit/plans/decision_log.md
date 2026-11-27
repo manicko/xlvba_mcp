@@ -256,3 +256,8 @@ U6-B/A/C/E/U7/U6-D all implemented + Validator-ACCEPT; alignment pass fixed inte
 - Save As live integration (Excel 16.0, PID 27704): 9 scenarios PASS; scenario-6 `.bak` conflict defect fixed (deterministic `PROTECTED_TARGET/backup_exists`); candidate real-agent run PASS.
 - Comparative baseline-vs-candidate model-in-the-loop benchmark: **BLOCKED** (only candidate server reachable; Kilo global config read-restricted; no baseline routing). No proxy substituted.
 - **Stage 1 = FAIL (blocked on comparative benchmark). Stage 2 NOT started.** Remediation: run the comparative benchmark where both variants are routable, then repeat Stage 1D.
+
+## Stage 2 outcome (2026-11-26, benchmark waived by user)
+- User waived the comparative benchmark; Stage 1 treated as PASS for gating.
+- Stage 1 fix (deterministic `PROTECTED_TARGET/backup_exists`) committed `fefc9ed`; docs `55b9398`; ruff clean; unit 1152 pass.
+- **Stage 2 ACCEPTED; rollout COMPLETED** on local `master` (no remote). Post-deploy health: 92 tools, canonical names present, single owned Excel, accepting. Rollback: revert `55b9398 fefc9ed` → `ef3e6cb`. Open (non-blocking): comparative benchmark (waived); post-restart live re-test of scenario-6 fix.

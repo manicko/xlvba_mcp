@@ -260,13 +260,22 @@ VBA. `test` — инструмент со смешанным профилем (`
 `destructive=true`, поскольку `run-suite` может диспетчеризовать шаги `macro_run` с внешними
 эффектами. `test` принимает `background=true`, чтобы promptly вернуть `RunningJob`.
 
+**Ограничение headless-UI (R13).** Ни `macro_run`, ни декларативный тест-раннер не могут выполнить
+процедуру, показывающую UI. Процедура, содержащая `MsgBox`, `InputBox`, `UserForm.Show`, `FileDialog`
+или любой иной токен R13, ветируется preflight'ом интерактивного UI **до** диспетчеризации и
+возвращает `INTERACTIVE_UI_NOT_SUPPORTED` (макрос не запускается). Это ожидаемое поведение, а не
+дефект: сервер владеет скрытым, неактивируемым экземпляром Excel без GUI, поэтому модальное окно
+заблокировало бы единственный STA-воркер на неопределённый срок. Вето намеренное и не ослабляется;
+удалите интерактивные токены (вне области действия этого сервера) или выполните процедуру в
+интерактивной сессии Excel.
+
 ## Листы / таблицы / имена
 
 | Инструмент | Действия | Назначение | Параметры | Возврат | Побочные эффекты | Ошибки | R/D/I |
 |------------|----------|------------|-----------|---------|------------------|--------|-------|
-| `sheet` | `add`, `rename`, `copy`, `set-visibility` | Добавляет, переименовывает, копирует лист; задаёт видимость. | `action`, `workbook_id`, `name?`, `new_name?`, `sheet_type?=worksheet`, `visible?` | `SheetInfo` | Новый/переименованный/скопированный лист; видимость; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/F/F |
-| `sheet_read` | `list`, `get` | Все листы или один лист по имени. | `action`, `workbook_id`, `name?` | `list[SheetInfo]` / `SheetInfo` | — | `COM_BUSY` (не найден) | T/F/T |
-| `sheet_delete` | (standalone) | Удаляет лист (разрушительно). | `workbook_id`, `name` | `SheetInfo` | Удаление листа; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/T/F |
+| `sheet` | `add`, `rename`, `copy`, `set-visibility` | Добавляет, переименовывает, копирует лист; задаёт видимость. | `action`, `workbook_id`, `name?`, `new_name?`, `sheet_type?=worksheet`, `visible?`, `target_name?` | `SheetInfo` | Новый/переименованный/скопированный лист; видимость; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `NOT_FOUND`, `INVALID_RANGE`, `COM_BUSY` | F/F/F |
+| `sheet_read` | `list`, `get` | Все листы или один лист по имени. | `action`, `workbook_id`, `name?` | `list[SheetInfo]` / `SheetInfo` | — | `NOT_FOUND` | T/F/T |
+| `sheet_delete` | (standalone) | Удаляет лист (разрушительно). | `workbook_id`, `name` | `SheetInfo` | Удаление листа; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `NOT_FOUND`, `COM_BUSY` | F/T/F |
 | `table` | `create`, `resize`, `append-rows`, `insert-row`, `update-rows`, `add-column` | Создаёт/изменяет размер таблицы; добавляет/вставляет/обновляет строки; добавляет колонку. | `action`, `workbook_id`, `sheet?`, `range_or_name?`, `name?`, `new_range?`, `rows?`, `at?`, `values?`, `updates?`, `header?`, `position?`, `style?` | `TableMutationResult` | Строки/колонки/диапазон таблицы; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/F/F |
 | `table_read` | `list`, `get`, `read-rows` | Все таблицы, одна таблица или ограниченный срез строк. | `action`, `workbook_id`, `name?`, `offset?=0`, `limit?` | `list[TableInfo]` / `TableInfo` / `TableRows` | — | `COM_BUSY` | T/F/T |
 | `table_delete_rows` | (standalone) | Удаляет строки по индексам или однозначному `where` (XOR-guard). | `workbook_id`, `name`, `indices?`, `where?` | `TableMutationResult` | Строки таблицы; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/T/F |
@@ -296,6 +305,14 @@ VBA. `test` — инструмент со смешанным профилем (`
 добавляет правило (с перенумерацией приоритетов). Структурные операции, пересекающие Excel Table
 (ListObject), отклоняются с `LISTOBJECT_INTERSECTION` и должны выполняться через инструменты
 таблиц.
+
+**Лимит ячеек (100 000).** Валидный диапазон, у которого `rows * cols` превышает `MAX_RANGE_CELLS`
+(100 000), отклоняется с явной ошибкой лимита — никогда «молча» не урезается и никогда не сообщается
+как общий `INVALID_RANGE` для корректного адреса. (Выделенный код ошибки лимита поставляется отдельной
+рабочей парой; отклонение уже сегодня явное — сверхбольшие валидные диапазоны падают, а не
+возвращают обрезанные данные.) Читайте большие области порциями через `offset` / `limit`; диапазон,
+обрезанный окном `offset`/`limit`, отмечается `truncated=true`, что отличается от отклонения по
+превышению лимита.
 
 ## Pivot
 
