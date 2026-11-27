@@ -199,15 +199,21 @@ is a genuine recovery state.
 |------|---------|---------|------------|---------|--------------|--------|-------|
 | `snapshot_create` | (standalone) | Creates an immutable snapshot of an open or known workbook. | `workbook_id` | `SnapshotManifest` | Snapshot files + `manifest.json`; audit | `SNAPSHOT_FAILED`, `APPROVAL_DENIED`, `EXCEL_HUNG` | F/F/F |
 | `snapshot_list` | (standalone) | Lists snapshots and their metadata. | — | `list[SnapshotManifest]` | — | `SNAPSHOT_FAILED` | T/F/T |
-| `snapshot_restore` | (standalone) | Restores a working session from a snapshot. | `snapshot_id`, `workbook_id?`, `confirm?=false` | `WorkbookInfo` | Closes the current copy without saving; opens a new working copy; audit | `CONFIRMATION_REQUIRED`, `SNAPSHOT_FAILED`, `APPROVAL_DENIED`, `EXCEL_HUNG` | F/T/F |
+| `snapshot_restore` | (standalone) | Restores a working session from a snapshot. | `snapshot_id`, `workbook_id`, `confirm?=false` | `SnapshotRestoreResult` | Closes the current copy without saving; opens a new working copy; audit | `CONFIRMATION_REQUIRED`, `INVALID_RANGE`, `SNAPSHOT_FAILED`, `APPROVAL_DENIED`, `EXCEL_HUNG` | F/T/F |
 | `snapshot_diff` | (standalone) | Compares two snapshots by metadata and hash. | `snapshot_id_a`, `snapshot_id_b` | `SnapshotDiff` | — | `SNAPSHOT_FAILED` | T/F/T |
 
 `snapshot_create` and `vba_export_project` write files and are approval-gated (F-4): auto-allowed
 in `full` mode, refused with `APPROVAL_DENIED` in `restricted` mode. `snapshot_restore` adds no
 second gate — its approval point is the inherited writable open it performs on the snapshot
-baseline. `confirm` is **required** (default `false`): a missing or `false` `confirm` is rejected
-with `CONFIRMATION_REQUIRED` **before** the working copy is closed. The snapshot restores files
-only — it does **not** undo external macro side effects.
+baseline. `workbook_id` is **required**: it identifies the current working copy to discard so
+exactly one active copy remains (a missing/empty `workbook_id` is rejected with `INVALID_RANGE`,
+`isRetryable=false`). `confirm` is **required** (default `false`): a missing or `false` `confirm`
+is rejected with `CONFIRMATION_REQUIRED` **before** the working copy is closed. A failed
+previous-copy close does **not** fail the restore: the result reports `previous_close="failed"`
+with safe `previous_close_error` text and the previous copy stays open (`"closed"` on a clean
+close, `"not_requested"` when no previous copy was supplied). Restoring the snapshot that is
+already the active restored baseline for the same original is rejected (`reason="same_snapshot"`).
+The snapshot restores files only — it does **not** undo external macro side effects.
 
 ## Jobs
 
@@ -547,8 +553,15 @@ Restore:
 { "snapshot_id": "snap-…", "workbook_id": "1f0c…", "confirm": true }
 ```
 
-The current working copy is closed **without saving**, then a new copy is opened from the baseline;
-a `WorkbookInfo` is returned. External macro effects are not rolled back. `confirm` is required.
+`workbook_id` is **required** (the current working copy to discard). The current working copy is
+closed **without saving**, then a new copy is opened from the baseline and validated; the restored
+session's identity is rebound to the **original** source (`source_path`), so `list_workbooks` /
+reopen reflect the original, never the immutable snapshot file. A `SnapshotRestoreResult` is
+returned: the restored `WorkbookInfo` plus `previous_close` (`"closed"` / `"failed"` /
+`"not_requested"`) and, on a failed close, safe `previous_close_error` text (the restore still
+succeeds and the previous copy stays open). Re-restoring the already-active baseline for the same
+original is rejected with `reason="same_snapshot"`. External macro effects are not rolled back.
+`confirm` is required.
 
 ### vba_replace_component_source
 
@@ -731,7 +744,7 @@ subsequent calls using the same `workbook_id` — after closing, the identifier 
 | `workbook` `close` (`discard_changes=true`) | Discards unsaved changes and closes | Destructive; refuse-by-default (D1) | Prefer `save_changes=true` or a prior `snapshot_create`; only pass `discard_changes=true` deliberately |
 | `workbook` `save` | Writes the working-copy file | Mutating | Combine with a snapshot; do not save "just in case" |
 | `excel_save_as` | Writes the working copy to a target path (own permission) | Standalone high-risk; overwrite policy | Check the target; use `overwrite_existing` / `overwrite_source` only after review |
-| `snapshot_restore` | Discards the current copy and opens the baseline | Mutating; requires `confirm=true` | Take a fresh `snapshot_create` first; a missing/false `confirm` is rejected before anything is discarded |
+| `snapshot_restore` | Discards the current copy and opens the baseline | Mutating; requires `workbook_id` + `confirm=true` | Take a fresh `snapshot_create` first; a missing `workbook_id` (`INVALID_RANGE`) or false `confirm` (`CONFIRMATION_REQUIRED`) is rejected before anything is discarded; a failed previous-copy close is reported (`previous_close="failed"`) and never fails the restore |
 | `sheet_delete` | Deletes a sheet with its data | Destructive, standalone | Check `sheet_read` `list`; rely on a snapshot |
 | `table_delete_rows` | Deletes table rows | Destructive, standalone (XOR guard) | Use explicit `indices`; use `where` only when unambiguous |
 | `table_delete_column` | Deletes a table column | Destructive, standalone (own permission) | Check `table_read` `get`; do not pass an ambiguous header |

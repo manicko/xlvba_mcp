@@ -204,15 +204,22 @@ STA-воркере, затем копирует её по `path` чисто-фа
 |------------|----------|------------|-----------|---------|------------------|--------|-------|
 | `snapshot_create` | (standalone) | Создаёт иммутабельный снапшот открытой или известной книги. | `workbook_id` | `SnapshotManifest` | Файлы снапшота + `manifest.json`; аудит | `SNAPSHOT_FAILED`, `APPROVAL_DENIED`, `EXCEL_HUNG` | F/F/F |
 | `snapshot_list` | (standalone) | Список снапшотов и их метаданных. | — | `list[SnapshotManifest]` | — | `SNAPSHOT_FAILED` | T/F/T |
-| `snapshot_restore` | (standalone) | Восстанавливает рабочую сессию из снапшота. | `snapshot_id`, `workbook_id?`, `confirm?=false` | `WorkbookInfo` | Закрытие текущей копии без сохранения; новая рабочая копия; аудит | `CONFIRMATION_REQUIRED`, `SNAPSHOT_FAILED`, `APPROVAL_DENIED`, `EXCEL_HUNG` | F/T/F |
+| `snapshot_restore` | (standalone) | Восстанавливает рабочую сессию из снапшота. | `snapshot_id`, `workbook_id`, `confirm?=false` | `SnapshotRestoreResult` | Закрытие текущей копии без сохранения; новая рабочая копия; аудит | `CONFIRMATION_REQUIRED`, `INVALID_RANGE`, `SNAPSHOT_FAILED`, `APPROVAL_DENIED`, `EXCEL_HUNG` | F/T/F |
 | `snapshot_diff` | (standalone) | Сравнивает два снапшота по метаданным и хэшу. | `snapshot_id_a`, `snapshot_id_b` | `SnapshotDiff` | — | `SNAPSHOT_FAILED` | T/F/T |
 
 `snapshot_create` и `vba_export_project` записывают файлы и гейтятся approval (F-4): авторизованы
 без гранта в `full`, отклоняются с `APPROVAL_DENIED` в `restricted`. `snapshot_restore` не
 добавляет второй гейт — его точка approval унаследована от writable-открытия, которое он выполняет
-над baseline снапшота. `confirm` **обязателен** (по умолчанию `false`): отсутствующий или `false`
-`confirm` отклоняется с `CONFIRMATION_REQUIRED` **до** закрытия рабочей копии. Снапшот
-восстанавливает только файлы — он **не** откатывает внешние эффекты макросов.
+над baseline снапшота. `workbook_id` **обязателен**: он определяет текущую рабочую копию для
+отбрасывания, чтобы осталась ровно одна активная копия (отсутствующий/пустой `workbook_id`
+отклоняется с `INVALID_RANGE`, `isRetryable=false`). `confirm` **обязателен** (по умолчанию
+`false`): отсутствующий или `false` `confirm` отклоняется с `CONFIRMATION_REQUIRED` **до** закрытия
+рабочей копии. Ошибка закрытия предыдущей копии **не** ломает восстановление: результат содержит
+`previous_close="failed"` с безопасным текстом `previous_close_error`, а предыдущая копия остаётся
+открытой (`"closed"` при чистом закрытии, `"not_requested"` если предыдущая копия не задана).
+Повторное восстановление снапшота, который уже является активным восстановленным baseline для того
+же оригинала, отклоняется (`reason="same_snapshot"`). Снапшот восстанавливает только файлы — он
+**не** откатывает внешние эффекты макросов.
 
 ## Jobs
 
@@ -558,8 +565,15 @@ Control. Отсутствующая фигура/элемент возвраща
 { "snapshot_id": "snap-…", "workbook_id": "1f0c…", "confirm": true }
 ```
 
-Текущая рабочая копия закрывается **без сохранения**, затем открывается новая копия из baseline;
-возвращается `WorkbookInfo`. Внешние эффекты макросов не откатываются. `confirm` обязателен.
+`workbook_id` **обязателен** (текущая рабочая копия для отбрасывания). Текущая рабочая копия
+закрывается **без сохранения**, затем открывается и валидируется новая копия из baseline; идентичность
+восстановленной сессии перепривязывается к **оригиналу** (`source_path`), поэтому `list_workbooks` /
+повторное открытие отражают оригинал, а не иммутабельный файл снапшота. Возвращается
+`SnapshotRestoreResult`: восстановленный `WorkbookInfo` плюс `previous_close` (`"closed"` /
+`"failed"` / `"not_requested"`) и, при ошибке закрытия, безопасный текст `previous_close_error`
+(восстановление всё равно успешно, предыдущая копия остаётся открытой). Повторное восстановление уже
+активного baseline для того же оригинала отклоняется с `reason="same_snapshot"`. Внешние эффекты
+макросов не откатываются. `confirm` обязателен.
 
 ### vba_replace_component_source
 
@@ -740,7 +754,7 @@ Fail-closed ответ:
 | `workbook` `close` (`discard_changes=true`) | Отбрасывает несохранённые изменения и закрывает | Разрушительно; по умолчанию отказ (D1) | Предпочесть `save_changes=true` или предварительный `snapshot_create`; передавать `discard_changes=true` только осознанно |
 | `workbook` `save` | Записывает файл рабочей копии | Mutating | Комбинировать со снапшотом; не сохранять «на всякий случай» |
 | `excel_save_as` | Записывает рабочую копию по целевому пути (own permission) | Standalone high-risk; overwrite policy | Проверить цель; использовать `overwrite_existing` / `overwrite_source` только после ревью |
-| `snapshot_restore` | Отбрасывает текущую копию и открывает baseline | Mutating; требует `confirm=true` | Делать свежий `snapshot_create` сначала; отсутствующий/ложный `confirm` отклоняется до отбрасывания |
+| `snapshot_restore` | Отбрасывает текущую копию и открывает baseline | Mutating; требует `workbook_id` + `confirm=true` | Делать свежий `snapshot_create` сначала; отсутствующий `workbook_id` (`INVALID_RANGE`) или ложный `confirm` (`CONFIRMATION_REQUIRED`) отклоняется до отбрасывания; ошибка закрытия предыдущей копии сообщается (`previous_close="failed"`) и не ломает восстановление |
 | `sheet_delete` | Удаляет лист с данными | Разрушительно, standalone | Проверять `sheet_read` `list`; полагаться на снапшот |
 | `table_delete_rows` | Удаляет строки таблицы | Разрушительно, standalone (XOR-guard) | Использовать явные `indices`; `where` только при однозначности |
 | `table_delete_column` | Удаляет колонку таблицы | Разрушительно, standalone (own permission) | Проверять `table_read` `get`; не передавать неоднозначный заголовок |

@@ -261,3 +261,9 @@ U6-B/A/C/E/U7/U6-D all implemented + Validator-ACCEPT; alignment pass fixed inte
 - User waived the comparative benchmark; Stage 1 treated as PASS for gating.
 - Stage 1 fix (deterministic `PROTECTED_TARGET/backup_exists`) committed `fefc9ed`; docs `55b9398`; ruff clean; unit 1152 pass.
 - **Stage 2 ACCEPTED; rollout COMPLETED** on local `master` (no remote). Post-deploy health: 92 tools, canonical names present, single owned Excel, accepting. Rollback: revert `55b9398 fefc9ed` → `ef3e6cb`. Open (non-blocking): comparative benchmark (waived); post-restart live re-test of scenario-6 fix.
+
+## Research B & D acceptance (2026-11-27, HEAD 24201f4)
+- Auditor `report_12` CONFIRMED all nine claims; two minor citation typos corrected (orphan-join production default **10 s** not 3 s; `_find_open_workbook` at **1684–1700**).
+- **Research B — CLOSED.** Accept shipped source-type gate (B1). Do NOT implement shorter timeouts (B2 rejected). Background execution (B3) **deferred** as an optional future WP, kept SEPARATE from D. Original Pivot hang investigation closed.
+- **Research D — ACCEPTED, no rewrite.** WP3 lifecycle stands; R1–R3 are **optional hardening**, not invariant fixes. A separate bounded plan (`plan_06 — Snapshot Restore Hardening R1-R3.md`) is prepared; **no production code change for R1–R3 until that plan is reviewed and approved.** Preserve original workbook / immutable snapshot / mutable working copy distinction.
+- No production code changes authorized by this acceptance.
