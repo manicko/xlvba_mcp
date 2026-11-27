@@ -72,11 +72,13 @@ from excel_vba_mcp.adapters.excel.pivot_tables_adapter import (
 )
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
+from excel_vba_mcp.config import LargeDataConfig
 from excel_vba_mcp.domain.errors import (
     AmbiguousFilterError,
     ApprovalDeniedError,
     ErrorCode,
     ExcelVbaMcpError,
+    StaleCursorError,
     WorkbookNotFoundError,
 )
 from excel_vba_mcp.domain.models import (
@@ -88,6 +90,7 @@ from excel_vba_mcp.domain.models import (
     PivotFilterState,
     PivotInventory,
     PivotRefreshResult,
+    PivotResultPage,
     PivotTableInfo,
     WorkbookInfo,
 )
@@ -144,6 +147,10 @@ class PivotTablesService:
             ``SNAPSHOT_FAILED`` (deny-by-default).
         approval: Deny-by-default approval gate for the refresh tools. ``None``
             in a read-only rig; the refresh tools then fail closed.
+        large_data: Unified large-data limits (single source). Defaults to
+            :class:`~excel_vba_mcp.config.LargeDataConfig`; the server passes
+            ``config.large_data``. ``max_pivot_result_cells`` bounds one
+            rendered-result page.
     """
 
     def __init__(
@@ -153,12 +160,14 @@ class PivotTablesService:
         audit: AuditLogger,
         snapshot_service: SnapshotService | None = None,
         approval: ApprovalPolicy | None = None,
+        large_data: LargeDataConfig | None = None,
     ) -> None:
         self._worker = worker
         self._session = session_service
         self._audit = audit
         self._snapshot = snapshot_service
         self._approval = approval
+        self._large_data = large_data if large_data is not None else LargeDataConfig()
         self._adapter = PivotTablesAdapter()
 
     # ------------------------------------------------------------------
@@ -317,6 +326,72 @@ class PivotTablesService:
                 "hidden_items": list(result.hidden_items),
                 "kind": result.filter.kind.value,
                 "unsupported": list(result.unsupported),
+            },
+        )
+        return result
+
+    async def read_pivot_result(
+        self,
+        workbook_id: str,
+        pivot_table: str,
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+        cursor_version: int | None = None,
+    ) -> PivotResultPage:
+        """Read a bounded page of a PivotTable's rendered output (read-only).
+
+        The displayed ``TableRange1`` cells are read through the shared bounded
+        Range reader on the STA worker, for every source type (database,
+        external, OLAP / Data Model — rendered cells are read, never the external
+        source). A large PivotTable is paged through successive ``offset`` reads;
+        the returned :class:`~excel_vba_mcp.domain.models.PageInfo` reports
+        ``has_more`` / ``complete`` / ``total`` and the workbook content
+        ``version``. Pass ``cursor_version`` (the prior page's ``page.version``)
+        to fail with ``STALE_CURSOR`` when the workbook changed between pages.
+        """
+
+        record = self._resolve_record(workbook_id)
+        result = await self._submit_read(
+            workbook_id,
+            "pivot_result_read",
+            lambda wb: self._adapter.read_pivot_result(
+                wb,
+                pivot_table,
+                offset=offset,
+                limit=limit,
+                version_getter=lambda: self._session.get_version(workbook_id),
+                max_cells=self._large_data.max_pivot_result_cells,
+            ),
+            record,
+        )
+        if cursor_version is not None and result.page.version != cursor_version:
+            raise StaleCursorError(
+                "The workbook changed since the first page; restart paging.",
+                context={
+                    "expected_version": cursor_version,
+                    "actual_version": result.page.version,
+                    "kind": "pivot_result",
+                },
+            )
+        self._record_audit(
+            "pivot_result_read",
+            "read_only",
+            record,
+            {
+                "workbook_id": workbook_id,
+                "pivot_table": pivot_table,
+                "offset": offset,
+                "limit": limit,
+            },
+            {
+                "pivot_table": result.pivot_table,
+                "sheet": result.sheet_name,
+                "source_type": result.source_type.value,
+                "rows": result.rows,
+                "cols": result.cols,
+                "returned": result.page.returned,
+                "has_more": result.page.has_more,
             },
         )
         return result
@@ -831,7 +906,7 @@ class PivotTablesService:
 
         call = self._bind_workbook(fn, record, workbook_id)
         call.__name__ = tool
-        return cast(
+        result = cast(
             "_T",
             await self._worker.submit(
                 call,
@@ -840,6 +915,8 @@ class PivotTablesService:
                 op_class=OperationClass.MUTATING,
             ),
         )
+        self._session.bump_version(workbook_id)
+        return result
 
     # ------------------------------------------------------------------
     # STA submission helpers

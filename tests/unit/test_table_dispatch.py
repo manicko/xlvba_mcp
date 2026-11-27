@@ -72,7 +72,12 @@ class FakeTablesService:
         return _table_info(name)
 
     async def read_table_rows(
-        self, workbook_id: str, name: str, offset: int = 0, limit: int | None = None
+        self,
+        workbook_id: str,
+        name: str,
+        offset: int = 0,
+        limit: int | None = None,
+        cursor_version: int | None = None,
     ) -> TableRows:
         self.calls.append(("read_rows", (workbook_id, name, offset, limit)))
         return _table_rows(name, offset, limit)

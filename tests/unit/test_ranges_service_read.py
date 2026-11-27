@@ -13,8 +13,9 @@ Covered:
 * ``range_read_values`` 1-cell (scalar) vs multi-cell (2-D) shape and typed
   classification (string / number / bool / blank / date / error), with date
   typing driven strictly by ``NumberFormat`` (never guessed from a serial);
-* bounds: oversized request rejected before reading, oversized response
-  truncated with ``truncated``;
+* bounds: a large logical range is paged (bounded response + ``PageInfo``)
+  rather than rejected, and an oversized response is truncated with
+  ``truncated``;
 * ``range_read_formulas`` ``Formula2`` primary / ``Formula`` fallback and
   ``_xlfn`` prefix flagging;
 * invalid sheet / invalid address -> typed ``InvalidRangeError``;
@@ -38,7 +39,6 @@ from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
 from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
-    MAX_RANGE_CELLS,
     MAX_RESPONSE_CELLS,
     RangeValues,
 )
@@ -594,33 +594,35 @@ def test_read_formulas_flags_xlfn_prefix() -> None:
 # ---------------------------------------------------------------------------
 # Adapter-level: bounds / truncation
 # ---------------------------------------------------------------------------
-def test_read_values_rejects_oversized_request_before_reading() -> None:
+def test_read_values_pages_large_range() -> None:
     wb = FakeWorkbook([FakeSheet("Data")])
     adapter = RangesAdapter()
 
-    # A syntactically valid range larger than MAX_RANGE_CELLS must be rejected up
-    # front with the dedicated RANGE_TOO_LARGE code (not INVALID_RANGE): the
-    # address is well-formed, the caller must page the read.
-    with pytest.raises(ExcelVbaMcpError) as exc_info:
-        adapter.read_values(wb, "Data", "A1:XFD1048576")
-    assert exc_info.value.code is ErrorCode.RANGE_TOO_LARGE
-    assert exc_info.value.code is not ErrorCode.INVALID_RANGE
-    assert exc_info.value.context["cells"] > MAX_RANGE_CELLS
+    # A large logical range is no longer rejected up front: it is paged through
+    # successive offset reads, each bounded by MAX_RESPONSE_CELLS, with a
+    # completeness block (PageInfo) describing has_more / complete / total.
+    rows = 120_000
+    page1 = adapter.read_values(wb, "Data", f"A1:A{rows}")
+    assert page1.page is not None
+    assert page1.page.total == rows
+    assert page1.page.returned <= MAX_RESPONSE_CELLS
+    assert page1.rows == page1.page.returned
+    assert page1.page.has_more is True
+    assert page1.page.complete is False
 
+    page2 = adapter.read_values(wb, "Data", f"A1:A{rows}", offset=page1.page.returned)
+    assert page2.page is not None
+    assert page2.page.offset == page1.page.returned
+    assert page2.page.returned <= MAX_RESPONSE_CELLS
 
-def test_read_values_valid_range_over_cap_is_range_too_large() -> None:
-    wb = FakeWorkbook([FakeSheet("Data")])
-    adapter = RangesAdapter()
+    last_offset = page1.page.returned + page2.page.returned
+    page3 = adapter.read_values(wb, "Data", f"A1:A{rows}", offset=last_offset)
+    assert page3.page is not None
+    assert page3.page.has_more is False
+    assert page3.page.complete is True
 
-    # A valid single-column range one row over the 100k cap: valid address, over
-    # the limit -> RANGE_TOO_LARGE, never truncated (the request is rejected, not
-    # silently cut short) and never the generic INVALID_RANGE.
-    rows = MAX_RANGE_CELLS + 1
-    with pytest.raises(ExcelVbaMcpError) as exc_info:
-        adapter.read_values(wb, "Data", f"A1:A{rows}")
-    assert exc_info.value.code is ErrorCode.RANGE_TOO_LARGE
-    assert exc_info.value.context["cells"] == rows
-    assert exc_info.value.context["limit"] == MAX_RANGE_CELLS
+    # No duplicate / skipped rows across the three pages.
+    assert page1.page.returned + page2.page.returned + page3.page.returned == rows
 
 
 def test_read_values_truncates_response() -> None:
@@ -722,3 +724,26 @@ async def test_service_invalid_sheet_raises(tmp_path: Path) -> None:
     with pytest.raises(ExcelVbaMcpError) as exc_info:
         await rig.service.get_range(info.workbook_id, "Nope", "A1")
     assert exc_info.value.code is ErrorCode.INVALID_RANGE
+
+
+async def test_read_values_stale_cursor(tmp_path: Path) -> None:
+    rig = Rig(tmp_path)
+    info = await rig.open()
+    sheet = rig.workbook().sheet("Data")
+    for r in range(1, 5):
+        sheet.set(r, 1, float(r))
+
+    page1 = await rig.service.read_values(info.workbook_id, "Data", "A1:A4")
+    assert page1.page is not None
+    first_version = page1.page.version
+
+    # Simulate a mutation between pages: the content version advances.
+    rig.session.bump_version(info.workbook_id)
+
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        await rig.service.read_values(
+            info.workbook_id, "Data", "A1:A4", cursor_version=first_version
+        )
+    assert exc_info.value.code is ErrorCode.STALE_CURSOR
+    assert exc_info.value.context["expected_version"] == first_version
+    assert exc_info.value.context["kind"] == "range"

@@ -635,6 +635,31 @@ async def test_service_refresh_table_dispatches_mutating(tmp_path: Path) -> None
     assert submit["op_class"] is OperationClass.MUTATING
 
 
+async def test_bump_version_wired_on_pivot_refresh(tmp_path: Path) -> None:
+    rig = Rig(tmp_path)
+    info = await rig.open()
+    rig.add_snapshot(info.workbook_id)
+    rig.grant(_ACTION_REFRESH_TABLE)
+    _seed_pivots(rig.workbook())
+    assert rig.session.get_version(info.workbook_id) == 0
+
+    await rig.service.refresh_pivot_table(info.workbook_id, "ptA")
+    assert rig.session.get_version(info.workbook_id) == 1
+
+    # A failed mutation (guard rejection: no snapshot) must NOT bump the version.
+    second_dir = tmp_path / "second"
+    second_dir.mkdir()
+    rig2 = Rig(second_dir)
+    info2 = await rig2.open()
+    rig2.grant(_ACTION_REFRESH_TABLE)
+    _seed_pivots(rig2.workbook())
+    assert rig2.session.get_version(info2.workbook_id) == 0
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        await rig2.service.refresh_pivot_table(info2.workbook_id, "ptA")
+    assert exc_info.value.code is ErrorCode.SNAPSHOT_FAILED
+    assert rig2.session.get_version(info2.workbook_id) == 0
+
+
 async def test_service_refresh_cache_dispatches_mutating(tmp_path: Path) -> None:
     rig = Rig(tmp_path)
     info = await rig.open()

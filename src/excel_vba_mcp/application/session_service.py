@@ -106,6 +106,9 @@ class _SessionRecord:
     # both before any source-overwrite so a drifted source is fail-closed.
     source_sha256: str
     source_size: int
+    # Monotonic workbook content version, bumped on each successful mutation;
+    # reads never bump it (WP-A large-data version primitive).
+    version: int = 0
 
 
 def _utc_now() -> datetime:
@@ -682,6 +685,9 @@ class SessionService:
         )
         record.dirty = False
         record.info = info
+        # A successful save is a content mutation: bump the record's own version
+        # so a later paged read detects the change (WP-B large-data cursor).
+        record.version += 1
 
         self._record_audit(
             tool="excel_save",
@@ -1088,6 +1094,26 @@ class SessionService:
         """
 
         return [record.info for record in self._records.values()]
+
+    def get_version(self, workbook_id: str) -> int:
+        """Return the workbook's monotonic content version (no COM).
+
+        The version starts at ``0`` on open and is bumped by :meth:`bump_version`
+        on each successful mutation; reads never bump it (WP-A large-data version
+        primitive). Raises :class:`WorkbookNotFoundError` for an unknown id.
+        """
+
+        return self._require_record(workbook_id).version
+
+    def bump_version(self, workbook_id: str) -> None:
+        """Increment the workbook's content version by one (no COM).
+
+        Called after a successful mutation so a later paged read can detect that
+        the workbook changed. Raises :class:`WorkbookNotFoundError` for an unknown
+        id.
+        """
+
+        self._require_record(workbook_id).version += 1
 
     # ------------------------------------------------------------------
     # Recovery / session lifecycle (task_034; spec §5.6, §9.4, §11)

@@ -40,6 +40,7 @@ _ENV_ACCESS_MODE = "EXCEL_VBA_MCP_ACCESS_MODE"
 _ENV_MACRO_TIMEOUT_S = "EXCEL_VBA_MCP_MACRO_TIMEOUT_S"
 _ENV_OPEN_TIMEOUT_S = "EXCEL_VBA_MCP_OPEN_TIMEOUT_S"
 _ENV_LIVENESS_CEILING_S = "EXCEL_VBA_MCP_LIVENESS_CEILING_S"
+_ENV_LARGE_DATA = "EXCEL_VBA_MCP_LARGE_DATA_"
 
 
 class ServerConfig(BaseModel):
@@ -73,10 +74,81 @@ class ServerConfig(BaseModel):
     )
 
 
+class LargeDataConfig(BaseModel):
+    """Unified large-data limits (single source; no per-tool limits).
+
+    Defaults are conservative and justified by benchmarks; they are changed only
+    via ``EXCEL_VBA_MCP_LARGE_DATA_*`` env vars, never raised to pass a test.
+    Capability comes from bounded/streaming processing, not larger allocations.
+    """
+
+    max_range_cells: int = Field(
+        default=100_000,
+        description="Per-request read window / per-write payload cell cap.",
+    )
+    max_response_cells: int = Field(
+        default=50_000,
+        description="Max cells returned in one MCP response.",
+    )
+    max_response_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        description="Serialized response byte budget for a single page.",
+    )
+    max_table_cells: int = Field(
+        default=50_000,
+        description="Max cells returned by table read-rows.",
+    )
+    max_pivot_result_cells: int = Field(
+        default=50_000,
+        description="Max cells in one PivotTable rendered-result page.",
+    )
+    max_pivot_members: int = Field(
+        default=10_000,
+        description="Max PivotItems enumerated for a field/member read.",
+    )
+    max_text_len: int = Field(
+        default=32_767,
+        description="Max characters returned for one text field (Excel cell max).",
+    )
+    max_file_mb: int = Field(
+        default=100,
+        description="Max OOXML input file size (MiB) before streaming.",
+    )
+    max_uncompressed_mb: int = Field(
+        default=1024,
+        description="Max total uncompressed OOXML size (MiB) — ZIP-bomb guard.",
+    )
+    max_compression_ratio: int = Field(
+        default=1000,
+        description="Max per-member compression ratio — ZIP-bomb guard.",
+    )
+    max_zip_members: int = Field(
+        default=10_000,
+        description="Max ZIP archive member count.",
+    )
+    max_shared_strings: int = Field(
+        default=1_000_000,
+        description="Max sharedStrings entries streamed.",
+    )
+    max_xml_depth: int = Field(
+        default=64,
+        description="Max XML nesting depth for the streaming parser.",
+    )
+    max_export_rows: int = Field(
+        default=10_000_000,
+        description="Max rows streamed to a file export.",
+    )
+    max_file_jobs: int = Field(
+        default=2,
+        description="Max concurrent non-COM file-processing jobs.",
+    )
+
+
 class Config(BaseModel):
     """Top-level configuration container."""
 
     server: ServerConfig = Field(default_factory=ServerConfig)
+    large_data: LargeDataConfig = Field(default_factory=LargeDataConfig)
 
 
 def load_config() -> Config:
@@ -111,4 +183,15 @@ def load_config() -> Config:
     liveness_ceiling_s = os.environ.get(_ENV_LIVENESS_CEILING_S)
     if liveness_ceiling_s is not None:
         present["liveness_ceiling_s"] = liveness_ceiling_s
-    return Config(server=ServerConfig.model_validate(present))
+    server = ServerConfig.model_validate(present)
+
+    # Large-data limits: each field is overridable via
+    # ``EXCEL_VBA_MCP_LARGE_DATA_<UPPER_FIELD>`` (e.g.
+    # ``EXCEL_VBA_MCP_LARGE_DATA_MAX_RANGE_CELLS``). Unset fields keep defaults.
+    large_present: dict[str, object] = {}
+    for field_name in LargeDataConfig.model_fields:
+        raw = os.environ.get(f"{_ENV_LARGE_DATA}{field_name.upper()}")
+        if raw is not None:
+            large_present[field_name] = raw
+    large_data = LargeDataConfig.model_validate(large_present)
+    return Config(server=server, large_data=large_data)

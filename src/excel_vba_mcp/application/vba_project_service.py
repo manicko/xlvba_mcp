@@ -679,12 +679,14 @@ class VBAProjectService:
             )
 
         replace_fn.__name__ = "vba_replace_component_source"
-        return await self._worker.submit(
+        payload = await self._worker.submit(
             replace_fn,
             timeout=timeout_s,
             section="diagnostic",
             op_class=OperationClass.MUTATING,
         )
+        self._session.bump_version(workbook_id)
+        return payload
 
     async def _submit_insert(
         self,
@@ -724,12 +726,14 @@ class VBAProjectService:
             )
 
         insert_fn.__name__ = "vba_insert_code"
-        return await self._worker.submit(
+        payload = await self._worker.submit(
             insert_fn,
             timeout=timeout_s,
             section="diagnostic",
             op_class=OperationClass.MUTATING,
         )
+        self._session.bump_version(workbook_id)
+        return payload
 
     @staticmethod
     def _build_mutation_result(

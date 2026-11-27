@@ -40,9 +40,11 @@ from excel_vba_mcp.api import (
     compile_tools,
     control_tools,
     environment_tools,
+    export_tools,
     job_tools,
     macro_tools,
     name_tools,
+    ooxml_tools,
     pivot_tools,
     range_tools,
     shape_tools,
@@ -59,6 +61,9 @@ from excel_vba_mcp.api.control_tools import (
     control,
 )
 from excel_vba_mcp.api.environment_tools import xlvba_environment
+from excel_vba_mcp.api.export_tools import (
+    data_export,
+)
 from excel_vba_mcp.api.health_tools import excel_health
 from excel_vba_mcp.api.job_tools import job_get, job_request_cancel
 from excel_vba_mcp.api.macro_tools import (
@@ -69,6 +74,9 @@ from excel_vba_mcp.api.name_tools import (
     name,
     name_delete,
     name_read,
+)
+from excel_vba_mcp.api.ooxml_tools import (
+    workbook_file_read,
 )
 from excel_vba_mcp.api.pivot_tools import (
     pivot_field,
@@ -117,9 +125,11 @@ from excel_vba_mcp.api.workbook_tools import (
 )
 from excel_vba_mcp.application.compile_service import CompileService
 from excel_vba_mcp.application.controls_service import ControlsService
+from excel_vba_mcp.application.data_export_service import DataExportService
 from excel_vba_mcp.application.job_registry import JobRegistry
 from excel_vba_mcp.application.macro_service import BackgroundSafetyRegistry, MacroService
 from excel_vba_mcp.application.names_service import NamesService
+from excel_vba_mcp.application.ooxml_service import OoxmlService
 from excel_vba_mcp.application.pivot_tables_service import PivotTablesService
 from excel_vba_mcp.application.ranges_service import RangesService
 from excel_vba_mcp.application.session_service import SessionService
@@ -1114,6 +1124,52 @@ _DESC_ENVIRONMENT = (
     "Examples: 'read one cell from a disposable file' -> excel-mcp; 'edit a "
     "cell, snapshot, then recover the owned Excel process' -> xlvba."
 )
+_DESC_WORKBOOK_FILE_READ = (
+    "Purpose: Read workbook metadata, a page of worksheet rows, or saved "
+    "PivotCache records from an immutable snapshot file via non-COM streaming "
+    "OOXML parsing. "
+    "Use when: you need large-sheet rows, workbook structure, or saved "
+    "pivot-cache records without materializing the sheet or occupying the "
+    "single-STA COM worker. "
+    "Do not use when: you need the live working copy or the displayed pivot "
+    "result — use range_read / pivot_read; you need VBA source — use vba_read. "
+    "Preconditions: an open workbook_id (or an explicit snapshot_id); when "
+    "snapshot_id is omitted a fresh snapshot is created as the immutable input. "
+    "Parameters: action='metadata'|'sheet-rows'|'pivot-cache-records'; "
+    "workbook_id; sheet (sheet-rows); offset (0-based); limit; snapshot_id; "
+    "cache_index (pivot-cache-records, 1-based). "
+    "Behavior: read-only, bounded and streamed in a worker thread; the "
+    "single-STA COM worker is never occupied; a cache with no saved local "
+    "records yields an empty page with page.reason='unsupported_source'. "
+    "Result: OoxmlMetadata (metadata), OoxmlSheetPage (sheet-rows) or "
+    "OoxmlPivotCachePage (pivot-cache-records). "
+    "Next actions: range_read / pivot_read for the live view; data_export to "
+    "stream a result to a file. "
+    "Example: {\"action\": \"sheet-rows\", \"workbook_id\": \"<id>\", "
+    "\"sheet\": \"Sheet1\", \"offset\": 0, \"limit\": 1000}"
+)
+_DESC_DATA_EXPORT = (
+    "Purpose: Stream a large dataset — a worksheet Range, an Excel Table "
+    "(ListObject) data body or a PivotTable's rendered result — to a CSV / "
+    "JSONL file artifact with bounded memory, returning only compact metadata. "
+    "Use when: the data is too large to return inline and you need it written "
+    "to a file artifact. "
+    "Do not use when: you need the data inline (use range_read / table_read / "
+    "pivot_read) or a non-file artifact — no existing tool streams to a file. "
+    "Preconditions: an open workbook_id; the source selector for source_kind. "
+    "Parameters: workbook_id; source_kind='range'|'table'|'pivot-result'; "
+    "sheet + address (range); table (table); pivot_table (pivot-result); "
+    "fmt='csv'|'jsonl'; limit_rows. "
+    "Behavior: each page is read and written straight to the artifact stream so "
+    "only one page is held in memory; the data is never returned inline; "
+    "non-destructive and idempotent (each call writes a new artifact). "
+    "Result: DataExportResult (artifact path, rows, bytes, sha256, "
+    "truncated/complete). "
+    "Next actions: workbook_file_read to page the source; range_read for a "
+    "bounded inline view. "
+    "Example: {\"workbook_id\": \"<id>\", \"source_kind\": \"range\", "
+    "\"sheet\": \"Sheet1\", \"address\": \"A1:C100000\", \"fmt\": \"csv\"}"
+)
 _DESC_RES_GLOSSARY = (
     "Read-only glossary (Markdown) of the server's jargon: R13, BG06, preflight, "
     "truth signal, fail-closed, RECOVERY, STA, Stage 1, normalized source hash, "
@@ -1136,6 +1192,8 @@ class _Runtime:
     names: NamesService
     ranges: RangesService
     pivots: PivotTablesService
+    ooxml: OoxmlService
+    data_export: DataExportService
     shapes: ShapesService
     controls: ControlsService
     compile: CompileService
@@ -1239,11 +1297,16 @@ def _build_runtime(config: Config) -> _Runtime:
         approval=approval,
     )
     sheets = SheetsService(worker, session, snapshot, approval, path_policy, audit)
-    tables = TablesService(worker, session, snapshot, approval, path_policy, audit)
-    ranges = RangesService(worker, session, snapshot, approval, path_policy, audit)
+    tables = TablesService(
+        worker, session, snapshot, approval, path_policy, audit, large_data=config.large_data
+    )
+    ranges = RangesService(
+        worker, session, snapshot, approval, path_policy, audit, large_data=config.large_data
+    )
     names = NamesService(worker, session, snapshot, approval, path_policy, audit)
     pivots = PivotTablesService(
-        worker, session, audit, snapshot_service=snapshot, approval=approval
+        worker, session, audit, snapshot_service=snapshot, approval=approval,
+        large_data=config.large_data,
     )
     shapes = ShapesService(worker, session, snapshot, approval, path_policy, audit)
     controls = ControlsService(worker, session, snapshot, approval, path_policy, audit)
@@ -1278,6 +1341,11 @@ def _build_runtime(config: Config) -> _Runtime:
         path_policy,
         audit,
     )
+    # Large-data services (WP-E/F): non-COM streaming OOXML read over an immutable
+    # snapshot, and bounded-memory file export. Constructed after ranges/tables/
+    # pivots/artifacts exist (data_export delegates per-page reads to them).
+    ooxml = OoxmlService(session, snapshot, config.large_data)
+    data_export = DataExportService(ranges, tables, pivots, artifacts, config.large_data)
     runs = RunRepository(_resolve_runtime_path(_ENV_RUN_DIR, _default_run_dir()))
     # Job persistence (Block F): a RUNNING marker is written at job start and the
     # record is finalized on terminal. The store reconciles any non-terminal record
@@ -1325,6 +1393,8 @@ def _build_runtime(config: Config) -> _Runtime:
         names=names,
         ranges=ranges,
         pivots=pivots,
+        ooxml=ooxml,
+        data_export=data_export,
         shapes=shapes,
         controls=controls,
         compile=compile_service,
@@ -1440,6 +1510,8 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         macro_tools.set_macro_service(runtime.macro)
         job_tools.set_job_registry(runtime.jobs)
         workbook_tools.set_workbook_model_service(runtime.model)
+        ooxml_tools.set_ooxml_service(runtime.ooxml)
+        export_tools.set_data_export_service(runtime.data_export)
     try:
         yield runtime
     finally:
@@ -1459,6 +1531,8 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[_Runtime]:
         compile_tools.set_compile_service(None)
         macro_tools.set_macro_service(None)
         job_tools.set_job_registry(None)
+        ooxml_tools.set_ooxml_service(None)
+        export_tools.set_data_export_service(None)
         await _safe_shutdown(runtime.worker)
         runtime.audit.close()
 
@@ -1870,6 +1944,7 @@ _ANN_READ_ONLY = frozenset(
         "pivot_read",
         "range_read",
         "name_read",
+        "workbook_file_read",
     }
 )
 _ANN_DESTRUCTIVE = frozenset(
@@ -1913,6 +1988,8 @@ _ANN_IDEMPOTENT = frozenset(
         "shape",
         "control",
         "macro",
+        "workbook_file_read",
+        "data_export",
     }
 )
 
@@ -2173,6 +2250,18 @@ def _register_tools(server: MCPServer) -> None:
         annotations=ToolAnnotations(
             read_only_hint=True, destructive_hint=False, idempotent_hint=True
         ),
+    )
+    server.add_tool(
+        workbook_file_read,
+        name="workbook_file_read",
+        description=_DESC_WORKBOOK_FILE_READ,
+        annotations=_annotations("workbook_file_read"),
+    )
+    server.add_tool(
+        data_export,
+        name="data_export",
+        description=_DESC_DATA_EXPORT,
+        annotations=_annotations("data_export"),
     )
 
 

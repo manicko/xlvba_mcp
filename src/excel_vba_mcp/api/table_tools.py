@@ -139,6 +139,7 @@ async def table_read_rows(
     name: str,
     offset: int = 0,
     limit: int | None = None,
+    cursor_version: int | None = None,
 ) -> TableRows:
     """Read a typed, bounded slice of a table's data rows.
 
@@ -147,6 +148,8 @@ async def table_read_rows(
         name: The table name.
         offset: 0-based data-row index of the first row to return.
         limit: Optional cap on the number of rows returned.
+        cursor_version: Optional prior page version; a mismatch raises
+            ``STALE_CURSOR`` so paging restarts from offset 0.
 
     Returns:
         A :class:`TableRows` with typed values (``str`` / ``int`` / ``float`` /
@@ -159,7 +162,9 @@ async def table_read_rows(
     if limit is not None:
         limit = _require_int(limit, "limit", minimum=1)
     service = get_tables_service()
-    return await service.read_table_rows(workbook_id, name, offset=offset, limit=limit)
+    return await service.read_table_rows(
+        workbook_id, name, offset=offset, limit=limit, cursor_version=cursor_version
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +479,7 @@ async def table_read(
     name: str | None = None,
     offset: int = 0,
     limit: int | None = None,
+    cursor_version: int | None = None,
 ) -> list[TableInfo] | TableInfo | TableRows:
     """Table read dispatch: ``list``, ``get`` or ``read-rows`` (WP3).
 
@@ -490,6 +496,8 @@ async def table_read(
         name: The table name; required for ``get`` / ``read-rows``.
         offset: 0-based data-row index of the first row (``read-rows``).
         limit: Optional cap on the number of rows (``read-rows``).
+        cursor_version: Optional prior page version; a mismatch raises
+            ``STALE_CURSOR`` so paging restarts from offset 0 (``read-rows``).
 
     Returns:
         A list of :class:`TableInfo` (``list``), a single :class:`TableInfo`
@@ -501,7 +509,9 @@ async def table_read(
     if action == "get":
         return await table_get(workbook_id or "", name or "")
     if action == "read-rows":
-        return await table_read_rows(workbook_id or "", name or "", offset, limit)
+        return await table_read_rows(
+            workbook_id or "", name or "", offset, limit, cursor_version
+        )
     raise ExcelVbaMcpError(
         f"Unknown table_read action {action!r}; expected 'list', 'get' or 'read-rows'.",
         code=ErrorCode.INVALID_RANGE,

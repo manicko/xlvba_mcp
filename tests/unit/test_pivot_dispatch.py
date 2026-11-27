@@ -23,6 +23,8 @@ from excel_vba_mcp.api import pivot_tools
 from excel_vba_mcp.api.pivot_tools import pivot_field, pivot_read, pivot_refresh
 from excel_vba_mcp.domain.errors import ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
+    CellValue,
+    PageInfo,
     PivotCacheInfo,
     PivotFieldFilters,
     PivotFieldInfo,
@@ -30,9 +32,11 @@ from excel_vba_mcp.domain.models import (
     PivotFilterSpec,
     PivotInventory,
     PivotRefreshResult,
+    PivotResultPage,
     PivotTableInfo,
 )
 from excel_vba_mcp.domain.statuses import (
+    CellValueKind,
     PivotAggregation,
     PivotFieldOrientation,
     PivotFilterRequestKind,
@@ -74,6 +78,20 @@ def _refresh_result(method: PivotRefreshMethod) -> PivotRefreshResult:
     )
 
 
+def _result_page() -> PivotResultPage:
+    return PivotResultPage(
+        pivot_table="pt",
+        sheet_name="Sheet1",
+        source_type=PivotSourceType.DATABASE,
+        table_range="$A$1:$B$7",
+        rows=1,
+        cols=1,
+        values=[[CellValue(kind=CellValueKind.STRING, value="v")]],
+        page=PageInfo(offset=0, returned=1, total=1),
+        fingerprint="$A$1:$B$7|",
+    )
+
+
 class FakePivotTablesService:
     """Records calls and returns canned DTOs; no COM."""
 
@@ -103,6 +121,19 @@ class FakePivotTablesService:
     ) -> PivotFieldFilters:
         self.calls.append(("get_pivot_field_filters", (workbook_id, pivot_table, field)))
         return _field_filters()
+
+    async def read_pivot_result(
+        self,
+        workbook_id: str,
+        pivot_table: str,
+        offset: int = 0,
+        limit: int | None = None,
+        cursor_version: int | None = None,
+    ) -> PivotResultPage:
+        self.calls.append(
+            ("read_pivot_result", (workbook_id, pivot_table, offset, limit, cursor_version))
+        )
+        return _result_page()
 
     async def refresh_pivot_table(
         self, workbook_id: str, pivot_table: str
@@ -251,6 +282,33 @@ async def test_pivot_read_field_get_filters_routes(
     verb, args = _install_fake.calls[-1]
     assert verb == "get_pivot_field_filters"
     assert args == ("wb1", "pt", "Region")
+
+
+async def test_pivot_read_result_read_routes(
+    _install_fake: FakePivotTablesService,
+) -> None:
+    await pivot_read(
+        "result-read",
+        workbook_id="wb1",
+        pivot_table="pt",
+        offset=2,
+        limit=5,
+        cursor_version=9,
+    )
+
+    verb, args = _install_fake.calls[-1]
+    assert verb == "read_pivot_result"
+    assert args == ("wb1", "pt", 2, 5, 9)
+
+
+async def test_pivot_read_result_read_defaults_routes(
+    _install_fake: FakePivotTablesService,
+) -> None:
+    await pivot_read("result-read", workbook_id="wb1", pivot_table="pt")
+
+    verb, args = _install_fake.calls[-1]
+    assert verb == "read_pivot_result"
+    assert args == ("wb1", "pt", 0, None, None)
 
 
 # ---------------------------------------------------------------------------

@@ -53,6 +53,7 @@ from excel_vba_mcp.domain.models import (
     PivotFilterSpec,
     PivotInventory,
     PivotRefreshResult,
+    PivotResultPage,
     PivotTableInfo,
 )
 from excel_vba_mcp.domain.statuses import (
@@ -308,6 +309,47 @@ async def pivot_field_get_filters(
     _require_non_empty(field, "field")
     service = get_pivot_tables_service()
     return await service.get_pivot_field_filters(workbook_id, pivot_table, field)
+
+
+async def pivot_result_read(
+    workbook_id: str,
+    pivot_table: str,
+    offset: int = 0,
+    limit: int | None = None,
+    cursor_version: int | None = None,
+) -> PivotResultPage:
+    """Read a bounded page of a PivotTable's **rendered** output (WP-C).
+
+    Returns the values Excel displays in ``TableRange1`` (never the external
+    source), so it works for every source type (database, external, OLAP / Data
+    Model). ``offset`` is a 0-based row index and ``limit`` caps the returned
+    rows; ``cursor_version`` (the prior page's ``page.version``) fails with
+    ``STALE_CURSOR`` when the workbook changed between pages. Read-only.
+
+    Args:
+        workbook_id: The id returned by ``excel_open``.
+        pivot_table: The stable PivotTable ``Name``.
+        offset: 0-based row index of the first row to return.
+        limit: Optional cap on the number of rows returned.
+        cursor_version: Optional prior page version; mismatch raises
+            ``STALE_CURSOR`` so paging restarts from offset 0.
+    """
+
+    _require_non_empty(workbook_id, "workbook_id")
+    _require_non_empty(pivot_table, "pivot_table")
+    _require_int(offset, "offset", minimum=0)
+    if limit is not None:
+        _require_int(limit, "limit", minimum=0)
+    if cursor_version is not None:
+        _require_int(cursor_version, "cursor_version", minimum=0)
+    service = get_pivot_tables_service()
+    return await service.read_pivot_result(
+        workbook_id,
+        pivot_table,
+        offset=offset,
+        limit=limit,
+        cursor_version=cursor_version,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -569,11 +611,15 @@ async def pivot_read(
         "cache-get",
         "fields-list",
         "field-get-filters",
+        "result-read",
     ],
     workbook_id: str | None = None,
     pivot_table: str | None = None,
     cache_index: int | None = None,
     field: str | None = None,
+    offset: int | None = None,
+    limit: int | None = None,
+    cursor_version: int | None = None,
     background: bool = False,
 ) -> (
     PivotInventory
@@ -581,29 +627,35 @@ async def pivot_read(
     | PivotCacheInfo
     | list[PivotFieldInfo]
     | PivotFieldFilters
+    | PivotResultPage
     | RunningJob
 ):
     """Pivot read dispatch: ``tables-list``, ``table-get``, ``cache-get``,
-    ``fields-list`` or ``field-get-filters`` (WP8).
+    ``fields-list``, ``field-get-filters`` or ``result-read`` (WP8).
 
     Thin flat-signature dispatcher (option (a) — flat args + handler
     validation): routes to the existing :func:`pivot_tables_list` /
     :func:`pivot_table_get` / :func:`pivot_cache_get` / :func:`pivot_fields_list`
-    / :func:`pivot_field_get_filters` handlers unchanged and forwards only the
-    validated arguments. Per-action required parameters are enforced by the
-    target handler (``cache-get`` needs ``cache_index``; ``table-get`` /
-    ``fields-list`` need ``pivot_table``; ``field-get-filters`` needs
-    ``pivot_table`` + ``field``; ``workbook_id`` is required for every action)
-    so a missing required argument surfaces as a structured
-    :class:`ExcelVbaMcpError` rather than a crash. This tool is read-only.
+    / :func:`pivot_field_get_filters` / :func:`pivot_result_read` handlers
+    unchanged and forwards only the validated arguments. Per-action required
+    parameters are enforced by the target handler (``cache-get`` needs
+    ``cache_index``; ``table-get`` / ``fields-list`` / ``result-read`` need
+    ``pivot_table``; ``field-get-filters`` needs ``pivot_table`` + ``field``;
+    ``workbook_id`` is required for every action) so a missing required argument
+    surfaces as a structured :class:`ExcelVbaMcpError` rather than a crash. This
+    tool is read-only.
 
     Args:
         action: The read verb to perform.
         workbook_id: The id returned by ``excel_open`` (required).
         pivot_table: The stable PivotTable ``Name`` (``table-get`` /
-            ``fields-list`` / ``field-get-filters``).
+            ``fields-list`` / ``field-get-filters`` / ``result-read``).
         cache_index: The 1-based ``CacheIndex`` (``cache-get``).
         field: The field ``SourceName`` (``field-get-filters``).
+        offset: 0-based row index of the first row (``result-read``).
+        limit: Optional cap on the returned rows (``result-read``).
+        cursor_version: Optional prior page version; a mismatch raises
+            ``STALE_CURSOR`` so paging restarts from offset 0 (``result-read``).
         background: When ``True`` (``tables-list`` only), schedule the inventory
             sweep on the job registry and return a ``RunningJob`` handle.
 
@@ -611,8 +663,8 @@ async def pivot_read(
         A :class:`PivotInventory` (``tables-list``), :class:`PivotTableInfo`
         (``table-get``), :class:`PivotCacheInfo` (``cache-get``),
         ``list[PivotFieldInfo]`` (``fields-list``), :class:`PivotFieldFilters`
-        (``field-get-filters``) or a ``RunningJob`` (``tables-list`` with
-        ``background=True``).
+        (``field-get-filters``), :class:`PivotResultPage` (``result-read``) or a
+        ``RunningJob`` (``tables-list`` with ``background=True``).
     """
 
     if action == "tables-list":
@@ -627,9 +679,14 @@ async def pivot_read(
         return await pivot_field_get_filters(
             workbook_id or "", pivot_table or "", field or ""
         )
+    if action == "result-read":
+        return await pivot_result_read(
+            workbook_id or "", pivot_table or "", offset or 0, limit, cursor_version
+        )
     raise ExcelVbaMcpError(
         f"Unknown pivot_read action {action!r}; expected 'tables-list', "
-        "'table-get', 'cache-get', 'fields-list' or 'field-get-filters'.",
+        "'table-get', 'cache-get', 'fields-list', 'field-get-filters' or "
+        "'result-read'.",
         code=ErrorCode.INVALID_RANGE,
         context={"tool": "pivot_read", "action": action},
     )
@@ -804,6 +861,7 @@ __all__ = [
     "pivot_fields_list",
     "pivot_read",
     "pivot_refresh",
+    "pivot_result_read",
     "pivot_table_get",
     "pivot_table_refresh",
     "pivot_tables_list",

@@ -33,7 +33,10 @@ the Excel object-model calls on the STA thread and captures before/after metadat
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
+
+from pydantic import Field
 
 from excel_vba_mcp.adapters.excel.cell_values import (
     EXCEL_ERROR_CODE_TO_LITERAL,
@@ -50,6 +53,7 @@ from excel_vba_mcp.domain.errors import (
 from excel_vba_mcp.domain.models import (
     CellValue,
     DomainModel,
+    PageInfo,
     TableColumnInfo,
     TableInfo,
 )
@@ -63,8 +67,10 @@ from excel_vba_mcp.domain.models import (
 
 # Upper bound on the number of cells a single ``read_rows`` response returns. A
 # larger table is truncated (``TableRows.truncated`` is set) rather than dumping
-# an unbounded payload across the worker boundary.
-_MAX_RESPONSE_CELLS = 2000
+# an unbounded payload across the worker boundary. Aligned with
+# ``LargeDataConfig.max_table_cells`` (the config-driven single source); a caller
+# may override it per call via ``read_rows(max_cells=...)``.
+_MAX_RESPONSE_CELLS = 50000
 
 # Upper bound on the number of preview rows attached to an ambiguity error.
 _MAX_PREVIEW_ROWS = 10
@@ -114,6 +120,10 @@ class TableRows(DomainModel):
     returned_rows: int
     truncated: bool
     rows: list[list[CellValue]]
+    page: PageInfo | None = Field(
+        default=None,
+        description="Large-data completeness/version block (additive); None on legacy paths.",
+    )
 
 
 class TableMutationResult(DomainModel):
@@ -424,14 +434,25 @@ class TablesAdapter:
         *,
         offset: int = 0,
         limit: int | None = None,
+        cursor_version: int | None = None,
+        version_getter: Callable[[], int] | None = None,
+        max_cells: int | None = None,
     ) -> TableRows:
         """Read a typed, bounded slice of a table's data rows (spec §7.6).
 
         ``offset`` is a 0-based data-row index; ``limit`` caps the returned rows.
-        The response is additionally capped at ``_MAX_RESPONSE_CELLS`` cells so a
-        huge table cannot flood the worker boundary (``truncated`` is set).
+        The response is additionally capped at ``max_cells`` (defaulting to
+        :data:`_MAX_RESPONSE_CELLS`, aligned with
+        ``LargeDataConfig.max_table_cells``) so a huge table cannot flood the
+        worker boundary (``truncated`` is set) and is paged via ``offset``.
+
+        The workbook content version is captured atomically with the read (at the
+        start of this STA-worker call) and attached to the returned
+        :class:`~excel_vba_mcp.domain.models.PageInfo`; ``cursor_version`` is the
+        caller's restart guard (the service raises ``STALE_CURSOR`` on mismatch).
         """
 
+        captured_version = version_getter() if version_getter else 0
         if offset < 0:
             raise InvalidRangeError(
                 "Argument 'offset' must be >= 0.",
@@ -459,6 +480,18 @@ class TablesAdapter:
                 returned_rows=0,
                 truncated=False,
                 rows=[],
+                page=PageInfo(
+                    offset=offset,
+                    limit=limit,
+                    returned=0,
+                    total=total_rows,
+                    has_more=False,
+                    complete=(total_rows == 0),
+                    truncated=False,
+                    version=captured_version,
+                    source="live",
+                    reason="no_data" if total_rows == 0 else None,
+                ),
             )
 
         start = min(offset, total_rows)
@@ -467,7 +500,8 @@ class TablesAdapter:
         column_count = len(columns)
 
         # Enforce the response-size ceiling by shrinking the row window.
-        max_rows_by_budget = max(0, _MAX_RESPONSE_CELLS // max(1, column_count))
+        budget = max_cells or _MAX_RESPONSE_CELLS
+        max_rows_by_budget = max(0, budget // max(1, column_count))
         truncated = requested > max_rows_by_budget
         row_count = min(requested, max_rows_by_budget)
         end = start + row_count
@@ -483,6 +517,17 @@ class TablesAdapter:
                 returned_rows=0,
                 truncated=truncated or offset >= total_rows,
                 rows=[],
+                page=PageInfo(
+                    offset=start,
+                    limit=limit,
+                    returned=0,
+                    total=total_rows,
+                    has_more=False,
+                    complete=(total_rows == 0),
+                    truncated=truncated,
+                    version=captured_version,
+                    source="live",
+                ),
             )
 
         top_row = _safe_int(body.Row) + start
@@ -517,6 +562,17 @@ class TablesAdapter:
             returned_rows=len(rows),
             truncated=truncated,
             rows=rows,
+            page=PageInfo(
+                offset=start,
+                limit=limit,
+                returned=len(rows),
+                total=total_rows,
+                has_more=(end < total_rows),
+                complete=(not truncated and end >= total_rows),
+                truncated=truncated,
+                version=captured_version,
+                source="live",
+            ),
         )
 
     # ------------------------------------------------------------------

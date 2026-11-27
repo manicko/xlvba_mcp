@@ -5,9 +5,9 @@ source of truth) and, for the mapping totalness, cross-checks the live registere
 tool surface. It never touches Excel/COM and never starts the worker.
 
 These tests lock the WP11 count/name/mapping/approval contract:
-  * the ledger has exactly 92 rows and every old_name resolves to one target;
-  * the live registered names equal the ledger's distinct target set (41);
-  * the security/approval matrix covers all 92 tools;
+  * the ledger has exactly 94 rows and every old_name resolves to one target;
+  * the live registered names equal the ledger's distinct target set (43);
+  * the security/approval matrix covers all 94 tools;
   * the four high-risk tools keep an explicit standalone/protected disposition;
   * no consolidation merges two distinct *approval* permission profiles.
 """
@@ -52,13 +52,13 @@ def baseline() -> dict:
 
 
 def test_ledger_has_exactly_92_rows(baseline: dict) -> None:
-    assert len(baseline["ledger"]) == 92
+    assert len(baseline["ledger"]) == 94
 
 
 def test_every_old_name_maps_to_exactly_one_target(baseline: dict) -> None:
     ledger = baseline["ledger"]
     old_names = [row["old_name"] for row in ledger]
-    assert len(set(old_names)) == 92, "ledger contains a duplicate old_name"
+    assert len(set(old_names)) == 94, "ledger contains a duplicate old_name"
 
     for row in ledger:
         target = row["target"]
@@ -72,14 +72,14 @@ def test_every_old_name_maps_to_exactly_one_target(baseline: dict) -> None:
 
 async def test_registered_names_equal_ledger_target_set(baseline: dict) -> None:
     targets = {row["target"]["tool"] for row in baseline["ledger"]}
-    assert len(targets) == 41
+    assert len(targets) == 43
     names = {tool.name for tool in await server.mcp.list_tools()}
     assert names == targets, "registered tool set differs from the ledger target set"
 
 
 def test_security_matrix_covers_all_92_tools(baseline: dict) -> None:
     security = baseline["security"]
-    assert len(security) == 92
+    assert len(security) == 94
 
     ledger_names = {row["old_name"] for row in baseline["ledger"]}
     security_names = {row["tool"] for row in security}

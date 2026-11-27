@@ -914,6 +914,10 @@ MAX_RESPONSE_CELLS = 50_000
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_WRITE_PAYLOAD_CELLS = 100_000
 MAX_VALIDATION_FORMULA_LENGTH = 255
+# Upper bound on the cells a single PivotTable rendered-result page returns. The
+# rendered output is read through the shared bounded Range reader, so a large
+# PivotTable is paged rather than dumped across the worker boundary.
+MAX_PIVOT_RESULT_CELLS = 50_000
 
 
 # ---------------------------------------------------------------------------
@@ -961,6 +965,49 @@ class RangeMetadata(DomainModel):
     cell_count: int
 
 
+class PageInfo(DomainModel):
+    """Large-data completeness + version block (additive; large-data contract §2).
+
+    Attached to paged reads so an agent never mistakes partial data for complete
+    data. ``version`` is the workbook content version the page belongs to;
+    ``source`` is ``"live"`` (open workbook), ``"snapshot"`` (immutable SaveCopyAs
+    file) or ``"cache"`` (saved PivotCache records). ``reason`` is set only when
+    the page is empty for a reason other than ``no_data``.
+    """
+
+    offset: int = Field(ge=0, description="0-based row/item offset of the first returned item.")
+    limit: int | None = Field(default=None, description="Requested cap (None = server default).")
+    returned: int = Field(ge=0, description="Items actually returned.")
+    total: int | None = Field(
+        default=None,
+        description="Total available when safely known, else None.",
+    )
+    has_more: bool = Field(default=False, description="More items exist beyond this page.")
+    complete: bool = Field(
+        default=False,
+        description="True iff every item has been delivered (returned == total).",
+    )
+    truncated: bool = Field(
+        default=False,
+        description="True iff a single response was cut by a limit.",
+    )
+    version: int = Field(default=0, ge=0, description="Workbook content version of this page.")
+    source: Literal["live", "snapshot", "cache"] = Field(
+        default="live",
+        description="Data origin: live workbook, immutable snapshot, or saved PivotCache.",
+    )
+    reason: Literal[
+        "no_data",
+        "unsupported_source",
+        "stale_cursor",
+        "invalid_page",
+        "read_failed",
+    ] | None = Field(
+        default=None,
+        description="Set only when the page is empty for a reason other than 'no data'.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Range values / formulas (2-D normalized)
 # ---------------------------------------------------------------------------
@@ -982,6 +1029,10 @@ class RangeValues(DomainModel):
     values: list[list[CellValue]]
     truncated: bool = False
     notes: list[str] = Field(default_factory=list)
+    page: PageInfo | None = Field(
+        default=None,
+        description="Large-data completeness/version block (additive); None on legacy paths.",
+    )
 
     @model_validator(mode="after")
     def _check_response_bounds(self) -> Self:
@@ -1021,6 +1072,10 @@ class RangeFormulas(DomainModel):
     formulas: list[list[FormulaCell]]
     truncated: bool = False
     notes: list[str] = Field(default_factory=list)
+    page: PageInfo | None = Field(
+        default=None,
+        description="Large-data completeness/version block (additive); None on legacy paths.",
+    )
 
     @model_validator(mode="after")
     def _check_response_bounds(self) -> Self:
@@ -1496,6 +1551,44 @@ class PivotTableInfo(DomainModel):
     hidden_fields: list[PivotFieldInfo] = Field(default_factory=list)
 
 
+class PivotResultPage(DomainModel):
+    """Bounded page of a PivotTable's **rendered** output (WP-C).
+
+    Reads the values Excel actually displays in ``TableRange1`` — never the
+    external source — so it works for every source type (database, external,
+    OLAP / Data Model). The page is produced by the shared bounded Range reader,
+    so ``rows`` / ``cols`` / ``values`` / ``page`` carry the same semantics as a
+    paged :class:`RangeValues` read. ``header_row_count`` is the number of rows
+    above ``DataBodyRange`` within ``TableRange1`` (``0`` when unknown) and
+    ``fingerprint`` is a structural id that changes when the table range or
+    refresh date changes.
+    """
+
+    pivot_table: str
+    sheet_name: str
+    source_type: PivotSourceType
+    table_range: str
+    data_body_range: str | None = None
+    refresh_date: datetime | None = None
+    header_row_count: int = 0
+    rows: int
+    cols: int
+    values: list[list[CellValue]]
+    page: PageInfo
+    fingerprint: str
+
+    @model_validator(mode="after")
+    def _check_response_bounds(self) -> Self:
+        if len(self.values) != self.rows:
+            raise ValueError("PivotResultPage.values row count must equal rows.")
+        if self.rows * self.cols > MAX_PIVOT_RESULT_CELLS:
+            raise ValueError(
+                f"Pivot result response {self.rows}x{self.cols} exceeds "
+                f"MAX_PIVOT_RESULT_CELLS ({MAX_PIVOT_RESULT_CELLS})."
+            )
+        return self
+
+
 class PivotInventory(DomainModel):
     """Full-workbook PivotTable + PivotCache inventory (task_039 §2, §8)."""
 
@@ -1629,3 +1722,170 @@ class SaveAsResult(TimestampedModel):
     )
     mode: SessionMode = Field(description="Session mode of the bound working copy.")
     notes: list[str] = Field(default_factory=list)
+
+
+# ===========================================================================
+# Non-COM OOXML snapshot reads (WP-E1)
+# ===========================================================================
+# These DTOs describe a read-only, streaming read of worksheet rows / workbook
+# metadata from an immutable snapshot file (a Workbook.SaveCopyAs image), without
+# occupying the single-STA COM worker. They are JSON-serializable and carry no
+# COM references. A page is bounded by ``MAX_RESPONSE_CELLS`` just like a Range
+# read, and every result records the snapshot SHA-256 it was read from.
+
+
+class OoxmlInputInfo(DomainModel):
+    """Provenance of a non-COM OOXML read (WP-E1).
+
+    ``input_sha256`` is the SHA-256 of the immutable snapshot file the data was
+    parsed from; ``snapshot_id`` is the snapshot used (the freshly created one,
+    or the caller-supplied one). ``source`` is always ``"snapshot"`` — the live
+    working copy and the original are never read.
+    """
+
+    input_sha256: str
+    snapshot_id: str | None = None
+    source: Literal["snapshot"] = "snapshot"
+
+
+class OxmlSheetMeta(DomainModel):
+    """One worksheet's structural metadata from the snapshot (WP-E1).
+
+    ``part`` is the package part path (e.g. ``xl/worksheets/sheet1.xml``);
+    ``hidden`` is ``True`` for hidden / very-hidden sheets; ``rows_hint`` is an
+    optional best-effort row count (``None`` when not cheaply known).
+    """
+
+    name: str
+    part: str
+    hidden: bool = False
+    rows_hint: int | None = None
+
+
+class OoxmlMetadata(DomainModel):
+    """Workbook metadata read non-COM from an immutable snapshot (WP-E1).
+
+    Lists the sheets (name/part/hidden/order via :class:`OxmlSheetMeta`), the
+    workbook defined names and the table-part count. Never carries cell data.
+    """
+
+    workbook_id: str
+    input: OoxmlInputInfo
+    sheets: list[OxmlSheetMeta] = Field(default_factory=list)
+    defined_names: list[str] = Field(default_factory=list)
+    table_count: int = 0
+
+
+class OoxmlSheetPage(DomainModel):
+    """A bounded page of typed worksheet rows read from a snapshot (WP-E1).
+
+    ``values`` holds one inner list per row, each aligned by column index; every
+    cell is a typed :class:`CellValue`. The grid is bounded by
+    :data:`MAX_RESPONSE_CELLS` and ``len(values) == rows``. ``page.source`` is
+    ``"snapshot"`` and ``page.version`` is ``0`` (a snapshot is immutable).
+    """
+
+    workbook_id: str
+    sheet: str
+    input: OoxmlInputInfo
+    rows: int
+    cols: int
+    values: list[list[CellValue]]
+    page: PageInfo
+
+    @model_validator(mode="after")
+    def _check_response_bounds(self) -> Self:
+        if len(self.values) != self.rows:
+            raise ValueError("OoxmlSheetPage.values row count must equal rows.")
+        if self.rows * self.cols > MAX_RESPONSE_CELLS:
+            raise ValueError(
+                f"OOXML sheet response {self.rows}x{self.cols} exceeds "
+                f"MAX_RESPONSE_CELLS ({MAX_RESPONSE_CELLS})."
+            )
+        return self
+
+
+class OoxmlPivotCacheMeta(DomainModel):
+    """Freshness / completeness metadata of a saved PivotCache (WP-E2).
+
+    Describes the **saved** cache (not the PivotTable's displayed result and not
+    the live source): ``record_count`` is the definition's ``recordCount`` (when
+    present), ``save_data`` is the ``saveData`` flag (``False`` means the cache
+    stored no local records), ``refresh_on_load`` / ``refresh_date`` report the
+    cache's refresh freshness, and ``has_records_part`` is ``True`` only when a
+    ``pivotCacheRecords`` part is actually present in the snapshot.
+    """
+
+    cache_index: int
+    record_count: int | None = None
+    save_data: bool | None = None
+    refresh_on_load: bool | None = None
+    refresh_date: datetime | None = None
+    has_records_part: bool = False
+
+
+class OoxmlPivotCachePage(DomainModel):
+    """A bounded page of typed **saved** PivotCache records (WP-E2).
+
+    ``values`` holds one inner list per record, field-aligned; every cell is a
+    typed :class:`CellValue` (shared-item indices resolved against the cache's
+    shared-items table). The grid is bounded by :data:`MAX_RESPONSE_CELLS` and
+    ``len(values) == rows``. ``page.source`` is ``"cache"`` and ``page.version`` is
+    ``0`` (a snapshot is immutable). When the cache has no local records
+    (``saveData="0"`` / OLAP / Data Model) the page is empty with
+    ``page.reason == "unsupported_source"`` and ``meta.has_records_part`` is
+    ``False`` — the records are never fabricated.
+    """
+
+    workbook_id: str
+    cache_index: int
+    input: OoxmlInputInfo
+    meta: OoxmlPivotCacheMeta
+    rows: int
+    cols: int
+    values: list[list[CellValue]]
+    page: PageInfo
+
+    @model_validator(mode="after")
+    def _check_response_bounds(self) -> Self:
+        if len(self.values) != self.rows:
+            raise ValueError("OoxmlPivotCachePage.values row count must equal rows.")
+        if self.rows * self.cols > MAX_RESPONSE_CELLS:
+            raise ValueError(
+                f"OOXML pivot-cache response {self.rows}x{self.cols} exceeds "
+                f"MAX_RESPONSE_CELLS ({MAX_RESPONSE_CELLS})."
+            )
+        return self
+
+
+# ===========================================================================
+# Large-data file export (WP-F)
+# ===========================================================================
+# A data export streams a large dataset (worksheet Range, Excel Table or
+# PivotTable rendered result) to a file artifact (CSV / JSONL) with bounded
+# memory, returning only compact metadata — never the data itself. The DTO is
+# JSON-serializable and carries no COM references.
+
+
+class DataExportResult(DomainModel):
+    """Compact result of a large-data file export (WP-F).
+
+    ``path`` is the stored artifact file (CSV / JSONL); the data is never returned
+    inline. ``rows`` is the number of data rows written (excluding a CSV header),
+    ``bytes`` / ``sha256`` describe the written file, ``complete`` is ``True`` iff
+    every source row was delivered, ``truncated`` is ``True`` iff the export was cut
+    by ``limit_rows`` or the ``max_export_rows`` ceiling, ``source`` is the source
+    kind (``"range"`` / ``"table"`` / ``"pivot-result"``) and ``source_version`` is
+    the workbook content version of the last page read.
+    """
+
+    artifact_id: str
+    path: str
+    format: Literal["csv", "jsonl"]
+    rows: int
+    bytes: int
+    sha256: str
+    complete: bool
+    source: str
+    source_version: int
+    truncated: bool = False

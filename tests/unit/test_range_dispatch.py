@@ -134,6 +134,7 @@ class FakeRangesService:
         address: str,
         offset: int = 0,
         limit: int | None = None,
+        cursor_version: int | None = None,
     ) -> RangeValues:
         self.calls.append(("read_values", (workbook_id, sheet, address, offset, limit)))
         return _values()
@@ -145,6 +146,7 @@ class FakeRangesService:
         address: str,
         offset: int = 0,
         limit: int | None = None,
+        cursor_version: int | None = None,
     ) -> RangeFormulas:
         self.calls.append(("read_formulas", (workbook_id, sheet, address, offset, limit)))
         return _formulas()

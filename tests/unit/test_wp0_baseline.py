@@ -5,7 +5,7 @@ four baseline matrices are complete and internally consistent. It never imports
 the server, touches Excel/COM, or starts the worker.
 
 The fixture is the "before" snapshot every later block (B2-B12) is verified
-against: a 92-row mapping ledger, a 92-row security/approval matrix, a per-action
+against: a 94-row mapping ledger, a 94-row security/approval matrix, a per-action
 annotation truth matrix, and one derived annotation triple per distinct target.
 """
 
@@ -38,18 +38,21 @@ def test_fixture_exists_and_has_schema_version(baseline: dict) -> None:
 
 def test_baseline_count_and_bytes(baseline: dict) -> None:
     meta = baseline["baseline"]
-    assert meta["tool_count"] == 92
-    # Locked "before" measurement (B0): count 92, serialized tools/list bytes.
-    assert meta["serialized_bytes"] == 479054
+    assert meta["tool_count"] == 94
+    # WP0 "before" ledger count is 94 (92 + the two justified large-data standalone
+    # tools workbook_file_read / data_export); serialized_bytes is the live-recomputed
+    # 43-tool surface measurement (the consolidated live surface, not the 92-tool WP0
+    # pre-consolidation snapshot).
+    assert meta["serialized_bytes"] == 352155
     assert meta["sdk"] == {"mcp": "2.3.0", "mcp-types": "2.3.0", "pydantic": "2.14.4"}
 
 
 def test_ledger_totalness_and_resolution(baseline: dict) -> None:
     ledger = baseline["ledger"]
-    assert len(ledger) == 92
+    assert len(ledger) == 94
 
     old_names = [row["old_name"] for row in ledger]
-    assert len(set(old_names)) == 92, "ledger contains a duplicate old_name"
+    assert len(set(old_names)) == 94, "ledger contains a duplicate old_name"
 
     for row in ledger:
         target = row["target"]
@@ -61,12 +64,12 @@ def test_ledger_totalness_and_resolution(baseline: dict) -> None:
 
 def test_ledger_distinct_target_count(baseline: dict) -> None:
     targets = {row["target"]["tool"] for row in baseline["ledger"]}
-    assert len(targets) == 41
+    assert len(targets) == 43
 
 
 def test_security_matrix_covers_every_tool(baseline: dict) -> None:
     security = baseline["security"]
-    assert len(security) == 92
+    assert len(security) == 94
 
     ledger_names = {row["old_name"] for row in baseline["ledger"]}
     security_names = {row["tool"] for row in security}
@@ -134,7 +137,7 @@ def test_tool_annotations_one_row_per_target(baseline: dict) -> None:
     targets = {row["target"]["tool"] for row in baseline["ledger"]}
 
     names = [row["tool"] for row in annotations]
-    assert len(names) == len(set(names)) == 41, "tool_annotations must have one row per target"
+    assert len(names) == len(set(names)) == 43, "tool_annotations must have one row per target"
     assert set(names) == targets
 
 

@@ -345,7 +345,7 @@ class NamesService:
 
         call = self._bind_workbook(fn, record, workbook_id)
         call.__name__ = tool
-        return cast(
+        result = cast(
             "_T",
             await self._worker.submit(
                 call,
@@ -354,6 +354,8 @@ class NamesService:
                 op_class=OperationClass.MUTATING,
             ),
         )
+        self._session.bump_version(workbook_id)
+        return result
 
     def _bind_workbook(
         self,

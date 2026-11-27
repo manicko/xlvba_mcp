@@ -49,10 +49,12 @@ from excel_vba_mcp.adapters.excel.ranges_adapter import (
 )
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
+from excel_vba_mcp.config import LargeDataConfig
 from excel_vba_mcp.domain.errors import (
     ApprovalDeniedError,
     ErrorCode,
     ExcelVbaMcpError,
+    StaleCursorError,
     WorkbookNotFoundError,
 )
 from excel_vba_mcp.domain.models import (
@@ -62,6 +64,7 @@ from excel_vba_mcp.domain.models import (
     FormatInfo,
     FormatMutationResult,
     FormulaWriteRequest,
+    PageInfo,
     RangeAddress,
     RangeFormatPatch,
     RangeFormulas,
@@ -115,6 +118,9 @@ class RangesService:
         path_policy: Allowlist policy (used to validate the working-copy path
             identity for approval keys of the mutating tools).
         audit: Append-only JSONL audit trail.
+        large_data: Unified large-data limits (single source). Defaults to
+            :class:`~excel_vba_mcp.config.LargeDataConfig` so existing
+            constructions keep working; the server passes ``config.large_data``.
     """
 
     def __init__(
@@ -125,6 +131,7 @@ class RangesService:
         approval: ApprovalPolicy,
         path_policy: PathPolicy,
         audit: AuditLogger,
+        large_data: LargeDataConfig | None = None,
     ) -> None:
         self._worker = worker
         self._session = session_service
@@ -132,6 +139,7 @@ class RangesService:
         self._approval = approval
         self._path_policy = path_policy
         self._audit = audit
+        self._large_data = large_data if large_data is not None else LargeDataConfig()
         self._adapter = RangesAdapter()
 
     # ------------------------------------------------------------------
@@ -169,16 +177,34 @@ class RangesService:
         *,
         offset: int = 0,
         limit: int | None = None,
+        cursor_version: int | None = None,
     ) -> RangeValues:
-        """Read typed cell values from a bounded Range window (read-only)."""
+        """Read typed cell values from a bounded Range window (read-only).
+
+        A large logical range is paged through successive ``offset`` reads; the
+        returned :class:`~excel_vba_mcp.domain.models.PageInfo` reports
+        ``has_more`` / ``complete`` / ``total`` and the workbook content
+        ``version``. Pass ``cursor_version`` (the prior page's ``page.version``)
+        to fail with ``STALE_CURSOR`` when the workbook changed between pages.
+        """
 
         record = self._resolve_record(workbook_id)
         result = await self._submit_read(
             workbook_id,
             "range_read_values",
-            lambda wb: self._adapter.read_values(wb, sheet, address, offset=offset, limit=limit),
+            lambda wb: self._adapter.read_values(
+                wb,
+                sheet,
+                address,
+                offset=offset,
+                limit=limit,
+                cursor_version=cursor_version,
+                version_getter=lambda: self._session.get_version(workbook_id),
+                max_response_cells=self._large_data.max_response_cells,
+            ),
             record,
         )
+        self._check_cursor(cursor_version, result.page, "range")
         self._record_audit(
             "range_read_values",
             "read_only",
@@ -208,16 +234,32 @@ class RangesService:
         *,
         offset: int = 0,
         limit: int | None = None,
+        cursor_version: int | None = None,
     ) -> RangeFormulas:
-        """Read typed formulas from a bounded Range window (``Formula2`` primary)."""
+        """Read typed formulas from a bounded Range window (``Formula2`` primary).
+
+        Pages a large logical range like :meth:`read_values`; pass
+        ``cursor_version`` to fail with ``STALE_CURSOR`` when the workbook changed
+        between pages.
+        """
 
         record = self._resolve_record(workbook_id)
         result = await self._submit_read(
             workbook_id,
             "range_read_formulas",
-            lambda wb: self._adapter.read_formulas(wb, sheet, address, offset=offset, limit=limit),
+            lambda wb: self._adapter.read_formulas(
+                wb,
+                sheet,
+                address,
+                offset=offset,
+                limit=limit,
+                cursor_version=cursor_version,
+                version_getter=lambda: self._session.get_version(workbook_id),
+                max_response_cells=self._large_data.max_response_cells,
+            ),
             record,
         )
+        self._check_cursor(cursor_version, result.page, "range")
         self._record_audit(
             "range_read_formulas",
             "read_only",
@@ -846,11 +888,16 @@ class RangesService:
         fn: Callable[[Any], _T],
         record: WorkbookInfo,
     ) -> _T:
-        """Run a mutating ``fn(wb)`` on the STA worker (never auto-retried)."""
+        """Run a mutating ``fn(wb)`` on the STA worker (never auto-retried).
+
+        Bumps the workbook content version after a successful mutation so a later
+        paged read can detect the change (``STALE_CURSOR``); a raising mutation
+        never reaches the bump.
+        """
 
         call = self._bind_workbook(fn, record, workbook_id)
         call.__name__ = tool
-        return cast(
+        result = cast(
             "_T",
             await self._worker.submit(
                 call,
@@ -859,6 +906,29 @@ class RangesService:
                 op_class=OperationClass.MUTATING,
             ),
         )
+        self._session.bump_version(workbook_id)
+        return result
+
+    @staticmethod
+    def _check_cursor(
+        cursor_version: int | None, page: PageInfo | None, kind: str
+    ) -> None:
+        """Raise ``STALE_CURSOR`` when the page version no longer matches the cursor.
+
+        A ``cursor_version`` is the caller's restart guard: when the workbook
+        content version captured with this page differs from the version the
+        caller paged from, continuing would mix workbook versions.
+        """
+
+        if cursor_version is not None and page is not None and cursor_version != page.version:
+            raise StaleCursorError(
+                "The workbook changed since the first page; restart paging.",
+                context={
+                    "expected_version": cursor_version,
+                    "actual_version": page.version,
+                    "kind": kind,
+                },
+            )
 
     # ------------------------------------------------------------------
     # STA submission helpers

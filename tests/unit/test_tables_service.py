@@ -743,6 +743,34 @@ def test_read_rows_invalid_offset() -> None:
         adapter.read_rows(wb, "Tbl", offset=-1)
 
 
+def test_read_rows_pages_with_max_cells() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    _new_table(wb, columns=["Name"], rows=[[f"r{i}"] for i in range(2500)])
+    adapter = TablesAdapter()
+
+    # A table larger than the per-call cell budget is paged via offset; each page
+    # carries a completeness block (PageInfo) with has_more / complete / total.
+    page1 = adapter.read_rows(wb, "Tbl", max_cells=1000)
+    assert page1.page is not None
+    assert page1.page.total == 2500
+    assert page1.page.returned == 1000
+    assert page1.page.has_more is True
+    assert page1.page.complete is False
+
+    page2 = adapter.read_rows(wb, "Tbl", offset=page1.page.returned, max_cells=1000)
+    assert page2.page is not None
+    assert page2.page.offset == 1000
+    assert page2.page.returned == 1000
+
+    page3 = adapter.read_rows(wb, "Tbl", offset=2000, max_cells=1000)
+    assert page3.page is not None
+    assert page3.page.has_more is False
+    assert page3.page.complete is True
+
+    # No duplicate / skipped rows across the three pages.
+    assert page1.page.returned + page2.page.returned + page3.page.returned == 2500
+
+
 # ---------------------------------------------------------------------------
 # Adapter-level: row mutations via ListRows
 # ---------------------------------------------------------------------------
@@ -954,6 +982,27 @@ async def test_service_read_rows(tmp_path: Path) -> None:
     rows = await rig.service.read_table_rows(info.workbook_id, "Tbl", offset=1, limit=1)
     assert rows.returned_rows == 1
     assert rows.rows[0][0].value == "b"
+
+
+async def test_read_table_rows_stale_cursor(tmp_path: Path) -> None:
+    rig = Rig(tmp_path)
+    info = await rig.open()
+    _new_table(rig.workbook(), columns=["Name"], rows=[["r1"], ["r2"], ["r3"]])
+
+    page1 = await rig.service.read_table_rows(info.workbook_id, "Tbl")
+    assert page1.page is not None
+    first_version = page1.page.version
+
+    # Simulate a mutation between pages: the content version advances.
+    rig.session.bump_version(info.workbook_id)
+
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        await rig.service.read_table_rows(
+            info.workbook_id, "Tbl", cursor_version=first_version
+        )
+    assert exc_info.value.code is ErrorCode.STALE_CURSOR
+    assert exc_info.value.context["expected_version"] == first_version
+    assert exc_info.value.context["kind"] == "table"
 
 
 async def test_service_unknown_workbook_raises(tmp_path: Path) -> None:

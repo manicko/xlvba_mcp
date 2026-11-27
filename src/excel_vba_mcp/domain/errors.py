@@ -84,6 +84,13 @@ class ErrorCode(StrEnum):
     # ``COM_BUSY`` fallback so a caller can tell "choose a unique name" from
     # "Excel busy, retry". Not retryable; category ``validation``.
     NAME_CONFLICT = "NAME_CONFLICT"
+    # Large-data (additive): a continuation cursor (offset + version + object
+    # key) refers to a workbook content version that differs from the current
+    # one, so the next page would mix workbook versions. Distinct from
+    # ``INVALID_RANGE`` (bad address) and ``RANGE_TOO_LARGE`` (oversized window):
+    # the address is valid and the window is small enough, but the data moved.
+    # Not retryable as-is; the caller must restart paging from offset 0.
+    STALE_CURSOR = "STALE_CURSOR"
 
 
 # Well-known HRESULT values that map to domain codes (hex shown for readability).
@@ -178,6 +185,7 @@ _CATEGORY_BY_CODE: dict[ErrorCode, str] = {
     ErrorCode.RANGE_TOO_LARGE: "validation",
     ErrorCode.CONFIRMATION_REQUIRED: "validation",
     ErrorCode.NAME_CONFLICT: "validation",
+    ErrorCode.STALE_CURSOR: "validation",
     # internal — unhandled non-domain failure at the tool boundary (U6-B).
     ErrorCode.INTERNAL_ERROR: "internal",
 }
@@ -268,6 +276,10 @@ _ACTIONS_BY_CODE: dict[ErrorCode, list[str]] = {
         "re-call with confirm=true after reviewing what is discarded"
     ],
     ErrorCode.NAME_CONFLICT: ["choose a unique name or delete the existing one"],
+    ErrorCode.STALE_CURSOR: [
+        "restart paging from offset 0 with the current workbook version",
+        "the workbook changed between pages; do not continue the old cursor",
+    ],
 }
 
 # Fallback category/actions for an unrecognized string key (never a real code).
@@ -570,6 +582,19 @@ class StaleTargetError(ExcelVbaMcpError):
     default_message = "The target changed since it was read; retry with fresh identity."
 
 
+class StaleCursorError(ExcelVbaMcpError):
+    """A continuation cursor refers to a different workbook version (large-data).
+
+    Raised by paged reads when the workbook content version at page time differs
+    from the version captured in the cursor, so continuing would mix workbook
+    versions. The address is valid and the window is bounded; the data moved.
+    Not retryable as-is — restart paging from offset 0.
+    """
+
+    default_code = ErrorCode.STALE_CURSOR
+    default_message = "The workbook changed since the first page; restart paging."
+
+
 class AmbiguousFilterError(ExcelVbaMcpError):
     """A field/caption/item filter resolved to zero or more than one target."""
 
@@ -734,4 +759,8 @@ _ERROR_BY_CODE: dict[ErrorCode, type[ExcelVbaMcpError]] = {
     # ``error_from_hresult`` (no HRESULT maps to it); registered so the
     # code -> exception mapping stays complete.
     ErrorCode.NAME_CONFLICT: NameConflictError,
+    # Large-data (additive): stale continuation cursor. Inert for
+    # ``error_from_hresult`` (no HRESULT maps to it); registered so the
+    # code -> exception mapping stays complete.
+    ErrorCode.STALE_CURSOR: StaleCursorError,
 }

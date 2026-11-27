@@ -133,6 +133,7 @@ from excel_vba_mcp.domain.models import (
     FormatInfo,
     FormatMutationResult,
     FormulaCell,
+    PageInfo,
     RangeAddress,
     RangeFormatPatch,
     RangeFormulas,
@@ -864,17 +865,26 @@ class RangesAdapter:
         *,
         offset: int = 0,
         limit: int | None = None,
+        cursor_version: int | None = None,
+        version_getter: Callable[[], int] | None = None,
+        max_response_cells: int = MAX_RESPONSE_CELLS,
     ) -> RangeValues:
         """Read typed cell values from a bounded ``Range.Value2`` window.
 
         ``offset`` is a 0-based row index into the requested range; ``limit``
-        caps the returned rows. The response is bounded by
-        :data:`~excel_vba_mcp.domain.models.MAX_RESPONSE_CELLS` (an oversized
-        window is truncated and ``truncated`` is set) and by
-        :data:`~excel_vba_mcp.domain.models.MAX_RANGE_CELLS` (an oversized
-        request is rejected before any cell is read).
+        caps the returned rows. The request is bounded by the **returned window**
+        (``max_response_cells``): a large logical range is paged through
+        successive reads rather than rejected, and ``truncated`` marks a response
+        cut short. The full-range ``MAX_RANGE_CELLS`` cap applies only to writes.
+
+        The workbook content version is captured **atomically with the read** (at
+        the start of this STA-worker call, before the range is opened) and attached
+        to the returned :class:`PageInfo` so a later page can detect a concurrent
+        mutation (``cursor_version`` is the caller's restart guard; the service
+        raises ``STALE_CURSOR`` when it no longer matches).
         """
 
+        captured_version = version_getter() if version_getter is not None else 0
         _validate_window(offset, limit)
         worksheet, range_obj, resolved = self._open(wb, sheet, address)
 
@@ -883,7 +893,9 @@ class RangesAdapter:
         total_rows = resolved.rows
         total_cols = resolved.cols
 
-        start, end, truncated = _window(total_rows, total_cols, offset, limit)
+        start, end, truncated = _window(
+            total_rows, total_cols, offset, limit, max_response_cells
+        )
         row_count = end - start
         shape = _shape_for(total_rows, total_cols)
 
@@ -895,6 +907,18 @@ class RangesAdapter:
                 cols=total_cols,
                 values=[],
                 truncated=truncated or start >= total_rows,
+                page=PageInfo(
+                    offset=start,
+                    limit=limit,
+                    returned=0,
+                    total=total_rows,
+                    has_more=False,
+                    complete=(total_rows == 0),
+                    truncated=truncated,
+                    version=captured_version,
+                    source="live",
+                    reason="no_data" if total_rows == 0 else None,
+                ),
             )
 
         sub_range = _sub_range(worksheet, range_obj, start, row_count, total_cols)
@@ -910,6 +934,17 @@ class RangesAdapter:
             cols=total_cols,
             values=values,
             truncated=truncated,
+            page=PageInfo(
+                offset=start,
+                limit=limit,
+                returned=row_count,
+                total=total_rows,
+                has_more=(end < total_rows),
+                complete=(not truncated and end >= total_rows),
+                truncated=truncated,
+                version=captured_version,
+                source="live",
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -923,6 +958,9 @@ class RangesAdapter:
         *,
         offset: int = 0,
         limit: int | None = None,
+        cursor_version: int | None = None,
+        version_getter: Callable[[], int] | None = None,
+        max_response_cells: int = MAX_RESPONSE_CELLS,
     ) -> RangeFormulas:
         """Read typed formulas from a bounded window (``Formula2`` primary).
 
@@ -932,8 +970,13 @@ class RangesAdapter:
         ``formula2`` (an ``@`` was added/removed by IIE). ``_xlfn`` / ``_xlws``
         / ``_xlpm`` prefixes are surfaced in ``notes``; the formula strings are
         never stripped or rewritten.
+
+        The request is bounded by the returned window (``max_response_cells``), not
+        the full range. The workbook content version is captured atomically with
+        the read and attached to the returned :class:`PageInfo`.
         """
 
+        captured_version = version_getter() if version_getter is not None else 0
         _validate_window(offset, limit)
         worksheet, range_obj, resolved = self._open(wb, sheet, address)
 
@@ -942,7 +985,9 @@ class RangesAdapter:
         total_rows = resolved.rows
         total_cols = resolved.cols
 
-        start, end, truncated = _window(total_rows, total_cols, offset, limit)
+        start, end, truncated = _window(
+            total_rows, total_cols, offset, limit, max_response_cells
+        )
         row_count = end - start
         shape = _shape_for(total_rows, total_cols)
         notes: list[str] = []
@@ -956,6 +1001,18 @@ class RangesAdapter:
                 formulas=[],
                 truncated=truncated or start >= total_rows,
                 notes=notes,
+                page=PageInfo(
+                    offset=start,
+                    limit=limit,
+                    returned=0,
+                    total=total_rows,
+                    has_more=False,
+                    complete=(total_rows == 0),
+                    truncated=truncated,
+                    version=captured_version,
+                    source="live",
+                    reason="no_data" if total_rows == 0 else None,
+                ),
             )
 
         sub_range = _sub_range(worksheet, range_obj, start, row_count, total_cols)
@@ -983,6 +1040,17 @@ class RangesAdapter:
             formulas=formulas,
             truncated=truncated,
             notes=notes,
+            page=PageInfo(
+                offset=start,
+                limit=limit,
+                returned=row_count,
+                total=total_rows,
+                has_more=(end < total_rows),
+                complete=(not truncated and end >= total_rows),
+                truncated=truncated,
+                version=captured_version,
+                source="live",
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -3738,37 +3806,28 @@ def _validate_window(offset: int, limit: int | None) -> None:
 
 
 def _window(
-    total_rows: int, total_cols: int, offset: int, limit: int | None
+    total_rows: int,
+    total_cols: int,
+    offset: int,
+    limit: int | None,
+    max_response_cells: int = MAX_RESPONSE_CELLS,
 ) -> tuple[int, int, bool]:
     """Compute the bounded ``(start, end, truncated)`` row window.
 
-    Rejects a request whose full size exceeds
-    :data:`~excel_vba_mcp.domain.models.MAX_RANGE_CELLS` before any cell is read
-    with :class:`~excel_vba_mcp.domain.errors.RangeTooLargeError`
-    (``RANGE_TOO_LARGE`` — a valid but oversized range, not ``INVALID_RANGE``),
-    then bounds the returned rows by
-    :data:`~excel_vba_mcp.domain.models.MAX_RESPONSE_CELLS` (setting
-    ``truncated`` when the response is cut short).
+    The request is bounded by the **returned window**, not the full range: a
+    large logical range is paged through successive ``offset`` / ``limit`` reads
+    rather than rejected up front. The returned rows are bounded by
+    ``max_response_cells`` (``truncated`` is set when the response is cut short).
+    The full-range :data:`~excel_vba_mcp.domain.models.MAX_RANGE_CELLS` cap
+    remains only for writes.
     """
-
-    if total_rows * total_cols > MAX_RANGE_CELLS:
-        raise RangeTooLargeError(
-            f"Range {total_rows}x{total_cols}={total_rows * total_cols} exceeds "
-            f"MAX_RANGE_CELLS ({MAX_RANGE_CELLS}).",
-            context={
-                "rows": total_rows,
-                "cols": total_cols,
-                "cells": total_rows * total_cols,
-                "limit": MAX_RANGE_CELLS,
-            },
-        )
 
     start = min(offset, total_rows)
     end = total_rows if limit is None else min(total_rows, offset + limit)
     requested = end - start
 
-    truncated = requested * total_cols > MAX_RESPONSE_CELLS
+    truncated = requested * total_cols > max_response_cells
     if truncated:
-        max_rows = max(0, MAX_RESPONSE_CELLS // max(1, total_cols))
+        max_rows = max(0, max_response_cells // max(1, total_cols))
         end = start + min(requested, max_rows)
     return start, end, truncated

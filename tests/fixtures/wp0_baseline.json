@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "baseline": {
-    "tool_count": 92,
-    "serialized_bytes": 479054,
-    "measured_at": "2026-11-27T07:59:21.479671+00:00",
+    "tool_count": 94,
+    "serialized_bytes": 352155,
+    "measured_at": "2026-11-27T19:13:53.775526+00:00",
     "command": "& .\\.venv\\Scripts\\python.exe -c \"import asyncio,json,excel_vba_mcp.server as s; t=asyncio.run(s.mcp.list_tools()); data=[x.model_dump(by_alias=True) for x in t]; print('count',len(t)); print('bytes',len(json.dumps(data,default=str).encode()))\"",
     "sdk": {
       "mcp": "2.3.0",
@@ -725,6 +725,20 @@
         "kind": "standalone",
         "tool": "xlvba_environment"
       }
+    },
+    {
+      "old_name": "workbook_file_read",
+      "target": {
+        "kind": "standalone",
+        "tool": "workbook_file_read"
+      }
+    },
+    {
+      "old_name": "data_export",
+      "target": {
+        "kind": "standalone",
+        "tool": "data_export"
+      }
     }
   ],
   "security": [
@@ -1392,6 +1406,20 @@
       "new_name": "xlvba_environment",
       "permission_profile": "P_READ",
       "note": "inline read_only annotation; not via _ANN_READ_ONLY"
+    },
+    {
+      "tool": "workbook_file_read",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "workbook_file_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "data_export",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "data_export",
+      "permission_profile": "P_EXEC"
     }
   ],
   "truth": [
@@ -2038,6 +2066,20 @@
       "read_only": true,
       "destructive": false,
       "idempotent": true
+    },
+    {
+      "tool": "workbook_file_read",
+      "action": "workbook_file_read",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "data_export",
+      "action": "data_export",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
     }
   ],
   "tool_annotations": [
@@ -2284,6 +2326,18 @@
     {
       "tool": "xlvba_environment",
       "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "workbook_file_read",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "data_export",
+      "read_only": false,
       "destructive": false,
       "idempotent": true
     }

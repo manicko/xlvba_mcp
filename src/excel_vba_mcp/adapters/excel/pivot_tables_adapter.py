@@ -74,9 +74,12 @@ mismatch is reported through ``verified=False`` rather than claimed as success.
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, cast
 
+from excel_vba_mcp.adapters.excel.ranges_adapter import RangesAdapter
 from excel_vba_mcp.domain.errors import (
     AmbiguousFilterError,
     ErrorCode,
@@ -86,6 +89,8 @@ from excel_vba_mcp.domain.errors import (
     UnsupportedPivotSourceError,
 )
 from excel_vba_mcp.domain.models import (
+    MAX_PIVOT_RESULT_CELLS,
+    PageInfo,
     PivotCacheInfo,
     PivotFieldFilters,
     PivotFieldInfo,
@@ -93,6 +98,7 @@ from excel_vba_mcp.domain.models import (
     PivotFilterSpec,
     PivotFilterState,
     PivotRefreshResult,
+    PivotResultPage,
     PivotTableInfo,
 )
 from excel_vba_mcp.domain.statuses import (
@@ -318,6 +324,31 @@ def _get_datetime(obj: Any, attr: str) -> datetime | None:
     try:
         return _safe_datetime(getattr(obj, attr))
     except Exception:  # noqa: BLE001 - defensive COM read
+        return None
+
+
+#: Matches the row digits of the first cell of an A1-style address (e.g. the
+#: ``1`` in ``"$A$1:$B$7"``). Column letters carry no digits, so the first
+#: numeric run in the first cell is its row.
+_TOP_ROW_RE = re.compile(r"(\d+)")
+
+
+def _top_row(address: str | None) -> int | None:
+    """Return the top row of an A1-style address, or ``None`` when unparseable.
+
+    The top row is the row of the top-left cell (``"$B$5:$B$7"`` -> ``5``); a
+    ``None`` / blank / unparseable address yields ``None`` rather than a guess.
+    """
+
+    if not address:
+        return None
+    first_cell = address.split(":", 1)[0]
+    match = _TOP_ROW_RE.search(first_cell)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:  # pragma: no cover - regex guarantees digits
         return None
 
 
@@ -1931,6 +1962,80 @@ class PivotTablesAdapter:
         _gate_supported_source_read(pivot, name)
         data_field_index = _data_field_index(pivot)
         return self._describe_all_fields(pivot, data_field_index)
+
+    # ------------------------------------------------------------------
+    # Rendered-result read (WP-C; read-only, all source types)
+    # ------------------------------------------------------------------
+    def read_pivot_result(
+        self,
+        wb: Any,
+        pivot_table: str,
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+        version_getter: Callable[[], int] | None = None,
+        max_cells: int = MAX_PIVOT_RESULT_CELLS,
+    ) -> PivotResultPage:
+        """Read a bounded page of a PivotTable's **rendered** output (WP-C).
+
+        The values Excel actually displays in ``TableRange1`` are read through the
+        shared bounded Range reader (:meth:`RangesAdapter.read_values`), so the
+        page is bounded by ``max_cells`` and carries a version-bound
+        :class:`~excel_vba_mcp.domain.models.PageInfo`. Only rendered cells are
+        read — never the external source — so this works for every source type
+        (database, external, OLAP / Data Model); the source type is reported for
+        context and is **not** gated.
+
+        ``pivot_table`` is the stable PivotTable ``Name``; a missing name raises
+        the same structured error as :meth:`enumerate_pivot_fields`.
+        """
+
+        pivot = _find_pivot(wb, pivot_table)
+        name = _get_str(pivot, "Name") or pivot_table
+        table_range1 = _get_address(pivot, "TableRange1")
+        data_body = _get_address(pivot, "DataBodyRange")
+        refresh = _get_datetime(pivot, "RefreshDate")
+        source_type, _olap = _classify_source_type(pivot.PivotCache())
+        sheet_name = _get_str(pivot.Parent, "Name") or ""
+
+        if not table_range1:
+            raise ExcelVbaMcpError(
+                f"PivotTable {name!r} exposes no TableRange1; its rendered "
+                "result cannot be read.",
+                code=ErrorCode.INVALID_RANGE,
+                context={"pivot_table": name, "reason": "no_table_range"},
+            )
+
+        header_row_count = 0
+        table_top = _top_row(table_range1)
+        body_top = _top_row(data_body)
+        if table_top is not None and body_top is not None:
+            header_row_count = max(0, body_top - table_top)
+
+        rv = RangesAdapter().read_values(
+            wb,
+            sheet_name,
+            table_range1,
+            offset=offset,
+            limit=limit,
+            version_getter=version_getter,
+            max_response_cells=max_cells,
+        )
+        fingerprint = f"{table_range1}|{refresh.isoformat() if refresh else ''}"
+        return PivotResultPage(
+            pivot_table=name,
+            sheet_name=sheet_name,
+            source_type=source_type,
+            table_range=table_range1,
+            data_body_range=data_body,
+            refresh_date=refresh,
+            header_row_count=header_row_count,
+            rows=rv.rows,
+            cols=rv.cols,
+            values=rv.values,
+            page=cast("PageInfo", rv.page),
+            fingerprint=fingerprint,
+        )
 
     # ------------------------------------------------------------------
     # Targeted refresh (task_049)

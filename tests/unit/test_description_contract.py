@@ -109,8 +109,10 @@ async def test_tool_count_is_final_exposed() -> None:
     # seven VBA read/diagnostic verbs into vba_read (vba_get_compile_diagnostics
     # folded in as get-compile-diagnostics); vba_replace_component_source,
     # vba_insert_code, vba_export_project and vba_compile_diagnostics stay
-    # standalone: 47 -> 41. B12 finalizes the count.
-    assert len(tools) == 41
+    # standalone: 47 -> 41. B12 finalizes the count. The large-data integration
+    # then adds two justified standalone tools (workbook_file_read, data_export):
+    # 41 -> 43.
+    assert len(tools) == 43
 
 
 async def test_single_switchover_no_legacy_names_or_aliases() -> None:

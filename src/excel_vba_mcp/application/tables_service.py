@@ -41,10 +41,12 @@ from excel_vba_mcp.adapters.excel.tables_adapter import (
 )
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
+from excel_vba_mcp.config import LargeDataConfig
 from excel_vba_mcp.domain.errors import (
     ApprovalDeniedError,
     ErrorCode,
     ExcelVbaMcpError,
+    StaleCursorError,
     WorkbookNotFoundError,
 )
 from excel_vba_mcp.domain.models import TableInfo, WorkbookInfo
@@ -82,6 +84,9 @@ class TablesService:
         path_policy: Allowlist policy (used to validate the working-copy path
             identity for approval keys).
         audit: Append-only JSONL audit trail.
+        large_data: Unified large-data limits (single source). Defaults to
+            :class:`~excel_vba_mcp.config.LargeDataConfig`; the server passes
+            ``config.large_data``.
     """
 
     def __init__(
@@ -92,6 +97,7 @@ class TablesService:
         approval: ApprovalPolicy,
         path_policy: PathPolicy,
         audit: AuditLogger,
+        large_data: LargeDataConfig | None = None,
     ) -> None:
         self._worker = worker
         self._session = session_service
@@ -99,6 +105,7 @@ class TablesService:
         self._approval = approval
         self._path_policy = path_policy
         self._audit = audit
+        self._large_data = large_data if large_data is not None else LargeDataConfig()
         self._adapter = TablesAdapter()
 
     # ------------------------------------------------------------------
@@ -146,16 +153,45 @@ class TablesService:
         *,
         offset: int = 0,
         limit: int | None = None,
+        cursor_version: int | None = None,
     ) -> TableRows:
-        """Read a typed, bounded slice of a table's data rows (read-only)."""
+        """Read a typed, bounded slice of a table's data rows (read-only).
+
+        Pages a large table through successive ``offset`` reads; the returned
+        :class:`~excel_vba_mcp.domain.models.PageInfo` reports
+        ``has_more`` / ``complete`` / ``total`` and the workbook content
+        ``version``. Pass ``cursor_version`` (the prior page's ``page.version``)
+        to fail with ``STALE_CURSOR`` when the workbook changed between pages.
+        """
 
         record = self._resolve_record(workbook_id)
         result = await self._submit_read(
             workbook_id,
             "table_read_rows",
-            lambda wb: self._adapter.read_rows(wb, name, offset=offset, limit=limit),
+            lambda wb: self._adapter.read_rows(
+                wb,
+                name,
+                offset=offset,
+                limit=limit,
+                cursor_version=cursor_version,
+                version_getter=lambda: self._session.get_version(workbook_id),
+                max_cells=self._large_data.max_table_cells,
+            ),
             record,
         )
+        if (
+            cursor_version is not None
+            and result.page is not None
+            and cursor_version != result.page.version
+        ):
+            raise StaleCursorError(
+                "The workbook changed since the first page; restart paging.",
+                context={
+                    "expected_version": cursor_version,
+                    "actual_version": result.page.version,
+                    "kind": "table",
+                },
+            )
         self._record_audit(
             "table_read_rows",
             "read_only",
@@ -459,11 +495,16 @@ class TablesService:
         fn: Callable[[Any], _T],
         record: WorkbookInfo,
     ) -> _T:
-        """Run a mutating ``fn(wb)`` on the STA worker (never auto-retried)."""
+        """Run a mutating ``fn(wb)`` on the STA worker (never auto-retried).
+
+        Bumps the workbook content version after a successful mutation so a later
+        paged read can detect the change (``STALE_CURSOR``); a raising mutation
+        never reaches the bump.
+        """
 
         call = self._bind_workbook(fn, record, workbook_id)
         call.__name__ = tool
-        return cast(
+        result = cast(
             "_T",
             await self._worker.submit(
                 call,
@@ -472,6 +513,8 @@ class TablesService:
                 op_class=OperationClass.MUTATING,
             ),
         )
+        self._session.bump_version(workbook_id)
+        return result
 
     def _bind_workbook(
         self,

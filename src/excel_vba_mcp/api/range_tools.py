@@ -179,13 +179,16 @@ async def range_read_values(
     address: str,
     offset: int = 0,
     limit: int | None = None,
+    cursor_version: int | None = None,
 ) -> RangeValues:
     """Read typed cell values from a bounded Range window.
 
     Values are typed (``empty`` / ``string`` / ``number`` / ``boolean`` /
     ``date`` / ``error``) with no lossy string coercion. ``offset`` is a 0-based
     row index into the requested range; ``limit`` caps the returned rows. The
-    response is bounded (``truncated`` marks a cut-short window).
+    response is bounded (``truncated`` marks a cut-short window). ``cursor_version``
+    restarts paging: pass the prior page's ``page.version`` to fail with
+    ``STALE_CURSOR`` when the workbook changed between pages.
 
     Args:
         workbook_id: The id returned by ``excel_open``.
@@ -193,6 +196,7 @@ async def range_read_values(
         address: An A1-style address for the target block.
         offset: 0-based row index of the first row to return.
         limit: Optional cap on the number of rows returned.
+        cursor_version: Optional prior page version; mismatch raises STALE_CURSOR.
     """
 
     _require_non_empty(workbook_id, "workbook_id")
@@ -202,7 +206,9 @@ async def range_read_values(
     if limit is not None:
         limit = _require_int(limit, "limit", minimum=1)
     service = get_ranges_service()
-    return await service.read_values(workbook_id, sheet, address, offset=offset, limit=limit)
+    return await service.read_values(
+        workbook_id, sheet, address, offset=offset, limit=limit, cursor_version=cursor_version
+    )
 
 
 async def range_read_formulas(
@@ -211,6 +217,7 @@ async def range_read_formulas(
     address: str,
     offset: int = 0,
     limit: int | None = None,
+    cursor_version: int | None = None,
 ) -> RangeFormulas:
     """Read typed formulas from a bounded Range window (``Formula2`` primary).
 
@@ -220,6 +227,7 @@ async def range_read_formulas(
         address: An A1-style address for the target block.
         offset: 0-based row index of the first row to return.
         limit: Optional cap on the number of rows returned.
+        cursor_version: Optional prior page version; mismatch raises STALE_CURSOR.
     """
 
     _require_non_empty(workbook_id, "workbook_id")
@@ -229,7 +237,9 @@ async def range_read_formulas(
     if limit is not None:
         limit = _require_int(limit, "limit", minimum=1)
     service = get_ranges_service()
-    return await service.read_formulas(workbook_id, sheet, address, offset=offset, limit=limit)
+    return await service.read_formulas(
+        workbook_id, sheet, address, offset=offset, limit=limit, cursor_version=cursor_version
+    )
 
 
 async def range_get_format(workbook_id: str, sheet: str, address: str) -> FormatInfo:
@@ -622,6 +632,7 @@ async def range_read(
     address: str | None = None,
     offset: int = 0,
     limit: int | None = None,
+    cursor_version: int | None = None,
 ) -> (
     RangeAddress
     | RangeValues
@@ -650,6 +661,9 @@ async def range_read(
         address: An A1-style address (required).
         offset: 0-based row index (``read-values`` / ``read-formulas``).
         limit: Optional cap on returned rows (``read-values`` / ``read-formulas``).
+        cursor_version: Optional prior page version; a mismatch raises
+            ``STALE_CURSOR`` so paging restarts from offset 0
+            (``read-values`` / ``read-formulas``).
 
     Returns:
         A :class:`RangeAddress` (``get``), :class:`RangeValues`
@@ -663,11 +677,11 @@ async def range_read(
         return await range_get(workbook_id or "", sheet or "", address or "")
     if action == "read-values":
         return await range_read_values(
-            workbook_id or "", sheet or "", address or "", offset, limit
+            workbook_id or "", sheet or "", address or "", offset, limit, cursor_version
         )
     if action == "read-formulas":
         return await range_read_formulas(
-            workbook_id or "", sheet or "", address or "", offset, limit
+            workbook_id or "", sheet or "", address or "", offset, limit, cursor_version
         )
     if action == "get-format":
         return await range_get_format(workbook_id or "", sheet or "", address or "")

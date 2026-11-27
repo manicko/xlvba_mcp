@@ -849,6 +849,25 @@ async def test_service_write_values_success(tmp_path: Path) -> None:
     assert rig.workbook().sheet("Data").get(1, 1) == 7.0
 
 
+async def test_bump_version_wired_on_range_write(tmp_path: Path) -> None:
+    rig = Rig(tmp_path)
+    info = await rig.open()
+    rig.add_snapshot(info.workbook_id)
+    rig.grant("range_write_values")
+    assert rig.session.get_version(info.workbook_id) == 0
+
+    payload = RangeWriteRequest(rows=1, cols=1, values=[[_cv(CellValueKind.NUMBER, 7.0)]])
+    await rig.service.write_values(info.workbook_id, "Data", "A1", payload)
+    assert rig.session.get_version(info.workbook_id) == 1
+
+    # A raising mutation (payload shape mismatch -> INVALID_RANGE on the worker)
+    # must NOT bump the version: the bump runs only after a successful submit.
+    bad = RangeWriteRequest(rows=2, cols=2, values=[[1, 2], [3, 4]])
+    with pytest.raises(ExcelVbaMcpError):
+        await rig.service.write_values(info.workbook_id, "Data", "A1", bad)
+    assert rig.session.get_version(info.workbook_id) == 1
+
+
 async def test_service_write_formulas_success(tmp_path: Path) -> None:
     rig = Rig(tmp_path)
     info = await rig.open()
