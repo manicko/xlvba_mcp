@@ -63,9 +63,7 @@ from excel_vba_mcp.api.environment_tools import xlvba_environment
 from excel_vba_mcp.api.health_tools import excel_health
 from excel_vba_mcp.api.job_tools import job_get, job_request_cancel
 from excel_vba_mcp.api.macro_tools import (
-    macro_classify_background,
-    macro_get_last_result,
-    macro_list,
+    macro,
     macro_run,
 )
 from excel_vba_mcp.api.name_tools import (
@@ -126,8 +124,7 @@ from excel_vba_mcp.api.test_tools import (
     snapshot_diff,
     snapshot_list,
     snapshot_restore,
-    test_get_run,
-    test_suite_run,
+    test,
 )
 from excel_vba_mcp.api.vba_tools import (
     vba_export_project,
@@ -343,32 +340,36 @@ _DESC_SNAPSHOT_RESTORE = (
     "Next actions: snapshot_create to re-baseline before further mutations."
 )
 _DESC_SNAPSHOT_DIFF = "Compare two snapshots by manifest metadata and file hash."
-_DESC_TEST_GET_RUN = (
-    "Return a previously persisted test run by run_id (statuses, per-case steps, "
-    "assertions, artifact references). Read-only: it never touches Excel."
-)
-_DESC_TEST_SUITE_RUN = (
-    "Purpose: Validate and run a declarative test suite (canonical entry point for "
-    "new use). "
-    "Use when: you have a suite object or a plain JSON-style mapping, or you need "
+_DESC_TEST = (
+    "Purpose: Validate and run a declarative test suite, or read a previously "
+    "persisted run, through one dispatch tool. "
+    "Use when: you have a suite object or a plain JSON-style mapping and want to "
+    "run it (run-suite), or you need to read back a persisted run by id "
+    "(get-run). "
+    "Do not use when: you need to run a single macro — use macro_run; run-suite "
+    "executes on disposable working copies and is not read-only. "
+    "Preconditions: suite.workbook_id must be an open workbook (call workbook "
+    "action='open' first) for run-suite; a baseline snapshot is created "
+    "automatically unless baseline='use_existing'; run_id is required for "
+    "get-run. "
+    "Parameters: action='run-suite'|'get-run'; suite (run-suite): TestSuiteSpec "
+    "or mapping; run_id (get-run); background (run-suite). The closed Range/Pivot "
+    "action and assertion vocabularies are validated before any Excel call, so an "
+    "unknown action/assertion or an arbitrary-code/unbounded payload is rejected "
+    "up front. "
+    "Behavior: run-suite uses one immutable baseline snapshot, one disposable "
+    "working copy per case, external macro side effects are NOT rolled back, and "
+    "background=true returns a RunningJob handle; get-run never touches Excel and "
+    "never re-runs anything. "
+    "Result: TestRunResult (run-suite / get-run), or RunningJob when "
     "background=true. "
-    "Preconditions: suite.workbook_id must be an open workbook (call workbook action='open' "
-    "first); a baseline snapshot is created automatically unless "
-    "baseline='use_existing'. "
-    "Parameters: suite:TestSuiteSpec or mapping; background=False. The closed "
-    "Range/Pivot action and assertion vocabularies are validated before any Excel "
-    "call, so an unknown action/assertion or an arbitrary-code/unbounded payload "
-    "is rejected up front. "
-    "Behavior: one immutable baseline snapshot, one disposable working copy per "
-    "case; external macro side effects are NOT rolled back; background=true returns "
-    "a RunningJob handle. "
-    "Result: TestRunResult, or RunningJob when background=true. "
-    "Next actions: job_get to retrieve a background result; test_get_run to read a "
-    "persisted run. "
-    "Example: {\"suite\": {\"suite\": \"smoke\", \"workbook_id\": \"<id>\", "
-    "\"cases\": [{\"id\": \"c1\", \"steps\": [{\"action\": \"range_write_values\", "
-    "\"sheet\": \"Sheet1\", \"range_address\": \"A1\", \"values_grid\": "
-    "{\"rows\": 1, \"cols\": 1, \"values\": [[1]]}}]}]}, \"background\": false}"
+    "Next actions: job_get to retrieve a background result; test action='get-run' "
+    "to read a persisted run. "
+    "Example: {\"action\": \"run-suite\", \"suite\": {\"suite\": \"smoke\", "
+    "\"workbook_id\": \"<id>\", \"cases\": [{\"id\": \"c1\", \"steps\": "
+    "[{\"action\": \"range_write_values\", \"sheet\": \"Sheet1\", "
+    "\"range_address\": \"A1\", \"values_grid\": {\"rows\": 1, \"cols\": 1, "
+    "\"values\": [[1]]}}]}]}, \"background\": false}"
 )
 _DESC_VBA_PROJECT_INFO = (
     "Return the VBA project summary: name, protection/lock state, component "
@@ -440,17 +441,12 @@ _DESC_VBA_COMPILE_DIAGNOSTICS = (
 _DESC_VBA_GET_COMPILE_DIAGNOSTICS = (
     "Return the last compile diagnostics (is_compile=false) without forcing a compile re-run."
 )
-_DESC_MACRO_LIST = (
-    "List the callable macro candidates of an open workbook: each public "
-    "Sub/Function of a standard/class module with its name, module, kind and "
-    "background_safe classification (BG06)."
-)
 _DESC_MACRO_RUN = (
     "Purpose: Run one approved, background-safe macro of an execute-mode workbook. "
     "Use when: you need to execute a reviewed VBA procedure. "
     "Do not use when: the procedure is not yet classified — run "
-    "macro_classify_background first; to re-read the last result use "
-    "macro_get_last_result. "
+    "macro action='classify-background' first; to re-read the last result use "
+    "macro action='get-last-result'. "
     "Preconditions (gates, in order): (1) execute-mode + writable session; "
     "(2) procedure resolution; (3) approval — 'approved' is the call-time "
     "ApprovalPolicy.check(EXECUTING) outcome (allowed by default in full; "
@@ -464,29 +460,35 @@ _DESC_MACRO_RUN = (
     "NOT dispatched; never dismisses a dialog or reports a waiting macro as "
     "passed; background=true returns a RunningJob handle. "
     "Result: MacroRunResult, or RunningJob when background=true. "
-    "Next actions: macro_get_last_result; job_get for a background run."
+    "Next actions: macro action='get-last-result'; job_get for a background run."
 )
-_DESC_MACRO_GET_LAST_RESULT = (
-    "Return the cached last macro run result (status, duration, return value, "
-    "structured error) without re-running the macro."
-)
-_DESC_MACRO_CLASSIFY_BACKGROUND = (
-    "Purpose: Classify a procedure's background_safe for the current workbook + "
-    "VBA source revision. "
-    "Use when: you have reviewed a procedure and want to enable macro_run for it. "
-    "Do not use when: you expect this to authorize execution — classification is "
-    "bookkeeping only and never grants run permission; macro_run still enforces "
+_DESC_MACRO = (
+    "Purpose: List callable macros, classify a procedure's background_safe, or "
+    "read the cached last macro run result through one dispatch tool. "
+    "Use when: you need the macro candidate inventory of an open workbook, you "
+    "have reviewed a procedure and want to record its background_safe "
+    "classification, or you need to re-read the last macro run result. "
+    "Do not use when: you need to execute a macro — use macro_run (standalone, "
+    "distinct permission); classify-background is bookkeeping only and never "
+    "grants run permission. "
+    "Preconditions: an open workbook_id; procedure + background_safe for "
+    "classify-background; review the code first (vba_read_component / "
+    "vba_list_procedures). "
+    "Parameters: action='list'|'classify-background'|'get-last-result'; "
+    "workbook_id; procedure (classify-background); background_safe "
+    "(classify-background); expected_project_source_hash (classify-background, "
+    "optional optimistic-concurrency guard). "
+    "Behavior: list and get-last-result are reads; classify-background is "
+    "UNGATED bookkeeping bound to (workbook hash, source hash, procedure) "
+    "(BG06) and invalidated on VBA source change; a heuristic or interactive-UI "
+    "procedure cannot be classified background_safe (R13 veto); the "
+    "classification never grants run permission — macro_run still enforces "
     "approval + BG06 + R13. "
-    "Preconditions: an open workbook_id; review the code first "
-    "(vba_read_component / vba_list_procedures). "
-    "Parameters: workbook_id; procedure; background_safe; "
-    "expected_project_source_hash (optional optimistic-concurrency guard). "
-    "Behavior: UNGATED bookkeeping; the classification is bound to (workbook hash, "
-    "source hash, procedure) (BG06) and invalidated on VBA source change; a "
-    "heuristic or interactive-UI procedure cannot be classified background_safe "
-    "(R13 veto). "
-    "Result: BackgroundSafetyClassification. "
-    "Next actions: macro_run once classified."
+    "Result: list[MacroInfo] (list), BackgroundSafetyClassification "
+    "(classify-background) or MacroRunResult / None (get-last-result). "
+    "Next actions: macro_run once classified; job_get for a background run. "
+    "Example: {\"action\": \"classify-background\", \"workbook_id\": \"<id>\", "
+    "\"procedure\": \"Module1.Recalculate\", \"background_safe\": true}"
 )
 _DESC_JOB_GET = (
     "Purpose: Return one job's status/result by job_id (poll; never touches COM). "
@@ -1815,7 +1817,6 @@ _ANN_READ_ONLY = frozenset(
         "xlvba_environment",
         "snapshot_list",
         "snapshot_diff",
-        "test_get_run",
         "vba_project_info",
         "vba_list_components",
         "vba_list_procedures",
@@ -1823,8 +1824,6 @@ _ANN_READ_ONLY = frozenset(
         "vba_get_references",
         "vba_search_code",
         "vba_get_compile_diagnostics",
-        "macro_list",
-        "macro_get_last_result",
         "job_get",
         "sheet_read",
         "table_read",
@@ -1856,6 +1855,8 @@ _ANN_DESTRUCTIVE = frozenset(
         "range_delete",
         "vba_replace_component_source",
         "vba_insert_code",
+        "macro_run",
+        "test",
     }
 )
 _ANN_IDEMPOTENT = frozenset(
@@ -1883,6 +1884,7 @@ _ANN_IDEMPOTENT = frozenset(
         "shape",
         "control",
         "vba_replace_component_source",
+        "macro",
     }
 )
 
@@ -1954,16 +1956,10 @@ def _register_tools(server: MCPServer) -> None:
         annotations=_annotations("snapshot_diff"),
     )
     server.add_tool(
-        test_suite_run,
-        name="test_suite_run",
-        description=_DESC_TEST_SUITE_RUN,
-        annotations=_annotations("test_suite_run"),
-    )
-    server.add_tool(
-        test_get_run,
-        name="test_get_run",
-        description=_DESC_TEST_GET_RUN,
-        annotations=_annotations("test_get_run"),
+        test,
+        name="test",
+        description=_DESC_TEST,
+        annotations=_annotations("test"),
     )
     server.add_tool(
         vba_project_info,
@@ -2032,28 +2028,16 @@ def _register_tools(server: MCPServer) -> None:
         annotations=_annotations("vba_get_compile_diagnostics"),
     )
     server.add_tool(
-        macro_list,
-        name="macro_list",
-        description=_DESC_MACRO_LIST,
-        annotations=_annotations("macro_list"),
+        macro,
+        name="macro",
+        description=_DESC_MACRO,
+        annotations=_annotations("macro"),
     )
     server.add_tool(
         macro_run,
         name="macro_run",
         description=_DESC_MACRO_RUN,
         annotations=_annotations("macro_run"),
-    )
-    server.add_tool(
-        macro_classify_background,
-        name="macro_classify_background",
-        description=_DESC_MACRO_CLASSIFY_BACKGROUND,
-        annotations=_annotations("macro_classify_background"),
-    )
-    server.add_tool(
-        macro_get_last_result,
-        name="macro_get_last_result",
-        description=_DESC_MACRO_GET_LAST_RESULT,
-        annotations=_annotations("macro_get_last_result"),
     )
     server.add_tool(
         job_get, name="job_get", description=_DESC_JOB_GET, annotations=_annotations("job_get")

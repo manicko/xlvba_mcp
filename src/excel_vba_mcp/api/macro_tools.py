@@ -20,7 +20,7 @@ Like the other tool modules, the active service is published here via
 from __future__ import annotations
 
 from functools import partial
-from typing import Any
+from typing import Any, Literal
 
 from excel_vba_mcp.api.job_tools import start_long_op
 from excel_vba_mcp.application.job_registry import RunningJob
@@ -29,7 +29,7 @@ from excel_vba_mcp.application.macro_service import (
     MacroInfo,
     MacroService,
 )
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import MacroRunResult
 from excel_vba_mcp.domain.statuses import OperationClass
 
@@ -183,8 +183,83 @@ async def macro_get_last_result(workbook_id: str) -> MacroRunResult | None:
     return await service.get_last_result(workbook_id)
 
 
+# ---------------------------------------------------------------------------
+# Flat-signature dispatcher (WP6, option (a))
+# ---------------------------------------------------------------------------
+async def macro(
+    action: Literal["list", "classify-background", "get-last-result"],
+    workbook_id: str | None = None,
+    procedure: str | None = None,
+    background_safe: bool | None = None,
+    expected_project_source_hash: str | None = None,
+) -> list[MacroInfo] | BackgroundSafetyClassification | MacroRunResult | None:
+    """Macro reads/bookkeeping dispatch: ``list``, ``classify-background`` or
+    ``get-last-result`` (WP6).
+
+    Thin flat-signature dispatcher (option (a) — flat args + handler
+    validation): routes to the existing :func:`macro_list` /
+    :func:`macro_classify_background` / :func:`macro_get_last_result` handlers
+    unchanged and forwards only the validated arguments. Per-action required
+    parameters are enforced by the target handler (``workbook_id`` is required
+    for every action; ``procedure`` and ``background_safe`` are required for
+    ``classify-background``) so a missing required argument surfaces as a
+    structured :class:`ExcelVbaMcpError` rather than a crash. An unknown
+    ``action`` raises a structured :class:`ExcelVbaMcpError`.
+
+    ``list`` and ``get-last-result`` are reads; ``classify-background`` is
+    UNGATED bookkeeping only — it records a procedure's ``background_safe`` for
+    the current source revision and **never grants run permission**; the
+    standalone :func:`macro_run` keeps the deny-by-default approval gate and the
+    deterministic R13 veto. ``macro_run`` is intentionally NOT folded into this
+    dispatcher: it keeps its own name and distinct Kilo permission.
+
+    Args:
+        action: ``list`` (callable macro candidates), ``classify-background``
+            (record ``background_safe`` for a procedure) or ``get-last-result``
+            (cached last run result).
+        workbook_id: The id returned by ``open``; required for every action.
+        procedure: The procedure to classify (``Module.Procedure`` or a bare
+            unique ``Procedure`` name); required for ``classify-background``.
+        background_safe: The classification to record; required for
+            ``classify-background``.
+        expected_project_source_hash: Optional optimistic-concurrency guard for
+            ``classify-background`` (rejects a stale write with ``STALE_TARGET``).
+
+    Returns:
+        A list of :class:`MacroInfo` (``list``), a
+        :class:`BackgroundSafetyClassification` (``classify-background``) or the
+        cached :class:`MacroRunResult` / ``None`` (``get-last-result``).
+    """
+
+    if action == "list":
+        return await macro_list(workbook_id or "")
+    if action == "classify-background":
+        if background_safe is None:
+            raise ExcelVbaMcpError(
+                "Argument 'background_safe' is required for action "
+                "'classify-background'.",
+                code=ErrorCode.INVALID_RANGE,
+                context={"tool": "macro", "action": action, "field": "background_safe"},
+            )
+        return await macro_classify_background(
+            workbook_id or "",
+            procedure or "",
+            background_safe,
+            expected_project_source_hash=expected_project_source_hash,
+        )
+    if action == "get-last-result":
+        return await macro_get_last_result(workbook_id or "")
+    raise ExcelVbaMcpError(
+        f"Unknown macro action {action!r}; expected 'list', 'classify-background' "
+        "or 'get-last-result'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "macro", "action": action},
+    )
+
+
 __all__ = [
     "get_macro_service",
+    "macro",
     "macro_classify_background",
     "macro_get_last_result",
     "macro_list",

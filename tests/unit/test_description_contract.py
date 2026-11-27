@@ -23,7 +23,7 @@ _CRITICAL = [
     "range_read_values",
     "range_write_formulas",
     "macro_run",
-    "macro_classify_background",
+    "macro",
     "table",
     "table_delete_rows",
     "name",
@@ -37,7 +37,7 @@ _CRITICAL = [
     "vba_compile_diagnostics",
     "vba_replace_component_source",
     "vba_insert_code",
-    "test_suite_run",
+    "test",
 ]
 
 # Tools that must carry exactly one request example (R-D8).
@@ -45,13 +45,13 @@ _EXAMPLE_TOOLS = [
     "range_write_values",
     "table",
     "vba_replace_component_source",
-    "test_suite_run",
+    "test",
 ]
 
 # Truthful, non-negotiable phrases (R-D1).
 _TRUTH = {
     "vba_compile_diagnostics": "does NOT compile",
-    "macro_classify_background": "never grants run permission",
+    "macro": "never grants run permission",
     "job_request_cancel": "intent-only; never interrupts",
 }
 
@@ -90,8 +90,10 @@ async def test_tool_count_is_92_exposed() -> None:
     # standalone): 84 -> 77. B5 (WP4) consolidates the four non-destructive name
     # verbs into name + name_read (name_delete stays standalone): 77 -> 75. B6
     # (WP5) consolidates the three shape verbs into shape and the three control
-    # verbs into control: 75 -> 71. B12 finalizes the count.
-    assert len(tools) == 71
+    # verbs into control: 75 -> 71. B7 (WP6) consolidates the three macro
+    # read/bookkeeping verbs into macro (macro_run stays standalone) and the two
+    # test verbs into test: 71 -> 68. B12 finalizes the count.
+    assert len(tools) == 68
 
 
 async def test_critical_tools_follow_template() -> None:
