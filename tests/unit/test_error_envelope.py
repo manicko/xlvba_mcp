@@ -130,6 +130,15 @@ def test_confirmation_required_is_validation_not_retryable_with_action() -> None
     ]
 
 
+def test_name_conflict_is_validation_not_retryable_with_action() -> None:
+    # WP1: a duplicate / cross-scope name is a validation error (not retryable)
+    # that tells the caller to choose a unique name or delete the existing one.
+    payload = ExcelVbaMcpError("x", code=ErrorCode.NAME_CONFLICT).to_dict()
+    assert payload["errorCategory"] == "validation"
+    assert payload["isRetryable"] is False
+    assert payload["suggestedNextActions"] == ["choose a unique name or delete the existing one"]
+
+
 def test_range_too_large_is_validation_not_retryable_with_action() -> None:
     # WP-Range: a valid but over-cap range is a validation error (not retryable)
     # that tells the caller to page the work into smaller ranges.

@@ -73,11 +73,17 @@ class ErrorCode(StrEnum):
     # U6-B (plan_05 §5.2): additive envelope codes. ``INTERNAL_ERROR`` is the
     # guaranteed structured fallback for an unhandled non-domain exception at the
     # ``call_tool`` boundary (so no bare "Error executing tool" leak reaches a
-    # client); ``CONFIRMATION_REQUIRED`` is a caller-argument gate raised before a
-    # destructive action when a required ``confirm`` flag is missing/false. Neither
+    # client); ``CONFIRMATION_REQUIRED`` is a caller-argument gate raised before
+    # a destructive action when a required ``confirm`` flag is missing/false. Neither
     # is retryable.
     INTERNAL_ERROR = "INTERNAL_ERROR"
     CONFIRMATION_REQUIRED = "CONFIRMATION_REQUIRED"
+    # WP1 (additive): a defined name (or table column header) collides with an
+    # existing one in the same scope, or a same identifier already exists at
+    # another scope (a cross-scope conflict). Distinct from the generic
+    # ``COM_BUSY`` fallback so a caller can tell "choose a unique name" from
+    # "Excel busy, retry". Not retryable; category ``validation``.
+    NAME_CONFLICT = "NAME_CONFLICT"
 
 
 # Well-known HRESULT values that map to domain codes (hex shown for readability).
@@ -171,6 +177,7 @@ _CATEGORY_BY_CODE: dict[ErrorCode, str] = {
     ErrorCode.INVALID_RANGE: "validation",
     ErrorCode.RANGE_TOO_LARGE: "validation",
     ErrorCode.CONFIRMATION_REQUIRED: "validation",
+    ErrorCode.NAME_CONFLICT: "validation",
     # internal — unhandled non-domain failure at the tool boundary (U6-B).
     ErrorCode.INTERNAL_ERROR: "internal",
 }
@@ -260,6 +267,7 @@ _ACTIONS_BY_CODE: dict[ErrorCode, list[str]] = {
     ErrorCode.CONFIRMATION_REQUIRED: [
         "re-call with confirm=true after reviewing what is discarded"
     ],
+    ErrorCode.NAME_CONFLICT: ["choose a unique name or delete the existing one"],
 }
 
 # Fallback category/actions for an unrecognized string key (never a real code).
@@ -649,6 +657,21 @@ class ObjectNotFoundError(ExcelVbaMcpError):
     default_message = "The requested object was not found."
 
 
+class NameConflictError(ExcelVbaMcpError):
+    """A defined name / table column header collides with an existing one.
+
+    Raised for a duplicate identifier in the requested scope and for a
+    cross-scope collision (the same identifier already exists at workbook level
+    or on another worksheet), and for a duplicate table column header. It is
+    deliberately distinct from the generic ``COM_BUSY`` fallback so a caller can
+    tell "choose a unique name or delete the existing one" from "Excel busy,
+    retry". Not retryable; category ``validation`` (WP1, additive).
+    """
+
+    default_code = ErrorCode.NAME_CONFLICT
+    default_message = "The name conflicts with an existing one."
+
+
 def error_from_hresult(
     hresult: int,
     message: str,
@@ -707,4 +730,8 @@ _ERROR_BY_CODE: dict[ErrorCode, type[ExcelVbaMcpError]] = {
     # code -> exception mapping stays complete for callers that rebuild a typed
     # error from a code.
     ErrorCode.NOT_FOUND: ObjectNotFoundError,
+    # WP1 (additive): duplicate / cross-scope name conflict. Inert for
+    # ``error_from_hresult`` (no HRESULT maps to it); registered so the
+    # code -> exception mapping stays complete.
+    ErrorCode.NAME_CONFLICT: NameConflictError,
 }

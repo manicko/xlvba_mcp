@@ -44,7 +44,12 @@ from excel_vba_mcp.adapters.excel.tables_adapter import TableMutationResult, Tab
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
 from excel_vba_mcp.application.tables_service import TablesService
-from excel_vba_mcp.domain.errors import ApprovalDeniedError, ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import (
+    ApprovalDeniedError,
+    ErrorCode,
+    ExcelVbaMcpError,
+    NameConflictError,
+)
 from excel_vba_mcp.domain.statuses import (
     CellValueKind,
     OperationClass,
@@ -1038,3 +1043,112 @@ async def test_create_and_resize_success(tmp_path: Path) -> None:
     rig.grant("table_resize")
     resized = await rig.service.resize_table(info.workbook_id, created.after.name, "A1:B4")
     assert resized.after.row_count == 3
+
+
+# ---------------------------------------------------------------------------
+# WP1: raise-site error taxonomy — deterministic cases must NOT be COM_BUSY
+# ---------------------------------------------------------------------------
+def _assert_non_retryable_taxonomy(
+    error: ExcelVbaMcpError, *, code: str, category: str
+) -> None:
+    """Assert the serialized envelope is a specific, non-retryable, corrective error."""
+
+    payload = error.to_dict()
+    assert payload["errorCode"] == code
+    assert payload["errorCode"] not in {"COM_BUSY", "RPC_E_CALL_REJECTED"}
+    assert payload["errorCategory"] == category
+    assert payload["errorCategory"] != "transient_com_failure"
+    assert payload["isRetryable"] is False
+    actions = payload["suggestedNextActions"]
+    assert actions and all(isinstance(action, str) and action for action in actions)
+    assert "retry" not in " ".join(actions).lower()
+
+
+def test_missing_table_is_not_found() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        TablesAdapter().get_table(wb, "Nope")
+    _assert_non_retryable_taxonomy(exc_info.value, code="NOT_FOUND", category="not_found")
+    assert exc_info.value.context["reason"] == "not_found"
+
+
+def test_unknown_header_is_not_found() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    _new_table(wb, columns=["Name"], rows=[["a"]])
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        TablesAdapter().append_rows(wb, "Tbl", [{"Nope": 1}])
+    _assert_non_retryable_taxonomy(exc_info.value, code="NOT_FOUND", category="not_found")
+
+
+def test_invalid_row_header_data_is_invalid_range() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    _new_table(wb, columns=["Name"], rows=[["a"]])
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        TablesAdapter().insert_row(wb, "Tbl", 5)  # out-of-range insert position
+    _assert_non_retryable_taxonomy(exc_info.value, code="INVALID_RANGE", category="validation")
+    assert exc_info.value.context["reason"] == "out_of_range"
+
+
+def test_invalid_offset_is_invalid_range() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    _new_table(wb, columns=["Name"], rows=[["r1"]])
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        TablesAdapter().read_rows(wb, "Tbl", offset=-1)
+    _assert_non_retryable_taxonomy(exc_info.value, code="INVALID_RANGE", category="validation")
+    assert exc_info.value.context["reason"] == "invalid_offset"
+
+
+def test_invalid_limit_is_invalid_range() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    _new_table(wb, columns=["Name"], rows=[["r1"]])
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        TablesAdapter().read_rows(wb, "Tbl", limit=0)
+    _assert_non_retryable_taxonomy(exc_info.value, code="INVALID_RANGE", category="validation")
+    assert exc_info.value.context["reason"] == "invalid_limit"
+
+
+def test_out_of_range_index_is_invalid_range() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    _new_table(wb, columns=["Name"], rows=[["a"]])
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        TablesAdapter().delete_rows(wb, "Tbl", indices=[5])
+    _assert_non_retryable_taxonomy(exc_info.value, code="INVALID_RANGE", category="validation")
+    assert exc_info.value.context["reason"] == "out_of_range"
+
+
+def test_ambiguous_row_selector_is_invalid_range() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    _new_table(wb, columns=["Name", "Qty"], rows=[["a", 1], ["a", 2]])
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        TablesAdapter().update_rows(wb, "Tbl", [{"where": {"Name": "a"}, "values": {"Qty": 9}}])
+    _assert_non_retryable_taxonomy(exc_info.value, code="INVALID_RANGE", category="validation")
+    assert exc_info.value.context["reason"] == "ambiguous"
+
+
+def test_invalid_update_input_is_invalid_range() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    _new_table(wb, columns=["Name"], rows=[["a"]])
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        TablesAdapter().update_rows(
+            wb, "Tbl", [{"index": 1, "where": {"Name": "a"}, "values": {"Name": "b"}}]
+        )
+    _assert_non_retryable_taxonomy(exc_info.value, code="INVALID_RANGE", category="validation")
+    assert exc_info.value.context["reason"] == "invalid_selector"
+
+
+def test_invalid_delete_input_is_invalid_range() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    _new_table(wb, columns=["Name"], rows=[["a"]])
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        TablesAdapter().delete_rows(wb, "Tbl")  # neither indices nor where
+    _assert_non_retryable_taxonomy(exc_info.value, code="INVALID_RANGE", category="validation")
+    assert exc_info.value.context["reason"] == "invalid_selector"
+
+
+def test_duplicate_column_header_is_name_conflict() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    _new_table(wb, columns=["Name"], rows=[["a"]])
+    with pytest.raises(NameConflictError) as exc_info:
+        TablesAdapter().add_column(wb, "Tbl", "name")  # case-insensitive duplicate
+    _assert_non_retryable_taxonomy(exc_info.value, code="NAME_CONFLICT", category="validation")
+    assert exc_info.value.context["reason"] == "duplicate"

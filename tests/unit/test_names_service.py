@@ -44,6 +44,7 @@ from excel_vba_mcp.domain.errors import (
     ApprovalDeniedError,
     ErrorCode,
     ExcelVbaMcpError,
+    NameConflictError,
     category_for,
 )
 from excel_vba_mcp.domain.models import DefinedNameInfo
@@ -801,3 +802,100 @@ async def test_update_success(tmp_path: Path) -> None:
     )
     assert updated.refers_to == "=Data!$B$1:$B$2"
     assert updated.target_kind is NameTargetKind.RANGE
+
+
+# ---------------------------------------------------------------------------
+# WP1: raise-site error taxonomy — deterministic cases must NOT be COM_BUSY
+# ---------------------------------------------------------------------------
+def _assert_non_retryable_taxonomy(
+    error: ExcelVbaMcpError, *, code: str, category: str
+) -> None:
+    """Assert the serialized envelope is a specific, non-retryable, corrective error."""
+
+    payload = error.to_dict()
+    assert payload["errorCode"] == code
+    assert payload["errorCode"] not in {"COM_BUSY", "RPC_E_CALL_REJECTED"}
+    assert payload["errorCategory"] == category
+    assert payload["errorCategory"] != "transient_com_failure"
+    assert payload["isRetryable"] is False
+    actions = payload["suggestedNextActions"]
+    assert actions and all(isinstance(action, str) and action for action in actions)
+    # Corrective, never a blind retry recommendation.
+    assert "retry" not in " ".join(actions).lower()
+
+
+def test_invalid_scope_is_invalid_range() -> None:
+    wb = _populated_workbook()
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        NamesAdapter().get_name(wb, "WbRange", "bogus_scope")  # type: ignore[arg-type]
+    _assert_non_retryable_taxonomy(exc_info.value, code="INVALID_RANGE", category="validation")
+    assert exc_info.value.context["reason"] == "invalid_scope"
+
+
+def test_missing_worksheet_for_sheet_scope_is_not_found() -> None:
+    wb = _populated_workbook()
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        NamesAdapter().create_name(
+            wb, "Local", "=1", scope=NameScope.WORKSHEET, sheet="NoSuchSheet"
+        )
+    _assert_non_retryable_taxonomy(exc_info.value, code="NOT_FOUND", category="not_found")
+    assert exc_info.value.context["reason"] == "not_found"
+
+
+def test_invalid_name_syntax_is_invalid_range() -> None:
+    wb = _populated_workbook()
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        NamesAdapter().create_name(wb, "   ", "=1", scope=NameScope.WORKBOOK)
+    _assert_non_retryable_taxonomy(exc_info.value, code="INVALID_RANGE", category="validation")
+    assert exc_info.value.context["reason"] == "invalid_name"
+
+
+def test_invalid_refers_to_is_invalid_range() -> None:
+    wb = _populated_workbook()
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        NamesAdapter().create_name(wb, "X", "   ", scope=NameScope.WORKBOOK)
+    _assert_non_retryable_taxonomy(exc_info.value, code="INVALID_RANGE", category="validation")
+    assert exc_info.value.context["reason"] == "invalid_refers_to"
+
+
+def test_duplicate_same_scope_is_name_conflict() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    adapter = NamesAdapter()
+    adapter.create_name(wb, "Dup", "=1", scope=NameScope.WORKBOOK)
+    with pytest.raises(NameConflictError) as exc_info:
+        adapter.create_name(wb, "Dup", "=2", scope=NameScope.WORKBOOK)
+    _assert_non_retryable_taxonomy(exc_info.value, code="NAME_CONFLICT", category="validation")
+    assert exc_info.value.context["reason"] == "duplicate"
+
+
+def test_cross_scope_conflict_is_name_conflict() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    adapter = NamesAdapter()
+    adapter.create_name(wb, "Shared", "=1", scope=NameScope.WORKBOOK)
+    with pytest.raises(NameConflictError) as exc_info:
+        adapter.create_name(wb, "Shared", "=Data!$A$1", scope=NameScope.WORKSHEET, sheet="Data")
+    _assert_non_retryable_taxonomy(exc_info.value, code="NAME_CONFLICT", category="validation")
+    assert exc_info.value.context["reason"] == "scope_conflict"
+
+
+def test_ambiguous_name_resolution_is_invalid_range() -> None:
+    wb = _populated_workbook()
+    adapter = NamesAdapter()
+    dup1 = FakeName("Dup", "=1", wb)
+    dup2 = FakeName("Dup", "=2", wb)
+    # Force two same-scope matches so the ambiguity guard is exercised.
+    adapter._iter_entries = lambda _wb: iter(  # type: ignore[method-assign]
+        [(dup1, NameScope.WORKBOOK, None), (dup2, NameScope.WORKBOOK, None)]
+    )
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        adapter.get_name(wb, "Dup", NameScope.WORKBOOK)
+    _assert_non_retryable_taxonomy(exc_info.value, code="INVALID_RANGE", category="validation")
+    assert exc_info.value.context["reason"] == "ambiguous_name"
+
+
+def test_missing_name_is_not_found() -> None:
+    wb = _populated_workbook()
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        NamesAdapter().get_name(wb, "NoSuchName", NameScope.WORKBOOK)
+    _assert_non_retryable_taxonomy(exc_info.value, code="NOT_FOUND", category="not_found")
+    assert exc_info.value.context["reason"] == "not_found"

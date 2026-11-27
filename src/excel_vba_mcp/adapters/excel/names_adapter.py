@@ -44,7 +44,12 @@ import re
 from collections.abc import Iterator
 from typing import Any
 
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError, ObjectNotFoundError
+from excel_vba_mcp.adapters.excel.com_transient import _is_transient_com
+from excel_vba_mcp.domain.errors import (
+    InvalidRangeError,
+    NameConflictError,
+    ObjectNotFoundError,
+)
 from excel_vba_mcp.domain.models import DefinedNameInfo
 from excel_vba_mcp.domain.statuses import NameScope, NameTargetKind
 
@@ -215,9 +220,9 @@ def _coerce_scope(scope: NameScope | str) -> NameScope:
     try:
         return NameScope(str(scope).strip().lower())
     except ValueError as exc:
-        raise ExcelVbaMcpError(
+        raise InvalidRangeError(
             f"Unknown name scope {scope!r}; expected 'workbook' or 'worksheet'.",
-            context={"scope": str(scope)},
+            context={"scope": str(scope), "reason": "invalid_scope"},
         ) from exc
 
 
@@ -227,9 +232,9 @@ def _require_sheet_for_scope(scope: NameScope, sheet: str | None) -> str | None:
     if scope is NameScope.WORKBOOK:
         return None
     if not isinstance(sheet, str) or not sheet.strip():
-        raise ExcelVbaMcpError(
+        raise InvalidRangeError(
             "Argument 'sheet' is required for a worksheet-scoped name.",
-            context={"scope": scope.value, "sheet": sheet},
+            context={"scope": scope.value, "sheet": sheet, "reason": "missing_sheet"},
         )
     return sheet
 
@@ -238,9 +243,9 @@ def _validate_name(name: str) -> str:
     """Validate a defined-name identifier."""
 
     if not isinstance(name, str) or not name.strip():
-        raise ExcelVbaMcpError(
+        raise InvalidRangeError(
             "Argument 'name' must be a non-empty string.",
-            context={"name": name},
+            context={"name": name, "reason": "invalid_name"},
         )
     return name
 
@@ -249,9 +254,9 @@ def _normalize_refers_to(refers_to: str) -> str:
     """Validate and normalize a name's ``RefersTo`` formula."""
 
     if not isinstance(refers_to, str) or not refers_to.strip():
-        raise ExcelVbaMcpError(
+        raise InvalidRangeError(
             "Argument 'refers_to' must be a non-empty formula string.",
-            context={"refers_to": refers_to},
+            context={"refers_to": refers_to, "reason": "invalid_refers_to"},
         )
     text = refers_to.strip()
     # Excel stores a name's RefersTo with a leading '='; accept both forms.
@@ -427,13 +432,16 @@ class NamesAdapter:
         try:
             collection.Add(Name=name, RefersTo=normalized)
         except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
-            raise ExcelVbaMcpError(
+            if _is_transient_com(exc):
+                raise
+            raise InvalidRangeError(
                 f"Could not create defined name {name!r} in {resolved_scope.value} scope.",
                 context={
                     "name": name,
                     "scope": resolved_scope.value,
                     "sheet": sheet_name,
                     "refers_to": normalized,
+                    "reason": "create_failed",
                 },
             ) from exc
         return self.get_name(wb, name, resolved_scope, sheet_name)
@@ -460,13 +468,16 @@ class NamesAdapter:
         try:
             name_obj.RefersTo = normalized
         except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
-            raise ExcelVbaMcpError(
+            if _is_transient_com(exc):
+                raise
+            raise InvalidRangeError(
                 f"Could not update defined name {name!r} in {resolved_scope.value} scope.",
                 context={
                     "name": name,
                     "scope": resolved_scope.value,
                     "sheet": sheet_name,
                     "refers_to": normalized,
+                    "reason": "update_failed",
                 },
             ) from exc
         return self.get_name(wb, name, resolved_scope, sheet_name)
@@ -488,9 +499,16 @@ class NamesAdapter:
         try:
             name_obj.Delete()
         except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
-            raise ExcelVbaMcpError(
+            if _is_transient_com(exc):
+                raise
+            raise InvalidRangeError(
                 f"Could not delete defined name {name!r} in {resolved_scope.value} scope.",
-                context={"name": name, "scope": resolved_scope.value, "sheet": sheet_name},
+                context={
+                    "name": name,
+                    "scope": resolved_scope.value,
+                    "sheet": sheet_name,
+                    "reason": "delete_failed",
+                },
             ) from exc
         return info
 
@@ -570,14 +588,14 @@ class NamesAdapter:
                 },
             )
         if len(matches) > 1:
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 f"Defined name {name!r} is ambiguous in {scope.value} scope "
                 f"(matched {len(matches)} entries); refusing to guess.",
                 context={
                     "name": name,
                     "scope": scope.value,
                     "sheet": sheet,
-                    "reason": "ambiguous",
+                    "reason": "ambiguous_name",
                 },
             )
         return matches[0]
@@ -603,7 +621,7 @@ class NamesAdapter:
             for entry_scope, entry_sheet in existing
         )
         if same_scope:
-            raise ExcelVbaMcpError(
+            raise NameConflictError(
                 f"Defined name {name!r} already exists in {scope.value} scope.",
                 context={
                     "name": name,
@@ -614,7 +632,7 @@ class NamesAdapter:
                 },
             )
         if existing:
-            raise ExcelVbaMcpError(
+            raise NameConflictError(
                 f"Defined name {name!r} already exists at another scope; "
                 "refusing to create an ambiguous cross-scope name.",
                 context={

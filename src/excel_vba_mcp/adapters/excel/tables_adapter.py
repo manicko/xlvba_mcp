@@ -41,7 +41,12 @@ from excel_vba_mcp.adapters.excel.cell_values import (
     classify_cell_kind_name,
     classify_cell_value,
 )
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.adapters.excel.com_transient import _is_transient_com
+from excel_vba_mcp.domain.errors import (
+    InvalidRangeError,
+    NameConflictError,
+    ObjectNotFoundError,
+)
 from excel_vba_mcp.domain.models import (
     CellValue,
     DomainModel,
@@ -349,9 +354,9 @@ def _require_list_object(wb: Any, name: str) -> tuple[Any, Any]:
         display = _safe_str(getattr(list_object, "DisplayName", "")).lower()
         if target in (candidate, display):
             return sheet, list_object
-    raise ExcelVbaMcpError(
+    raise ObjectNotFoundError(
         f"Table {name!r} was not found in the workbook.",
-        context={"table": name},
+        context={"table": name, "reason": "not_found"},
     )
 
 
@@ -367,9 +372,9 @@ def _header_index(list_object: Any, header: str) -> int:
                 return index
     except Exception:  # noqa: BLE001 - defensive COM read
         pass
-    raise ExcelVbaMcpError(
+    raise ObjectNotFoundError(
         f"Column {header!r} was not found in the table.",
-        context={"header": header},
+        context={"header": header, "reason": "not_found"},
     )
 
 
@@ -428,14 +433,14 @@ class TablesAdapter:
         """
 
         if offset < 0:
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 "Argument 'offset' must be >= 0.",
-                context={"offset": offset},
+                context={"offset": offset, "reason": "invalid_offset"},
             )
         if limit is not None and limit < 1:
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 "Argument 'limit' must be >= 1 when provided.",
-                context={"limit": limit},
+                context={"limit": limit, "reason": "invalid_limit"},
             )
 
         sheet, list_object = _require_list_object(wb, name)
@@ -525,9 +530,9 @@ class TablesAdapter:
         """
 
         if not rows:
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 "Argument 'rows' must contain at least one row.",
-                context={"table": name},
+                context={"table": name, "reason": "empty_rows"},
             )
         sheet, list_object = _require_list_object(wb, name)
         before = describe_table(wb, sheet, list_object)
@@ -567,9 +572,9 @@ class TablesAdapter:
         before = describe_table(wb, sheet, list_object)
         count = _safe_int(list_object.ListRows.Count)
         if at < 1 or at > count + 1:
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 f"Insert position {at} is out of range; expected 1..{count + 1}.",
-                context={"table": name, "at": at, "row_count": count},
+                context={"table": name, "at": at, "row_count": count, "reason": "out_of_range"},
             )
         if values:
             TablesAdapter._validate_row_headers(list_object, [values])
@@ -603,9 +608,9 @@ class TablesAdapter:
         """
 
         if not updates:
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 "Argument 'updates' must contain at least one update.",
-                context={"table": name},
+                context={"table": name, "reason": "empty_updates"},
             )
         sheet, list_object = _require_list_object(wb, name)
         before = describe_table(wb, sheet, list_object)
@@ -640,18 +645,18 @@ class TablesAdapter:
         """
 
         if (indices is None) == (where is None):
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 "Provide exactly one of 'indices' or 'where' for delete_rows.",
-                context={"table": name},
+                context={"table": name, "reason": "invalid_selector"},
             )
         sheet, list_object = _require_list_object(wb, name)
         before = describe_table(wb, sheet, list_object)
 
         if indices is not None:
             if not indices:
-                raise ExcelVbaMcpError(
+                raise InvalidRangeError(
                     "Argument 'indices' must contain at least one row index.",
-                    context={"table": name},
+                    context={"table": name, "reason": "empty_indices"},
                 )
             targets = self._validate_indices(list_object, indices)
         else:
@@ -688,23 +693,33 @@ class TablesAdapter:
         """
 
         if not isinstance(header, str) or not header.strip():
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 "Argument 'header' must be a non-empty string.",
-                context={"table": name},
+                context={"table": name, "reason": "invalid_header"},
             )
         sheet, list_object = _require_list_object(wb, name)
         before = describe_table(wb, sheet, list_object)
         existing = [h.strip().lower() for h in _header_names(list_object)]
         if header.strip().lower() in existing:
-            raise ExcelVbaMcpError(
+            raise NameConflictError(
                 f"Column header {header!r} already exists (headers must be unique).",
-                context={"table": name, "header": header, "existing": existing},
+                context={
+                    "table": name,
+                    "header": header,
+                    "existing": existing,
+                    "reason": "duplicate",
+                },
             )
         column_count = len(existing)
         if position is not None and (position < 1 or position > column_count + 1):
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 f"Column position {position} is out of range; expected 1..{column_count + 1}.",
-                context={"table": name, "position": position, "column_count": column_count},
+                context={
+                    "table": name,
+                    "position": position,
+                    "column_count": column_count,
+                    "reason": "out_of_range",
+                },
             )
 
         if position is None:
@@ -731,9 +746,9 @@ class TablesAdapter:
         """
 
         if not isinstance(header, str) or not header.strip():
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 "Argument 'header' must be a non-empty string.",
-                context={"table": name},
+                context={"table": name, "reason": "invalid_header"},
             )
         sheet, list_object = _require_list_object(wb, name)
         before = describe_table(wb, sheet, list_object)
@@ -745,12 +760,17 @@ class TablesAdapter:
             if column_name.strip().lower() == target
         ]
         if not matches:
-            raise ExcelVbaMcpError(
+            raise ObjectNotFoundError(
                 f"Column {header!r} was not found in the table.",
-                context={"table": name, "header": header, "headers": _header_names(list_object)},
+                context={
+                    "table": name,
+                    "header": header,
+                    "headers": _header_names(list_object),
+                    "reason": "not_found",
+                },
             )
         if len(matches) > 1:
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 f"Column header {header!r} is ambiguous (matched {matches}); "
                 "refusing to guess which column to delete.",
                 context={
@@ -791,14 +811,14 @@ class TablesAdapter:
         """
 
         if not isinstance(sheet, str) or not sheet.strip():
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 "Argument 'sheet' must be a non-empty string.",
-                context={"sheet": sheet},
+                context={"sheet": sheet, "reason": "invalid_sheet"},
             )
         if not isinstance(range_or_name, str) or not range_or_name.strip():
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 "Argument 'range_or_name' must be a non-empty string.",
-                context={"sheet": sheet},
+                context={"sheet": sheet, "reason": "invalid_range_or_name"},
             )
         worksheet = _require_sheet(wb, sheet)
         source = _resolve_source_range(wb, worksheet, range_or_name)
@@ -810,18 +830,26 @@ class TablesAdapter:
                 XlListObjectHasHeaders=1,
             )
         except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
-            raise ExcelVbaMcpError(
+            if _is_transient_com(exc):
+                raise
+            raise InvalidRangeError(
                 f"Could not create a table on {sheet!r} over {range_or_name!r}.",
-                context={"sheet": sheet, "range_or_name": range_or_name},
+                context={
+                    "sheet": sheet,
+                    "range_or_name": range_or_name,
+                    "reason": "create_failed",
+                },
             ) from exc
 
         if style:
             try:
                 list_object.TableStyle = style
             except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
-                raise ExcelVbaMcpError(
+                if _is_transient_com(exc):
+                    raise
+                raise InvalidRangeError(
                     f"Could not apply table style {style!r}.",
-                    context={"sheet": sheet, "style": style},
+                    context={"sheet": sheet, "style": style, "reason": "invalid_style"},
                 ) from exc
 
         after = describe_table(wb, worksheet, list_object)
@@ -841,25 +869,29 @@ class TablesAdapter:
         """
 
         if not isinstance(new_range, str) or not new_range.strip():
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 "Argument 'new_range' must be a non-empty A1 range.",
-                context={"table": name},
+                context={"table": name, "reason": "invalid_range"},
             )
         sheet, list_object = _require_list_object(wb, name)
         before = describe_table(wb, sheet, list_object)
         try:
             target = sheet.Range(new_range)
         except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
-            raise ExcelVbaMcpError(
+            if _is_transient_com(exc):
+                raise
+            raise InvalidRangeError(
                 f"Range {new_range!r} is not valid on sheet {sheet.Name!r}.",
-                context={"table": name, "new_range": new_range},
+                context={"table": name, "new_range": new_range, "reason": "invalid_range"},
             ) from exc
         try:
             list_object.Resize(target)
         except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
-            raise ExcelVbaMcpError(
+            if _is_transient_com(exc):
+                raise
+            raise InvalidRangeError(
                 f"Could not resize table {name!r} to {new_range!r}.",
-                context={"table": name, "new_range": new_range},
+                context={"table": name, "new_range": new_range, "reason": "resize_failed"},
             ) from exc
 
         after = describe_table(wb, sheet, list_object)
@@ -882,10 +914,14 @@ class TablesAdapter:
         for row in rows:
             for header in row:
                 if header.strip().lower() not in headers:
-                    raise ExcelVbaMcpError(
+                    raise ObjectNotFoundError(
                         f"Row references unknown header {header!r}; "
                         f"available headers are {sorted(headers)}.",
-                        context={"table": _safe_str(list_object.Name), "header": header},
+                        context={
+                            "table": _safe_str(list_object.Name),
+                            "header": header,
+                            "reason": "not_found",
+                        },
                     )
 
     @staticmethod
@@ -901,28 +937,37 @@ class TablesAdapter:
             has_index = "index" in entry and entry["index"] is not None
             has_where = "where" in entry and entry["where"] is not None
             if has_index == has_where:
-                raise ExcelVbaMcpError(
+                raise InvalidRangeError(
                     "Each update must provide exactly one of 'index' or 'where'.",
-                    context={"table": _safe_str(list_object.Name), "entry": _preview(entry)},
+                    context={
+                        "table": _safe_str(list_object.Name),
+                        "entry": _preview(entry),
+                        "reason": "invalid_selector",
+                    },
                 )
             values = entry.get("values") or {}
             if has_index:
                 index = _safe_int(entry["index"], default=0)
                 if index < 1 or index > count:
-                    raise ExcelVbaMcpError(
+                    raise InvalidRangeError(
                         f"Update row index {index} is out of range; expected 1..{count}.",
                         context={
                             "table": _safe_str(list_object.Name),
                             "index": index,
                             "row_count": count,
+                            "reason": "out_of_range",
                         },
                     )
             else:
                 index = TablesAdapter._resolve_where(list_object, entry["where"])
             if index in seen:
-                raise ExcelVbaMcpError(
+                raise InvalidRangeError(
                     f"Row index {index} is updated more than once; refusing to guess.",
-                    context={"table": _safe_str(list_object.Name), "index": index},
+                    context={
+                        "table": _safe_str(list_object.Name),
+                        "index": index,
+                        "reason": "duplicate_index",
+                    },
                 )
             seen.add(index)
             resolved.append((index, dict(values)))
@@ -934,18 +979,23 @@ class TablesAdapter:
 
         count = _safe_int(list_object.ListRows.Count)
         if len(set(indices)) != len(indices):
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 "Argument 'indices' contains duplicate row indices.",
-                context={"table": _safe_str(list_object.Name), "indices": list(indices)},
+                context={
+                    "table": _safe_str(list_object.Name),
+                    "indices": list(indices),
+                    "reason": "duplicate_index",
+                },
             )
         for index in indices:
             if index < 1 or index > count:
-                raise ExcelVbaMcpError(
+                raise InvalidRangeError(
                     f"Delete row index {index} is out of range; expected 1..{count}.",
                     context={
                         "table": _safe_str(list_object.Name),
                         "index": index,
                         "row_count": count,
+                        "reason": "out_of_range",
                     },
                 )
         return list(indices)
@@ -955,25 +1005,29 @@ class TablesAdapter:
         """Resolve a ``where`` filter to exactly one 1-based row index or raise."""
 
         if not where:
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 "A 'where' filter must reference at least one header.",
-                context={"table": _safe_str(list_object.Name)},
+                context={"table": _safe_str(list_object.Name), "reason": "invalid_where"},
             )
         header_index = {
             h.strip().lower(): i for i, h in enumerate(_header_names(list_object), start=1)
         }
         for key in where:
             if key.strip().lower() not in header_index:
-                raise ExcelVbaMcpError(
+                raise ObjectNotFoundError(
                     f"Filter references unknown header {key!r}; "
                     f"available headers are {sorted(header_index)}.",
-                    context={"table": _safe_str(list_object.Name), "header": key},
+                    context={
+                        "table": _safe_str(list_object.Name),
+                        "header": key,
+                        "reason": "not_found",
+                    },
                 )
 
         count = _safe_int(list_object.ListRows.Count)
         body = getattr(list_object, "DataBodyRange", None)
         if body is None or count == 0:
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 "The 'where' filter matched no rows (the table has no data).",
                 context={
                     "table": _safe_str(list_object.Name),
@@ -1003,7 +1057,7 @@ class TablesAdapter:
                     preview.append({"index": row_index, "values": row_values})
 
         if len(matches) != 1:
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 f"The 'where' filter matched {len(matches)} rows; an unambiguous "
                 "single-row match is required (refusing to guess).",
                 context={
@@ -1021,9 +1075,13 @@ class TablesAdapter:
 
         body = getattr(list_object, "DataBodyRange", None)
         if body is None:
-            raise ExcelVbaMcpError(
+            raise InvalidRangeError(
                 "The table has no data body to update.",
-                context={"table": _safe_str(list_object.Name), "index": index},
+                context={
+                    "table": _safe_str(list_object.Name),
+                    "index": index,
+                    "reason": "no_data_body",
+                },
             )
         for header, value in values.items():
             col_index = _header_index(list_object, header)
@@ -1063,9 +1121,11 @@ def _require_sheet(wb: Any, name: str) -> Any:
     try:
         return wb.Worksheets.Item(name)
     except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
-        raise ExcelVbaMcpError(
+        if _is_transient_com(exc):
+            raise
+        raise ObjectNotFoundError(
             f"Worksheet {name!r} was not found in the workbook.",
-            context={"sheet": name},
+            context={"sheet": name, "reason": "not_found"},
         ) from exc
 
 
@@ -1081,10 +1141,12 @@ def _resolve_source_range(wb: Any, worksheet: Any, range_or_name: str) -> Any:
         name = wb.Names(candidate)
         refers = name.RefersToRange
     except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
-        raise ExcelVbaMcpError(
+        if _is_transient_com(exc):
+            raise
+        raise InvalidRangeError(
             f"Range or defined name {range_or_name!r} could not be resolved on "
             f"sheet {worksheet.Name!r}.",
-            context={"range_or_name": range_or_name},
+            context={"range_or_name": range_or_name, "reason": "invalid_range_or_name"},
         ) from exc
     return refers
 

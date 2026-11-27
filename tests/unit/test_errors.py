@@ -26,6 +26,7 @@ from excel_vba_mcp.application.vba_project_service import VBAProjectService
 from excel_vba_mcp.domain.errors import (
     ErrorCode,
     ExcelVbaMcpError,
+    NameConflictError,
     ObjectNotFoundError,
     ProtectedTargetError,
     RevisionConflictError,
@@ -55,6 +56,8 @@ def test_new_error_codes_are_additive_members() -> None:
     assert "REVISION_CONFLICT" in values
     # Block B7a (F6): the shape/control not-found code is a new additive member.
     assert "NOT_FOUND" in values
+    # WP1: the duplicate / cross-scope name-conflict code is a new additive member.
+    assert "NAME_CONFLICT" in values
     # The Stage-1 closed set is untouched (subset check).
     assert {
         "ACCESS_VBOM_DISABLED",
@@ -75,6 +78,21 @@ def test_object_not_found_error_carries_code_and_is_registered() -> None:
     error = ObjectNotFoundError()
     assert error.code is ErrorCode.NOT_FOUND
     assert error.to_dict()["errorCode"] == "NOT_FOUND"
+
+
+def test_name_conflict_error_carries_code_and_is_registered() -> None:
+    # WP1: NAME_CONFLICT maps to NameConflictError and serializes as a
+    # non-retryable validation error with a corrective action.
+    from excel_vba_mcp.domain import errors as err
+
+    assert err._ERROR_BY_CODE[ErrorCode.NAME_CONFLICT] is NameConflictError
+    error = NameConflictError()
+    assert error.code is ErrorCode.NAME_CONFLICT
+    payload = error.to_dict()
+    assert payload["errorCode"] == "NAME_CONFLICT"
+    assert payload["errorCategory"] == "validation"
+    assert payload["isRetryable"] is False
+    assert payload["suggestedNextActions"] == ["choose a unique name or delete the existing one"]
 
 
 def test_workbook_not_found_error_carries_code() -> None:
