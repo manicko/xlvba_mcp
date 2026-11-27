@@ -1,10 +1,11 @@
 """Defined-name (Named Range) MCP tools (task_028, spec §7.7 / §6.5).
 
-Thin, async tool handlers for the defined-name surface: ``names_list``,
-``name_get``, ``name_create``, ``name_update`` and ``name_delete``. They are
-deliberately **thin**: each validates its arguments, delegates to
-:class:`~excel_vba_mcp.application.names_service.NamesService` and returns a
-domain DTO. They **never touch COM** (ARCH-009): no ``pythoncom`` /
+Thin, async tool handlers for the defined-name surface: the ``name`` /
+``name_read`` flat-signature dispatchers (WP4) over the per-verb handlers
+``names_list``, ``name_get``, ``name_create``, ``name_update`` and
+``name_delete``. They are deliberately **thin**: each validates its arguments,
+delegates to :class:`~excel_vba_mcp.application.names_service.NamesService` and
+returns a domain DTO. They **never touch COM** (ARCH-009): no ``pythoncom`` /
 ``win32com`` import lives in this module; all Excel access happens on the
 single-STA worker inside the service.
 
@@ -21,10 +22,10 @@ Like the other tool modules, the active service is published here via
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from excel_vba_mcp.application.names_service import NamesService
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import DefinedNameInfo
 from excel_vba_mcp.domain.statuses import NameScope
 
@@ -232,11 +233,103 @@ async def name_delete(
     return await service.delete_name(workbook_id, name, scope=resolved_scope, sheet=resolved_sheet)
 
 
+# ---------------------------------------------------------------------------
+# Flat-signature dispatchers (WP4, option (a))
+# ---------------------------------------------------------------------------
+async def name(
+    action: Literal["create", "update"],
+    workbook_id: str | None = None,
+    name: str | None = None,
+    refers_to: str | None = None,
+    scope: str | None = None,
+    sheet: str | None = None,
+) -> DefinedNameInfo:
+    """Defined-name mutation dispatch: ``create`` or ``update`` (WP4).
+
+    Thin flat-signature dispatcher (option (a) — flat args + handler
+    validation): routes to the existing :func:`name_create` / :func:`name_update`
+    handlers unchanged and forwards only the validated arguments. Per-action
+    required parameters are enforced by the target handler (``create`` /
+    ``update`` both need ``name``, ``refers_to`` and ``scope``; a
+    worksheet-scoped name also needs ``sheet``) so a missing required argument
+    surfaces as a structured :class:`ExcelVbaMcpError` rather than a crash. An
+    unknown ``action`` raises a structured :class:`ExcelVbaMcpError`.
+    ``delete`` is intentionally **not** an action here — use the standalone
+    :func:`name_delete`.
+
+    Args:
+        action: ``create`` (new defined name) or ``update`` (repoint ``RefersTo``).
+        workbook_id: The id returned by ``open``; required for every action.
+        name: The defined-name identifier; required for every action.
+        refers_to: The formula / reference (``=Sheet1!$A$1``, ``=42``, …);
+            required for every action.
+        scope: ``"workbook"`` or ``"worksheet"``; required for every action.
+        sheet: The owning worksheet; required for a worksheet-scoped name.
+
+    Returns:
+        The affected :class:`DefinedNameInfo`.
+    """
+
+    if action == "create":
+        return await name_create(
+            workbook_id or "", name or "", refers_to or "", scope or "", sheet
+        )
+    if action == "update":
+        return await name_update(
+            workbook_id or "", name or "", refers_to or "", scope or "", sheet
+        )
+    raise ExcelVbaMcpError(
+        f"Unknown name action {action!r}; expected 'create' or 'update'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "name", "action": action},
+    )
+
+
+async def name_read(
+    action: Literal["list", "get"],
+    workbook_id: str | None = None,
+    name: str | None = None,
+    scope: str | None = None,
+    sheet: str | None = None,
+) -> list[DefinedNameInfo] | DefinedNameInfo:
+    """Defined-name read dispatch: ``list`` or ``get`` (WP4).
+
+    Thin flat-signature dispatcher (option (a)): routes to the existing
+    :func:`names_list` / :func:`name_get` handlers unchanged. ``list`` requires
+    only ``workbook_id``; ``get`` also requires ``name`` and ``scope`` (and
+    ``sheet`` for a worksheet scope), enforced by the target handler. An unknown
+    ``action`` raises a structured :class:`ExcelVbaMcpError`.
+
+    Args:
+        action: ``list`` (every defined name) or ``get`` (one by name + scope).
+        workbook_id: The id returned by ``open``; required for both actions.
+        name: The defined-name identifier; required for ``get``.
+        scope: ``"workbook"`` or ``"worksheet"``; required for ``get``.
+        sheet: The owning worksheet; required for a worksheet-scoped ``get``.
+
+    Returns:
+        A list of :class:`DefinedNameInfo` (``list``) or a single
+        :class:`DefinedNameInfo` (``get``).
+    """
+
+    if action == "list":
+        return await names_list(workbook_id or "")
+    if action == "get":
+        return await name_get(workbook_id or "", name or "", scope or "", sheet)
+    raise ExcelVbaMcpError(
+        f"Unknown name_read action {action!r}; expected 'list' or 'get'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "name_read", "action": action},
+    )
+
+
 __all__ = [
     "get_names_service",
+    "name",
     "name_create",
     "name_delete",
     "name_get",
+    "name_read",
     "name_update",
     "names_list",
     "set_names_service",

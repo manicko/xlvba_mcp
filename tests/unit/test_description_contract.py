@@ -26,8 +26,7 @@ _CRITICAL = [
     "macro_classify_background",
     "table",
     "table_delete_rows",
-    "name_create",
-    "name_update",
+    "name",
     "sheet",
     "snapshot_restore",
     "excel_recover",
@@ -86,8 +85,10 @@ async def test_tool_count_is_92_exposed() -> None:
     # non-destructive sheet verbs into sheet + sheet_read (sheet_delete stays
     # standalone): 88 -> 84. B4 (WP3) consolidates the nine non-destructive table
     # verbs into table + table_read (table_delete_rows and table_delete_column stay
-    # standalone): 84 -> 77. B12 finalizes the count.
-    assert len(tools) == 77
+    # standalone): 84 -> 77. B5 (WP4) consolidates the four non-destructive name
+    # verbs into name + name_read (name_delete stays standalone): 77 -> 75. B12
+    # finalizes the count.
+    assert len(tools) == 75
 
 
 async def test_critical_tools_follow_template() -> None:
@@ -119,6 +120,7 @@ async def test_guarded_mutations_use_uniform_guard_sentence() -> None:
         "sheet",
         "sheet_delete",
         "table",
+        "name",
         "name_delete",
         "shape_set_on_action",
         "control_set_on_action",

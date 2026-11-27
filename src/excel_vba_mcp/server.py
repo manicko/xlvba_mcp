@@ -71,11 +71,9 @@ from excel_vba_mcp.api.macro_tools import (
     macro_run,
 )
 from excel_vba_mcp.api.name_tools import (
-    name_create,
+    name,
     name_delete,
-    name_get,
-    name_update,
-    names_list,
+    name_read,
 )
 from excel_vba_mcp.api.pivot_tools import (
     pivot_cache_get,
@@ -824,32 +822,42 @@ _DESC_RANGE_SET_CONDITIONAL_FORMATTING = (
     "types (reported supported=false). Guarded mutation: writable session + "
     "snapshot + approval + postcondition re-read."
 )
-_DESC_NAMES_LIST = (
-    "List every defined name (Named Range) of an open workbook across workbook "
+_DESC_NAME = (
+    "Purpose: Create or update a defined name (Named Range) in an explicit scope. "
+    "Use when: you need a named range or constant in an open workbook, or you need "
+    "to repoint an existing name's RefersTo. "
+    "Do not use when: you need to delete a name — use name_delete; you need to "
+    "read names — use name_read. "
+    "Preconditions: an open workbook_id; writable session + snapshot + approval "
+    "Approval gate (see xlvba://glossary) + postcondition re-read. "
+    "Parameters: action='create'|'update'; workbook_id; name; refers_to (may be "
+    "given with or without a leading '=', normalized); scope ('workbook' or "
+    "'worksheet' + owning sheet). "
+    "Behavior: create rejects duplicate and cross-scope conflicts; update preserves "
+    "scope and only rewrites RefersTo. Guarded mutation (see xlvba://glossary). "
+    "Result: DefinedNameInfo. "
+    "Next actions: name_read action='get' to confirm. "
+    "Example: {\"action\": \"create\", \"workbook_id\": \"<id>\", \"name\": "
+    "\"Sales\", \"refers_to\": \"=Sheet1!$A$1\", \"scope\": \"workbook\"}"
+)
+_DESC_NAME_READ = (
+    "Purpose: Read the defined names (Named Ranges) of an open workbook without "
+    "mutating it. "
+    "Use when: you need every defined name or one name's metadata by name + scope. "
+    "Do not use when: you need to create/update a name — use name; you need to "
+    "delete a name — use name_delete. "
+    "Preconditions: an open workbook_id; name + scope are required for get (sheet "
+    "also required for a worksheet scope). "
+    "Parameters: action='list'|'get'; workbook_id; name (get); scope (get); sheet "
+    "(get, worksheet scope). "
+    "Behavior: read-only; list returns one entry per defined name across workbook "
     "and worksheet scopes with scope, NameLocal, Visible, RefersTo/RefersToLocal "
-    "and target_kind (range with sheet+address, constant, formula, external, "
-    "error or unknown)."
-)
-_DESC_NAME_GET = (
-    "Return one defined name by name and explicit scope ('workbook' or "
-    "'worksheet'; worksheet scope also requires the owning sheet)."
-)
-_DESC_NAME_CREATE = (
-    "Purpose: Create a defined name in an explicit scope. Use when: you need a named range or "
-    "constant in an open workbook. Do not use when: you need to change an existing name — use "
-    "name_update. Preconditions: writable session + snapshot + approval Approval gate (see "
-    "xlvba://glossary) + postcondition re-read. Parameters: workbook_id; name; refers_to (may "
-    "be given with or without a leading '=', normalized); scope ('workbook' or 'worksheet' + "
-    "owning sheet). Behavior: duplicate and cross-scope conflicts are rejected. Result: "
-    "DefinedNameInfo. Next actions: names_list to confirm."
-)
-_DESC_NAME_UPDATE = (
-    "Purpose: Update a defined name's RefersTo in an explicit scope (scope is preserved). Use "
-    "when: you need to repoint an existing defined name. Do not use when: the name does not "
-    "exist yet — use name_create. Preconditions: writable session + snapshot + approval "
-    "Approval gate (see xlvba://glossary) + postcondition re-read. Parameters: refers_to may "
-    "be given with or without a leading '=' (normalized). Behavior: scope is preserved; the "
-    "postcondition is re-read. Result: DefinedNameInfo. Next actions: name_get to confirm."
+    "and target_kind (range with sheet+address, constant, formula, external, error "
+    "or unknown); get returns one DefinedNameInfo. "
+    "Result: list[DefinedNameInfo] (list) or DefinedNameInfo (get). "
+    "Next actions: name action='create' to add a name; name_delete to remove one. "
+    "Example: {\"action\": \"get\", \"workbook_id\": \"<id>\", \"name\": "
+    "\"Sales\", \"scope\": \"workbook\"}"
 )
 _DESC_NAME_DELETE = (
     "Delete a defined name in an explicit scope. Guarded mutation (see xlvba://glossary). "
@@ -1816,8 +1824,7 @@ _ANN_READ_ONLY = frozenset(
         "range_get_format",
         "range_get_validation",
         "range_get_conditional_formatting",
-        "names_list",
-        "name_get",
+        "name_read",
         "shapes_list",
         "shape_get",
         "controls_list",
@@ -1861,8 +1868,7 @@ _ANN_IDEMPOTENT = frozenset(
         "pivot_field_set_properties",
         "pivot_field_apply_filter",
         "pivot_field_clear_filters",
-        "name_create",
-        "name_update",
+        "name_read",
         "shape_set_on_action",
         "control_set_on_action",
         "vba_replace_component_source",
@@ -2264,28 +2270,16 @@ def _register_tools(server: MCPServer) -> None:
         annotations=_annotations("range_set_conditional_formatting"),
     )
     server.add_tool(
-        names_list,
-        name="names_list",
-        description=_DESC_NAMES_LIST,
-        annotations=_annotations("names_list"),
+        name,
+        name="name",
+        description=_DESC_NAME,
+        annotations=_annotations("name"),
     )
     server.add_tool(
-        name_get,
-        name="name_get",
-        description=_DESC_NAME_GET,
-        annotations=_annotations("name_get"),
-    )
-    server.add_tool(
-        name_create,
-        name="name_create",
-        description=_DESC_NAME_CREATE,
-        annotations=_annotations("name_create"),
-    )
-    server.add_tool(
-        name_update,
-        name="name_update",
-        description=_DESC_NAME_UPDATE,
-        annotations=_annotations("name_update"),
+        name_read,
+        name="name_read",
+        description=_DESC_NAME_READ,
+        annotations=_annotations("name_read"),
     )
     server.add_tool(
         name_delete,
