@@ -1,0 +1,2291 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "tool_count": 92,
+    "serialized_bytes": 479054,
+    "measured_at": "2026-11-27T07:59:21.479671+00:00",
+    "command": "& .\\.venv\\Scripts\\python.exe -c \"import asyncio,json,excel_vba_mcp.server as s; t=asyncio.run(s.mcp.list_tools()); data=[x.model_dump(by_alias=True) for x in t]; print('count',len(t)); print('bytes',len(json.dumps(data,default=str).encode()))\"",
+    "sdk": {
+      "mcp": "2.3.0",
+      "mcp-types": "2.3.0",
+      "pydantic": "2.14.4"
+    }
+  },
+  "ledger": [
+    {
+      "old_name": "excel_open",
+      "target": {
+        "kind": "consolidated",
+        "tool": "workbook",
+        "action": "open"
+      }
+    },
+    {
+      "old_name": "excel_close",
+      "target": {
+        "kind": "consolidated",
+        "tool": "workbook",
+        "action": "close"
+      }
+    },
+    {
+      "old_name": "excel_save",
+      "target": {
+        "kind": "consolidated",
+        "tool": "workbook",
+        "action": "save"
+      }
+    },
+    {
+      "old_name": "excel_get_status",
+      "target": {
+        "kind": "consolidated",
+        "tool": "workbook_read",
+        "action": "status"
+      }
+    },
+    {
+      "old_name": "excel_list_workbooks",
+      "target": {
+        "kind": "consolidated",
+        "tool": "workbook_read",
+        "action": "list"
+      }
+    },
+    {
+      "old_name": "workbook_get_model",
+      "target": {
+        "kind": "consolidated",
+        "tool": "workbook_read",
+        "action": "model"
+      }
+    },
+    {
+      "old_name": "sheet_add",
+      "target": {
+        "kind": "consolidated",
+        "tool": "sheet",
+        "action": "add"
+      }
+    },
+    {
+      "old_name": "sheet_rename",
+      "target": {
+        "kind": "consolidated",
+        "tool": "sheet",
+        "action": "rename"
+      }
+    },
+    {
+      "old_name": "sheet_copy",
+      "target": {
+        "kind": "consolidated",
+        "tool": "sheet",
+        "action": "copy"
+      }
+    },
+    {
+      "old_name": "sheet_set_visibility",
+      "target": {
+        "kind": "consolidated",
+        "tool": "sheet",
+        "action": "set-visibility"
+      }
+    },
+    {
+      "old_name": "sheets_list",
+      "target": {
+        "kind": "consolidated",
+        "tool": "sheet_read",
+        "action": "list"
+      }
+    },
+    {
+      "old_name": "sheet_get",
+      "target": {
+        "kind": "consolidated",
+        "tool": "sheet_read",
+        "action": "get"
+      }
+    },
+    {
+      "old_name": "table_create",
+      "target": {
+        "kind": "consolidated",
+        "tool": "table",
+        "action": "create"
+      }
+    },
+    {
+      "old_name": "table_resize",
+      "target": {
+        "kind": "consolidated",
+        "tool": "table",
+        "action": "resize"
+      }
+    },
+    {
+      "old_name": "table_append_rows",
+      "target": {
+        "kind": "consolidated",
+        "tool": "table",
+        "action": "append-rows"
+      }
+    },
+    {
+      "old_name": "table_insert_row",
+      "target": {
+        "kind": "consolidated",
+        "tool": "table",
+        "action": "insert-row"
+      }
+    },
+    {
+      "old_name": "table_update_rows",
+      "target": {
+        "kind": "consolidated",
+        "tool": "table",
+        "action": "update-rows"
+      }
+    },
+    {
+      "old_name": "table_add_column",
+      "target": {
+        "kind": "consolidated",
+        "tool": "table",
+        "action": "add-column"
+      }
+    },
+    {
+      "old_name": "tables_list",
+      "target": {
+        "kind": "consolidated",
+        "tool": "table_read",
+        "action": "list"
+      }
+    },
+    {
+      "old_name": "table_get",
+      "target": {
+        "kind": "consolidated",
+        "tool": "table_read",
+        "action": "get"
+      }
+    },
+    {
+      "old_name": "table_read_rows",
+      "target": {
+        "kind": "consolidated",
+        "tool": "table_read",
+        "action": "read-rows"
+      }
+    },
+    {
+      "old_name": "name_create",
+      "target": {
+        "kind": "consolidated",
+        "tool": "name",
+        "action": "create"
+      }
+    },
+    {
+      "old_name": "name_update",
+      "target": {
+        "kind": "consolidated",
+        "tool": "name",
+        "action": "update"
+      }
+    },
+    {
+      "old_name": "names_list",
+      "target": {
+        "kind": "consolidated",
+        "tool": "name_read",
+        "action": "list"
+      }
+    },
+    {
+      "old_name": "name_get",
+      "target": {
+        "kind": "consolidated",
+        "tool": "name_read",
+        "action": "get"
+      }
+    },
+    {
+      "old_name": "shapes_list",
+      "target": {
+        "kind": "consolidated",
+        "tool": "shape",
+        "action": "list"
+      }
+    },
+    {
+      "old_name": "shape_get",
+      "target": {
+        "kind": "consolidated",
+        "tool": "shape",
+        "action": "get"
+      }
+    },
+    {
+      "old_name": "shape_set_on_action",
+      "target": {
+        "kind": "consolidated",
+        "tool": "shape",
+        "action": "set-on-action"
+      }
+    },
+    {
+      "old_name": "controls_list",
+      "target": {
+        "kind": "consolidated",
+        "tool": "control",
+        "action": "list"
+      }
+    },
+    {
+      "old_name": "control_get",
+      "target": {
+        "kind": "consolidated",
+        "tool": "control",
+        "action": "get"
+      }
+    },
+    {
+      "old_name": "control_set_on_action",
+      "target": {
+        "kind": "consolidated",
+        "tool": "control",
+        "action": "set-on-action"
+      }
+    },
+    {
+      "old_name": "macro_list",
+      "target": {
+        "kind": "consolidated",
+        "tool": "macro",
+        "action": "list"
+      }
+    },
+    {
+      "old_name": "macro_classify_background",
+      "target": {
+        "kind": "consolidated",
+        "tool": "macro",
+        "action": "classify-background"
+      }
+    },
+    {
+      "old_name": "macro_get_last_result",
+      "target": {
+        "kind": "consolidated",
+        "tool": "macro",
+        "action": "get-last-result"
+      }
+    },
+    {
+      "old_name": "test_suite_run",
+      "target": {
+        "kind": "consolidated",
+        "tool": "test",
+        "action": "run-suite"
+      }
+    },
+    {
+      "old_name": "test_get_run",
+      "target": {
+        "kind": "consolidated",
+        "tool": "test",
+        "action": "get-run"
+      }
+    },
+    {
+      "old_name": "range_get",
+      "target": {
+        "kind": "consolidated",
+        "tool": "range_read",
+        "action": "get"
+      }
+    },
+    {
+      "old_name": "range_read_values",
+      "target": {
+        "kind": "consolidated",
+        "tool": "range_read",
+        "action": "read-values"
+      }
+    },
+    {
+      "old_name": "range_read_formulas",
+      "target": {
+        "kind": "consolidated",
+        "tool": "range_read",
+        "action": "read-formulas"
+      }
+    },
+    {
+      "old_name": "range_get_format",
+      "target": {
+        "kind": "consolidated",
+        "tool": "range_read",
+        "action": "get-format"
+      }
+    },
+    {
+      "old_name": "range_get_validation",
+      "target": {
+        "kind": "consolidated",
+        "tool": "range_read",
+        "action": "get-validation"
+      }
+    },
+    {
+      "old_name": "range_get_conditional_formatting",
+      "target": {
+        "kind": "consolidated",
+        "tool": "range_read",
+        "action": "get-conditional-formatting"
+      }
+    },
+    {
+      "old_name": "range_write_values",
+      "target": {
+        "kind": "consolidated",
+        "tool": "range_write",
+        "action": "write-values"
+      }
+    },
+    {
+      "old_name": "range_write_formulas",
+      "target": {
+        "kind": "consolidated",
+        "tool": "range_write",
+        "action": "write-formulas"
+      }
+    },
+    {
+      "old_name": "range_set_format",
+      "target": {
+        "kind": "consolidated",
+        "tool": "range_write",
+        "action": "set-format"
+      }
+    },
+    {
+      "old_name": "range_set_validation",
+      "target": {
+        "kind": "consolidated",
+        "tool": "range_write",
+        "action": "set-validation"
+      }
+    },
+    {
+      "old_name": "range_set_conditional_formatting",
+      "target": {
+        "kind": "consolidated",
+        "tool": "range_write",
+        "action": "set-conditional-formatting"
+      }
+    },
+    {
+      "old_name": "range_copy",
+      "target": {
+        "kind": "consolidated",
+        "tool": "range_structural",
+        "action": "copy"
+      }
+    },
+    {
+      "old_name": "range_insert",
+      "target": {
+        "kind": "consolidated",
+        "tool": "range_structural",
+        "action": "insert"
+      }
+    },
+    {
+      "old_name": "range_unmerge",
+      "target": {
+        "kind": "consolidated",
+        "tool": "range_structural",
+        "action": "unmerge"
+      }
+    },
+    {
+      "old_name": "pivot_tables_list",
+      "target": {
+        "kind": "consolidated",
+        "tool": "pivot_read",
+        "action": "tables-list"
+      }
+    },
+    {
+      "old_name": "pivot_table_get",
+      "target": {
+        "kind": "consolidated",
+        "tool": "pivot_read",
+        "action": "table-get"
+      }
+    },
+    {
+      "old_name": "pivot_cache_get",
+      "target": {
+        "kind": "consolidated",
+        "tool": "pivot_read",
+        "action": "cache-get"
+      }
+    },
+    {
+      "old_name": "pivot_fields_list",
+      "target": {
+        "kind": "consolidated",
+        "tool": "pivot_read",
+        "action": "fields-list"
+      }
+    },
+    {
+      "old_name": "pivot_field_get_filters",
+      "target": {
+        "kind": "consolidated",
+        "tool": "pivot_read",
+        "action": "field-get-filters"
+      }
+    },
+    {
+      "old_name": "pivot_table_refresh",
+      "target": {
+        "kind": "consolidated",
+        "tool": "pivot_refresh",
+        "action": "refresh-table"
+      }
+    },
+    {
+      "old_name": "pivot_cache_refresh",
+      "target": {
+        "kind": "consolidated",
+        "tool": "pivot_refresh",
+        "action": "refresh-cache"
+      }
+    },
+    {
+      "old_name": "pivot_field_set_layout",
+      "target": {
+        "kind": "consolidated",
+        "tool": "pivot_field",
+        "action": "field-set-layout"
+      }
+    },
+    {
+      "old_name": "pivot_field_set_position",
+      "target": {
+        "kind": "consolidated",
+        "tool": "pivot_field",
+        "action": "field-set-position"
+      }
+    },
+    {
+      "old_name": "pivot_field_set_aggregation",
+      "target": {
+        "kind": "consolidated",
+        "tool": "pivot_field",
+        "action": "field-set-aggregation"
+      }
+    },
+    {
+      "old_name": "pivot_field_set_properties",
+      "target": {
+        "kind": "consolidated",
+        "tool": "pivot_field",
+        "action": "field-set-properties"
+      }
+    },
+    {
+      "old_name": "pivot_field_apply_filter",
+      "target": {
+        "kind": "consolidated",
+        "tool": "pivot_field",
+        "action": "field-apply-filter"
+      }
+    },
+    {
+      "old_name": "pivot_field_clear_filters",
+      "target": {
+        "kind": "consolidated",
+        "tool": "pivot_field",
+        "action": "field-clear-filters"
+      }
+    },
+    {
+      "old_name": "vba_project_info",
+      "target": {
+        "kind": "consolidated",
+        "tool": "vba_read",
+        "action": "project-info"
+      }
+    },
+    {
+      "old_name": "vba_list_components",
+      "target": {
+        "kind": "consolidated",
+        "tool": "vba_read",
+        "action": "list-components"
+      }
+    },
+    {
+      "old_name": "vba_list_procedures",
+      "target": {
+        "kind": "consolidated",
+        "tool": "vba_read",
+        "action": "list-procedures"
+      }
+    },
+    {
+      "old_name": "vba_read_component",
+      "target": {
+        "kind": "consolidated",
+        "tool": "vba_read",
+        "action": "read-component"
+      }
+    },
+    {
+      "old_name": "vba_get_references",
+      "target": {
+        "kind": "consolidated",
+        "tool": "vba_read",
+        "action": "get-references"
+      }
+    },
+    {
+      "old_name": "vba_search_code",
+      "target": {
+        "kind": "consolidated",
+        "tool": "vba_read",
+        "action": "search-code"
+      }
+    },
+    {
+      "old_name": "vba_get_compile_diagnostics",
+      "target": {
+        "kind": "consolidated",
+        "tool": "vba_read",
+        "action": "get-compile-diagnostics"
+      }
+    },
+    {
+      "old_name": "excel_save_as",
+      "target": {
+        "kind": "standalone",
+        "tool": "excel_save_as"
+      }
+    },
+    {
+      "old_name": "excel_health",
+      "target": {
+        "kind": "standalone",
+        "tool": "excel_health"
+      }
+    },
+    {
+      "old_name": "excel_recover",
+      "target": {
+        "kind": "standalone",
+        "tool": "excel_recover"
+      }
+    },
+    {
+      "old_name": "snapshot_create",
+      "target": {
+        "kind": "standalone",
+        "tool": "snapshot_create"
+      }
+    },
+    {
+      "old_name": "snapshot_list",
+      "target": {
+        "kind": "standalone",
+        "tool": "snapshot_list"
+      }
+    },
+    {
+      "old_name": "snapshot_restore",
+      "target": {
+        "kind": "standalone",
+        "tool": "snapshot_restore"
+      }
+    },
+    {
+      "old_name": "snapshot_diff",
+      "target": {
+        "kind": "standalone",
+        "tool": "snapshot_diff"
+      }
+    },
+    {
+      "old_name": "vba_export_project",
+      "target": {
+        "kind": "standalone",
+        "tool": "vba_export_project"
+      }
+    },
+    {
+      "old_name": "vba_replace_component_source",
+      "target": {
+        "kind": "standalone",
+        "tool": "vba_replace_component_source"
+      }
+    },
+    {
+      "old_name": "vba_insert_code",
+      "target": {
+        "kind": "standalone",
+        "tool": "vba_insert_code"
+      }
+    },
+    {
+      "old_name": "vba_compile_diagnostics",
+      "target": {
+        "kind": "standalone",
+        "tool": "vba_compile_diagnostics"
+      }
+    },
+    {
+      "old_name": "macro_run",
+      "target": {
+        "kind": "standalone",
+        "tool": "macro_run"
+      }
+    },
+    {
+      "old_name": "job_get",
+      "target": {
+        "kind": "standalone",
+        "tool": "job_get"
+      }
+    },
+    {
+      "old_name": "job_request_cancel",
+      "target": {
+        "kind": "standalone",
+        "tool": "job_request_cancel"
+      }
+    },
+    {
+      "old_name": "sheet_delete",
+      "target": {
+        "kind": "standalone",
+        "tool": "sheet_delete"
+      }
+    },
+    {
+      "old_name": "table_delete_rows",
+      "target": {
+        "kind": "standalone",
+        "tool": "table_delete_rows"
+      }
+    },
+    {
+      "old_name": "table_delete_column",
+      "target": {
+        "kind": "standalone",
+        "tool": "table_delete_column"
+      }
+    },
+    {
+      "old_name": "range_delete",
+      "target": {
+        "kind": "standalone",
+        "tool": "range_delete"
+      }
+    },
+    {
+      "old_name": "range_merge",
+      "target": {
+        "kind": "standalone",
+        "tool": "range_merge"
+      }
+    },
+    {
+      "old_name": "name_delete",
+      "target": {
+        "kind": "standalone",
+        "tool": "name_delete"
+      }
+    },
+    {
+      "old_name": "server_health",
+      "target": {
+        "kind": "standalone",
+        "tool": "server_health"
+      }
+    },
+    {
+      "old_name": "xlvba_environment",
+      "target": {
+        "kind": "standalone",
+        "tool": "xlvba_environment"
+      }
+    }
+  ],
+  "security": [
+    {
+      "tool": "server_health",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "server_health",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "excel_open",
+      "risk": "lifecycle",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "workbook",
+      "permission_profile": "P_LIFE"
+    },
+    {
+      "tool": "excel_close",
+      "risk": "high-risk",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "workbook",
+      "permission_profile": "P_LIFE",
+      "note": "D1 refuse-by-default: close discards unsaved changes only with explicit discard_changes=true; contradictory flags rejected; high-risk disposition inside workbook close action"
+    },
+    {
+      "tool": "excel_save",
+      "risk": "lifecycle",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "workbook",
+      "permission_profile": "P_LIFE"
+    },
+    {
+      "tool": "excel_save_as",
+      "risk": "high-risk",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "excel_save_as",
+      "permission_profile": "P_HIGH",
+      "note": "standalone; own permission/overwrite policy (H1)"
+    },
+    {
+      "tool": "excel_get_status",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "workbook_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "excel_list_workbooks",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "workbook_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "excel_health",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "excel_health",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "excel_recover",
+      "risk": "destructive",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "excel_recover",
+      "permission_profile": "P_RECOV",
+      "note": "standalone recovery; terminates owned process"
+    },
+    {
+      "tool": "snapshot_create",
+      "risk": "lifecycle",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "snapshot_create",
+      "permission_profile": "P_LIFE"
+    },
+    {
+      "tool": "snapshot_list",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "snapshot_list",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "snapshot_restore",
+      "risk": "destructive",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "snapshot_restore",
+      "permission_profile": "P_LIFE"
+    },
+    {
+      "tool": "snapshot_diff",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "snapshot_diff",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "test_suite_run",
+      "risk": "destructive",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "test",
+      "permission_profile": "P_EXEC",
+      "note": "H1 deviation (accepted, R-Q2): test is a mixed-profile tool (run-suite P_EXEC + get-run P_READ); run-suite's real approval gate is macro_run EXECUTING class + xlvba_* name glob"
+    },
+    {
+      "tool": "test_get_run",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "test",
+      "permission_profile": "P_READ",
+      "note": "H1 deviation (accepted, R-Q2): test is a mixed-profile tool (run-suite P_EXEC + get-run P_READ)"
+    },
+    {
+      "tool": "vba_project_info",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "vba_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "vba_list_components",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "vba_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "vba_list_procedures",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "vba_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "vba_read_component",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "vba_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "vba_export_project",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "vba_export_project",
+      "permission_profile": "P_MUT",
+      "note": "standalone; writes export files"
+    },
+    {
+      "tool": "vba_get_references",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "vba_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "vba_search_code",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "vba_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "vba_replace_component_source",
+      "risk": "destructive",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "vba_replace_component_source",
+      "permission_profile": "P_MUT",
+      "note": "standalone; hash-guarded mutation (H1)"
+    },
+    {
+      "tool": "vba_insert_code",
+      "risk": "destructive",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "vba_insert_code",
+      "permission_profile": "P_MUT",
+      "note": "standalone; hash-guarded mutation (H1)"
+    },
+    {
+      "tool": "vba_compile_diagnostics",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "vba_compile_diagnostics",
+      "permission_profile": "P_READ",
+      "note": "not read-only (does NOT compile) but non-mutating diagnostic"
+    },
+    {
+      "tool": "vba_get_compile_diagnostics",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "vba_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "macro_list",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "macro",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "macro_run",
+      "risk": "high-risk",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "macro_run",
+      "permission_profile": "P_EXEC",
+      "note": "standalone; executes reviewed macros (H1)"
+    },
+    {
+      "tool": "macro_classify_background",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "macro",
+      "permission_profile": "P_BOOK",
+      "note": "bookkeeping only; never grants run permission"
+    },
+    {
+      "tool": "macro_get_last_result",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "macro",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "job_get",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "job_get",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "job_request_cancel",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "job_request_cancel",
+      "permission_profile": "P_LIFE",
+      "note": "intent-only; never interrupts"
+    },
+    {
+      "tool": "sheets_list",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "sheet_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "sheet_get",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "sheet_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "sheet_add",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "sheet",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "sheet_rename",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "sheet",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "sheet_copy",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "sheet",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "sheet_delete",
+      "risk": "destructive",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "sheet_delete",
+      "permission_profile": "P_MUT",
+      "note": "standalone destructive (H1)"
+    },
+    {
+      "tool": "sheet_set_visibility",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "sheet",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "tables_list",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "table_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "table_get",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "table_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "table_read_rows",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "table_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "table_append_rows",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "table",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "table_insert_row",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "table",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "table_update_rows",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "table",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "table_delete_rows",
+      "risk": "destructive",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "table_delete_rows",
+      "permission_profile": "P_MUT",
+      "note": "standalone destructive; XOR guard (H1)"
+    },
+    {
+      "tool": "table_add_column",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "table",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "table_delete_column",
+      "risk": "high-risk",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "table_delete_column",
+      "permission_profile": "P_HIGH",
+      "note": "standalone; own permission (H1)"
+    },
+    {
+      "tool": "table_create",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "table",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "table_resize",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "table",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "pivot_tables_list",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "pivot_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "pivot_table_get",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "pivot_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "pivot_cache_get",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "pivot_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "pivot_fields_list",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "pivot_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "pivot_table_refresh",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "pivot_refresh",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "pivot_cache_refresh",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "pivot_refresh",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "pivot_field_set_layout",
+      "risk": "destructive",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "pivot_field",
+      "permission_profile": "P_MUT",
+      "note": "delete=True path discards a field (destructive)"
+    },
+    {
+      "tool": "pivot_field_set_position",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "pivot_field",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "pivot_field_set_aggregation",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "pivot_field",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "pivot_field_set_properties",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "pivot_field",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "pivot_field_get_filters",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "pivot_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "pivot_field_apply_filter",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "pivot_field",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "pivot_field_clear_filters",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "pivot_field",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "range_get",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "range_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "range_read_values",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "range_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "range_read_formulas",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "range_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "range_write_values",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "range_write",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "range_write_formulas",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "range_write",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "range_get_format",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "range_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "range_set_format",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "range_write",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "range_copy",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "range_structural",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "range_insert",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "range_structural",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "range_delete",
+      "risk": "destructive",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "range_delete",
+      "permission_profile": "P_MUT",
+      "note": "standalone destructive (H1)"
+    },
+    {
+      "tool": "range_merge",
+      "risk": "destructive",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "range_merge",
+      "permission_profile": "P_MUT",
+      "note": "standalone destructive; dual-hint (F,T,T)"
+    },
+    {
+      "tool": "range_unmerge",
+      "risk": "destructive",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "range_structural",
+      "permission_profile": "P_MUT",
+      "note": "discards merges"
+    },
+    {
+      "tool": "range_get_validation",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "range_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "range_set_validation",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "range_write",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "range_get_conditional_formatting",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "range_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "range_set_conditional_formatting",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "range_write",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "names_list",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "name_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "name_get",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "name_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "name_create",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "name",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "name_update",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "name",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "name_delete",
+      "risk": "destructive",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "name_delete",
+      "permission_profile": "P_MUT",
+      "note": "standalone destructive (H1)"
+    },
+    {
+      "tool": "shapes_list",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "shape",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "shape_get",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "shape",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "shape_set_on_action",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "shape",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "controls_list",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "control",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "control_get",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "control",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "control_set_on_action",
+      "risk": "additive-mutation",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "control",
+      "permission_profile": "P_MUT"
+    },
+    {
+      "tool": "workbook_get_model",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "workbook_read",
+      "permission_profile": "P_READ"
+    },
+    {
+      "tool": "xlvba_environment",
+      "risk": "read",
+      "kilo_policy": "ask (xlvba_*)",
+      "new_name": "xlvba_environment",
+      "permission_profile": "P_READ",
+      "note": "inline read_only annotation; not via _ANN_READ_ONLY"
+    }
+  ],
+  "truth": [
+    {
+      "tool": "workbook",
+      "action": "open",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "workbook",
+      "action": "close",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "workbook",
+      "action": "save",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "workbook_read",
+      "action": "status",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "workbook_read",
+      "action": "list",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "workbook_read",
+      "action": "model",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "excel_save_as",
+      "action": "excel_save_as",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "excel_health",
+      "action": "excel_health",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "excel_recover",
+      "action": "excel_recover",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "snapshot_create",
+      "action": "snapshot_create",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "snapshot_list",
+      "action": "snapshot_list",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "snapshot_restore",
+      "action": "snapshot_restore",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "snapshot_diff",
+      "action": "snapshot_diff",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "test",
+      "action": "run-suite",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "test",
+      "action": "get-run",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "vba_read",
+      "action": "project-info",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "vba_read",
+      "action": "list-components",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "vba_read",
+      "action": "list-procedures",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "vba_read",
+      "action": "read-component",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "vba_read",
+      "action": "get-references",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "vba_read",
+      "action": "search-code",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "vba_read",
+      "action": "get-compile-diagnostics",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "vba_export_project",
+      "action": "vba_export_project",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "vba_replace_component_source",
+      "action": "vba_replace_component_source",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "vba_insert_code",
+      "action": "vba_insert_code",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "vba_compile_diagnostics",
+      "action": "vba_compile_diagnostics",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "macro",
+      "action": "list",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "macro",
+      "action": "classify-background",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "macro",
+      "action": "get-last-result",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "macro_run",
+      "action": "macro_run",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "job_get",
+      "action": "job_get",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "job_request_cancel",
+      "action": "job_request_cancel",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "sheet",
+      "action": "add",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "sheet",
+      "action": "rename",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "sheet",
+      "action": "copy",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "sheet",
+      "action": "set-visibility",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "sheet_read",
+      "action": "list",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "sheet_read",
+      "action": "get",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "sheet_delete",
+      "action": "sheet_delete",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "table",
+      "action": "create",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "table",
+      "action": "resize",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "table",
+      "action": "append-rows",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "table",
+      "action": "insert-row",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "table",
+      "action": "update-rows",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "table",
+      "action": "add-column",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "table_read",
+      "action": "list",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "table_read",
+      "action": "get",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "table_read",
+      "action": "read-rows",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "table_delete_rows",
+      "action": "table_delete_rows",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "table_delete_column",
+      "action": "table_delete_column",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "pivot_read",
+      "action": "tables-list",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "pivot_read",
+      "action": "table-get",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "pivot_read",
+      "action": "cache-get",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "pivot_read",
+      "action": "fields-list",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "pivot_read",
+      "action": "field-get-filters",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "pivot_refresh",
+      "action": "refresh-table",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "pivot_refresh",
+      "action": "refresh-cache",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "pivot_field",
+      "action": "field-set-layout",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": true
+    },
+    {
+      "tool": "pivot_field",
+      "action": "field-set-position",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "pivot_field",
+      "action": "field-set-aggregation",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "pivot_field",
+      "action": "field-set-properties",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "pivot_field",
+      "action": "field-apply-filter",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "pivot_field",
+      "action": "field-clear-filters",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "range_read",
+      "action": "get",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "range_read",
+      "action": "read-values",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "range_read",
+      "action": "read-formulas",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "range_read",
+      "action": "get-format",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "range_read",
+      "action": "get-validation",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "range_read",
+      "action": "get-conditional-formatting",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "range_write",
+      "action": "write-values",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "range_write",
+      "action": "write-formulas",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "range_write",
+      "action": "set-format",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "range_write",
+      "action": "set-validation",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "range_write",
+      "action": "set-conditional-formatting",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "range_structural",
+      "action": "copy",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "range_structural",
+      "action": "insert",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "range_structural",
+      "action": "unmerge",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": true
+    },
+    {
+      "tool": "range_delete",
+      "action": "range_delete",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "range_merge",
+      "action": "range_merge",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": true
+    },
+    {
+      "tool": "name",
+      "action": "create",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "name",
+      "action": "update",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "name_read",
+      "action": "list",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "name_read",
+      "action": "get",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "name_delete",
+      "action": "name_delete",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "shape",
+      "action": "list",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "shape",
+      "action": "get",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "shape",
+      "action": "set-on-action",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "control",
+      "action": "list",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "control",
+      "action": "get",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "control",
+      "action": "set-on-action",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "server_health",
+      "action": "server_health",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "xlvba_environment",
+      "action": "xlvba_environment",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    }
+  ],
+  "tool_annotations": [
+    {
+      "tool": "workbook",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "workbook_read",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "excel_save_as",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "excel_health",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "excel_recover",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "snapshot_create",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "snapshot_list",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "snapshot_restore",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "snapshot_diff",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "test",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "vba_read",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "vba_export_project",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "vba_replace_component_source",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "vba_insert_code",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "vba_compile_diagnostics",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "macro",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "macro_run",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "job_get",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "job_request_cancel",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "sheet",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "sheet_read",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "sheet_delete",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "table",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "table_read",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "table_delete_rows",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "table_delete_column",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "pivot_read",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "pivot_refresh",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "pivot_field",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": true
+    },
+    {
+      "tool": "range_read",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "range_write",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "tool": "range_structural",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "range_delete",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "range_merge",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": true
+    },
+    {
+      "tool": "name",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "name_read",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "name_delete",
+      "read_only": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "tool": "shape",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "control",
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "server_health",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    },
+    {
+      "tool": "xlvba_environment",
+      "read_only": true,
+      "destructive": false,
+      "idempotent": true
+    }
+  ]
+}
