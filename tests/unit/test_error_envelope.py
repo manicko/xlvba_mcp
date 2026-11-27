@@ -130,6 +130,16 @@ def test_confirmation_required_is_validation_not_retryable_with_action() -> None
     ]
 
 
+def test_range_too_large_is_validation_not_retryable_with_action() -> None:
+    # WP-Range: a valid but over-cap range is a validation error (not retryable)
+    # that tells the caller to page the work into smaller ranges.
+    payload = ExcelVbaMcpError("x", code=ErrorCode.RANGE_TOO_LARGE).to_dict()
+    assert payload["errorCategory"] == "validation"
+    assert payload["isRetryable"] is False
+    joined = " ".join(payload["suggestedNextActions"]).lower()
+    assert "smaller ranges" in joined
+
+
 def test_job_interrupted_unknown_is_never_retryable() -> None:
     # Job-state string (not an ErrorCode member) still classifies truthfully.
     assert category_for("interrupted_unknown") == "interrupted_unknown"

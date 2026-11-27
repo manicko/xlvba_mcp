@@ -205,6 +205,85 @@ def test_range_write_request_rejects_shape_mismatch() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Raw-scalar cell coercion (WP-Range ergonomics)
+# ---------------------------------------------------------------------------
+def test_range_write_request_coerces_raw_scalars_by_json_type() -> None:
+    req = RangeWriteRequest.model_validate(
+        {"rows": 1, "cols": 4, "values": [["s", 5, True, None]]}
+    )
+    cells = req.values[0]
+    assert [cell.kind for cell in cells] == [
+        CellValueKind.STRING,
+        CellValueKind.NUMBER,
+        CellValueKind.BOOLEAN,
+        CellValueKind.EMPTY,
+    ]
+    assert cells[0].value == "s"
+    assert cells[1].value == 5
+    assert cells[2].value is True
+    assert cells[3].value is None
+    # After construction every cell is a typed CellValue (normalization ran).
+    assert all(isinstance(cell, CellValue) for cell in cells)
+
+
+def test_range_write_request_raw_float_is_number() -> None:
+    req = RangeWriteRequest.model_validate({"rows": 1, "cols": 1, "values": [[1.5]]})
+    cell = req.values[0][0]
+    assert cell.kind is CellValueKind.NUMBER
+    assert cell.value == 1.5
+
+
+def test_range_write_request_raw_leading_equals_stays_string() -> None:
+    req = RangeWriteRequest.model_validate({"rows": 1, "cols": 1, "values": [["=1+1"]]})
+    cell = req.values[0][0]
+    assert cell.kind is CellValueKind.STRING
+    assert cell.value == "=1+1"
+
+
+def test_range_write_request_ambiguous_strings_not_coerced() -> None:
+    # "true" / "123" / "2024-01-01" are JSON strings and must stay strings.
+    req = RangeWriteRequest.model_validate(
+        {"rows": 1, "cols": 3, "values": [["true", "123", "2024-01-01"]]}
+    )
+    assert [cell.kind for cell in req.values[0]] == [
+        CellValueKind.STRING,
+        CellValueKind.STRING,
+        CellValueKind.STRING,
+    ]
+    assert [cell.value for cell in req.values[0]] == ["true", "123", "2024-01-01"]
+
+
+def test_range_write_request_cellvalue_dict_still_accepted() -> None:
+    req = RangeWriteRequest.model_validate(
+        {"rows": 1, "cols": 2, "values": [[{"kind": "number", "value": 9}, "x"]]}
+    )
+    assert req.values[0][0].kind is CellValueKind.NUMBER
+    assert req.values[0][0].value == 9
+    assert req.values[0][1].kind is CellValueKind.STRING
+
+
+def test_range_write_request_rejects_nested_list_cell() -> None:
+    # A nested list is neither a CellValue nor a raw scalar -> rejected.
+    with pytest.raises(ValidationError):
+        RangeWriteRequest.model_validate({"rows": 1, "cols": 1, "values": [[[1, 2]]]})
+
+
+def test_range_write_request_schema_advertises_raw_scalars() -> None:
+    # The tool input schema (model JSON schema) must advertise the raw-scalar
+    # union for each cell, not only the CellValue object.
+    schema = RangeWriteRequest.model_json_schema()
+    cell_schema = schema["$defs"]["CellValue"]
+    values_schema = schema["properties"]["values"]
+    # The cell option is a union that includes the CellValue ref plus scalar types.
+    rendered = json.dumps(values_schema)
+    assert cell_schema["title"] == "CellValue"
+    assert "string" in rendered
+    assert "number" in rendered
+    assert "boolean" in rendered
+    assert "null" in rendered
+
+
 def test_formula_write_request_rejects_non_formula_constant() -> None:
     # A formula write must not silently carry constants through: the payload is
     # still shape-validated here; constant-vs-formula separation is enforced by
@@ -505,6 +584,7 @@ def test_pivot_unsupported_source_is_explicit() -> None:
 
 _PHASE2_CODES = {
     "INVALID_RANGE",
+    "RANGE_TOO_LARGE",
     "PROTECTED_TARGET",
     "UNSUPPORTED_PIVOT_SOURCE",
     "STALE_TARGET",
@@ -516,6 +596,7 @@ _PHASE2_CODES = {
 
 _PHASE2_SUBCLASSES = {
     ErrorCode.INVALID_RANGE: err.InvalidRangeError,
+    ErrorCode.RANGE_TOO_LARGE: err.RangeTooLargeError,
     ErrorCode.PROTECTED_TARGET: err.ProtectedTargetError,
     ErrorCode.UNSUPPORTED_PIVOT_SOURCE: err.UnsupportedPivotSourceError,
     ErrorCode.STALE_TARGET: err.StaleTargetError,

@@ -29,6 +29,7 @@ import pytest
 import excel_vba_mcp.storage.snapshot_store as store_mod
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import WorkerStatus
+from excel_vba_mcp.api import test_tools
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import (
     SnapshotService,
@@ -36,6 +37,7 @@ from excel_vba_mcp.application.snapshot_service import (
 )
 from excel_vba_mcp.domain.errors import (
     ApprovalDeniedError,
+    ErrorCode,
     ExcelVbaMcpError,
     SnapshotFailedError,
 )
@@ -162,6 +164,9 @@ class FakeWorker:
     def __init__(self, status: WorkerStatus | None = None) -> None:
         self.submits: list[dict[str, Any]] = []
         self._status = status or WorkerStatus(state=WorkbookSessionState.RUNNING, accepting=True)
+        # Names of submitted callables that must raise a simulated STA failure.
+        # Used to drive the restore-validation-failure path without Excel.
+        self.fail_names: set[str] = set()
 
     async def submit(
         self,
@@ -171,9 +176,10 @@ class FakeWorker:
         section: str = "diagnostic",
         op_class: OperationClass = OperationClass.READ_ONLY,
     ) -> Any:
-        self.submits.append(
-            {"name": getattr(fn, "__name__", "?"), "section": section, "op_class": op_class}
-        )
+        name = getattr(fn, "__name__", "?")
+        self.submits.append({"name": name, "section": section, "op_class": op_class})
+        if name in self.fail_names:
+            raise RuntimeError(f"simulated STA failure in {name!r}")
         return fn()
 
     def get_status(self) -> WorkerStatus:
@@ -358,6 +364,112 @@ async def test_restore_closes_without_save_and_opens_baseline(tmp_path: Path) ->
 
     # The immutable snapshot file is unchanged.
     assert rig.store.load(manifest.snapshot_id).sha256 == manifest.sha256
+
+
+# ---------------------------------------------------------------------------
+# Restore — WP3 lifecycle: validate restored BEFORE closing previous
+# ---------------------------------------------------------------------------
+async def test_restore_closes_only_previous_and_keeps_restored_active(tmp_path: Path) -> None:
+    """A successful restore leaves exactly one open copy: the restored one.
+
+    The previous working copy is closed (without saving) only after the restored
+    copy is validated; the restored copy remains the single active session record
+    (never both, never zero).
+    """
+
+    rig = Rig(tmp_path)
+    info = await rig.open(read_only=False)
+    manifest = await rig.service.create_snapshot(info.workbook_id)
+
+    snapshot_file = rig.store.path_for(manifest.snapshot_id) / manifest.file_name
+    snapshot_canonical = str(
+        rig.path_policy.validate_path(str(snapshot_file), OperationClass.MUTATING)
+    )
+    rig.grant("excel_open", canonical=snapshot_canonical)
+
+    # Exactly one open workbook before the restore.
+    assert len(await rig.session.list_workbooks()) == 1
+
+    restored = await rig.service.restore_snapshot(
+        manifest.snapshot_id, workbook_id=info.workbook_id
+    )
+
+    # Exactly one open workbook after the restore: the restored one.
+    open_infos = await rig.session.list_workbooks()
+    assert len(open_infos) == 1
+    assert open_infos[0].workbook_id == restored.workbook_id
+    assert all(w.workbook_id != info.workbook_id for w in open_infos)
+
+    # The previous working copy was closed WITHOUT saving.
+    previous_wb = next(w for w in rig.app.Workbooks.items if w.FullName == info.path)
+    assert previous_wb.closed is True
+    assert previous_wb.saved_on_close is False
+
+    # The restored working copy is open and active in the owned instance.
+    restored_wb = next(w for w in rig.app.Workbooks.items if w.FullName == restored.path)
+    assert restored_wb.closed is False
+    open_in_app = [w for w in rig.app.Workbooks.items if not w.closed]
+    assert len(open_in_app) == 1
+
+
+async def test_restore_validation_failure_keeps_previous_open(tmp_path: Path) -> None:
+    """If the restored copy fails validation, the previous copy stays open.
+
+    The failed (just-opened) restored copy is cleaned up best-effort so exactly
+    one working copy — the previous one — remains, and a structured
+    ``SNAPSHOT_FAILED`` error is surfaced.
+    """
+
+    rig = Rig(tmp_path)
+    info = await rig.open(read_only=False)
+    manifest = await rig.service.create_snapshot(info.workbook_id)
+
+    snapshot_file = rig.store.path_for(manifest.snapshot_id) / manifest.file_name
+    snapshot_canonical = str(
+        rig.path_policy.validate_path(str(snapshot_file), OperationClass.MUTATING)
+    )
+    rig.grant("excel_open", canonical=snapshot_canonical)
+
+    # Simulate the STA inspect of the restored copy failing.
+    rig.worker.fail_names.add("validate_restored")
+
+    with pytest.raises(SnapshotFailedError) as exc_info:
+        await rig.service.restore_snapshot(manifest.snapshot_id, workbook_id=info.workbook_id)
+    assert exc_info.value.code.value == "SNAPSHOT_FAILED"
+
+    # The previous working copy is still open (never closed).
+    open_infos = await rig.session.list_workbooks()
+    assert len(open_infos) == 1
+    assert open_infos[0].workbook_id == info.workbook_id
+    previous_wb = next(w for w in rig.app.Workbooks.items if w.FullName == info.path)
+    assert previous_wb.closed is False
+
+    # The failed restored copy was cleaned up: exactly one open in the instance.
+    open_in_app = [w for w in rig.app.Workbooks.items if not w.closed]
+    assert len(open_in_app) == 1
+
+
+async def test_restore_confirm_false_rejects_before_any_change(tmp_path: Path) -> None:
+    """``confirm=False`` rejects before any close/open (U6-E gate unchanged)."""
+
+    rig = Rig(tmp_path)
+    info = await rig.open(read_only=False)
+    manifest = await rig.service.create_snapshot(info.workbook_id)
+
+    test_tools.set_snapshot_service(rig.service)
+    try:
+        with pytest.raises(ExcelVbaMcpError) as exc_info:
+            await test_tools.snapshot_restore(manifest.snapshot_id, info.workbook_id, confirm=False)
+    finally:
+        test_tools.set_snapshot_service(None)
+
+    assert exc_info.value.code is ErrorCode.CONFIRMATION_REQUIRED
+    # No destructive action: the previous copy is still the only open one.
+    open_infos = await rig.session.list_workbooks()
+    assert len(open_infos) == 1
+    assert open_infos[0].workbook_id == info.workbook_id
+    previous_wb = next(w for w in rig.app.Workbooks.items if w.FullName == info.path)
+    assert previous_wb.closed is False
 
 
 # ---------------------------------------------------------------------------

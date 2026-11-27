@@ -185,11 +185,18 @@ class SheetsService:
         )
         return result
 
-    async def copy_sheet(self, workbook_id: str, name: str) -> SheetInfo:
+    async def copy_sheet(
+        self, workbook_id: str, name: str, *, target_name: str | None = None
+    ) -> SheetInfo:
         """Copy ``name`` in ``workbook_id`` and return the new sheet's DTO.
 
         Guarded mutation: writable session + snapshot + approval. Postcondition:
         the returned DTO is the newly created sheet (resolved by the adapter).
+
+        When ``target_name`` is given the copy is renamed to it (validated by the
+        adapter: non-empty, ``<= 31`` chars, unique; an invalid value raises
+        ``INVALID_RANGE``). When ``target_name`` is ``None`` the copy keeps the
+        Excel-generated name (unchanged behaviour).
         """
 
         record = self._require_writable(workbook_id)
@@ -197,14 +204,14 @@ class SheetsService:
         self._require_approval(record, _ACTION_COPY)
 
         def copy_fn(wb: Any) -> SheetInfo:
-            return self._adapter.copy_sheet(wb, name, to_end=True)
+            return self._adapter.copy_sheet(wb, name, to_end=True, target_name=target_name)
 
         result = await self._submit_mutation(workbook_id, "sheet_copy", copy_fn, record)
         self._record_audit(
             "sheet_copy",
             "mutating",
             record,
-            {"workbook_id": workbook_id, "source": name},
+            {"workbook_id": workbook_id, "source": name, "target_name": target_name},
             {"sheet": result.name, "index": result.index},
         )
         return result

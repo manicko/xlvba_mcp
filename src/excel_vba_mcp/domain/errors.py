@@ -42,6 +42,11 @@ class ErrorCode(StrEnum):
     PATH_NOT_ALLOWED = "PATH_NOT_ALLOWED"
     # --- Phase 2 additions (task_040; additive, do not remove Stage 1 codes) ---
     INVALID_RANGE = "INVALID_RANGE"
+    # WP-Range (additive): a syntactically valid Range whose cell count exceeds
+    # ``MAX_RANGE_CELLS`` (100_000). Distinct from ``INVALID_RANGE`` (malformed /
+    # ambiguous / wrong-shaped ranges) so a caller can tell "too large, page it"
+    # from "bad address, fix it". Not retryable.
+    RANGE_TOO_LARGE = "RANGE_TOO_LARGE"
     PROTECTED_TARGET = "PROTECTED_TARGET"
     UNSUPPORTED_PIVOT_SOURCE = "UNSUPPORTED_PIVOT_SOURCE"
     STALE_TARGET = "STALE_TARGET"
@@ -164,6 +169,7 @@ _CATEGORY_BY_CODE: dict[ErrorCode, str] = {
     ErrorCode.NOT_FOUND: "not_found",
     # validation — caller argument/schema error (also the pydantic path).
     ErrorCode.INVALID_RANGE: "validation",
+    ErrorCode.RANGE_TOO_LARGE: "validation",
     ErrorCode.CONFIRMATION_REQUIRED: "validation",
     # internal — unhandled non-domain failure at the tool boundary (U6-B).
     ErrorCode.INTERNAL_ERROR: "internal",
@@ -230,6 +236,10 @@ _ACTIONS_BY_CODE: dict[ErrorCode, list[str]] = {
     ErrorCode.NOT_FOUND: ["verify workbook_id / object name / procedure"],
     ErrorCode.MACRO_NOT_FOUND: ["verify workbook_id / object name / procedure"],
     ErrorCode.INVALID_RANGE: ["fix arguments to match input schema"],
+    ErrorCode.RANGE_TOO_LARGE: [
+        "read/write in smaller ranges (offset/limit)",
+        "split the target into blocks of at most 100000 cells",
+    ],
     ErrorCode.ACCESS_VBOM_DISABLED: [
         "enable Trust access to the VBA project object model in Excel Trust Center"
     ],
@@ -518,6 +528,19 @@ class InvalidRangeError(ExcelVbaMcpError):
     default_message = "The range reference is invalid or out of bounds."
 
 
+class RangeTooLargeError(ExcelVbaMcpError):
+    """A syntactically valid Range exceeds ``MAX_RANGE_CELLS`` (WP-Range).
+
+    Raised by the range read/write preflight when a well-formed target is larger
+    than the 100_000-cell cap. Distinct from :class:`InvalidRangeError` (malformed
+    / ambiguous / wrong-shaped ranges): the address is valid, the caller must page
+    the work into smaller ranges. Not retryable.
+    """
+
+    default_code = ErrorCode.RANGE_TOO_LARGE
+    default_message = "The range exceeds the maximum supported cell count."
+
+
 class ProtectedTargetError(ExcelVbaMcpError):
     """The mutation target is protected, locked, or otherwise read-only."""
 
@@ -664,6 +687,7 @@ _ERROR_BY_CODE: dict[ErrorCode, type[ExcelVbaMcpError]] = {
     ErrorCode.PATH_NOT_ALLOWED: PathNotAllowedError,
     # Phase 2 additions (task_040).
     ErrorCode.INVALID_RANGE: InvalidRangeError,
+    ErrorCode.RANGE_TOO_LARGE: RangeTooLargeError,
     ErrorCode.PROTECTED_TARGET: ProtectedTargetError,
     ErrorCode.UNSUPPORTED_PIVOT_SOURCE: UnsupportedPivotSourceError,
     ErrorCode.STALE_TARGET: StaleTargetError,

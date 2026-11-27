@@ -34,7 +34,12 @@ from excel_vba_mcp.adapters.excel.sheets_adapter import SheetsAdapter
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.sheets_service import SheetsService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
-from excel_vba_mcp.domain.errors import ApprovalDeniedError, ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import (
+    ApprovalDeniedError,
+    ErrorCode,
+    ExcelVbaMcpError,
+    category_for,
+)
 from excel_vba_mcp.domain.statuses import (
     OperationClass,
     SessionMode,
@@ -430,6 +435,20 @@ def test_get_sheet_missing_raises() -> None:
         adapter.get_sheet(wb, "Nope")
 
 
+def test_get_sheet_missing_is_not_found() -> None:
+    # A missing sheet is a caller-addressed missing identity: NOT_FOUND (not the
+    # generic COM_BUSY / transient_com_failure fallback).
+    wb = FakeWorkbook([FakeSheet("Sheet1")])
+    adapter = SheetsAdapter()
+
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        adapter.get_sheet(wb, "Nope")
+    assert exc_info.value.code is ErrorCode.NOT_FOUND
+    assert category_for(exc_info.value.code) == "not_found"
+    assert exc_info.value.context["reason"] == "not_found"
+    assert exc_info.value.context["sheet"] == "Nope"
+
+
 def test_rename_keeps_code_name() -> None:
     wb = FakeWorkbook([FakeSheet("Old", code_name="Old_Code")])
     adapter = SheetsAdapter()
@@ -451,6 +470,51 @@ def test_add_sheet_and_copy_sheet() -> None:
     copied = adapter.copy_sheet(wb, "Sheet1", to_end=True)
     assert copied.name.startswith("Sheet1")
     assert copied.name != "Sheet1"
+
+
+def test_copy_sheet_with_target_name_renames() -> None:
+    wb = FakeWorkbook([FakeSheet("Sheet1")])
+    adapter = SheetsAdapter()
+
+    copied = adapter.copy_sheet(wb, "Sheet1", to_end=True, target_name="Sheet1Copy")
+
+    assert copied.name == "Sheet1Copy"
+    # The copy is a distinct, renamed sheet; the source is untouched.
+    names = {s.name for s in adapter.list_sheets(wb)}
+    assert "Sheet1" in names
+    assert "Sheet1Copy" in names
+
+
+def test_copy_sheet_without_target_name_unchanged() -> None:
+    wb = FakeWorkbook([FakeSheet("Sheet1")])
+    adapter = SheetsAdapter()
+
+    copied = adapter.copy_sheet(wb, "Sheet1", to_end=True)
+
+    # Excel-generated name (the fake yields "<name> (2)"); no rename applied.
+    assert copied.name == "Sheet1 (2)"
+
+
+def test_copy_sheet_duplicate_target_name_rejected() -> None:
+    wb = FakeWorkbook([FakeSheet("Sheet1"), FakeSheet("Data")])
+    adapter = SheetsAdapter()
+
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        adapter.copy_sheet(wb, "Sheet1", to_end=True, target_name="Data")
+    assert exc_info.value.code is ErrorCode.INVALID_RANGE
+    assert category_for(exc_info.value.code) == "validation"
+    assert exc_info.value.context["reason"] == "duplicate_target_name"
+
+
+@pytest.mark.parametrize("bad_name", ["", "   ", "x" * 32, "bad/name"])
+def test_copy_sheet_invalid_target_name_rejected(bad_name: str) -> None:
+    wb = FakeWorkbook([FakeSheet("Sheet1")])
+    adapter = SheetsAdapter()
+
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        adapter.copy_sheet(wb, "Sheet1", to_end=True, target_name=bad_name)
+    assert exc_info.value.code is ErrorCode.INVALID_RANGE
+    assert exc_info.value.context["reason"] == "invalid_target_name"
 
 
 def test_set_visibility_and_last_visible_guard() -> None:
@@ -556,6 +620,36 @@ async def test_copy_sheet_success(tmp_path: Path) -> None:
 
     assert copied.name.startswith("Sheet1")
     assert copied.name != "Sheet1"
+
+
+async def test_copy_sheet_with_target_name_success(tmp_path: Path) -> None:
+    rig = Rig(tmp_path)
+    info = await rig.open()
+    rig.add_snapshot(info.workbook_id)
+    rig.grant("sheet_copy")
+
+    copied = await rig.service.copy_sheet(
+        info.workbook_id, "Sheet1", target_name="Sheet1Copy"
+    )
+
+    assert copied.name == "Sheet1Copy"
+    names = {s.name for s in rig.service._adapter.list_sheets(rig.workbook())}
+    assert "Sheet1Copy" in names
+    mutate = next(s for s in rig.worker.submits if s["name"] == "sheet_copy")
+    assert mutate["op_class"] == OperationClass.MUTATING
+
+
+async def test_service_copy_sheet_duplicate_target_name_rejected(tmp_path: Path) -> None:
+    rig = Rig(tmp_path)
+    info = await rig.open()
+    rig.add_snapshot(info.workbook_id)
+    rig.grant("sheet_copy")
+
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        await rig.service.copy_sheet(info.workbook_id, "Sheet1", target_name="Data")
+    assert exc_info.value.code is ErrorCode.INVALID_RANGE
+    # The source sheet is untouched (the duplicate rename was rejected).
+    assert "Sheet1" in {s.Name for s in rig.workbook()._sheets}
 
 
 async def test_set_visibility_success(tmp_path: Path) -> None:

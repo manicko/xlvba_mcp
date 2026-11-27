@@ -296,23 +296,33 @@ class SnapshotService:
         auto-allowed in ``full`` mode. The snapshot baseline itself is only read,
         so no additional gate is needed.
 
-        Closes the current working copy **without saving** (when ``workbook_id``
-        is given and still open), then opens a fresh working copy from the
-        snapshot baseline via the session service. The freshly opened restored
-        session is **execute mode** and **writable** (``read_only=False``),
-        matching the default ``excel_open``; this lets the Full-Edit workflow
-        continue editing and running macros after a restore (an inspect-mode
-        restore would disable macros and make ``macro_run`` fail with
-        ``MACRO_BLOCKED``). The immutable snapshot file is never modified (the
-        session service copies it into ``work/`` before opening).
+        Lifecycle order (WP3; never close both copies, never zero): the fresh
+        working copy is opened from the snapshot baseline **first**, while the
+        previous working copy (when ``workbook_id`` is given and still open) is
+        left untouched. The restored copy is then **validated** (a lightweight
+        STA inspect confirms it is actually open in the owned instance). Only
+        **after** validation succeeds is the obsolete previous working copy
+        closed **without saving** (discarding its mutations). The restored copy
+        remains the single active session record. If validation of the restored
+        copy fails, the previous copy is kept open and a structured
+        ``SNAPSHOT_FAILED`` error is raised (the failed restored copy is cleaned
+        up best-effort so exactly one working copy — the previous one — remains).
+
+        The freshly opened restored session is **execute mode** and **writable**
+        (``read_only=False``), matching the default ``excel_open``; this lets the
+        Full-Edit workflow continue editing and running macros after a restore
+        (an inspect-mode restore would disable macros and make ``macro_run`` fail
+        with ``MACRO_BLOCKED``). The immutable snapshot file is never modified
+        (the session service copies it into ``work/`` before opening).
 
         External macro side effects are **not** undone — only the workbook file is
         restored (spec §9.4).
 
         Args:
             snapshot_id: The snapshot to restore.
-            workbook_id: The currently-open working copy to discard (no save).
-            timeout_s: Soft per-call ceiling for the STA open/close.
+            workbook_id: The currently-open working copy to discard (no save) once
+                the restored copy has been validated.
+            timeout_s: Soft per-call ceiling for the STA open/close/validate.
 
         Returns:
             A :class:`WorkbookInfo` describing the freshly opened working copy in
@@ -322,19 +332,17 @@ class SnapshotService:
         Raises:
             ApprovalDeniedError: If the inherited ``excel_open`` approval gate
                 denies the writable open (restricted mode).
-            SnapshotFailedError: If the snapshot does not exist.
+            SnapshotFailedError: If the snapshot does not exist, or the restored
+                working copy could not be validated as open (the previous copy is
+                kept open in that case).
         """
 
         manifest = self._store.load(snapshot_id)
         snapshot_file = self._store.path_for(snapshot_id) / manifest.file_name
 
-        if workbook_id is not None:
-            # Close the current working copy WITHOUT saving (discard mutations).
-            with contextlib.suppress(ExcelVbaMcpError):
-                await self._session.close_workbook(
-                    workbook_id, save_changes=False, timeout_s=timeout_s
-                )
-
+        # 1. Open the restored working copy FIRST, while the previous copy (if any)
+        #    is still open. If this open fails, the previous copy is untouched and
+        #    the error propagates — both copies are never closed.
         info = await self._session.open_workbook(
             str(snapshot_file),
             mode=SessionMode.EXECUTE,
@@ -344,6 +352,33 @@ class SnapshotService:
         # A freshly restored working copy is clean.
         with contextlib.suppress(Exception):
             info = info.model_copy(update={"source_path": manifest.source_path})
+
+        # 2. Validate the restored working copy BEFORE closing the previous copy.
+        #    On failure the previous copy is kept open; the just-opened (invalid)
+        #    restored copy is discarded best-effort so exactly one copy remains.
+        try:
+            await self._validate_restored_copy(info, timeout_s=timeout_s)
+        except ExcelVbaMcpError:
+            with contextlib.suppress(ExcelVbaMcpError):
+                await self._session.close_workbook(
+                    info.workbook_id,
+                    save_changes=False,
+                    discard_changes=True,
+                    timeout_s=timeout_s,
+                )
+            raise
+
+        # 3. Validation succeeded: close the obsolete previous working copy
+        #    WITHOUT saving (discard mutations). The restored copy remains the
+        #    single active session record (never both, never zero).
+        if workbook_id is not None and workbook_id != info.workbook_id:
+            with contextlib.suppress(ExcelVbaMcpError):
+                await self._session.close_workbook(
+                    workbook_id,
+                    save_changes=False,
+                    discard_changes=True,
+                    timeout_s=timeout_s,
+                )
 
         self._latest_snapshot[info.workbook_id] = manifest
         self._known_sources[info.workbook_id] = manifest.source_path
@@ -360,6 +395,57 @@ class SnapshotService:
             },
         )
         return info
+
+    async def _validate_restored_copy(self, info: WorkbookInfo, *, timeout_s: float) -> None:
+        """Confirm the restored working copy is actually open in the owned instance.
+
+        Runs a lightweight, read-only inspect on the single-STA worker: it locates
+        the restored workbook by its working path (``wb.FullName``) and touches a
+        harmless property to prove the instance responds. It raises
+        :class:`~excel_vba_mcp.domain.errors.SnapshotFailedError` (a structured
+        ``SNAPSHOT_FAILED``) when the restored copy cannot be found or inspected,
+        so :meth:`restore_snapshot` never closes the previous working copy until
+        the restored one is known-good.
+        """
+
+        app_adapter = self._app_adapter()
+        working_path = info.path
+
+        def inspect_restored_fn() -> bool:
+            wb = _find_open_workbook(app_adapter, working_path)
+            if wb is None:
+                return False
+            # Touch a harmless property to confirm the instance actually responds.
+            _ = wb.FullName
+            return True
+
+        inspect_restored_fn.__name__ = "validate_restored"
+        try:
+            valid = await self._worker.submit(
+                inspect_restored_fn,
+                timeout=timeout_s,
+                section="diagnostic",
+                op_class=OperationClass.READ_ONLY,
+            )
+        except ExcelVbaMcpError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - wrap any inspect failure
+            raise SnapshotFailedError(
+                "The restored working copy could not be validated as open.",
+                context={
+                    "restored_workbook_id": info.workbook_id,
+                    "working_path": working_path,
+                    "error": str(exc),
+                },
+            ) from exc
+        if not valid:
+            raise SnapshotFailedError(
+                "The restored working copy is not open in the owned instance.",
+                context={
+                    "restored_workbook_id": info.workbook_id,
+                    "working_path": working_path,
+                },
+            )
 
     # ------------------------------------------------------------------
     # Diff / list

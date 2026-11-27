@@ -117,6 +117,7 @@ from excel_vba_mcp.domain.errors import (
     InvalidRangeError,
     ListObjectIntersectionError,
     ProtectedTargetError,
+    RangeTooLargeError,
 )
 from excel_vba_mcp.domain.models import (
     MAX_RANGE_CELLS,
@@ -137,9 +138,11 @@ from excel_vba_mcp.domain.models import (
     RangeFormulas,
     RangeMutationResult,
     RangeValues,
+    ScalarValue,
     StructuralMutationResult,
     ValidationRule,
     ValidationSpec,
+    coerce_cell_value,
 )
 from excel_vba_mcp.domain.statuses import (
     CellValueKind,
@@ -1002,16 +1005,19 @@ class RangesAdapter:
         address: str,
         rows: int,
         cols: int,
-        values: list[list[CellValue]],
+        values: list[list[CellValue | ScalarValue]],
     ) -> RangeMutationResult:
         """Write typed cell values to a bounded Range and verify the result.
 
         The payload shape (``rows`` x ``cols``) is validated against the resolved
         target **before** any COM mutation; a wrong-sized payload raises a typed
         :class:`~excel_vba_mcp.domain.errors.InvalidRangeError` and leaves the
-        workbook untouched. ``None`` clears a cell; ``datetime`` values are
-        converted to an Excel serial; Excel error literals are written as error
-        values; a string beginning with ``=`` is stored as text (never a formula).
+        workbook untouched. Each cell may be a typed :class:`CellValue` or a raw
+        JSON scalar (WP-Range): a string / number / boolean / ``null`` is coerced
+        to a literal :class:`CellValue` by real JSON type only (a leading ``=``
+        stays text, never a formula). ``None`` clears a cell; ``datetime`` values
+        are converted to an Excel serial; Excel error literals are written as error
+        values.
 
         When the target intersects a ListObject, the adapter captures the table
         geometry before and after the write and rejects a structural change with
@@ -1022,13 +1028,14 @@ class RangesAdapter:
         _validate_payload_shape(resolved.rows, resolved.cols, rows, cols, len(values))
         _validate_target_cells(resolved.rows * resolved.cols)
 
+        normalized = _normalize_value_grid(values)
         table_before = _capture_tables(worksheet, range_obj)
-        raw_grid = _values_to_raw_grid(values, rows, cols)
+        raw_grid = _values_to_raw_grid(normalized, rows, cols)
         _assign_value2(range_obj, raw_grid, rows, cols)
         _guard_table_structure(worksheet, range_obj, table_before)
 
         post = self.read_values(wb, sheet, address)
-        verified = _values_match(values, post)
+        verified = _values_match(normalized, post)
         notes: list[str] = []
         if not verified:
             notes.append("Postcondition mismatch: the re-read values differ from the payload.")
@@ -2974,13 +2981,42 @@ def _validate_payload_shape(
 
 
 def _validate_target_cells(cells: int) -> None:
-    """Reject a target larger than ``MAX_RANGE_CELLS`` before any mutation."""
+    """Reject a valid target larger than ``MAX_RANGE_CELLS`` before any mutation.
+
+    A well-formed but oversized target raises
+    :class:`~excel_vba_mcp.domain.errors.RangeTooLargeError` (``RANGE_TOO_LARGE``),
+    not ``INVALID_RANGE`` — the address is valid, the caller must page the write.
+    """
 
     if cells > MAX_RANGE_CELLS:
-        raise InvalidRangeError(
+        raise RangeTooLargeError(
             f"Target {cells} cells exceeds MAX_RANGE_CELLS ({MAX_RANGE_CELLS}).",
             context={"cells": cells, "limit": MAX_RANGE_CELLS},
         )
+
+
+def _normalize_value_grid(
+    values: list[list[CellValue | ScalarValue]],
+) -> list[list[CellValue]]:
+    """Coerce a raw/typed value grid to a fully typed :class:`CellValue` grid.
+
+    Defense in depth for the adapter write path (WP-Range): the service passes an
+    already-normalized grid from :class:`RangeWriteRequest`, but a direct caller
+    may supply raw JSON scalars. Each cell is coerced by real JSON type only (a
+    leading ``=`` stays text); a ``dict`` is validated as a :class:`CellValue`.
+    """
+
+    normalized: list[list[CellValue]] = []
+    for row in values:
+        normalized_row: list[CellValue] = []
+        for cell in row:
+            coerced = coerce_cell_value(cell)
+            if isinstance(coerced, CellValue):
+                normalized_row.append(coerced)
+            else:
+                normalized_row.append(CellValue.model_validate(coerced))
+        normalized.append(normalized_row)
+    return normalized
 
 
 def _values_to_raw_grid(
@@ -3707,14 +3743,16 @@ def _window(
     """Compute the bounded ``(start, end, truncated)`` row window.
 
     Rejects a request whose full size exceeds
-    :data:`~excel_vba_mcp.domain.models.MAX_RANGE_CELLS` before any cell is read,
+    :data:`~excel_vba_mcp.domain.models.MAX_RANGE_CELLS` before any cell is read
+    with :class:`~excel_vba_mcp.domain.errors.RangeTooLargeError`
+    (``RANGE_TOO_LARGE`` — a valid but oversized range, not ``INVALID_RANGE``),
     then bounds the returned rows by
     :data:`~excel_vba_mcp.domain.models.MAX_RESPONSE_CELLS` (setting
     ``truncated`` when the response is cut short).
     """
 
     if total_rows * total_cols > MAX_RANGE_CELLS:
-        raise InvalidRangeError(
+        raise RangeTooLargeError(
             f"Range {total_rows}x{total_cols}={total_rows * total_cols} exceeds "
             f"MAX_RANGE_CELLS ({MAX_RANGE_CELLS}).",
             context={

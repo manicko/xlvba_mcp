@@ -130,7 +130,9 @@ async def sheet_rename(workbook_id: str, name: str, new_name: str) -> SheetInfo:
     return await service.rename_sheet(workbook_id, name, new_name)
 
 
-async def sheet_copy(workbook_id: str, name: str) -> SheetInfo:
+async def sheet_copy(
+    workbook_id: str, name: str, *, target_name: str | None = None
+) -> SheetInfo:
     """Copy a sheet and return the new sheet's DTO.
 
     Guarded mutation: requires a writable session, a snapshot and an approval
@@ -139,12 +141,16 @@ async def sheet_copy(workbook_id: str, name: str) -> SheetInfo:
     Args:
         workbook_id: The id returned by :func:`excel_open`.
         name: The sheet to copy.
+        target_name: Optional name for the copy. When given the new sheet is
+            renamed to it (validated non-empty, ``<= 31`` chars, unique; an
+            invalid value raises ``INVALID_RANGE``). When ``None`` the copy keeps
+            the Excel-generated name.
     """
 
     _require_non_empty(workbook_id, "workbook_id")
     _require_non_empty(name, "name")
     service = get_sheets_service()
-    return await service.copy_sheet(workbook_id, name)
+    return await service.copy_sheet(workbook_id, name, target_name=target_name)
 
 
 async def sheet_delete(workbook_id: str, name: str) -> SheetInfo:
@@ -191,6 +197,7 @@ async def sheet(
     new_name: str | None = None,
     sheet_type: str = "worksheet",
     visible: bool | None = None,
+    target_name: str | None = None,
 ) -> SheetInfo:
     """Sheet mutation dispatch: ``add``, ``rename``, ``copy`` or ``set-visibility`` (WP2).
 
@@ -213,6 +220,9 @@ async def sheet(
         sheet_type: Only ``"worksheet"`` is supported (``add`` only).
         visible: ``True`` for ``xlSheetVisible``, ``False`` for ``xlSheetHidden``
             (``set-visibility`` only).
+        target_name: Optional name for the copy (``copy`` only); when given the
+            new sheet is renamed to it (validated non-empty, ``<= 31`` chars,
+            unique).
 
     Returns:
         The affected :class:`SheetInfo` (the new sheet for ``add`` / ``copy``,
@@ -225,7 +235,7 @@ async def sheet(
     if action == "rename":
         return await sheet_rename(workbook_id or "", name or "", new_name or "")
     if action == "copy":
-        return await sheet_copy(workbook_id or "", name or "")
+        return await sheet_copy(workbook_id or "", name or "", target_name=target_name)
     if action == "set-visibility":
         if visible is None:
             raise ExcelVbaMcpError(

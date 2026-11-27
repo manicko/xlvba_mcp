@@ -60,9 +60,11 @@ class FakeSheetsService:
         self.calls.append(("rename", (workbook_id, name, new_name)))
         return _sheet_info(new_name)
 
-    async def copy_sheet(self, workbook_id: str, name: str) -> SheetInfo:
-        self.calls.append(("copy", (workbook_id, name)))
-        return _sheet_info(name)
+    async def copy_sheet(
+        self, workbook_id: str, name: str, *, target_name: str | None = None
+    ) -> SheetInfo:
+        self.calls.append(("copy", (workbook_id, name, target_name)))
+        return _sheet_info(target_name or name)
 
     async def delete_sheet(self, workbook_id: str, name: str) -> SheetInfo:
         self.calls.append(("delete", (workbook_id, name)))
@@ -111,7 +113,16 @@ async def test_sheet_copy_routes_to_copy(_install_fake: FakeSheetsService) -> No
 
     name, args = _install_fake.calls[-1]
     assert name == "copy"
-    assert args == ("wb1", "Data")
+    assert args == ("wb1", "Data", None)
+
+
+async def test_sheet_copy_with_target_name_routes(_install_fake: FakeSheetsService) -> None:
+    info = await sheet("copy", workbook_id="wb1", name="Data", target_name="DataCopy")
+
+    assert info.name == "DataCopy"
+    name, args = _install_fake.calls[-1]
+    assert name == "copy"
+    assert args == ("wb1", "Data", "DataCopy")
 
 
 async def test_sheet_set_visibility_routes(_install_fake: FakeSheetsService) -> None:

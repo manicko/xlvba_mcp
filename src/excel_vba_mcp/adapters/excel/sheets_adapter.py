@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ExcelVbaMcpError, InvalidRangeError, ObjectNotFoundError
 from excel_vba_mcp.domain.models import SheetInfo
 from excel_vba_mcp.domain.statuses import SheetObjectType, SheetVisibility
 
@@ -42,6 +42,10 @@ _XL_SHEET_VERY_HIDDEN = 2
 
 # ``WshSheetType`` codes for ``Sheets.Add(Type=...)`` (MVP supports Worksheet).
 _XL_WORKSHEET = -4167
+
+# Excel worksheet-name constraints (validation for an explicit copy target name).
+_MAX_SHEET_NAME_LEN = 31
+_INVALID_SHEET_NAME_CHARS = frozenset(":\\/?*[]")
 
 
 def _safe_str(value: Any, default: str = "") -> str:
@@ -207,9 +211,11 @@ def _require_sheet(sheets: Any, name: str) -> Any:
     try:
         return sheets.Item(name)
     except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
-        raise ExcelVbaMcpError(
+        # A missing sheet is a caller-addressed missing identity, not COM
+        # contention: surface NOT_FOUND (not the generic COM_BUSY fallback).
+        raise ObjectNotFoundError(
             f"Sheet {name!r} was not found in the workbook.",
-            context={"sheet": name},
+            context={"sheet": name, "reason": "not_found"},
         ) from exc
 
 
@@ -311,12 +317,24 @@ class SheetsAdapter:
             ) from exc
         return describe_sheet(wb, sheet)
 
-    def copy_sheet(self, wb: Any, name: str, *, to_end: bool = True) -> SheetInfo:
+    def copy_sheet(
+        self,
+        wb: Any,
+        name: str,
+        *,
+        to_end: bool = True,
+        target_name: str | None = None,
+    ) -> SheetInfo:
         """Copy ``name`` and return the DTO of the new sheet.
 
         ``to_end=True`` places the copy after the last sheet; otherwise Excel
         places it before the source. ``CodeName`` is never touched on the source
         (the copy receives its own Excel-assigned code name).
+
+        When ``target_name`` is given the new sheet is renamed to it (validated
+        non-empty, ``<= 31`` chars and unique; an invalid value raises
+        ``INVALID_RANGE``). When ``target_name`` is ``None`` the copy keeps the
+        Excel-generated name (unchanged behaviour).
         """
 
         sheets = wb.Sheets
@@ -335,22 +353,18 @@ class SheetsAdapter:
             ) from exc
         # Re-fetch the collection: the pre-copy COM object can be stale after Copy.
         sheets = wb.Sheets
-        # The copy is the newly appeared sheet; resolve it by diffing the
-        # pre-copy name set (Excel names a copy "<name> (2)" by default).
-        for sheet in sheets:
-            sheet_name = _safe_str(sheet.Name)
-            if sheet_name not in before_names:
-                return describe_sheet(wb, sheet)
-        # Fallback: the copy shares the source name pattern and is not the source.
-        source_name = _safe_str(source.Name)
-        for sheet in sheets:
-            sheet_name = _safe_str(sheet.Name)
-            if sheet_name != source_name and sheet_name.startswith(source_name):
-                return describe_sheet(wb, sheet)
-        raise ExcelVbaMcpError(
-            "Could not determine the copied sheet after Copy().",
-            context={"sheet": name, "to_end": to_end},
-        )
+        new_sheet = _find_copied_sheet(sheets, source, before_names, name=name, to_end=to_end)
+        if target_name is not None:
+            existing_names = {_safe_str(sheet.Name) for sheet in sheets}
+            candidate = _validate_target_name(target_name, existing_names)
+            try:
+                new_sheet.Name = candidate
+            except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
+                raise InvalidRangeError(
+                    f"Could not set the copied sheet name to {candidate!r}.",
+                    context={"target_name": target_name, "reason": "invalid_target_name"},
+                ) from exc
+        return describe_sheet(wb, new_sheet)
 
     def delete_sheet(self, wb: Any, name: str) -> SheetInfo:
         """Delete ``name`` and return the DTO captured *before* deletion.
@@ -400,6 +414,71 @@ def visible_worksheet_count(wb: Any) -> int:
     """Public helper: count visible worksheets in ``wb`` (guard input)."""
 
     return _visible_worksheet_count(wb)
+
+
+def _validate_target_name(target_name: str, existing_names: set[str]) -> str:
+    """Validate an explicit copy target name (non-empty, <=31 chars, unique).
+
+    Rejects an empty / over-long / Excel-illegal / duplicate name with
+    ``INVALID_RANGE`` (a caller argument error) before the rename is attempted, so
+    a bad ``target_name`` never reaches the COM ``Name`` setter.
+    """
+
+    candidate = target_name.strip()
+    if not candidate:
+        raise InvalidRangeError(
+            "Argument 'target_name' must be a non-empty string.",
+            context={"target_name": target_name, "reason": "invalid_target_name"},
+        )
+    if len(candidate) > _MAX_SHEET_NAME_LEN:
+        raise InvalidRangeError(
+            f"Argument 'target_name' must be at most {_MAX_SHEET_NAME_LEN} characters.",
+            context={"target_name": target_name, "reason": "invalid_target_name"},
+        )
+    if any(char in _INVALID_SHEET_NAME_CHARS for char in candidate):
+        raise InvalidRangeError(
+            "Argument 'target_name' contains a character Excel does not allow in a "
+            "sheet name (: \\ / ? * [ ]).",
+            context={"target_name": target_name, "reason": "invalid_target_name"},
+        )
+    if candidate.casefold() in {name.casefold() for name in existing_names}:
+        raise InvalidRangeError(
+            f"A sheet named {candidate!r} already exists; 'target_name' must be unique.",
+            context={"target_name": target_name, "reason": "duplicate_target_name"},
+        )
+    return candidate
+
+
+def _find_copied_sheet(
+    sheets: Any,
+    source: Any,
+    before_names: set[str],
+    *,
+    name: str,
+    to_end: bool,
+) -> Any:
+    """Return the newly created sheet proxy after ``Copy()`` (STA-local).
+
+    The copy is the newly appeared sheet (Excel names it ``"<name> (2)"`` by
+    default); it is resolved by diffing the pre-copy name set, with a fallback to
+    the source name pattern. A copy that cannot be identified raises a structured
+    error rather than guessing.
+    """
+
+    for sheet in sheets:
+        sheet_name = _safe_str(sheet.Name)
+        if sheet_name not in before_names:
+            return sheet
+    # Fallback: the copy shares the source name pattern and is not the source.
+    source_name = _safe_str(source.Name)
+    for sheet in sheets:
+        sheet_name = _safe_str(sheet.Name)
+        if sheet_name != source_name and sheet_name.startswith(source_name):
+            return sheet
+    raise ExcelVbaMcpError(
+        "Could not determine the copied sheet after Copy().",
+        context={"sheet": name, "to_end": to_end},
+    )
 
 
 __all__ = [

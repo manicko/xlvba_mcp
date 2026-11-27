@@ -598,11 +598,29 @@ def test_read_values_rejects_oversized_request_before_reading() -> None:
     wb = FakeWorkbook([FakeSheet("Data")])
     adapter = RangesAdapter()
 
-    # A range larger than MAX_RANGE_CELLS must be rejected up front.
+    # A syntactically valid range larger than MAX_RANGE_CELLS must be rejected up
+    # front with the dedicated RANGE_TOO_LARGE code (not INVALID_RANGE): the
+    # address is well-formed, the caller must page the read.
     with pytest.raises(ExcelVbaMcpError) as exc_info:
         adapter.read_values(wb, "Data", "A1:XFD1048576")
-    assert exc_info.value.code is ErrorCode.INVALID_RANGE
+    assert exc_info.value.code is ErrorCode.RANGE_TOO_LARGE
+    assert exc_info.value.code is not ErrorCode.INVALID_RANGE
     assert exc_info.value.context["cells"] > MAX_RANGE_CELLS
+
+
+def test_read_values_valid_range_over_cap_is_range_too_large() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    adapter = RangesAdapter()
+
+    # A valid single-column range one row over the 100k cap: valid address, over
+    # the limit -> RANGE_TOO_LARGE, never truncated (the request is rejected, not
+    # silently cut short) and never the generic INVALID_RANGE.
+    rows = MAX_RANGE_CELLS + 1
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        adapter.read_values(wb, "Data", f"A1:A{rows}")
+    assert exc_info.value.code is ErrorCode.RANGE_TOO_LARGE
+    assert exc_info.value.context["cells"] == rows
+    assert exc_info.value.context["limit"] == MAX_RANGE_CELLS
 
 
 def test_read_values_truncates_response() -> None:

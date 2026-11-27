@@ -312,15 +312,20 @@ async def range_write_values(
     """Write typed cell values to a bounded Range.
 
     The payload shape is validated against the target **before** any COM
-    mutation. A string beginning with ``=`` is stored as text, not a formula.
-    Guarded mutation: requires a writable session, a snapshot, an approval grant
-    and a postcondition re-read.
+    mutation. Each cell accepts a typed :class:`CellValue` or a raw JSON scalar
+    (WP-Range): a string, number, boolean or ``null`` is stored as a literal value
+    coerced by real JSON type only (no ambiguous string coercion — ``"true"`` /
+    ``"123"`` / ``"2024-01-01"`` stay strings). A string beginning with ``=`` is
+    stored as text, not a formula; formula interpretation is **exclusive** to
+    :func:`range_write_formulas`. Guarded mutation: requires a writable session, a
+    snapshot, an approval grant and a postcondition re-read.
 
     Args:
         workbook_id: The id returned by ``excel_open``.
         sheet: The worksheet name.
         address: The A1-style target address (its dimensions must match payload).
-        payload: The bounded 2-D value grid (:class:`RangeWriteRequest`).
+        payload: The bounded 2-D value grid (:class:`RangeWriteRequest`); each cell
+            is a :class:`CellValue` or a raw JSON scalar.
     """
 
     _require_non_empty(workbook_id, "workbook_id")

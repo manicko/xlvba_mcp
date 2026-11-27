@@ -1210,6 +1210,52 @@ class ConditionalFormatMutationResult(DomainModel):
 # ---------------------------------------------------------------------------
 
 
+#: A raw JSON scalar accepted as a literal cell value by
+#: :class:`RangeWriteRequest` (WP-Range ergonomics). Coercion to
+#: :class:`CellValue` is **unambiguous** and driven only by the real JSON type:
+#: a JSON string -> ``string`` (a leading ``=`` stays literal text; formula
+#: interpretation is exclusive to :class:`FormulaWriteRequest`), a JSON number
+#: (int/float, never bool) -> ``number``, a JSON bool -> ``boolean``, and JSON
+#: ``null`` -> ``empty``. Strings such as ``"true"`` / ``"123"`` / ``"2024-01-01"``
+#: are **not** coerced to bool/number/date — they stay strings.
+ScalarValue = str | int | float | bool | None
+
+
+def coerce_cell_value(raw: object) -> CellValue | dict[str, Any]:
+    """Coerce one raw cell input to a :class:`CellValue` (unambiguous, WP-Range).
+
+    A :class:`CellValue` passes through unchanged; a ``dict`` is returned as-is so
+    Pydantic validates it as a :class:`CellValue` (a malformed dict surfaces as a
+    normal validation error). A raw JSON scalar maps by its **real** type only:
+
+    * ``None`` -> ``CellValue{kind: "empty"}`` (an empty cell);
+    * ``bool`` -> ``CellValue{kind: "boolean"}`` (checked before ``int`` because
+      ``bool`` is a subclass of ``int``);
+    * ``int`` / ``float`` -> ``CellValue{kind: "number"}``;
+    * ``str`` -> ``CellValue{kind: "string"}`` (a leading ``=`` stays text).
+
+    Any other type (e.g. a nested ``list``) raises ``ValueError`` so the request
+    is rejected rather than silently coerced.
+    """
+
+    if isinstance(raw, CellValue):
+        return raw
+    if raw is None:
+        return CellValue(kind=CellValueKind.EMPTY)
+    if isinstance(raw, bool):
+        return CellValue(kind=CellValueKind.BOOLEAN, value=raw)
+    if isinstance(raw, (int, float)):
+        return CellValue(kind=CellValueKind.NUMBER, value=raw)
+    if isinstance(raw, str):
+        return CellValue(kind=CellValueKind.STRING, value=raw)
+    if isinstance(raw, dict):
+        return raw
+    raise ValueError(
+        "A cell value must be a CellValue object or a raw JSON scalar "
+        "(string, number, boolean or null)."
+    )
+
+
 class RangeWriteRequest(DomainModel):
     """Bounded 2-D bulk write payload for values/formulas (task_038 §3.3).
 
@@ -1217,11 +1263,37 @@ class RangeWriteRequest(DomainModel):
     ceilings or when ``values`` shape does not match ``rows`` × ``cols``. A
     string beginning with ``=`` is **not** a formula: value writes store text;
     formula writes use :class:`FormulaWriteRequest`.
+
+    Each cell accepts either a typed :class:`CellValue` or a raw JSON scalar
+    (WP-Range ergonomics): a string, number, boolean or ``null`` is coerced to a
+    literal :class:`CellValue` by real JSON type only (no ambiguous string
+    coercion — see :data:`ScalarValue` / :func:`coerce_cell_value`). The
+    normalization runs before field validation, so ``values`` always holds
+    :class:`CellValue` instances after construction while the input schema still
+    advertises the raw-scalar union.
     """
 
     rows: int = Field(ge=1)
     cols: int = Field(ge=1)
-    values: list[list[CellValue]]
+    values: list[list[CellValue | ScalarValue]]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_values(cls, data: object) -> object:
+        """Coerce raw scalar cells to :class:`CellValue` before field validation."""
+
+        if not isinstance(data, dict):
+            return data
+        raw_values = data.get("values")
+        if not isinstance(raw_values, list):
+            return data
+        normalized: list[object] = []
+        for row in raw_values:
+            if isinstance(row, list):
+                normalized.append([coerce_cell_value(cell) for cell in row])
+            else:
+                normalized.append(row)
+        return {**data, "values": normalized}
 
     @model_validator(mode="after")
     def _check_bounds(self) -> Self:

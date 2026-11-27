@@ -40,7 +40,12 @@ from excel_vba_mcp.adapters.excel.names_adapter import NamesAdapter
 from excel_vba_mcp.application.names_service import NamesService
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
-from excel_vba_mcp.domain.errors import ApprovalDeniedError, ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import (
+    ApprovalDeniedError,
+    ErrorCode,
+    ExcelVbaMcpError,
+    category_for,
+)
 from excel_vba_mcp.domain.models import DefinedNameInfo
 from excel_vba_mcp.domain.statuses import (
     NameScope,
@@ -479,6 +484,34 @@ def test_get_name_missing_raises() -> None:
     adapter = NamesAdapter()
     with pytest.raises(ExcelVbaMcpError):
         adapter.get_name(wb, "NoSuchName", NameScope.WORKBOOK)
+
+
+def test_get_name_missing_is_not_found() -> None:
+    # A missing defined name is a caller-addressed missing identity: NOT_FOUND
+    # (not the generic COM_BUSY / transient_com_failure fallback).
+    wb = _populated_workbook()
+    adapter = NamesAdapter()
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        adapter.get_name(wb, "NoSuchName", NameScope.WORKBOOK)
+    assert exc_info.value.code is ErrorCode.NOT_FOUND
+    assert category_for(exc_info.value.code) == "not_found"
+    assert exc_info.value.context["reason"] == "not_found"
+    assert exc_info.value.context["name"] == "NoSuchName"
+
+
+def test_worksheet_scope_missing_sheet_is_not_found() -> None:
+    # A worksheet-scoped name whose owning sheet does not exist is a missing
+    # identity: NOT_FOUND (not COM_BUSY).
+    wb = _populated_workbook()
+    adapter = NamesAdapter()
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        adapter.create_name(
+            wb, "Local", "=1", scope=NameScope.WORKSHEET, sheet="NoSuchSheet"
+        )
+    assert exc_info.value.code is ErrorCode.NOT_FOUND
+    assert category_for(exc_info.value.code) == "not_found"
+    assert exc_info.value.context["reason"] == "not_found"
+    assert exc_info.value.context["sheet"] == "NoSuchSheet"
 
 
 def test_get_name_worksheet_requires_sheet() -> None:

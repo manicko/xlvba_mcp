@@ -44,7 +44,7 @@ import re
 from collections.abc import Iterator
 from typing import Any
 
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ExcelVbaMcpError, ObjectNotFoundError
 from excel_vba_mcp.domain.models import DefinedNameInfo
 from excel_vba_mcp.domain.statuses import NameScope, NameTargetKind
 
@@ -264,9 +264,11 @@ def _require_worksheet(wb: Any, sheet: str) -> Any:
     try:
         return wb.Worksheets.Item(sheet)
     except Exception as exc:  # noqa: BLE001 - convert COM error to domain error
-        raise ExcelVbaMcpError(
+        # A missing worksheet is a caller-addressed missing identity, not COM
+        # contention: surface NOT_FOUND (not the generic COM_BUSY fallback).
+        raise ObjectNotFoundError(
             f"Worksheet {sheet!r} was not found in the workbook.",
-            context={"sheet": sheet},
+            context={"sheet": sheet, "reason": "not_found"},
         ) from exc
 
 
@@ -556,9 +558,16 @@ class NamesAdapter:
             matches.append(name_obj)
 
         if not matches:
-            raise ExcelVbaMcpError(
+            # A missing defined name is a caller-addressed missing identity, not
+            # COM contention: surface NOT_FOUND (not the generic COM_BUSY fallback).
+            raise ObjectNotFoundError(
                 f"Defined name {name!r} was not found in {scope.value} scope.",
-                context={"name": name, "scope": scope.value, "sheet": sheet},
+                context={
+                    "name": name,
+                    "scope": scope.value,
+                    "sheet": sheet,
+                    "reason": "not_found",
+                },
             )
         if len(matches) > 1:
             raise ExcelVbaMcpError(

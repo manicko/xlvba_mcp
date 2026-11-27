@@ -32,12 +32,13 @@ import pytest
 
 from excel_vba_mcp.adapters.excel.app_adapter import ExcelAppAdapter
 from excel_vba_mcp.adapters.excel.com_worker import WorkerStatus
-from excel_vba_mcp.adapters.excel.ranges_adapter import RangesAdapter
+from excel_vba_mcp.adapters.excel.ranges_adapter import RangesAdapter, _validate_target_cells
 from excel_vba_mcp.application.ranges_service import RangesService
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.snapshot_service import SnapshotService
 from excel_vba_mcp.domain.errors import ApprovalDeniedError, ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
+    MAX_RANGE_CELLS,
     CellValue,
     FormulaWriteRequest,
     RangeWriteRequest,
@@ -607,6 +608,86 @@ def test_write_values_error_literal_serializes_to_ole_code() -> None:
     result = adapter.write_values(wb, "Data", "A1", 1, 1, [[_cv(CellValueKind.ERROR, "#DIV/0!")]])
     assert result.verified is True
     assert wb.sheet("Data").get(1, 1) == -2146826281
+
+
+# ---------------------------------------------------------------------------
+# Adapter-level: raw JSON scalars (WP-Range ergonomics)
+# ---------------------------------------------------------------------------
+def test_write_values_accepts_raw_scalars() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    adapter = RangesAdapter()
+
+    # Raw JSON scalars (no {kind, value} wrapper) are stored as literals by real
+    # JSON type only: string, number, boolean, null.
+    grid = [["hello", 42, True, None]]
+    result = adapter.write_values(wb, "Data", "A1:D1", 1, 4, grid)
+    assert result.verified is True
+    sheet = wb.sheet("Data")
+    assert sheet.get(1, 1) == "hello"
+    assert sheet.get(1, 2) == 42
+    assert sheet.get(1, 3) is True
+    assert sheet.get(1, 4) is None
+    kinds = [cell.kind for cell in result.postcondition_values.values[0]]  # type: ignore[union-attr]
+    assert kinds == [
+        CellValueKind.STRING,
+        CellValueKind.NUMBER,
+        CellValueKind.BOOLEAN,
+        CellValueKind.EMPTY,
+    ]
+
+
+def test_write_values_raw_leading_equals_stays_text() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    adapter = RangesAdapter()
+
+    result = adapter.write_values(wb, "Data", "A1", 1, 1, [["=1+1"]])
+    assert result.verified is True
+    # A raw string beginning with '=' is stored as text, never a formula.
+    assert wb.sheet("Data").get(1, 1) == "=1+1"
+    assert wb.sheet("Data").get_formula(1, 1) == "=1+1"
+
+
+def test_write_values_raw_ambiguous_strings_stay_strings() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    adapter = RangesAdapter()
+
+    # "true" / "123" / "2024-01-01" are real JSON strings and must NOT be coerced
+    # to bool / number / date (no ambiguous coercion).
+    grid = [["true", "123", "2024-01-01"]]
+    result = adapter.write_values(wb, "Data", "A1:C1", 1, 3, grid)
+    assert result.verified is True
+    kinds = [cell.kind for cell in result.postcondition_values.values[0]]  # type: ignore[union-attr]
+    assert kinds == [CellValueKind.STRING, CellValueKind.STRING, CellValueKind.STRING]
+    assert wb.sheet("Data").get(1, 2) == "123"
+
+
+def test_write_values_cellvalue_dict_still_works() -> None:
+    wb = FakeWorkbook([FakeSheet("Data")])
+    adapter = RangesAdapter()
+
+    # A typed CellValue dict is still accepted unchanged alongside raw scalars.
+    grid = [[{"kind": "number", "value": 7}, "x"]]
+    result = adapter.write_values(wb, "Data", "A1:B1", 1, 2, grid)
+    assert result.verified is True
+    assert wb.sheet("Data").get(1, 1) == 7
+    assert wb.sheet("Data").get(1, 2) == "x"
+
+
+# ---------------------------------------------------------------------------
+# Adapter-level: over-cap valid target -> RANGE_TOO_LARGE (WP-Range)
+# ---------------------------------------------------------------------------
+def test_validate_target_cells_rejects_valid_over_cap() -> None:
+    # A valid target one cell over the cap is RANGE_TOO_LARGE, not INVALID_RANGE.
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        _validate_target_cells(MAX_RANGE_CELLS + 1)
+    assert exc_info.value.code is ErrorCode.RANGE_TOO_LARGE
+    assert exc_info.value.code is not ErrorCode.INVALID_RANGE
+    assert exc_info.value.context["cells"] == MAX_RANGE_CELLS + 1
+
+
+def test_validate_target_cells_allows_exact_cap() -> None:
+    # Exactly at the cap is allowed (no raise).
+    _validate_target_cells(MAX_RANGE_CELLS)
 
 
 # ---------------------------------------------------------------------------

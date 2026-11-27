@@ -82,6 +82,7 @@ from excel_vba_mcp.domain.errors import (
     ErrorCode,
     ExcelVbaMcpError,
     InvalidRangeError,
+    ObjectNotFoundError,
     UnsupportedPivotSourceError,
 )
 from excel_vba_mcp.domain.models import (
@@ -767,9 +768,11 @@ def _find_pivot(wb: Any, pivot_table: str) -> Any:
         name = _get_str(pivot, "Name") or ""
         if name.lower() == target:
             return pivot
-    raise ExcelVbaMcpError(
+    # A missing PivotTable is a caller-addressed missing identity, not COM
+    # contention: surface NOT_FOUND (not the generic COM_BUSY fallback).
+    raise ObjectNotFoundError(
         f"PivotTable {pivot_table!r} was not found in the workbook.",
-        context={"pivot_table": pivot_table},
+        context={"pivot_table": pivot_table, "reason": "not_found"},
     )
 
 
@@ -790,9 +793,11 @@ def _find_cache(wb: Any, cache_index: int) -> Any:
                     f"The PivotCache for index {cache_index} could not be resolved.",
                     context={"cache_index": cache_index},
                 ) from exc
-    raise ExcelVbaMcpError(
+    # A missing PivotCache is a caller-addressed missing identity, not COM
+    # contention: surface NOT_FOUND (not the generic COM_BUSY fallback).
+    raise ObjectNotFoundError(
         f"PivotCache {cache_index} was not found in the workbook.",
-        context={"cache_index": cache_index},
+        context={"cache_index": cache_index, "reason": "not_found"},
     )
 
 
@@ -933,6 +938,32 @@ def _require_supported_source(pivot: Any) -> PivotSourceType:
             context={
                 "source_type": source_type.value,
                 "reason": "unsupported_pivot_source",
+            },
+        )
+    return source_type
+
+
+def _gate_supported_source_read(pivot: Any, pivot_table: str) -> PivotSourceType:
+    """Fail closed before any ``PivotFields`` read on an unsupported cache.
+
+    ``pivot_fields_list`` / ``pivot_field_get_filters`` enumerate
+    ``PivotFields``; on an external / OLAP / Data Model cache that enumeration
+    forces Excel to resolve external data, which blocks the single-STA worker
+    past the client deadline (the WP1 hang). The cache source type is resolved
+    first and anything that is not ``DATABASE`` — including an ``UNKNOWN`` /
+    undeterminable type — is rejected **before** the ``PivotFields`` handle is
+    obtained (fail closed).
+    """
+
+    cache = pivot.PivotCache()
+    source_type, _olap = _classify_source_type(cache)
+    if source_type is not PivotSourceType.DATABASE:
+        raise UnsupportedPivotSourceError(
+            _unsupported_reason(source_type),
+            context={
+                "pivot_table": pivot_table,
+                "source_type": source_type.value,
+                "reason": "unsupported_source",
             },
         )
     return source_type
@@ -1790,9 +1821,11 @@ class PivotTablesAdapter:
         for cache in caches:
             if cache.cache_index == cache_index:
                 return cache
-        raise ExcelVbaMcpError(
+        # A missing PivotCache is a caller-addressed missing identity, not COM
+        # contention: surface NOT_FOUND (not the generic COM_BUSY fallback).
+        raise ObjectNotFoundError(
             f"PivotCache {cache_index} was not found in the workbook.",
-            context={"cache_index": cache_index},
+            context={"cache_index": cache_index, "reason": "not_found"},
         )
 
     def _sweep_sheet(
@@ -1893,16 +1926,11 @@ class PivotTablesAdapter:
         raises a structured error.
         """
 
-        target = pivot_table.strip().lower()
-        for _sheet, _sheet_index, pivot in _iter_pivot_tables(wb):
-            name = _get_str(pivot, "Name") or ""
-            if name.lower() == target:
-                data_field_index = _data_field_index(pivot)
-                return self._describe_all_fields(pivot, data_field_index)
-        raise ExcelVbaMcpError(
-            f"PivotTable {pivot_table!r} was not found in the workbook.",
-            context={"pivot_table": pivot_table},
-        )
+        pivot = _find_pivot(wb, pivot_table)
+        name = _get_str(pivot, "Name") or pivot_table
+        _gate_supported_source_read(pivot, name)
+        data_field_index = _data_field_index(pivot)
+        return self._describe_all_fields(pivot, data_field_index)
 
     # ------------------------------------------------------------------
     # Targeted refresh (task_049)
@@ -2579,8 +2607,9 @@ class PivotTablesAdapter:
         """
 
         pivot = _find_pivot(wb, pivot_table)
-        target, info = _resolve_field_target(pivot, field)
         pivot_name = _get_str(pivot, "Name") or pivot_table
+        _gate_supported_source_read(pivot, pivot_name)
+        target, info = _resolve_field_target(pivot, field)
         return _field_filters(pivot_name, target, info.source_name)
 
     def apply_field_filter(

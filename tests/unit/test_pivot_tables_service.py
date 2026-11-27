@@ -50,7 +50,7 @@ from excel_vba_mcp.application.pivot_tables_service import (
     _overall_sheet_status,
 )
 from excel_vba_mcp.application.session_service import SessionService
-from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError, category_for
 from excel_vba_mcp.domain.models import (
     PivotCacheInfo,
     PivotFieldInfo,
@@ -887,7 +887,12 @@ def test_field_not_found_raises() -> None:
     adapter = PivotTablesAdapter()
     with pytest.raises(ExcelVbaMcpError) as exc_info:
         adapter.enumerate_pivot_fields(wb, "missing")
+    # A missing PivotTable is a caller-addressed missing identity: NOT_FOUND (not
+    # the generic COM_BUSY / transient_com_failure fallback).
+    assert exc_info.value.code is ErrorCode.NOT_FOUND
+    assert category_for(exc_info.value.code) == "not_found"
     assert exc_info.value.context["pivot_table"] == "missing"
+    assert exc_info.value.context["reason"] == "not_found"
 
 
 def test_cache_not_found_raises() -> None:
@@ -895,7 +900,11 @@ def test_cache_not_found_raises() -> None:
     adapter = PivotTablesAdapter()
     with pytest.raises(ExcelVbaMcpError) as exc_info:
         adapter.read_pivot_cache(wb, 99)
+    # A missing PivotCache is a caller-addressed missing identity: NOT_FOUND.
+    assert exc_info.value.code is ErrorCode.NOT_FOUND
+    assert category_for(exc_info.value.code) == "not_found"
     assert exc_info.value.context["cache_index"] == 99
+    assert exc_info.value.context["reason"] == "not_found"
 
 
 # ---------------------------------------------------------------------------
@@ -1037,8 +1046,10 @@ def test_error_code_on_missing_pivot() -> None:
     adapter = PivotTablesAdapter()
     with pytest.raises(ExcelVbaMcpError) as exc_info:
         adapter.enumerate_pivot_fields(wb, "nope")
-    # A missing PivotTable is a lookup failure, not an unsupported source.
-    assert exc_info.value.code is ErrorCode.COM_BUSY
+    # A missing PivotTable is a caller-addressed missing identity (NOT_FOUND), not
+    # COM contention or an unsupported source (WP2 taxonomy correction).
+    assert exc_info.value.code is ErrorCode.NOT_FOUND
+    assert category_for(exc_info.value.code) == "not_found"
 
 
 # ---------------------------------------------------------------------------
