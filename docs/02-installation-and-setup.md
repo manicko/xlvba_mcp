@@ -245,6 +245,43 @@ modified: only the copy from `work/` is opened.
 
 2. Restart the MCP client so it picks up the new server version.
 
+## Tool-surface migration (single switchover)
+
+The MCP tool surface was consolidated from **92 tools to 41 tools** in a **single switchover**
+(no dual-run). Production `tools/list` goes directly 92 → 41: there are **no** `meta.deprecated`
+aliases and **no** compatibility window. Clients that match the old per-verb tool names must migrate
+to the consolidated tool + `action` form.
+
+| Old per-verb tool | New form |
+|-------------------|----------|
+| `excel_open` | `workbook` `action="open"` |
+| `excel_close` / `excel_save` | `workbook` `action="close"` / `action="save"` |
+| `range_read_values` | `range_read` `action="read-values"` |
+| `table_update_rows` | `table` `action="update-rows"` |
+| `macro_classify_background` | `macro` `action="classify-background"` |
+| `test_suite_run` | `test` `action="run-suite"` |
+
+**Approval globs.** Kilo approval remains the `xlvba_*` name-glob; tool annotations
+(`readOnly` / `destructive` / `idempotent`) are **hints, not enforcement**. High-risk standalone
+names are unchanged and keep their own permission: `macro_run`, `excel_save_as`,
+`table_delete_column`. `workbook` `close` is a protected action: it **refuses by default** when
+there are unsaved changes; pass `discard_changes=true` to discard (or `save_changes=true` to save on
+close). See [Configuration](03-configuration.md) and the
+[MCP Tools Reference](05-mcp-tools-reference.md).
+
+**Final tool groups (41):**
+
+- **Lifecycle / session:** `workbook`, `workbook_read`, `excel_save_as`, `excel_health`, `excel_recover`
+- **Snapshots:** `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff`
+- **Jobs:** `job_get`, `job_request_cancel`
+- **VBA:** `vba_read`, `vba_export_project`, `vba_replace_component_source`, `vba_insert_code`, `vba_compile_diagnostics`
+- **Macro / test:** `macro`, `macro_run`, `test`
+- **Sheets / tables / names:** `sheet`, `sheet_read`, `sheet_delete`, `table`, `table_read`, `table_delete_rows`, `table_delete_column`, `name`, `name_read`, `name_delete`
+- **Ranges:** `range_read`, `range_write`, `range_structural`, `range_delete`, `range_merge`
+- **Pivot:** `pivot_read`, `pivot_refresh`, `pivot_field`
+- **Objects:** `shape`, `control`
+- **Capability / health:** `xlvba_environment`, `server_health`
+
 ## Uninstalling
 
 1. Remove the virtual environment:

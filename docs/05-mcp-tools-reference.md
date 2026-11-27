@@ -18,17 +18,18 @@ related:
 
 ## Purpose
 
-This reference describes **all 91 tools** of the `xlvba` MCP server: purpose, parameters,
-return value, side effects, typical errors and access class. The document is based on the
-actual tool schemas obtained from a live `MCPServer` and on the source modules `api/*`,
-`application/*` and `adapters/*`.
+This reference describes the **41 tools** of the `xlvba` MCP server: purpose, `action` values,
+parameters, return value, side effects, typical errors and truthful annotations. The document is
+based on the actual tool schemas obtained from a live `MCPServer` and on the source modules
+`api/*`, `application/*` and `adapters/*`.
 
-> **Forward references (planned, not yet exposed):** a read-only `xlvba_environment`
-> tool (access mode / policy / build / capabilities) will be added, and the request
-> enums for `range_set_conditional_formatting`, `pivot_field_set_layout` and
-> `pivot_field_apply_filter` will be **pruned** so the advertised request contract
-> matches what the runtime accepts (the pruned values are already rejected today; only
-> the advertised schema narrows). Until then the tool count stays **91 exposed**.
+The surface was consolidated from an earlier **92-tool** catalogue (the intermediate "91 exposed"
+count in older revisions was reconciled to 92 once `server_health` was counted) down to the final
+**41 tools** in a single switchover. Non-destructive verbs per domain were merged into
+`action`-dispatch tools (with `_read` companions where reads exist); destructive, high-risk and
+lifecycle operations were kept standalone with unchanged names. See
+[Migration (single switchover)](02-installation-and-setup.md#tool-surface-migration-single-switchover)
+for the client migration note.
 
 This document does not restate the architecture — that is covered in
 [Architecture](04-architecture.md). Settings are in [Configuration](03-configuration.md),
@@ -39,17 +40,18 @@ the security model is in [Architecture](04-architecture.md), and limits are in
 
 | Element | Meaning |
 |---------|---------|
-| `Tool` | The exact MCP name. Clients display it with a prefix (for example, Kilo uses `xlvba_excel_open`). Tables show it without the prefix. |
-| `Parameters` | `name:type`; `?` means optional; `=value` is the default. `—` means no parameters. |
+| `Tool` | The exact MCP name. Clients display it with a prefix (for example, Kilo uses `xlvba_workbook`). Tables show it without the prefix. |
+| `Actions` | The `action` values the tool dispatches on. A standalone tool has a single implicit action equal to its name. |
+| `Parameters` | `name:type`; `?` means optional; `=value` is the default. `—` means no parameters. The `action` selector plus the action-specific fields are validated in the handler (per-action required params). |
 | `Returns` | The DTO type or response shape. All DTOs serialize to JSON and contain no COM references. |
 | `Side effects` | What changes outside the response: files, snapshots, workbook state, artifacts, audit. |
 | `Errors` | Stable `ErrorCode` values or other codes the tool may return. |
-| `Access` | `read-only` (auto-allowed), `mutating` (guarded), `executing` (gated), `mixed` (depends on parameters). |
+| `R/D/I` | Truthful MCP annotations: `readOnly` / `destructive` / `idempotent` (`T`/`F`), taken from the live tool annotations. |
 
 Shared conventions:
 
 1. **Access mode.** In the default `full` mode (`EXCEL_VBA_MCP_ACCESS_MODE=full`), `ApprovalPolicy`
-   authorizes `mutating` and `executing` operations without a per-action grant. In `restricted` mode
+   authorizes mutating and executing operations without a per-action grant. In `restricted` mode
    the deny-by-default gate applies: those operations are refused with `APPROVAL_DENIED` unless an
    in-process allowlist entry or live grant matches. There is no MCP tool to grant approval or edit
    the allowlist, so a restricted server exposes only `read-only` work over MCP. Per the B4 error
@@ -63,8 +65,8 @@ Shared conventions:
    from `macro_run` / `vba_compile_diagnostics`, which require recovery — except that `macro_run` recovers the
    session itself on a hang/timeout (F2b). In the per-tool tables, `COM_BUSY` on a
    mutating row denotes genuine contention, not approval denial, a bad id, or a revision conflict.
-2. **`excel_open` first.** Any tool that needs a `workbook_id` requires the workbook to be
-   opened first. `workbook_id` is the identifier of the working copy issued by the server, not a
+2. **`workbook` `action="open"` first.** Any tool that needs a `workbook_id` requires the workbook to
+   be opened first. `workbook_id` is the identifier of the working copy issued by the server, not a
    file path.
 3. **Snapshot before mutation.** Mutating tools require a successful snapshot
    (`snapshot_create`); otherwise — `SNAPSHOT_FAILED`.
@@ -72,32 +74,34 @@ Shared conventions:
    requests beyond the limit are rejected, not silently truncated.
 5. **No GUI.** Tools never activate windows, never show dialogs and never send keystrokes.
 
-## Access classes
+## Annotations (truthful hints)
 
-| Class | Count | Behavior |
-|-------|-------|----------|
-| `read-only` | 43 | Allowed automatically; does not change the workbook. May write snapshot, export, artifact and in-memory classification state. |
-| `mutating` | 41 | Guarded: writable session → snapshot → approval → checks → postcondition + audit. |
-| `executing` | 2 | Runs code (`macro_run`, `test_suite_run`); additionally gated by approval (in `restricted` mode) and `background_safe`. |
-| `mixed` | 2 | `excel_open` and `excel_close`: the class depends on parameters (`read_only`, `mode`, `save_changes`). |
-| `recovery` | 1 | `excel_recover`: agent-directed owned-process recovery; allow-by-default in **both** `full` and `restricted` mode, audited, pid-scoped, originals-safe. |
-| `config` (bookkeeping) | 1 | `macro_classify_background`: changes in-memory classification state only (no workbook mutation); ungated bookkeeping, `macro_run` remains the security boundary. |
+Every tool advertises the MCP `readOnlyHint` / `destructiveHint` / `idempotentHint` triple computed
+from the per-action truth matrix (MCP default semantics: absent is not neutral). The hints are
+**hints, not enforcement** — Kilo approval remains the `xlvba_*` name-glob (see
+[Configuration](03-configuration.md) and the migration note). The distribution across the 41 tools:
 
-It is important to distinguish "the tool is implemented" from "the tool is available through
-MCP". All 41 `mutating` and 2 `executing` tools exist and are described in this reference. In the
-default `full` access mode the approval gate authorizes them (a baseline snapshot is still required
-before a mutation); only in `restricted` mode are they refused with `APPROVAL_DENIED`. The
-`background_safe` requirement on `macro_run` applies in both modes.
+| Annotation | Count | Tools |
+|------------|-------|-------|
+| `readOnly=true` | 13 | `workbook_read`, `excel_health`, `snapshot_list`, `snapshot_diff`, `vba_read`, `job_get`, `sheet_read`, `table_read`, `pivot_read`, `range_read`, `name_read`, `server_health`, `xlvba_environment` |
+| `destructive=true` | 16 | `workbook`, `excel_save_as`, `excel_recover`, `snapshot_restore`, `test`, `vba_replace_component_source`, `vba_insert_code`, `macro_run`, `sheet_delete`, `table_delete_rows`, `table_delete_column`, `pivot_field`, `range_structural`, `range_delete`, `range_merge`, `name_delete` |
+| `idempotent=true` | 21 | `workbook_read`, `excel_health`, `snapshot_list`, `snapshot_diff`, `vba_read`, `job_get`, `job_request_cancel`, `sheet_read`, `table_read`, `pivot_read`, `pivot_refresh`, `range_read`, `range_merge`, `name`, `name_read`, `shape`, `control`, `server_health`, `xlvba_environment`, `macro`, `pivot_field` |
 
-**`vba_compile_diagnostics` is `read-only`, not `executing`.** `vba_compile_diagnostics` submits its STA diagnostic probe
-with `op_class=EXECUTING`, but that tag only governs **retry eligibility** (the probe is never
-blindly replayed after a busy/timeout) and the **audit `operation_class`** label — it does not drive
-the approval gate. `CompileService` is constructed without an `ApprovalPolicy` and never calls the
-approval gate, so `vba_compile_diagnostics` is **not** approval-gated: it runs in both `full` and `restricted`
-modes, is non-mutating/non-activating, and never changes the workbook or shows UI.
-`vba_get_compile_diagnostics` only reads the cached result. `vba_compile_diagnostics` is therefore counted as
-`read-only` and is **not** one of the two `executing` tools (`macro_run`,
-`test_suite_run`), whose `EXECUTING` classification does gate approval and execute user code.
+Notable, matrix-proven cases:
+
+- **`workbook` is `destructive=true`** because its `close` action has a destructive
+  `discard_changes=true` path; `close` **refuses by default** (D1) and `open`/`save` are
+  non-destructive. See [D1 close disposition](#workbook).
+- **`range_structural` is NOT idempotent** (H4): re-`insert` duplicates rows/cells and `unmerge`
+  discards merges.
+- **Dual-hint tools are exactly `range_merge` and `pivot_field`** (`destructive=true` **and**
+  `idempotent=true`), both proven by the matrix (`pivot_field` via `field-set-layout(delete=True)`).
+- **`macro` is `readOnly=false, destructive=false, idempotent=true`**: `list`/`get-last-result` are
+  reads and `classify-background` is idempotent bookkeeping; the tool is not read-only overall.
+- **`vba_compile_diagnostics` is `readOnly=false, destructive=false, idempotent=false`**: it does
+  **not** compile (always `indeterminate` on the validated build) and is non-mutating, but it is not
+  advertised read-only. Its STA probe is tagged `op_class=EXECUTING` for retry/audit only and does
+  not drive the approval gate.
 
 ## Abbreviations
 
@@ -114,366 +118,232 @@ modes, is non-mutating/non-activating, and never changes the workbook or shows U
 
 ## Group summary
 
-| Group | Count | Tools | Access class |
-|-------|-------|-------|--------------|
-| Workbook/session | 8 | `excel_open`, `excel_close`, `excel_save`, `excel_save_as`, `excel_get_status`, `excel_list_workbooks`, `excel_health`, `excel_recover` | mixed / mutating / read-only / recovery |
-| Snapshots | 4 | `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff` | read-only + 2 mutating |
-| Test runner | 2 | `test_suite_run`, `test_get_run` | executing + read-only |
-| Jobs | 2 | `job_get`, `job_request_cancel` | read-only |
-| VBA | 9 | `vba_project_info`, `vba_list_components`, `vba_list_procedures`, `vba_read_component`, `vba_export_project`, `vba_get_references`, `vba_search_code`, `vba_replace_component_source`, `vba_insert_code` | read-only + 2 mutating |
-| Compile | 2 | `vba_compile_diagnostics`, `vba_get_compile_diagnostics` | read-only (see access-class note) |
-| Macros | 4 | `macro_list`, `macro_run`, `macro_get_last_result`, `macro_classify_background` | read-only + 1 executing + 1 config (bookkeeping) |
-| Sheets | 7 | `sheets_list`, `sheet_get`, `sheet_add`, `sheet_rename`, `sheet_copy`, `sheet_delete`, `sheet_set_visibility` | read-only + 5 mutating |
-| Tables | 11 | `tables_list`, `table_get`, `table_read_rows`, `table_append_rows`, `table_insert_row`, `table_update_rows`, `table_delete_rows`, `table_add_column`, `table_delete_column`, `table_create`, `table_resize` | read-only + 8 mutating |
-| PivotTables | 13 | `pivot_tables_list`, `pivot_table_get`, `pivot_cache_get`, `pivot_fields_list`, `pivot_table_refresh`, `pivot_cache_refresh`, `pivot_field_set_layout`, `pivot_field_set_position`, `pivot_field_set_aggregation`, `pivot_field_set_properties`, `pivot_field_get_filters`, `pivot_field_apply_filter`, `pivot_field_clear_filters` | read-only + 8 mutating |
-| Ranges | 16 | `range_get`, `range_read_values`, `range_read_formulas`, `range_write_values`, `range_write_formulas`, `range_get_format`, `range_set_format`, `range_copy`, `range_insert`, `range_delete`, `range_merge`, `range_unmerge`, `range_get_validation`, `range_set_validation`, `range_get_conditional_formatting`, `range_set_conditional_formatting` | read-only + 10 mutating |
-| Names | 5 | `names_list`, `name_get`, `name_create`, `name_update`, `name_delete` | read-only + 3 mutating |
-| Shapes | 3 | `shapes_list`, `shape_get`, `shape_set_on_action` | read-only + 1 mutating |
-| Controls | 3 | `controls_list`, `control_get`, `control_set_on_action` | read-only + 1 mutating |
-| Workbook model | 1 | `workbook_get_model` | read-only |
-| Health | 1 | `server_health` | read-only |
-| Environment | 1 | `xlvba_environment` | read-only |
-| **Total** | **91** | — | 44 read-only, 41 mutating, 2 executing, 2 mixed, 1 recovery, 1 config (bookkeeping) |
+| Group | Count | Tools |
+|-------|-------|-------|
+| Lifecycle / session | 5 | `workbook`, `workbook_read`, `excel_save_as`, `excel_health`, `excel_recover` |
+| Snapshots | 4 | `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff` |
+| Jobs | 2 | `job_get`, `job_request_cancel` |
+| VBA | 5 | `vba_read`, `vba_export_project`, `vba_replace_component_source`, `vba_insert_code`, `vba_compile_diagnostics` |
+| Macro / test | 3 | `macro`, `macro_run`, `test` |
+| Sheets / tables / names | 10 | `sheet`, `sheet_read`, `sheet_delete`, `table`, `table_read`, `table_delete_rows`, `table_delete_column`, `name`, `name_read`, `name_delete` |
+| Ranges | 5 | `range_read`, `range_write`, `range_structural`, `range_delete`, `range_merge` |
+| Pivot | 3 | `pivot_read`, `pivot_refresh`, `pivot_field` |
+| Objects | 2 | `shape`, `control` |
+| Capability / health | 2 | `xlvba_environment`, `server_health` |
+| **Total** | **41** | — |
 
-Sum across groups: 7 + 4 + 2 + 2 + 9 + 2 + 4 + 7 + 11 + 13 + 16 + 5 + 3 + 3 + 1 + 1 + 1 = **91**.
+Sum across groups: 5 + 4 + 2 + 5 + 3 + 10 + 5 + 3 + 2 + 2 = **41**.
 
-## Workbook/session
+## Lifecycle / session
 
-| Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
-|------|---------|------------|---------|--------------|--------|--------|
-| `excel_open` | Opens an allowed workbook as a hidden working copy. | `path:string, mode:SessionMode=execute?, read_only:boolean=false?, background:boolean=false?` | `WorkbookInfo` or `RunningJob` | File copy in `work/`; audit record | `PATH_NOT_ALLOWED`, `APPROVAL_DENIED` (restricted mode), `EXCEL_HUNG` | mixed |
-| `excel_close` | Closes an open workbook; does not save by default. | `workbook_id:string, save_changes:boolean=false?` | `SessionStatus` | Closes the working copy; deletes the copy; audit record | `APPROVAL_DENIED` (restricted mode, when `save_changes=true`), `EXCEL_HUNG` | mixed |
-| `excel_save` | Explicitly saves the working copy. | `workbook_id:string` | `WorkbookInfo` | Writes the working-copy file; audit record | `APPROVAL_DENIED` (restricted mode), `EXCEL_HUNG`, `COM_BUSY` | mutating |
-| `excel_save_as` | Saves the working copy to a (possibly new) target path without rebinding the session. | `workbook_id:string, path:string, overwrite_existing:boolean=false?, overwrite_source:boolean=false?` | `SaveAsResult` | Flushes the working copy (`wb.Save`), then an atomic temp→replace copy + single `<target>.bak`; audit record | `PATH_NOT_ALLOWED`, `PROTECTED_TARGET` (working copy / source / existing target), `STALE_TARGET` (source replaced/modified), `APPROVAL_DENIED` (restricted mode) | mutating |
-| `excel_get_status` | Returns session/workbook state without touching COM. | `workbook_id:string?` | `SessionStatus` | — | — | read-only |
-| `excel_list_workbooks` | Lists open workbooks from bookkeeping. | — | `list[WorkbookInfo]` | — | — | read-only |
-| `excel_health` | Worker/session state without forcing a restart and without COM. | — | `ExcelHealth` | — | — (always a payload) | read-only |
-| `excel_recover` | Agent-directed recovery of the owned Excel process (fail-closed; originals safe). | `reason:string=agent_directed?, confirm:boolean=false?` | `RecoveryResult` | Terminates the wedged owned `EXCEL.EXE` via the held handle; discards working copies; rebuilds a fresh hidden instance; audit | `CONFIRMATION_REQUIRED` (missing/false `confirm`); otherwise reports `ok=false` / `recovery_possible=false` when refused | recovery |
+| Tool | Actions | Purpose | Parameters | Returns | Side effects | Errors | R/D/I |
+|------|---------|---------|------------|---------|--------------|--------|-------|
+| `workbook` | `open`, `close`, `save` | Opens a workbook as a hidden working copy; closes it; saves it. | `action`, `path?`, `mode?=execute`, `read_only?=false`, `background?=false`, `workbook_id?`, `save_changes?`, `discard_changes?` | `WorkbookInfo` / `SessionStatus` / `RunningJob` | File copy in `work/`; close deletes the copy; save writes the working copy; audit | `PATH_NOT_ALLOWED`, `APPROVAL_DENIED`, `EXCEL_HUNG`, `CONFIRMATION_REQUIRED` | F/T/F |
+| `workbook_read` | `status`, `list`, `model` | Session/workbook state; open-workbook list; aggregated workbook model. | `action`, `workbook_id?`, `include_vba?=true` | `SessionStatus` / `list[WorkbookInfo]` / `WorkbookModel` | — | — (VBA state is in `vba_access`) | T/F/T |
+| `excel_save_as` | (standalone) | Saves the working copy to a (possibly new) target path without rebinding the session. | `workbook_id`, `path`, `overwrite_existing?=false`, `overwrite_source?=false` | `SaveAsResult` | Flushes the working copy (`wb.Save`), then an atomic temp→replace copy + single `<target>.bak`; audit | `PATH_NOT_ALLOWED`, `PROTECTED_TARGET`, `STALE_TARGET`, `APPROVAL_DENIED` | F/T/F |
+| `excel_health` | (standalone) | Worker/session state without forcing a restart and without COM. | — | `ExcelHealth` | — | — (always a payload) | T/F/T |
+| `excel_recover` | (standalone) | Agent-directed recovery of the owned Excel process (fail-closed; originals safe). | `reason?=agent_directed`, `confirm?=false` | `RecoveryResult` | Terminates the wedged owned `EXCEL.EXE` via the held handle; discards working copies; rebuilds a fresh hidden instance; audit | `CONFIRMATION_REQUIRED`; otherwise reports `ok=false` / `recovery_possible=false` when refused | F/T/F |
 
-`excel_open` is `mixed`: `mode="inspect"` + `read_only=true` passes as `READ_ONLY`;
-`mode="inspect"` + `read_only=false` is `MUTATING`; `mode="execute"` is `EXECUTING`.
-`excel_close` is `read-only` with `save_changes=false` and `mutating` with `save_changes=true`.
-`excel_recover` is the only `recovery`-class tool: it is allow-by-default in **both** `full` and
-`restricted` mode, audited, pid-scoped (never a wildcard) and discards **working copies only** —
-originals are never modified. It is fail-closed: when no live, identity-verified handle is held it
-is refused and a server restart is the documented fallback. See
+### workbook
+
+`workbook` dispatches on `action`:
+
+- `open` — `mode="execute"` (default) opens a writable, execution-capable session; `mode="inspect"`
+  and/or `read_only=true` opens a macros-disabled or read-only session. Authorized in `full` mode;
+  refused with `APPROVAL_DENIED` in `restricted` mode for a writable/execute open.
+- `close` — **refuse-by-default (D1).** A clean workbook closes normally. If there are unsaved
+  changes, `close` **refuses by default**; discarding requires explicit `discard_changes=true`.
+  Preserve an explicit save-on-close option (`save_changes=true`) where supported; **contradictory
+  flags** (e.g. `discard_changes=true` together with `save_changes=true`) are rejected with a
+  structured `ExcelVbaMcpError`.
+- `save` — explicitly saves the working copy and returns an updated `WorkbookInfo` with
+  `dirty=false`. Changes are never saved implicitly.
+
+`workbook` is `readOnly=false, destructive=true, idempotent=false`: the `discard_changes=true` path
+is destructive, so the tool carries a destructive hint even though `open`/`save` are non-destructive.
+
+### excel_save_as
+
+Save the working copy to a new (or the original) path — the fail-closed Save As (standalone, own
+permission/overwrite policy). `excel_save_as` flushes the working copy with `wb.Save` on the STA
+worker, then copies it to `path` by a pure-filesystem atomic temp→`os.replace` (never `wb.SaveAs`,
+so the session stays bound to its working copy). A single `<target>.bak` preserves any previous
+target across an overwrite.
+
+- A **new** path is written directly (`outcome="ok"`).
+- An **existing** target is refused with `PROTECTED_TARGET/target_exists` unless
+  `overwrite_existing=true` (which writes the `.bak`).
+- The **original source** as target is refused with `PROTECTED_TARGET/source_protected` unless
+  `overwrite_source=true`; the source identity (SHA-256 + size) captured at open is re-verified, so
+  a source replaced or modified since open is `STALE_TARGET`.
+- The **open working copy** as target is always refused (`PROTECTED_TARGET/target_is_working_copy`).
+- `outcome` is `"ok"` only after the final size + SHA-256 verify; an interrupted/unprovable write
+  reports `"unknown"`/`"error"` (never success) with `backup_path` when a `.bak` exists.
+
+### excel_recover
+
+`excel_recover` is agent-directed: it is allow-by-default in **both** `full` and `restricted` mode,
+audited, pid-scoped (never a wildcard) and discards **working copies only** — originals are never
+modified. It is fail-closed: when no live, identity-verified handle is held it is refused
+(`confirm` must be `true`) and a server restart is the documented fallback. See
 [Architecture](04-architecture.md) and [Security](08-security.md).
 
-`ExcelHealth.worker_state` / `session_state` use `WorkbookSessionState`, which now includes
+`ExcelHealth.worker_state` / `session_state` include
 `running/deadline_exceeded` (a single COM call exceeded its execution deadline; the call is **not**
-cancelled and the owned pid is **not** terminated — the worker resumes `running` when the call
-returns). This is distinct from `running/needs_recovery`, which is a genuine recovery state. A
-read-only owned-pid liveness probe additionally forces `needs_recovery` when the hidden `EXCEL.EXE`
-has died while the bookkeeping still says `running`/`accepting`.
+cancelled and the owned pid is **not** terminated) — distinct from `running/needs_recovery`, which
+is a genuine recovery state.
 
 ## Snapshots
 
-| Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
-|------|---------|------------|---------|--------------|--------|--------|
-| `snapshot_create` | Creates an immutable snapshot of an open or known workbook. | `workbook_id:string` | `SnapshotManifest` | Snapshot files + `manifest.json`; audit record | `SNAPSHOT_FAILED`, `APPROVAL_DENIED` (restricted mode), `EXCEL_HUNG` | mutating (approval-gated) |
-| `snapshot_list` | Lists snapshots and their metadata. | — | `list[SnapshotManifest]` | — | `SNAPSHOT_FAILED` | read-only |
-| `snapshot_restore` | Restores a working session from a snapshot. | `snapshot_id:string, workbook_id:string?, confirm:boolean=false?` | `WorkbookInfo` | Closes the current copy without saving; opens a new working copy; audit | `CONFIRMATION_REQUIRED` (missing/false `confirm`), `SNAPSHOT_FAILED`, `APPROVAL_DENIED` (restricted mode), `EXCEL_HUNG` | mutating |
-| `snapshot_diff` | Compares two snapshots by metadata and hash. | `snapshot_id_a:string, snapshot_id_b:string` | `SnapshotDiff` | — | `SNAPSHOT_FAILED` | read-only |
+| Tool | Actions | Purpose | Parameters | Returns | Side effects | Errors | R/D/I |
+|------|---------|---------|------------|---------|--------------|--------|-------|
+| `snapshot_create` | (standalone) | Creates an immutable snapshot of an open or known workbook. | `workbook_id` | `SnapshotManifest` | Snapshot files + `manifest.json`; audit | `SNAPSHOT_FAILED`, `APPROVAL_DENIED`, `EXCEL_HUNG` | F/F/F |
+| `snapshot_list` | (standalone) | Lists snapshots and their metadata. | — | `list[SnapshotManifest]` | — | `SNAPSHOT_FAILED` | T/F/T |
+| `snapshot_restore` | (standalone) | Restores a working session from a snapshot. | `snapshot_id`, `workbook_id?`, `confirm?=false` | `WorkbookInfo` | Closes the current copy without saving; opens a new working copy; audit | `CONFIRMATION_REQUIRED`, `SNAPSHOT_FAILED`, `APPROVAL_DENIED`, `EXCEL_HUNG` | F/T/F |
+| `snapshot_diff` | (standalone) | Compares two snapshots by metadata and hash. | `snapshot_id_a`, `snapshot_id_b` | `SnapshotDiff` | — | `SNAPSHOT_FAILED` | T/F/T |
 
-## Test runner
-
-| Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
-|------|---------|------------|---------|--------------|--------|--------|
-| `test_suite_run` | Canonical entry point: accepts a suite object or a JSON-like mapping, plus `background`. | `suite:TestSuiteSpec` or `object`, `background:boolean=false?` | `TestRunResult` or `RunningJob` | Baseline snapshot, a working copy per case, artifacts, `runs/`, audit | `INVALID_RANGE`, `APPROVAL_DENIED` (restricted mode), `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED` | executing |
-| `test_get_run` | Returns a persisted run by `run_id`. | `run_id:string` | `TestRunResult` | — | `ExcelVbaMcpError` (not found) | read-only |
-
-**Test-tool routing.** `test_suite_run` is the single canonical test entry point (it accepts a
-mapping or a typed spec, plus `background`).
-
-The runner opens the working copy in `execute` mode. In the default `full` mode this is
-authorized; in `restricted` mode every case gets `blocked` (`APPROVAL_DENIED`) and the suite is
-`blocked`. A `macro_run` step on an unclassified procedure is blocked with
-`BACKGROUND_SAFETY_NOT_VERIFIED` in either mode.
-
-`test_suite_run` accepts `background=true` to return a `RunningJob` handle
-promptly instead of blocking; poll with `job_get` (see [Background jobs](#background-jobs)).
+`snapshot_create` and `vba_export_project` write files and are approval-gated (F-4): auto-allowed
+in `full` mode, refused with `APPROVAL_DENIED` in `restricted` mode. `snapshot_restore` adds no
+second gate — its approval point is the inherited writable open it performs on the snapshot
+baseline. `confirm` is **required** (default `false`): a missing or `false` `confirm` is rejected
+with `CONFIRMATION_REQUIRED` **before** the working copy is closed. The snapshot restores files
+only — it does **not** undo external macro side effects.
 
 ## Jobs
 
-| Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
-|------|---------|------------|---------|--------------|--------|--------|
-| `job_get` | Returns one background job's status/result by `job_id` (poll; never touches COM). | `job_id:string` | `JobStatus` | — | `NOT_FOUND` (unknown `job_id`) | read-only |
-| `job_request_cancel` | Records a job's cancel **intent** (intent-only; never interrupts the running COM call). | `job_id:string` | `JobStatus` | — | `NOT_FOUND` (unknown `job_id`) | read-only |
+| Tool | Actions | Purpose | Parameters | Returns | Side effects | Errors | R/D/I |
+|------|---------|---------|------------|---------|--------------|--------|-------|
+| `job_get` | (standalone) | Returns one background job's status/result by `job_id` (poll; never touches COM). | `job_id` | `JobStatus` | — | `NOT_FOUND` | T/F/T |
+| `job_request_cancel` | (standalone) | Records a job's cancel **intent** (intent-only; never interrupts the running COM call). | `job_id` | `JobStatus` | — | `NOT_FOUND` | F/F/T |
 
-`job_get` and `job_request_cancel` never touch COM. `job_request_cancel` only sets `cancel_requested` on the job so
-a poller can observe it: the single-STA COM call runs to completion and the job still reaches a
-terminal state. See [Background jobs](#background-jobs) for the full lifecycle.
+`job_get` and `job_request_cancel` never touch COM. `job_request_cancel` only sets `cancel_requested`
+on the job so a poller can observe it: the single-STA COM call runs to completion and the job still
+reaches a terminal state. See [Background jobs](#background-jobs).
 
 ## VBA
 
-| Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
-|------|---------|------------|---------|--------------|--------|--------|
-| `vba_project_info` | VBA project summary: name, protection, components, references. | `workbook_id:string` | `VbaProjectInfo` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED`, `EXCEL_HUNG` | read-only |
-| `vba_list_components` | Lists components with type, line count and hash. | `workbook_id:string` | `list[VbaComponentInfo]` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
-| `vba_list_procedures` | Procedures of one component via the VBIDE CodeModule. | `workbook_id:string, component:string` | `list[VbaProcedureInfo]` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
-| `vba_read_component` | Reads a component module (code + normalized hash). | `workbook_id:string, component:string` | `VbaComponentSource` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
-| `vba_export_project` | Exports every component and returns a manifest. | `workbook_id:string, out_dir:string?` | `VbaExportManifest` | `.bas`/`.cls`/`.frm`/`.frx` files; artifact root; audit | `ACCESS_VBOM_DISABLED`, `PATH_NOT_ALLOWED`, `SNAPSHOT_FAILED` | read-only |
-| `vba_get_references` | Project references with Name/GUID/version/path. | `workbook_id:string` | `list[VbaReferenceInfo]` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
-| `vba_search_code` | Searches all components' code (substring or regex). | `workbook_id:string, pattern:string, regex:boolean=false?` | `list[VbaSearchMatch]` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
-| `vba_replace_component_source` | Fully replaces a Standard/Class module. | `workbook_id:string, component:string, new_source:string, expected_source_hash:string` | `VbaMutationResult` | Changes the VBA project; before/after export; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `APPROVAL_DENIED` (restricted mode), `REVISION_CONFLICT` (revision conflict), `PROTECTED_TARGET` (non-replaceable component), `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | mutating |
-| `vba_insert_code` | Inserts code at a semantic position in a Standard/Class module. | `workbook_id:string, component:string, code:string, position:string, expected_source_hash:string` | `VbaMutationResult` | Changes the VBA project; audit | same; an invalid `position` — `COM_BUSY` | mutating |
+| Tool | Actions | Purpose | Parameters | Returns | Side effects | Errors | R/D/I |
+|------|---------|---------|------------|---------|--------------|--------|-------|
+| `vba_read` | `project-info`, `list-components`, `list-procedures`, `read-component`, `get-references`, `search-code`, `get-compile-diagnostics` | VBA project summary; component/procedure/reference inventory; module source; code search; cached compile diagnostics. | `action`, `workbook_id`, `component?`, `pattern?`, `regex?=false` | `VbaProjectInfo` / `list[VbaComponentInfo]` / `list[VbaProcedureInfo]` / `VbaComponentSource` / `list[VbaReferenceInfo]` / `list[VbaSearchMatch]` / `CompileDiagnostics` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED`, `EXCEL_HUNG` | T/F/T |
+| `vba_export_project` | (standalone) | Exports every component and returns a manifest. | `workbook_id`, `out_dir?` | `VbaExportManifest` | `.bas`/`.cls`/`.frm`/`.frx` files; artifact root; audit | `ACCESS_VBOM_DISABLED`, `PATH_NOT_ALLOWED`, `SNAPSHOT_FAILED` | F/F/F |
+| `vba_replace_component_source` | (standalone) | Fully replaces a Standard/Class module. | `workbook_id`, `component`, `new_source`, `expected_source_hash` | `VbaMutationResult` | Changes the VBA project; before/after export; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `APPROVAL_DENIED`, `REVISION_CONFLICT`, `PROTECTED_TARGET`, `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | F/T/F |
+| `vba_insert_code` | (standalone) | Inserts code at a semantic position in a Standard/Class module. | `workbook_id`, `component`, `code`, `position`, `expected_source_hash` | `VbaMutationResult` | Changes the VBA project; audit | same; an invalid `position` — `COM_BUSY` | F/T/F |
+| `vba_compile_diagnostics` | (standalone) | Fail-closed compile diagnostic; always `indeterminate` on the validated build. | `workbook_id` | `CompileResult` | — (does not launch UI) | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | F/F/F |
 
-`vba_replace_component_source` and `vba_insert_code` work only with Standard/Class modules;
-Document modules and UserForms are rejected with `PROTECTED_TARGET`
+`vba_read` is read-only. `vba_replace_component_source` and `vba_insert_code` work only with
+Standard/Class modules; Document modules and UserForms are rejected with `PROTECTED_TARGET`
 (`reason=non_replaceable_component`). A stale `expected_source_hash` is rejected with
-`REVISION_CONFLICT` (`reason=revision_conflict`).
+`REVISION_CONFLICT` (`reason=revision_conflict`); re-calling with the same hash fails the revision
+guard, so `vba_replace_component_source` is **not** idempotent. `vba_compile_diagnostics` never
+returns `compiled` or `compile_error`, and never shows or activates UI.
 
-`vba_export_project` writes files and is approval-gated (F-4). With `out_dir` omitted it exports to
-a fresh temporary directory (the manifest returns absolute paths). A supplied `out_dir` must live
-under the resolved `snapshots` / `artifacts` artifact root (default
-`<temp>/excel_vba_mcp/artifacts`, or `EXCEL_VBA_MCP_ARTIFACT_DIR`); an out-of-root `out_dir` fails
-closed with `PATH_NOT_ALLOWED` whose `context.allowed_root` / `context.expected_root` carry the
-**absolute** allowed artifacts-root path (not the symbolic `"artifacts"` name).
+## Macro / test
 
-## Compile
+| Tool | Actions | Purpose | Parameters | Returns | Side effects | Errors | R/D/I |
+|------|---------|---------|------------|---------|--------------|--------|-------|
+| `macro` | `list`, `classify-background`, `get-last-result` | Lists callable macros with `background_safe`; records a procedure's classification; returns the cached last run. | `action`, `workbook_id`, `procedure?`, `background_safe?`, `expected_project_source_hash?` | `list[MacroInfo]` / `BackgroundSafetyClassification` / `MacroRunResult` | `classify-background` mutates in-memory classification state (bookkeeping); audit | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED`, `MACRO_NOT_FOUND`, `STALE_TARGET`, `INTERACTIVE_UI_NOT_SUPPORTED`, `EXCEL_HUNG` | F/F/T |
+| `macro_run` | (standalone) | Runs one approved `background_safe` macro. | `workbook_id`, `macro_name`, `args?`, `background?=false` | `MacroRunResult` or `RunningJob` | VBA execution; possible external effects; audit | `APPROVAL_DENIED`, `MACRO_BLOCKED`, `MACRO_NOT_FOUND`, `MACRO_RUNTIME_ERROR`, `MACRO_TIMEOUT`, `BACKGROUND_SAFETY_NOT_VERIFIED`, `INTERACTIVE_UI_NOT_SUPPORTED` | F/T/F |
+| `test` | `run-suite`, `get-run` | Runs a declarative test suite (canonical entry point) or reads a persisted run. | `action`, `suite?`, `background?=false`, `run_id?` | `TestRunResult` / `RunningJob` | Baseline snapshot, a working copy per case, artifacts, `runs/`, audit | `INVALID_RANGE`, `APPROVAL_DENIED`, `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED` | F/T/F |
 
-| Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
-|------|---------|------------|---------|--------------|--------|--------|
-| `vba_compile_diagnostics` | Fail-closed compile diagnostic; always `indeterminate` on the validated build. | `workbook_id:string` | `CompileResult` | — (does not launch UI) | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
-| `vba_get_compile_diagnostics` | Last diagnostics without re-running. | `workbook_id:string` | `CompileDiagnostics` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED` | read-only |
+`macro` is not read-only overall (`classify-background` is a bookkeeping write) but is not
+destructive; `classify-background` is **ungated** and is not the security boundary — `macro_run`
+keeps the approval gate and the deterministic R13 veto. The classification is bound to
+`(workbook_file_sha256, project_source_hash, procedure)` and is invalidated when the VBA source
+changes. `test` is a mixed-profile tool (`run-suite` executes, `get-run` reads) and is
+`destructive=true` because `run-suite` can dispatch `macro_run` steps with external side effects.
+`test` accepts `background=true` to return a `RunningJob` promptly.
 
-`vba_compile_diagnostics`'s worker probe is tagged `op_class=EXECUTING` for retry/audit only; the tool itself is
-`read-only` and not approval-gated (see the access-class note).
+## Sheets / tables / names
 
-## Macros
-
-| Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
-|------|---------|------------|---------|--------------|--------|--------|
-| `macro_list` | Lists callable macros with their `background_safe` classification. | `workbook_id:string` | `list[MacroInfo]` | — | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED`, `EXCEL_HUNG` | read-only |
-| `macro_run` | Runs one approved `background_safe` macro. | `workbook_id:string, macro_name:string, args:array?, background:boolean=false?` | `MacroRunResult` or `RunningJob` | VBA execution; possible external effects; audit | `APPROVAL_DENIED` (restricted mode), `MACRO_BLOCKED` (Office macro-security), `MACRO_NOT_FOUND`, `MACRO_RUNTIME_ERROR`, `MACRO_TIMEOUT`, `BACKGROUND_SAFETY_NOT_VERIFIED`, `INTERACTIVE_UI_NOT_SUPPORTED` | executing |
-| `macro_classify_background` | Records a procedure's `background_safe` for the current workbook hash and VBA source revision (ungated bookkeeping). | `workbook_id:string, procedure:string, background_safe:boolean, expected_project_source_hash:string?` | `BackgroundSafetyClassification` | Mutates in-memory classification state (bookkeeping); audit | `MACRO_NOT_FOUND`, `STALE_TARGET` (source hash mismatch), `INTERACTIVE_UI_NOT_SUPPORTED` (interactive/heuristic + `background_safe=true`), `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED`, `EXCEL_HUNG` | config (bookkeeping, ungated) |
-| `macro_get_last_result` | Returns the cached last run without re-executing. | `workbook_id:string` | `MacroRunResult` | — | — | read-only |
-
-`macro_classify_background` is **ungated**: it only records classification state and is not the
-security boundary — `macro_run` keeps the approval gate and the deterministic R13 veto. The
-classification is bound to `(workbook_file_sha256, project_source_hash, procedure)` and is
-invalidated when the VBA source changes (a later `macro_run`/`macro_list` recomputes the live
-`project_source_hash`; a mismatch means the procedure is unclassified again and returns
-`BACKGROUND_SAFETY_NOT_VERIFIED`). Passing a stale `expected_project_source_hash` rejects the
-write with `STALE_TARGET`.
-
-## Sheets
-
-| Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
-|------|---------|------------|---------|--------------|--------|--------|
-| `sheets_list` | All sheets with type, visibility, `code_name` and protection. | `workbook_id:string` | `list[SheetInfo]` | — | — | read-only |
-| `sheet_get` | One sheet by name (honours `Sheets`/`Worksheets`). | `workbook_id:string, name:string` | `SheetInfo` | — | `COM_BUSY` (sheet not found) | read-only |
-| `sheet_add` | Adds a worksheet (MVP: only `worksheet`). | `workbook_id:string, name:string, sheet_type:string=worksheet?` | `SheetInfo` | New sheet in the workbook; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `sheet_rename` | Renames a sheet; `CodeName` is unchanged. | `workbook_id:string, name:string, new_name:string` | `SheetInfo` | Sheet name; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `sheet_copy` | Copies a sheet and returns the new sheet's DTO. | `workbook_id:string, name:string` | `SheetInfo` | New sheet; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `sheet_delete` | Deletes a sheet (destructive). | `workbook_id:string, name:string` | `SheetInfo` | Sheet deletion; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `sheet_set_visibility` | Sets sheet visibility. | `workbook_id:string, name:string, visible:boolean` | `SheetInfo` | Sheet visibility; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
+| Tool | Actions | Purpose | Parameters | Returns | Side effects | Errors | R/D/I |
+|------|---------|---------|------------|---------|--------------|--------|-------|
+| `sheet` | `add`, `rename`, `copy`, `set-visibility` | Adds, renames, copies a sheet; sets visibility. | `action`, `workbook_id`, `name?`, `new_name?`, `sheet_type?=worksheet`, `visible?` | `SheetInfo` | New/renamed/copied sheet; visibility; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/F/F |
+| `sheet_read` | `list`, `get` | All sheets, or one sheet by name. | `action`, `workbook_id`, `name?` | `list[SheetInfo]` / `SheetInfo` | — | `COM_BUSY` (not found) | T/F/T |
+| `sheet_delete` | (standalone) | Deletes a sheet (destructive). | `workbook_id`, `name` | `SheetInfo` | Sheet deletion; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/T/F |
+| `table` | `create`, `resize`, `append-rows`, `insert-row`, `update-rows`, `add-column` | Creates/resizes a table; appends/inserts/updates rows; adds a column. | `action`, `workbook_id`, `sheet?`, `range_or_name?`, `name?`, `new_range?`, `rows?`, `at?`, `values?`, `updates?`, `header?`, `position?`, `style?` | `TableMutationResult` | Table rows/columns/range; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/F/F |
+| `table_read` | `list`, `get`, `read-rows` | All tables, one table, or a bounded slice of rows. | `action`, `workbook_id`, `name?`, `offset?=0`, `limit?` | `list[TableInfo]` / `TableInfo` / `TableRows` | — | `COM_BUSY` | T/F/T |
+| `table_delete_rows` | (standalone) | Deletes rows by indices or an unambiguous `where` (XOR guard). | `workbook_id`, `name`, `indices?`, `where?` | `TableMutationResult` | Table rows; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/T/F |
+| `table_delete_column` | (standalone) | Deletes a column by its unique header (own permission). | `workbook_id`, `name`, `header` | `TableMutationResult` | Table column; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/T/F |
+| `name` | `create`, `update` | Creates a name in an explicit scope; updates `RefersTo` (scope preserved). | `action`, `workbook_id`, `name`, `refers_to?`, `scope`, `sheet?` | `DefinedNameInfo` | New/updated name; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/F/T |
+| `name_read` | `list`, `get` | All names, or one name by name and explicit scope. | `action`, `workbook_id`, `name?`, `scope?`, `sheet?` | `list[DefinedNameInfo]` / `DefinedNameInfo` | — | `COM_BUSY` | T/F/T |
+| `name_delete` | (standalone) | Deletes a name and returns its previous value. | `workbook_id`, `name`, `scope`, `sheet?` | `DefinedNameInfo` | Name; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/T/F |
 
 `sheet_delete` is rejected if no visible sheet would remain after the deletion;
-`sheet_set_visibility` rejects hiding the last visible sheet.
-
-## Tables
-
-| Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
-|------|---------|------------|---------|--------------|--------|--------|
-| `tables_list` | All tables (ListObject) with ranges and columns. | `workbook_id:string` | `list[TableInfo]` | — | — | read-only |
-| `table_get` | One table by name/`DisplayName`. | `workbook_id:string, name:string` | `TableInfo` | — | `COM_BUSY` (not found) | read-only |
-| `table_read_rows` | Typed, bounded slice of table rows. | `workbook_id:string, name:string, offset:integer=0?, limit:integer?` | `TableRows` | — | `COM_BUSY` | read-only |
-| `table_append_rows` | Appends rows via `ListRows.Add` (structure preserved). | `workbook_id:string, name:string, rows:array<object>` | `TableMutationResult` | Table rows; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `table_insert_row` | Inserts one row at the 1-based position `at`. | `workbook_id:string, name:string, at:integer, values:object?` | `TableMutationResult` | Table row; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `table_update_rows` | Updates rows by index or an unambiguous `where`. | `workbook_id:string, name:string, updates:array<object>` | `TableMutationResult` | Row values; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `table_delete_rows` | Deletes rows by indices or an unambiguous `where`. | `workbook_id:string, name:string, indices:array?, where:object?` | `TableMutationResult` | Table rows; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `table_add_column` | Adds a column via `ListColumns.Add(Position)`. | `workbook_id:string, name:string, header:string, position:integer?` | `TableMutationResult` | Table column; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `table_delete_column` | Deletes a column by its unique header. | `workbook_id:string, name:string, header:string` | `TableMutationResult` | Table column; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `table_create` | Creates a ListObject on a sheet over an A1 range or name. | `workbook_id:string, sheet:string, range_or_name:string, style:string?` | `TableMutationResult` | New table; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `table_resize` | Resizes the table via `ListObject.Resize`. | `workbook_id:string, name:string, new_range:string` | `TableMutationResult` | Table range; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-
-## PivotTables
-
-| Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
-|------|---------|------------|---------|--------------|--------|--------|
-| `pivot_tables_list` | All PivotTables and their caches across all sheets. | `workbook_id:string, background:boolean=false?` | `PivotInventory` or `RunningJob` | — | `COM_BUSY` | read-only |
-| `pivot_table_get` | Metadata for one PivotTable by `Name`. | `workbook_id:string, pivot_table:string` | `PivotTableInfo` | — | `COM_BUSY` | read-only |
-| `pivot_cache_get` | PivotCache metadata by 1-based `CacheIndex`. | `workbook_id:string, cache_index:integer` | `PivotCacheInfo` | — | `COM_BUSY` | read-only |
-| `pivot_fields_list` | PivotTable fields with orientation and aggregation. | `workbook_id:string, pivot_table:string` | `list[PivotFieldInfo]` | — | `COM_BUSY` | read-only |
-| `pivot_table_refresh` | Refreshes one PivotTable (`RefreshTable`). | `workbook_id:string, pivot_table:string` | `PivotRefreshResult` | PivotTable data; audit | `UNSUPPORTED_PIVOT_SOURCE`, `REFRESH_FAILED`, `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `pivot_cache_refresh` | Refreshes one PivotCache (`PivotCache.Refresh`). | `workbook_id:string, cache_index:integer` | `PivotRefreshResult` | Data of all tables in the cache; audit | `UNSUPPORTED_PIVOT_SOURCE`, `REFRESH_FAILED`, `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `pivot_field_set_layout` | Sets a field's orientation or removes it. | `workbook_id:string, pivot_table:string, field:string, orientation:PivotFieldOrientation, delete:boolean=false?` | `PivotFieldInfo` | PivotTable structure; audit | `UNSUPPORTED_PIVOT_SOURCE`, `AMBIGUOUS_FILTER`, `INVALID_RANGE`, `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `pivot_field_set_position` | Sets the 1-based position of a field in its orientation. | `workbook_id:string, pivot_table:string, field:string, position:integer` | `PivotFieldInfo` | Field order; audit | `UNSUPPORTED_PIVOT_SOURCE`, `AMBIGUOUS_FILTER`, `INVALID_RANGE`, `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `pivot_field_set_aggregation` | Adds or updates a data-field aggregation. | `workbook_id:string, pivot_table:string, field:string, function:PivotAggregation, caption:string?` | `PivotFieldInfo` | Data field; audit | `UNSUPPORTED_PIVOT_SOURCE`, `AMBIGUOUS_FILTER`, `INVALID_RANGE`, `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `pivot_field_set_properties` | Sets `caption` / `number_format` / `show_all_items`. | `workbook_id:string, pivot_table:string, field:string, properties:PivotFieldProperties` | `PivotFieldInfo` | Field properties; audit | `UNSUPPORTED_PIVOT_SOURCE`, `AMBIGUOUS_FILTER`, `INVALID_RANGE`, `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `pivot_field_get_filters` | Current filter state of a field. | `workbook_id:string, pivot_table:string, field:string` | `PivotFieldFilters` | — | `AMBIGUOUS_FILTER`, `COM_BUSY` | read-only |
-| `pivot_field_apply_filter` | Applies a manual filter over visible items. | `workbook_id:string, pivot_table:string, field:string, spec:PivotFilterSpec` | `PivotFieldFilters` | Item visibility; audit | `UNSUPPORTED_PIVOT_SOURCE`, `AMBIGUOUS_FILTER`, `INVALID_RANGE`, `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `pivot_field_clear_filters` | Clears a field's filters or the whole table's filters. | `workbook_id:string, pivot_table:string, field:string?, scope:string=field?` | `PivotFieldFilters` | Filters; audit | `UNSUPPORTED_PIVOT_SOURCE`, `AMBIGUOUS_FILTER`, `INVALID_RANGE`, `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-
-Creating and deleting PivotTables/PivotCaches is not supported. `PivotFilters.Add`
-(label/value/date/top-bottom) does not work on the validated build: it returns an explicit
-`unsupported` result with `filter.supported=false` and a reason, rather than silently converting
-to a manual filter.
-
-**Page (report-filter) fields (F3).** A page field does not store its selection in
-`PivotItem.Visible` (every item reads `Visible=False` on the target build), so its state is
-classified from `CurrentPage` / `AllItemsVisible`. An untouched page field reports `kind:"none"`
-with `hidden_items:[]`, exactly matching the `filter_state` reported by `pivot_table_get` /
-`pivot_fields_list` — the two readers share one classifier. Consequences:
-
-- `pivot_field_clear_filters` with `scope:"field"` or `scope:"table"` no longer raises a false
-  `AMBIGUOUS_FILTER` for an untouched page field;
-- `pivot_field_apply_filter` on a page field is **rejected** before any COM mutation: the result
-  carries `filters.filter.supported=false` plus `unsupported_reason`, and the mutation is reported
-  as `applied=false`, `verified=false`. A manual visible-item filter is not applicable there and
-  the result is never silently downgraded. Select a page through the page
-  dropdown / `CurrentPage` instead.
-
-Row/column/data fields keep the existing `PivotItems[i].Visible` manual-filter semantics.
-
-**Inventory sweep status (Block B).** `pivot_tables_list` performs a **single worksheet sweep**
-feeding both the PivotTable and PivotCache inventories (linked by a `CacheIndex` memo). The source
-type is gated first per PivotTable, so an external / OLAP / Data Model cache is reported with its
-identity only and `source_status="unsupported_source"` (otherwise `"supported"`). A per-sheet
-**measured** budget (field / `PivotItems` reads, never file size / row count / `UsedRange`) stops
-the sweep between COM ops: a sheet is reported `ok`, `capped` (partial results kept) or `too_large`
-(named, no partial) in the audit record. `pivot_tables_list` also accepts `background=true` (see
-[Background jobs](#background-jobs)). Output cells are never materialized and `Workbook.RefreshAll`
-is never used.
+`sheet set-visibility` rejects hiding the last visible sheet. `table` `update-rows` accepts an
+explicit index or an unambiguous `where`; `table_delete_rows` requires exactly one of `indices` /
+`where` (XOR). `name` `create` rejects a duplicate (same scope) or a cross-scope conflict; `name`
+`update` never re-scopes a name.
 
 ## Ranges
 
-| Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
-|------|---------|------------|---------|--------------|--------|--------|
-| `range_get` | Metadata for an A1 range (address, size, shape, merged state). | `workbook_id:string, sheet:string, address:string` | `RangeAddress` | — | `INVALID_RANGE` | read-only |
-| `range_read_values` | Typed values of a bounded window. | `workbook_id:string, sheet:string, address:string, offset:integer=0?, limit:integer?` | `RangeValues` | — | `INVALID_RANGE` | read-only |
-| `range_read_formulas` | Typed formulas of a bounded window. | `workbook_id:string, sheet:string, address:string, offset:integer=0?, limit:integer?` | `RangeFormulas` | — | `INVALID_RANGE` | read-only |
-| `range_write_values` | Writes typed values to a bounded range. | `workbook_id:string, sheet:string, address:string, payload:RangeWriteRequest` | `RangeMutationResult` | Cell values; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION` | mutating |
-| `range_write_formulas` | Writes formulas to a bounded range. | `workbook_id:string, sheet:string, address:string, payload:FormulaWriteRequest` | `RangeMutationResult` | Cell formulas; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION` | mutating |
-| `range_get_format` | Tri-state formatting of a range. | `workbook_id:string, sheet:string, address:string` | `FormatInfo` | — | `INVALID_RANGE` | read-only |
-| `range_set_format` | Partial formatting update. | `workbook_id:string, sheet:string, address:string, patch:RangeFormatPatch` | `FormatMutationResult` | Formatting; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE` | mutating |
-| `range_copy` | Copies a range to another sheet/address (no clipboard). | `workbook_id:string, sheet:string, source:string, destination_sheet:string, destination:string` | `StructuralMutationResult` | Destination data; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION` | mutating |
-| `range_insert` | Inserts cells with a `right`/`down` shift. | `workbook_id:string, sheet:string, address:string, shift:string, allow_merged:boolean=false?` | `StructuralMutationResult` | Cell shift; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION`, `PROTECTED_TARGET` | mutating |
-| `range_delete` | Deletes cells with a `left`/`up` shift. | `workbook_id:string, sheet:string, address:string, shift:string, allow_merged:boolean=false?` | `StructuralMutationResult` | Cell deletion; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION`, `PROTECTED_TARGET` | mutating |
-| `range_merge` | Merges a range into a single cell. | `workbook_id:string, sheet:string, address:string, across:boolean=false?, allow_data_loss:boolean=false?` | `StructuralMutationResult` | Merge; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION`, `PROTECTED_TARGET` | mutating |
-| `range_unmerge` | Unmerges every merged area intersecting the target. | `workbook_id:string, sheet:string, address:string` | `StructuralMutationResult` | Unmerge; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION`, `PROTECTED_TARGET` | mutating |
-| `range_get_validation` | Data-validation rule of a range. | `workbook_id:string, sheet:string, address:string` | `ValidationRule` | — | `INVALID_RANGE` | read-only |
-| `range_set_validation` | Adds or changes a data-validation rule. | `workbook_id:string, sheet:string, address:string, spec:ValidationSpec` | `ValidationRule` | Validation rule; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `PROTECTED_TARGET` | mutating |
-| `range_get_conditional_formatting` | Conditional-formatting rules by priority. | `workbook_id:string, sheet:string, address:string` | `list[ConditionalFormatRule]` | — | `INVALID_RANGE` | read-only |
-| `range_set_conditional_formatting` | Adds, changes or deletes a rule. | `workbook_id:string, sheet:string, address:string, spec:ConditionalFormatSpec, mode:string=add?` | `ConditionalFormatMutationResult` | Rules; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `PROTECTED_TARGET` | mutating |
+| Tool | Actions | Purpose | Parameters | Returns | Side effects | Errors | R/D/I |
+|------|---------|---------|------------|---------|--------------|--------|-------|
+| `range_read` | `get`, `read-values`, `read-formulas`, `get-format`, `get-validation`, `get-conditional-formatting` | Range metadata; typed values/formulas; format; validation; conditional formatting. | `action`, `workbook_id`, `sheet`, `address`, `offset?=0`, `limit?` | `RangeAddress` / `RangeValues` / `RangeFormulas` / `FormatInfo` / `ValidationRule` / `list[ConditionalFormatRule]` | — | `INVALID_RANGE` | T/F/T |
+| `range_write` | `write-values`, `write-formulas`, `set-format`, `set-validation`, `set-conditional-formatting` | Writes typed values/formulas; sets format, validation or a conditional-format rule. | `action`, `workbook_id`, `sheet`, `address`, `payload?`, `patch?`, `spec?`, `mode?=add` | `RangeMutationResult` / `FormatMutationResult` / `ValidationRule` / `ConditionalFormatMutationResult` | Cell values/formulas/format/rules; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION`, `PROTECTED_TARGET` | F/F/F |
+| `range_structural` | `copy`, `insert`, `unmerge` | Copies a range; inserts cells (`right`/`down`); unmerges. | `action`, `workbook_id`, `sheet`, `source?`, `destination_sheet?`, `destination?`, `address?`, `shift?`, `allow_merged?=false` | `StructuralMutationResult` | Destination data / cell shift / unmerge; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION`, `PROTECTED_TARGET` | F/T/F |
+| `range_delete` | (standalone) | Deletes cells with a `left`/`up` shift. | `workbook_id`, `sheet`, `address`, `shift`, `allow_merged?=false` | `StructuralMutationResult` | Cell deletion; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION`, `PROTECTED_TARGET` | F/T/F |
+| `range_merge` | (standalone) | Merges a range into a single cell. | `workbook_id`, `sheet`, `address`, `across?=false`, `allow_data_loss?=false` | `StructuralMutationResult` | Merge; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY`, `INVALID_RANGE`, `LISTOBJECT_INTERSECTION`, `PROTECTED_TARGET` | F/T/T |
 
-Structural operations (`range_insert`, `range_delete`, `range_copy`, `range_merge`) that
-intersect an Excel Table (ListObject) are rejected with `LISTOBJECT_INTERSECTION` and must be
-performed through the Tables tools.
+`range_structural` is **not idempotent** (H4): re-`insert` duplicates and `unmerge` discards merges.
+`range_write` is not idempotent because `set-conditional-formatting(mode="add")` appends a rule
+(renumbering priorities). Structural operations that intersect an Excel Table (ListObject) are
+rejected with `LISTOBJECT_INTERSECTION` and must be performed through the table tools.
 
-`RangeAddress` reports merged-cell geometry: `is_merged` is `true` only when every cell of the
-target belongs to the **same** merged block (a target mixing merged and unmerged cells is not a
-single merged block), and `merged_area` is the `$`-absolute anchor area (`$A$1:$B$2`) or `null`.
-Interior/sub-range addresses of a merged block resolve to that anchor area, and `is_merged` is
-`false` again after `range_unmerge` (F1). The declarative `range_structure` assertion checks
-`rows` / `cols` / `merged` against this same descriptor.
+## Pivot
 
-## Names
+| Tool | Actions | Purpose | Parameters | Returns | Side effects | Errors | R/D/I |
+|------|---------|---------|------------|---------|--------------|--------|-------|
+| `pivot_read` | `tables-list`, `table-get`, `cache-get`, `fields-list`, `field-get-filters` | PivotTable/cache inventory; table/cache metadata; field list; field filter state. | `action`, `workbook_id`, `pivot_table?`, `cache_index?`, `field?`, `background?=false` | `PivotInventory` / `PivotTableInfo` / `PivotCacheInfo` / `list[PivotFieldInfo]` / `PivotFieldFilters` (or `RunningJob`) | — | `COM_BUSY`, `AMBIGUOUS_FILTER` | T/F/T |
+| `pivot_refresh` | `refresh-table`, `refresh-cache` | Refreshes one PivotTable or one PivotCache. | `action`, `workbook_id`, `pivot_table?`, `cache_index?` | `PivotRefreshResult` | PivotTable/cache data; audit | `UNSUPPORTED_PIVOT_SOURCE`, `REFRESH_FAILED`, `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/F/T |
+| `pivot_field` | `field-set-layout`, `field-set-position`, `field-set-aggregation`, `field-set-properties`, `field-apply-filter`, `field-clear-filters` | Sets a field's orientation/position/aggregation/properties; applies/clears filters. | `action`, `workbook_id`, `pivot_table`, `field?`, `orientation?`, `delete?=false`, `position?`, `function?`, `caption?`, `properties?`, `spec?`, `scope?=field` | `PivotFieldInfo` / `PivotFieldFilters` | PivotTable structure/data; audit | `UNSUPPORTED_PIVOT_SOURCE`, `AMBIGUOUS_FILTER`, `INVALID_RANGE`, `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/T/T |
 
-| Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
-|------|---------|------------|---------|--------------|--------|--------|
-| `names_list` | All workbook and worksheet-scoped defined names. | `workbook_id:string` | `list[DefinedNameInfo]` | — | — | read-only |
-| `name_get` | One name by name and explicit scope. | `workbook_id:string, name:string, scope:string, sheet:string?` | `DefinedNameInfo` | — | `COM_BUSY` | read-only |
-| `name_create` | Creates a name in an explicit scope. | `workbook_id:string, name:string, refers_to:string, scope:string, sheet:string?` | `DefinedNameInfo` | New name; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `name_update` | Updates `RefersTo` (scope is preserved). | `workbook_id:string, name:string, refers_to:string, scope:string, sheet:string?` | `DefinedNameInfo` | Name; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
-| `name_delete` | Deletes a name and returns its previous value. | `workbook_id:string, name:string, scope:string, sheet:string?` | `DefinedNameInfo` | Name; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | mutating |
+`pivot_read` is read-only; `pivot_refresh` and `pivot_field` are not. `pivot_field` is
+`destructive=true` **and** `idempotent=true` (dual-hint): `field-set-layout(delete=True)` discards a
+field, while re-applying the same layout/position/aggregation is idempotent. `cache-get` /
+`refresh-cache` require `cache_index`; field actions require `pivot_table` + `field`
+(`field-clear-filters` also accepts table scope). Creating/deleting PivotTables/PivotCaches is not
+supported. `PivotFilters.Add` (label/value/date/top-bottom) is not supported on the validated build:
+it returns an explicit `unsupported` result rather than silently converting to a manual filter. A
+page (report-filter) field's state is classified from `CurrentPage` / `AllItemsVisible`;
+`field-apply-filter` on a page field is rejected before any COM mutation.
 
-### Name scope rules (create / update / resolve)
+## Objects
 
-These rules match the adapter behaviour exactly (`names_adapter.py`).
+| Tool | Actions | Purpose | Parameters | Returns | Side effects | Errors | R/D/I |
+|------|---------|---------|------------|---------|--------------|--------|-------|
+| `shape` | `list`, `get`, `set-on-action` | All shapes; one shape by name; assigns a macro to a shape. | `action`, `workbook_id`, `name?`, `macro_name?` | `list[ShapeInfo]` / `ShapeInfo` | `OnAction`; audit | `NOT_FOUND`, `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED` | F/F/T |
+| `control` | `list`, `get`, `set-on-action` | All Form Controls/ActiveX; one control by name; assigns a macro to a Form Control. | `action`, `workbook_id`, `name?`, `macro_name?` | `list[ControlEntry]` / `ControlEntry` | `OnAction`; audit | `NOT_FOUND`, `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED` | F/F/T |
 
-**Cross-scope conflict on create (`_guard_no_conflict`).** `name_create` rejects a name that
-already exists — it never silently creates an ambiguous duplicate:
+`shape` and `control` are mixed tools (list/get read, set-on-action mutates) and are
+`readOnly=false, destructive=false, idempotent=true` (all actions idempotent per the matrix). An
+empty `macro_name` clears the assignment. ActiveX controls are rejected: they do not have Form
+Control `OnAction` semantics. A missing shape/control returns `NOT_FOUND` (F6); an ambiguous
+(duplicate) name is a plain `ExcelVbaMcpError` with `COM_BUSY` semantics and
+`context.reason="ambiguous"`.
 
-- **Duplicate (same scope):** the name already exists in the requested `scope` (and `sheet` for
-  worksheet scope) → rejected with `context.reason="duplicate"`.
-- **Cross-scope conflict:** the name exists at *another* scope (or on another sheet) → rejected
-  with `context.reason="scope_conflict"`. This is **stricter than Excel**, which allows the same
-  name at workbook and worksheet scope; the server refuses it to avoid ambiguity.
+## Capability / health
 
-Success example — creating a fresh name at workbook scope returns the new `DefinedNameInfo`:
+| Tool | Actions | Purpose | Parameters | Returns | Side effects | Errors | R/D/I |
+|------|---------|---------|------------|---------|--------------|--------|-------|
+| `xlvba_environment` | (standalone) | Reports the server access mode, policy, build and capabilities without touching COM. | — | `EnvironmentReport` | — | — | T/F/T |
+| `server_health` | (standalone) | Read-only liveness probe; never touches Excel/COM. | — | `{"status", "service", "version"}` | — | — | T/F/T |
 
-```json
-{ "workbook_id": "1f0c…", "name": "Total", "refers_to": "=Sheet1!$B$2", "scope": "workbook" }
-```
-
-Reject example — the same name already exists at worksheet scope:
-
-```json
-{ "workbook_id": "1f0c…", "name": "Total", "refers_to": "=Sheet1!$B$2", "scope": "workbook" }
-```
-
-→ `reason="scope_conflict"` (the name is defined on a sheet), so the create is refused.
-
-**Update preserves scope (`update_name`).** `name_update` only rewrites `RefersTo`; it **never**
-moves a name between scopes. The `scope`/`sheet` arguments identify the existing name to update —
-they do not re-scope it. Updating a workbook-scoped name with `scope="worksheet"` does not create
-or move anything; resolution simply fails if no worksheet-scoped name matches.
-
-**Resolution order (`_resolve_name`).** `name_get` / `name_update` / `name_delete` resolve
-`(name, scope, sheet)` by scanning workbook-scoped names (`wb.Names`) and worksheet-scoped names
-(per sheet), filtered case-insensitively by scope and (for worksheet scope) sheet:
-
-- exactly one match → that name is used;
-- no match → `NOT_FOUND`-style error (`"... was not found in <scope> scope"`);
-- more than one match → rejected as ambiguous (`context.reason="ambiguous"`), never guessed.
-
-## Shapes
-
-| Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
-|------|---------|------------|---------|--------------|--------|--------|
-| `shapes_list` | All shapes with type, `on_action`, position and text. | `workbook_id:string` | `list[ShapeInfo]` | — | — | read-only |
-| `shape_get` | One shape by name (case-insensitive). | `workbook_id:string, name:string` | `ShapeInfo` | — | `NOT_FOUND` (no such shape) | read-only |
-| `shape_set_on_action` | Assigns a macro to a shape (the macro is not executed). | `workbook_id:string, name:string, macro_name:string` | `ShapeInfo` | `OnAction`; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `NOT_FOUND` (no such shape) | mutating |
-
-An empty `macro_name` clears the assignment.
-
-## Controls
-
-| Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
-|------|---------|------------|---------|--------------|--------|--------|
-| `controls_list` | All Form Controls and ActiveX controls in the workbook. | `workbook_id:string` | `list[ControlEntry]` | — | — | read-only |
-| `control_get` | One control by name (case-insensitive). | `workbook_id:string, name:string` | `ControlEntry` | — | `NOT_FOUND` (no such control) | read-only |
-| `control_set_on_action` | Assigns a macro to a Form Control (not ActiveX). | `workbook_id:string, name:string, macro_name:string` | `ControlEntry` | `OnAction`; audit | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `NOT_FOUND` (no such control) | mutating |
-
-A missing shape or control returns `NOT_FOUND` (F6), a caller error that must not be retried;
-genuine COM contention still reports `COM_BUSY`. An ambiguous (duplicate) name is a plain
-`ExcelVbaMcpError` with `COM_BUSY` semantics and `context.reason="ambiguous"`.
-
-ActiveX controls are rejected: they do not have Form Control `OnAction` semantics.
-
-## Workbook model
-
-| Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
-|------|---------|------------|---------|--------------|--------|--------|
-| `workbook_get_model` | Aggregated workbook model: sheets, tables, names, shapes, controls, VBA. | `workbook_id:string, include_vba:boolean=true?` | `WorkbookModel` | — | — (VBA state is in `vba_access`) | read-only |
-
-The model does not read "all cells" and does not execute VBA; when VBOM is unavailable the
-other sections are still returned and `vba_access` reports the state.
-
-## Health
-
-| Tool | Purpose | Parameters | Returns | Side effects | Errors | Access |
-|------|---------|------------|---------|--------------|--------|--------|
-| `server_health` | Read-only liveness probe; never touches Excel/COM. | — | `{"status", "service", "version"}` | — | — | read-only |
-
-`excel_health` is grouped with Workbook/session because it describes session and worker state;
-the Health group contains only the server liveness probe.
+`xlvba_environment` is registered with an **inline** `read_only` annotation (not via the shared
+annotation set); `server_health` is likewise inline. Both are read-only and never touch COM.
 
 ## Complex tools in detail
 
-### excel_open
+### workbook `action="open"`
 
-`excel_open` defaults to `mode="execute", read_only=False` — a writable, execution-capable
+`workbook` `open` defaults to `mode="execute", read_only=False` — a writable, execution-capable
 session. Pass `mode="inspect"` and/or `read_only=True` to opt into a macros-disabled or read-only
-session. Read-only inspect mode:
+session:
 
 ```json
-{ "path": "C:/data/report.xlsm", "mode": "inspect", "read_only": true }
+{ "action": "open", "path": "C:/data/report.xlsm", "mode": "inspect", "read_only": true }
 ```
 
-Expected response shape:
+Expected response shape (`WorkbookInfo`):
 
 ```json
 {
@@ -490,95 +360,40 @@ Expected response shape:
 }
 ```
 
-A writable/execute open (the default when `mode`/`read_only` are omitted):
-
-```json
-{ "path": "C:/data/report.xlsm", "mode": "execute", "read_only": false }
-```
-
-In the default `full` access mode this open is authorized and a working copy is created. In
-`restricted` mode it is classified `MUTATING`/`EXECUTING` and **refused** with
-`code="APPROVAL_DENIED"`; the workbook is not opened and no working copy is created, because no
-grant tool exists through MCP.
-
-#### WorkbookInfo: `path` vs `source_path`
-
 `WorkbookInfo` carries **two paths** and deliberately **no** `original_name`:
 
 - `path` is the **working copy** actually opened by the server — the materialized file under the
-  server `work/` directory (`wb.FullName`). Every read, write and mutation targets this copy; the
-  original is never modified.
-- `source_path` is the **original, allowlisted** path the working copy was materialized from. It
-  is `null` when the workbook has no on-disk source (for example a snapshot restored from a
-  baseline that itself had no source).
-- `original_name` is **intentionally absent**: it would be redundant with `name` (the file name is
-  identical for the working copy and its source), so no separate field is exposed.
+  server `work/` directory. Every read, write and mutation targets this copy; the original is never
+  modified.
+- `source_path` is the **original, allowlisted** path the working copy was materialized from, or
+  `null` when the workbook has no on-disk source.
+- `original_name` is intentionally absent (redundant with `name`).
 
-Examples:
-
-| Scenario | `path` | `source_path` | `name` |
-|----------|--------|---------------|--------|
-| New open of `C:/data/report.xlsm` | `<temp>/excel_vba_mcp/work/<id>.xlsm` | `C:/data/report.xlsm` | `report.xlsm` |
-| Writable working copy (default open) | same working copy as above | still the untouched original | `report.xlsm` |
-| Separate source/current after edits | working copy diverges from the original | pristine original, unchanged | `report.xlsm` |
-
-### excel_close / excel_save
+### workbook `action="close"` / `action="save"`
 
 ```json
-{ "workbook_id": "1f0c…", "save_changes": false }
+{ "action": "close", "workbook_id": "1f0c…", "save_changes": false }
 ```
 
-`excel_close` without saving is read-only and allowed; the response is a `SessionStatus` with
-`state="closed"`. Saving on close is a mutation:
+`close` without saving is read-only and allowed; the response is a `SessionStatus` with
+`state="closed"`. **Refuse-by-default (D1):** with unsaved changes, `close` refuses unless
+`discard_changes=true`; `save_changes=true` saves on close (a mutation, `APPROVAL_DENIED` in
+`restricted` mode); contradictory flags are rejected. Explicit save:
 
 ```json
-{ "workbook_id": "1f0c…", "save_changes": true }
+{ "action": "save", "workbook_id": "1f0c…" }
 ```
 
-Authorized in the default `full` mode; in `restricted` mode it is refused with `APPROVAL_DENIED`.
-Explicit save:
+Requires approval (authorized in `full` mode; `APPROVAL_DENIED` in `restricted` mode) and returns an
+updated `WorkbookInfo` with `dirty=false`. Changes are never saved implicitly.
 
-```json
-{ "workbook_id": "1f0c…" }
-```
-
-Requires `MUTATING` approval (authorized in `full` mode; `APPROVAL_DENIED` in `restricted` mode)
-and returns an updated `WorkbookInfo` with `dirty=false`. Changes are never saved implicitly.
-
-### excel_save_as
-
-Save the working copy to a new (or the original) path — the fail-closed Save As:
-
-```json
-{ "workbook_id": "1f0c…", "path": "C:/data/report_copy.xlsm" }
-```
-
-`excel_save_as` flushes the working copy with `wb.Save` on the STA worker, then copies it to
-`path` by a pure-filesystem atomic temp→`os.replace` (never `wb.SaveAs`, so the session stays
-bound to its working copy — `workbook_id` / working copy / source are unchanged). A single
-`<target>.bak` preserves any previous target across an overwrite.
-
-- A **new** path is written directly (`outcome="ok"`).
-- An **existing** target is refused with `PROTECTED_TARGET/target_exists` unless
-  `overwrite_existing=true` (which writes the `.bak`).
-- The **original source** as target is refused with `PROTECTED_TARGET/source_protected` unless
-  `overwrite_source=true`; the source identity (SHA-256 + size) captured at `excel_open` is
-  re-verified, so a source replaced or modified since open is `STALE_TARGET`
-  (`source_replaced` / `source_modified_since_open`).
-- The **open working copy** as target is always refused (`PROTECTED_TARGET/target_is_working_copy`).
-- `outcome` is `"ok"` only after the final size + SHA-256 verify; an interrupted/unprovable
-  write reports `"unknown"`/`"error"` (never success) with `backup_path` when a `.bak` exists.
-  There is no auto-resume.
-
-Requires `MUTATING` approval on the target (authorized in `full` mode; `APPROVAL_DENIED` in
-`restricted` mode). The snapshot gate is skipped (Save As does not mutate the open working copy).
-
-### range_read_values / range_write_values
+### range_read `action="read-values"` / range_write `action="write-values"`
 
 Reading a bounded window:
 
 ```json
 {
+  "action": "read-values",
   "workbook_id": "1f0c…",
   "sheet": "Sheet1",
   "address": "A1:C10",
@@ -611,6 +426,7 @@ Writing requires an exact rectangular `payload`:
 
 ```json
 {
+  "action": "write-values",
   "workbook_id": "1f0c…",
   "sheet": "Sheet1",
   "address": "B2:C3",
@@ -625,19 +441,18 @@ Writing requires an exact rectangular `payload`:
 }
 ```
 
-A string beginning with `=` is stored as **text**, not as a formula (a separate tool exists for
-formulas). A wrong payload shape is rejected with `INVALID_RANGE` and no changes. The response
-is a `RangeMutationResult` with `range_before`, `range_after`, `verified` and
-`postcondition_values` (re-read values). The mutation requires a writable session and a snapshot;
-the approval gate authorizes it in the default `full` mode and refuses it with `APPROVAL_DENIED` in
-`restricted` mode.
+A string beginning with `=` is stored as **text**, not as a formula (use
+`range_write` `action="write-formulas"`). A wrong payload shape is rejected with `INVALID_RANGE`
+and no changes. The response is a `RangeMutationResult` with `range_before`, `range_after`,
+`verified` and `postcondition_values`.
 
-### range_set_format
+### range_write `action="set-format"`
 
 Sparse write: only the fields explicitly set in `patch` are applied.
 
 ```json
 {
+  "action": "set-format",
   "workbook_id": "1f0c…",
   "sheet": "Sheet1",
   "address": "A1:C1",
@@ -652,26 +467,14 @@ Sparse write: only the fields explicitly set in `patch` are applied.
 ```
 
 Missing fields stay unchanged; `null` resets a value to automatic only where Excel allows it.
-Response:
 
-```json
-{
-  "action": "set_format",
-  "range": { "sheet": "Sheet1", "address": "A1:C1", "rows": 1, "cols": 3 },
-  "applied": ["font.bold", "number_format"],
-  "ignored": [],
-  "verified": true,
-  "result_format": { "font": { "bold": true }, "number_format": "0.00" },
-  "notes": []
-}
-```
-
-### table_update_rows / table_delete_rows
+### table `action="update-rows"` / table_delete_rows
 
 An update accepts either an **explicit index** or an **unambiguous `where`**:
 
 ```json
 {
+  "action": "update-rows",
   "workbook_id": "1f0c…",
   "name": "Sales",
   "updates": [
@@ -681,21 +484,9 @@ An update accepts either an **explicit index** or an **unambiguous `where`**:
 }
 ```
 
-If `where` does not resolve to exactly one row, the tool returns `COM_BUSY` with a message about
-the ambiguity and a preview of the matched rows — there is no automatic "guessing". (Table
-ambiguity deliberately reuses the base `COM_BUSY` code with `context.reason="ambiguous"`; it is
-distinct from the PivotTable `AMBIGUOUS_FILTER` code used by the pivot tools.) The response
-is a `TableMutationResult` with `before`/`after` (`TableInfo`) and `affected_rows`.
-
-Deleting rows:
-
-```json
-{ "workbook_id": "1f0c…", "name": "Sales", "indices": [3, 5] }
-```
-
-or via `where`; omitting both arguments is a validation error. Deletion and update require a
-writable session and a snapshot; the approval gate authorizes them in the default `full` mode and
-refuses them with `APPROVAL_DENIED` in `restricted` mode.
+If `where` does not resolve to exactly one row, the tool returns `COM_BUSY` with a message about the
+ambiguity and a preview of the matched rows — there is no automatic "guessing". Deleting rows uses
+the standalone `table_delete_rows` with `indices` or `where`; omitting both is a validation error.
 
 ### snapshot_create / snapshot_restore
 
@@ -729,14 +520,10 @@ Response — `SnapshotManifest`:
 ```
 
 The top-level `sha256` is the snapshot **file** hash. Each `vba_exports` entry's
-`export_file_sha256` is the SHA-256 of the **exported component file bytes** (F7 renamed this
-from `sha256` at `model_version: 2` so it is not mistaken for the normalized `source_hash`). It
-is **not** a valid `expected_source_hash` for the VBA mutation tools — those require the
-normalized `source_hash` from `vba_read_component`. `snapshot_list` returns the same manifests;
-`snapshot_diff` compares the full manifests — every field except the volatile
-`snapshot_id`/`created_at`/`stored_path`, so this includes `vba_exports` and therefore each
-`export_file_sha256` — and separately reports the top-level snapshot file-hash comparison
-(`file_identical`, `sha256_a`, `sha256_b`).
+`export_file_sha256` is the SHA-256 of the **exported component file bytes** (F7) — **not** a valid
+`expected_source_hash` for the VBA mutation tools, which require the normalized `source_hash` from
+`vba_read` `action="read-component"`. `snapshot_list` returns the same manifests; `snapshot_diff`
+compares the full manifests and separately reports the top-level file-hash comparison.
 
 Restore:
 
@@ -744,45 +531,27 @@ Restore:
 { "snapshot_id": "snap-…", "workbook_id": "1f0c…", "confirm": true }
 ```
 
-The current working copy is closed **without saving**, then a new copy is opened from the
-baseline; a `WorkbookInfo` is returned. External macro effects are not rolled back.
-
-`confirm` is **required** (default `false`): a missing or `false` `confirm` is rejected with
-`code="CONFIRMATION_REQUIRED"` **before** the working copy is closed — nothing is discarded and
-the snapshot service is not called. Set `confirm=true` only after reviewing what is discarded
-(the current working copy with its unsaved changes) versus what is preserved (the snapshot
-baseline and the untouched original at `source_path`). The snapshot restores files only — it does
-**not** undo external macro side effects (database writes, emails, network calls, files, printing).
-
-Note that `snapshot_create` and `vba_export_project` write files: snapshots under the snapshot
-temp directory and exported components under the artifact/temp directory. Both are
-**approval-gated** (F-4): they are auto-allowed in the default `full` mode and refused with
-`APPROVAL_DENIED` in `restricted` mode. `snapshot_restore` adds no second gate — its approval
-point is the inherited writable `excel_open` (EXECUTING) it performs on the snapshot baseline.
+The current working copy is closed **without saving**, then a new copy is opened from the baseline;
+a `WorkbookInfo` is returned. External macro effects are not rolled back. `confirm` is required.
 
 ### vba_replace_component_source
 
-Before replacing, two calls are needed: `vba_list_components` (confirm the component is
-Standard/Class) and `vba_read_component` (obtain `source_hash`). Then:
+Before replacing, two `vba_read` calls are needed: `list-components` (confirm Standard/Class) and
+`read-component` (obtain `source_hash`). Then:
 
 ```json
 {
   "workbook_id": "1f0c…",
   "component": "Module1",
   "new_source": "Option Explicit\n\nPublic Sub Hello()\nEnd Sub",
-  "expected_source_hash": "<source_hash from vba_read_component>"
+  "expected_source_hash": "<source_hash from vba_read read-component>"
 }
 ```
 
 `expected_source_hash` is the stale-revision guard: the server compares it with the current
-normalized hash before and **inside** the STA worker. A mismatch raises `REVISION_CONFLICT` with
-`context.reason="revision_conflict"` and the mutation is not performed. The guard token is the
-**normalized `source_hash`** from `vba_read_component` — never the snapshot export **file** hash
-(`snapshot_create.vba_exports[].export_file_sha256`, the SHA-256 of the exported `.bas`/`.cls`/`.frm`
-bytes). The two hashes differ (UserForm exports carry a designer header and `.frx` is not
-byte-reproducible), so passing the snapshot file hash yields `REVISION_CONFLICT` (F7). The response
-is a `VbaMutationResult` with `before_hash`, `after_hash` and export paths. Document modules and
-UserForms are rejected.
+normalized hash before and **inside** the STA worker. A mismatch raises `REVISION_CONFLICT`. The
+guard token is the **normalized `source_hash`** from `vba_read` `read-component` — never the
+snapshot export **file** hash. Document modules and UserForms are rejected.
 
 ### macro_run
 
@@ -794,73 +563,36 @@ Gate order:
 
 1. execute mode + writable session (`_require_execute_context`);
 2. procedure resolution from the inventory (`Module.Procedure`);
-3. approval (key: canonical path + SHA-256 + action + procedure) — authorized in the default
-   `full` mode, `APPROVAL_DENIED` in `restricted` mode;
+3. approval (key: canonical path + SHA-256 + action + procedure) — authorized in `full` mode,
+   `APPROVAL_DENIED` in `restricted` mode;
 4. `background_safe` for the current workbook hash **and** `project_source_hash` (BG06);
-5. interactive-UI preflight (R13): `MsgBox`, `InputBox`, `.Show`, `FileDialog`, `Shell`,
-   `CreateObject`, `FollowHyperlink`, `SendKeys`, `DoEvents`, `GetOpenFilename`,
-   `GetSaveAsFilename`, `CallByName`, `ExecuteGlobal`, `Execute`, `Eval`, `OnTime`,
-   `DisplayAlerts`, `.Run`, `CommandBars`, `AppActivate`, `Application.Visible`, `.Activate`,
-   `WindowState` (case-insensitive);
+5. interactive-UI preflight (R13) — the token list in [Abbreviations](#abbreviations);
 6. one `Application.Run` on the STA worker.
 
-Possible `MacroRunResult` statuses: `success`, `not_found`, `runtime_error`, `blocked`,
-`timeout`, `needs_recovery`. When blocked the macro **is not started**: `blocked` with
-`APPROVAL_DENIED` (restricted-mode approval), `BACKGROUND_SAFETY_NOT_VERIFIED` (unclassified for
-the current workbook hash and source revision) or `INTERACTIVE_UI_NOT_SUPPORTED` (dangerous token,
-an "unsafe" classification, or a heuristic procedure).
+Possible `MacroRunResult` statuses: `success`, `not_found`, `runtime_error`, `blocked`, `timeout`,
+`needs_recovery`. When blocked the macro **is not started**. On a deadline the owned PID is inspected
+read-only for a visible modal (modal → `MACRO_RUNTIME_ERROR`, no modal → `MACRO_TIMEOUT`); in both
+branches only the automation-owned Excel PID is terminated and the session is recovered in-process
+(`MacroRunResult.session_recovery` reports `"recovered"` / `"needs_recovery"` / `null`). Recovery
+**discards open workbooks**: the prior `workbook_id` is invalid afterwards and the macro is never
+auto-replayed.
 
-**Deadline, dialogs and auto-recovery (F2a/F2b).** The dispatch has a soft deadline
-(`macro_timeout_s`, default **90 s**, `EXCEL_VBA_MCP_MACRO_TIMEOUT_S`). It runs inside a
-defense-in-depth guard that sets `Application.Interactive=False` and `DisplayAlerts=False` and
-restores the prior values in `finally`; this suppresses only Excel's own built-in alerts and does
-**not** block `MsgBox`, `UserForm.Show`, `FileDialog`, add-in UI or Win32 dialogs — the BG06/R13
-veto and owned-PID termination remain the real protections. When the deadline is exceeded the
-owned PID is inspected read-only for a visible modal:
-
-- modal present → `MACRO_RUNTIME_ERROR`, `dismissed=false`;
-- no modal → `MACRO_TIMEOUT`.
-
-In **both** branches only the automation-owned Excel PID is terminated (never a user-owned
-process), and the session is then recovered **in-process** — no server restart and no new tool.
-`MacroRunResult.session_recovery` reports the outcome: `"recovered"` when the rebuilt hidden
-instance is `RUNNING` again, `"needs_recovery"` when it is not, and `null` when no recovery was
-attempted (the success / blocked / not-found paths). Recovery **discards open workbooks**: the
-caller's prior `workbook_id` is invalid afterwards (also stated in `error_text`), the macro is
-never auto-replayed, and the workbook must be re-opened with `excel_open`.
-
-**Residual false-safe boundary.** The R13 token scan is a heuristic veto, not static proof.
-Dynamic/indirect UI (`CallByName` / `ExecuteGlobal` / `Eval` indirection) and UI reached
-transitively through other procedures the scan does not see are not fully covered. The veto list
-now also covers window/focus and visibility tokens (`AppActivate`, `Application.Visible`,
-`.Activate`, `WindowState`), but a procedure that reaches the UI only indirectly can still evade a
-substring scan. A `background_safe` classification is a human review outcome, and the deterministic
-layer can only veto, never certify.
-
-### macro_classify_background
-
-Classify a procedure's `background_safe` for the current workbook hash and VBA source revision:
+### macro `action="classify-background"`
 
 ```json
-{
-  "workbook_id": "1f0c…",
-  "procedure": "Module1.Hello",
-  "background_safe": true
-}
+{ "action": "classify-background", "workbook_id": "1f0c…", "procedure": "Module1.Hello", "background_safe": true }
 ```
 
-The optional `expected_project_source_hash` is an optimistic-concurrency guard: when it no longer
-matches the live source hash the write is rejected with `STALE_TARGET`. Classifying a heuristic or
-interactive-token procedure as `background_safe` is rejected with `INTERACTIVE_UI_NOT_SUPPORTED`
-(the R13 veto). The result is a `BackgroundSafetyClassification` carrying `workbook_sha256`,
-`project_source_hash` and `classified_at`. The tool is **ungated** (no approval) and is not the
-security boundary — `macro_run` still applies the approval gate and the R13 veto. The registry is
-in-memory and server-lifetime; a later VBA source change invalidates the classification.
+The optional `expected_project_source_hash` is an optimistic-concurrency guard (mismatch →
+`STALE_TARGET`). Classifying a heuristic or interactive-token procedure as `background_safe` is
+rejected with `INTERACTIVE_UI_NOT_SUPPORTED` (the R13 veto). The tool is **ungated** and is not the
+security boundary — `macro_run` still applies the approval gate and the R13 veto.
 
-### test_suite_run
+### test `action="run-suite"`
 
 ```json
 {
+  "action": "run-suite",
   "suite": {
     "suite": "smoke",
     "workbook_id": "1f0c…",
@@ -869,21 +601,10 @@ in-memory and server-lifetime; a later VBA source change invalidates the classif
       {
         "id": "reads-range",
         "steps": [
-          {
-            "action": "range_read_values",
-            "sheet": "Sheet1",
-            "range_address": "A1:B2",
-            "limit": 2
-          }
+          { "action": "range_read", "sheet": "Sheet1", "range_address": "A1:B2", "limit": 2 }
         ],
         "assertions": [
-          {
-            "type": "range_structure",
-            "sheet": "Sheet1",
-            "address": "A1:B2",
-            "rows": 2,
-            "cols": 2
-          }
+          { "type": "range_structure", "sheet": "Sheet1", "address": "A1:B2", "rows": 2, "cols": 2 }
         ]
       }
     ]
@@ -891,20 +612,12 @@ in-memory and server-lifetime; a later VBA source change invalidates the classif
 }
 ```
 
-`action` and `type` come from **closed** vocabularies: `TestAction` (37 actions) and
-`AssertionType` (29 checks); the schema forbids extra fields (`extra="forbid"`). An unknown
-action, arbitrary code, a shell command or an unbounded payload is rejected before any Excel
-access (`INVALID_RANGE`).
-
-Isolation: one immutable baseline snapshot, then **a disposable working copy per case**; a case
-cannot "dirty" the next one. Sequential edit→macro→edit→macro flows are supported: a `macro_run`
-step may carry an optional data-only `background_safe` field, and the runner classifies the
-procedure through the guarded `MacroService.classify_background` path before dispatch (never
-touching the registry directly). Compile-before-macro is explicit — include a `vba_compile` step;
-a failed `vba_compile` step blocks later `macro_run` steps in the same case, and a `macro_run` step
-on an unclassified procedure is blocked with `BACKGROUND_SAFETY_NOT_VERIFIED`. An `indeterminate`
-compile is not treated as a compile failure. The return value is a `TestRunResult` with
-per-case/per-step statuses; the run is persisted (`runs/`) and read via `test_get_run`.
+`action` and `type` come from **closed** vocabularies: `TestAction` and `AssertionType`; the schema
+forbids extra fields (`extra="forbid"`). Isolation: one immutable baseline snapshot, then **a
+disposable working copy per case**. A `macro_run` step may carry an optional data-only
+`background_safe` field, and the runner classifies the procedure through the guarded
+`MacroService.classify_background` path before dispatch. Compile-before-macro is explicit — include
+a `vba_compile` step. The run is persisted (`runs/`) and read via `test` `action="get-run"`.
 
 ### vba_compile_diagnostics
 
@@ -935,17 +648,15 @@ Fail-closed response:
 }
 ```
 
-The tool never returns `compiled` or `compile_error`, and never shows or activates UI. Reasons:
-`NON_ACTIVATING_COMPILE_UNAVAILABLE`, `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED`.
-`vba_get_compile_diagnostics` returns the same data from the cache without re-collecting.
+The tool never returns `compiled` or `compile_error`, and never shows or activates UI.
+`vba_read` `action="get-compile-diagnostics"` returns the same data from the cache without
+re-collecting.
 
 ## Background jobs
 
-Four long-running tools accept `background=true`: `excel_open`, `macro_run`, `test_suite_run`
-and `pivot_tables_list`.
-With `background=true` the tool schedules the
-operation on the in-process job registry and returns a prompt `RunningJob` handle well within the
-client wall-clock:
+Four long-running tools accept `background=true`: `workbook` (`open`), `macro_run`,
+`test` (`run-suite`) and `pivot_read` (`tables-list`). With `background=true` the tool schedules the
+operation on the in-process job registry and returns a prompt `RunningJob` handle:
 
 ```json
 { "status": "running", "job_id": "job-…", "poll_after_s": 5 }
@@ -953,12 +664,12 @@ client wall-clock:
 
 The client then **pulls/poll**s `job_get(job_id)` no sooner than `poll_after_s` (clamped to
 `[1, 30]`, default `5`). The registry **owns the result**, so a client timeout or disconnect never
-drops it; a completed result stays retrievable by `job_id` (and, after a restart, from the
-persisted `JobStore`).
+drops it; a completed result stays retrievable by `job_id` (and, after a restart, from the persisted
+`JobStore`).
 
 `JobStatus` fields: `job_id`, `status`, `started`, `cancel_requested`, `poll_after_s`, `result`
-(once terminal), `error_code`, `error_text`, `retry_after_s`, `phase`, `outcome`, `retryable` and
-an additive `events` history.
+(once terminal), `error_code`, `error_text`, `retry_after_s`, `phase`, `outcome`, `retryable` and an
+additive `events` history.
 
 `status` is one of:
 
@@ -973,53 +684,53 @@ an additive `events` history.
 | `unknown` | Reserved; never produced by the registry. |
 
 `job_request_cancel` records cancel **intent** only (`cancel_requested=true`); it cannot interrupt the
-uninterruptible COM call, so the job still runs to a terminal state. `interrupted_unknown` jobs are
-never replayed. The lifecycle and persistence model are described in
-[Architecture](04-architecture.md); the `excel_recover` interaction is in
+uninterruptible COM call, so the job still runs to a terminal state. The lifecycle and persistence
+model are described in [Architecture](04-architecture.md); the `excel_recover` interaction is in
 [Troubleshooting](10-troubleshooting.md).
 
 ## Tool dependencies
 
-1. **`excel_open` before any workbook tool.** Every tool with a `workbook_id` requires an open
-   working copy; otherwise — `ExcelVbaMcpError` "unknown workbook_id".
-2. **`snapshot_create` before any guarded mutation.** Without a successful snapshot the mutation
-   is rejected with `SNAPSHOT_FAILED`.
-3. **`vba_list_components` / `vba_read_component` before `vba_replace_component_source` and
+1. **`workbook` `action="open"` before any workbook tool.** Every tool with a `workbook_id` requires
+   an open working copy; otherwise — `ExcelVbaMcpError` "unknown workbook_id".
+2. **`snapshot_create` before any guarded mutation.** Without a successful snapshot the mutation is
+   rejected with `SNAPSHOT_FAILED`.
+3. **`vba_read` (`list-components` / `read-component`) before `vba_replace_component_source` and
    `vba_insert_code`.** They provide the component name and the current `source_hash` for
    `expected_source_hash`.
-4. **`vba_compile_diagnostics` before `vba_get_compile_diagnostics` — only to seed the cache.** Without the
-   first call the diagnostics are collected again; this does not change the result
-   (`is_compile=false`).
-5. **`macro_list` before `macro_run`.** It reveals the exact `Module.Procedure` name and the
+4. **`vba_compile_diagnostics` before `vba_read` `get-compile-diagnostics`** — only to seed the
+   cache; without the first call the diagnostics are collected again (same result).
+5. **`macro` `list` before `macro_run`.** It reveals the exact `Module.Procedure` name and the
    `background_safe` status before execution.
-6. **`test_get_run` after `test_suite_run`.** The `run_id` comes from
+6. **`test` `get-run` after `test` `run-suite`.** The `run_id` comes from
    `TestRunResult.test_run_id`; the tool only reads the persisted run.
 
-Additionally, `excel_close` (without saving) and `excel_save` are incompatible with subsequent
-calls using the same `workbook_id` — after closing, the identifier is no longer valid.
+Additionally, `workbook` `close` (without saving) and `workbook` `save` are incompatible with
+subsequent calls using the same `workbook_id` — after closing, the identifier is no longer valid.
 
 ## Mutating and potentially dangerous operations
 
 | Tool | What changes | Why it is gated | How to use it safely |
 |------|--------------|-----------------|----------------------|
-| `excel_open` (writable/execute) | Creates a working copy and opens it with macros (`execute`) | Default open; authorized in `full` mode, `APPROVAL_DENIED` in `restricted` | Use `mode="inspect", read_only=true` for read-only work; apply `execute` only to verified copies |
-| `excel_close(save_changes=true)` | Saves the working copy to disk | `MUTATING` | Save only after `snapshot_create` and a deliberate check |
-| `excel_save` | Writes the working-copy file | `MUTATING` | Combine with a snapshot; do not save "just in case" |
-| `snapshot_restore` | Discards the current copy without saving and opens the baseline | `mutating` (including writable-open); requires `confirm=true` | Take a fresh `snapshot_create` before restoring; a missing/false `confirm` is rejected with `CONFIRMATION_REQUIRED` before anything is discarded |
-| `sheet_delete` | Deletes a sheet with its data | Destructive, gated | Check `sheets_list`; rely on a snapshot |
-| `table_delete_rows` | Deletes table rows | Destructive, gated | Use explicit `indices`; use `where` only when unambiguous |
-| `table_delete_column` | Deletes a table column | Destructive, gated | Check `table_get`; do not pass an ambiguous header |
-| `range_write_values` | Overwrites cell values | `MUTATING`, gated | Check the payload size; take a snapshot |
-| `range_write_formulas` | Overwrites formulas | `MUTATING`, gated | Do not use it for constants (use values) |
-| `range_delete` | Deletes cells with a shift | Destructive, gated | Always pass `shift` explicitly; check table intersections |
-| `range_merge` | Merges cells, discarding data outside the anchor | Can lose data | Review `preconditions`; pass `allow_data_loss=true` only after review |
-| `name_delete` | Deletes a defined name | Can break formulas | Check `names_list` and dependencies; rely on a snapshot |
-| `vba_replace_component_source` | Fully replaces a module's code | `MUTATING`, gated | Pass the exact `expected_source_hash`; check `vba_compile_diagnostics` afterwards |
-| `vba_insert_code` | Inserts code into a module | `MUTATING`, gated | Specify an exact `position`; do not insert code blindly |
-| `shape_set_on_action` | Assigns a macro to a shape | `MUTATING`, gated | Check `shapes_list`; an empty `macro_name` clears the assignment |
-| `control_set_on_action` | Assigns a macro to a Form Control | `MUTATING`, gated | Work only with Form Controls; ActiveX is unsupported |
-| `macro_run` | Executes VBA code | `EXECUTING`, gated by approval (restricted mode) + `background_safe` + R13 | Only after `macro_list` / `macro_classify_background` and preflight; do not run macros with external effects |
-| `excel_recover` | Terminates the owned Excel process and discards working copies | `recovery` class; allow-by-default (both modes), audited, pid-scoped, fail-closed; requires `confirm=true` | Use only when `excel_health` shows `needs_recovery` / `running/deadline_exceeded`; originals are never modified, but open working copies are lost and an in-flight op is `prior_job="unknown"` (never replayed); a missing/false `confirm` is rejected with `CONFIRMATION_REQUIRED` before any termination |
+| `workbook` `open` (writable/execute) | Creates a working copy and opens it with macros | Default open; authorized in `full`, `APPROVAL_DENIED` in `restricted` | Use `mode="inspect", read_only=true` for read-only work; apply `execute` only to verified copies |
+| `workbook` `close` (`discard_changes=true`) | Discards unsaved changes and closes | Destructive; refuse-by-default (D1) | Prefer `save_changes=true` or a prior `snapshot_create`; only pass `discard_changes=true` deliberately |
+| `workbook` `save` | Writes the working-copy file | Mutating | Combine with a snapshot; do not save "just in case" |
+| `excel_save_as` | Writes the working copy to a target path (own permission) | Standalone high-risk; overwrite policy | Check the target; use `overwrite_existing` / `overwrite_source` only after review |
+| `snapshot_restore` | Discards the current copy and opens the baseline | Mutating; requires `confirm=true` | Take a fresh `snapshot_create` first; a missing/false `confirm` is rejected before anything is discarded |
+| `sheet_delete` | Deletes a sheet with its data | Destructive, standalone | Check `sheet_read` `list`; rely on a snapshot |
+| `table_delete_rows` | Deletes table rows | Destructive, standalone (XOR guard) | Use explicit `indices`; use `where` only when unambiguous |
+| `table_delete_column` | Deletes a table column | Destructive, standalone (own permission) | Check `table_read` `get`; do not pass an ambiguous header |
+| `range_write` | Overwrites values/formulas/format/rules | Mutating | Check the payload size; take a snapshot |
+| `range_structural` | Copies/inserts/unmerges cells | Destructive; not idempotent | Pass `shift` explicitly for `insert`; check table intersections |
+| `range_delete` | Deletes cells with a shift | Destructive, standalone | Always pass `shift` explicitly; check table intersections |
+| `range_merge` | Merges cells, discarding data outside the anchor | Destructive (dual-hint) | Review preconditions; pass `allow_data_loss=true` only after review |
+| `name_delete` | Deletes a defined name | Destructive, standalone | Check `name_read` and dependencies; rely on a snapshot |
+| `vba_replace_component_source` | Fully replaces a module's code | Destructive, standalone | Pass the exact `expected_source_hash`; check `vba_compile_diagnostics` afterwards |
+| `vba_insert_code` | Inserts code into a module | Destructive, standalone | Specify an exact `position`; do not insert code blindly |
+| `shape` `set-on-action` | Assigns a macro to a shape | Mutating | Check `shape` `list`; an empty `macro_name` clears the assignment |
+| `control` `set-on-action` | Assigns a macro to a Form Control | Mutating | Work only with Form Controls; ActiveX is unsupported |
+| `macro_run` | Executes VBA code | Executing; gated by approval (restricted) + `background_safe` + R13 | Only after `macro` `list` / `macro` `classify-background` and preflight; do not run macros with external effects |
+| `test` `run-suite` | Runs a declarative suite (may dispatch `macro_run`) | Executing; destructive | Review cases; a `macro_run` step needs a classified procedure |
+| `excel_recover` | Terminates the owned Excel process and discards working copies | Recovery; allow-by-default (both modes), audited, pid-scoped, fail-closed; requires `confirm=true` | Use only when `excel_health` shows `needs_recovery` / `running/deadline_exceeded`; originals are never modified, but open working copies are lost |
 
 ## Read-only resources
 
@@ -1034,57 +745,49 @@ Resources are read-only: they do not mutate the workbook and do not execute VBA.
 
 ## Known tool limitations
 
-1. **Compilation is always `indeterminate`.** `vba_compile_diagnostics` cannot confirm compilation on the
-   validated build; `is_compile=false`.
+1. **Compilation is always `indeterminate`.** `vba_compile_diagnostics` cannot confirm compilation on
+   the validated build; `is_compile=false`.
 2. **Macros require background-safety classification.** `BackgroundSafetyRegistry` starts empty
-   (fail-closed); classify a procedure with `macro_classify_background`. An unclassified procedure
+   (fail-closed); classify a procedure with `macro` `classify-background`. An unclassified procedure
    returns `blocked` (`BACKGROUND_SAFETY_NOT_VERIFIED`); an interactive one is vetoed
    (`INTERACTIVE_UI_NOT_SUPPORTED`). The R13 token scan is a heuristic veto, not static proof.
 3. **No approval grant tool.** Approval/allowlist management cannot be granted through MCP. In the
    default `full` access mode mutations and execute mode are authorized without a grant; in
-   `restricted` mode they are refused with `APPROVAL_DENIED`. `background_safe` classification is
-   available through `macro_classify_background`. Consequently, in `restricted` mode there is no
-   in-band path to grant approvals or manage the allowlist, so the default execute `excel_open` is
-   denied and only `inspect`+`read_only` sessions are usable; the remedy is to run in `full` mode or
-   pre-authorize via the library.
+   `restricted` mode they are refused with `APPROVAL_DENIED`. Consequently, in `restricted` mode
+   there is no in-band path to grant approvals or manage the allowlist, so the default execute
+   `workbook` `open` is denied and only `inspect`+`read_only` sessions are usable; the remedy is to
+   run in `full` mode or pre-authorize via the library.
 4. **No PivotTable/PivotCache creation or deletion.** Only existing objects can be managed;
    external/OLAP/Data-Model sources are rejected.
-5. **Range and ListObject intersection.** Structural range operations over tables are rejected
-   with `LISTOBJECT_INTERSECTION`; use the Tables tools instead.
-6. **Bounded reads.** `range_read_values`, `range_read_formulas` and `table_read_rows` return
-   bounded windows; read large ranges in chunks via `offset`/`limit`.
+5. **Range and ListObject intersection.** Structural range operations over tables are rejected with
+   `LISTOBJECT_INTERSECTION`; use the table tools instead.
+6. **Bounded reads.** `range_read` (`read-values` / `read-formulas`) and `table_read` (`read-rows`)
+   return bounded windows; read large ranges in chunks via `offset`/`limit`.
 7. **No charts, PivotCharts or slicers.** No tools are provided for them.
-8. **No workbook creation.** `excel_open` opens only existing files; a new workbook cannot be
+8. **No workbook creation.** `workbook` `open` opens only existing files; a new workbook cannot be
    created through MCP.
 9. **No full recalculation or cross-workbook copy.** `Application.Calculate` is not exposed;
-   `range_copy` works only within one workbook and without the clipboard.
-10. **No list pagination.** `tables_list` and `pivot_tables_list` return the full bounded list
-    without paging.
+   `range_structural` `copy` works only within one workbook and without the clipboard.
+10. **No list pagination.** `table_read` `list` and `pivot_read` `tables-list` return the full
+    bounded list without paging.
 11. **A dead owned Excel is detected as `needs_recovery`; recovery is agent-directed.**
     `excel_health` reads worker/session bookkeeping without touching COM and additionally runs a
-    read-only owned-pid liveness probe (`OpenProcess` + `GetExitCodeProcess`, no COM, no kill): if
-    the hidden `EXCEL.EXE` the worker owns has died while the bookkeeping still says
-    `running`/`accepting`, `excel_health` reports `needs_recovery` instead of a false `ok`. A
-    `macro_run` hang/timeout rebuilds the instance automatically (F2b). For every other
-    `needs_recovery` / `running/deadline_exceeded` state the agent calls `excel_recover`
+    read-only owned-pid liveness probe: if the hidden `EXCEL.EXE` the worker owns has died while the
+    bookkeeping still says `running`/`accepting`, `excel_health` reports `needs_recovery` instead of
+    a false `ok`. A `macro_run` hang/timeout rebuilds the instance automatically (F2b). For every
+    other `needs_recovery` / `running/deadline_exceeded` state the agent calls `excel_recover`
     (agent-directed, fail-closed, originals-safe); the server never auto-terminates a live pid on a
-    deadline. If recovery is refused (no live, identity-verified handle) the fallback is a server
-    restart.
-12. **`macro_run` has no snapshot precondition (spec deviation, tracked).**
-    Unlike content-mutating tools, `macro_run` does not require a prior `snapshot_create`; it runs
-    a classified, approved macro without one. The recommended workflow still snapshots first so a
-    macro's external side effects have a rollback baseline. This asymmetry is a documented
-    limitation, not a guarantee that macros are snapshot-gated.
+    deadline. If recovery is refused the fallback is a server restart.
+12. **`macro_run` has no snapshot precondition (spec deviation, tracked).** Unlike content-mutating
+    tools, `macro_run` does not require a prior `snapshot_create`. The recommended workflow still
+    snapshots first so a macro's external side effects have a rollback baseline.
 13. **`excel_recover` is the only recovery tool; there is no `excel_recover_session` tool.**
     `SessionService.recover_session`/`close_session` exist internally but are not exposed as MCP
-    tools. The agent-directed `excel_recover` terminates the wedged owned process (through the held
-    handle), discards working copies and rebuilds a fresh hidden instance; it is allow-by-default
-    in both modes, audited and pid-scoped. The `macro_run` hang/timeout path also recovers
-    automatically (F2b) and reports it in `MacroRunResult.session_recovery`. An interrupted
-    operation is reported `prior_job="unknown"` and is never auto-retried.
-14. **`macro_policy.classify_operation` is non-authoritative (dead/illustrative table).**
-    The `classify_operation` function in `security/macro_policy.py` is retained for illustration
-    and is **not** wired into the runtime enforcement path; the live operation class of each tool
-    is defined per-service. Its table is stale (it predates the current 91-tool catalogue) and
-    must not be read as the authoritative tool classification — use this reference or the service
-    code for that.
+    tools. The `macro_run` hang/timeout path also recovers automatically (F2b) and reports it in
+    `MacroRunResult.session_recovery`. An interrupted operation is reported `prior_job="unknown"`
+    and is never auto-retried.
+14. **`macro_policy.classify_operation` is non-authoritative (dead/illustrative table).** The
+    `classify_operation` function in `security/macro_policy.py` is retained for illustration and is
+    **not** wired into the runtime enforcement path; the live operation class of each tool is defined
+    per-service. Its table predates the current 41-tool catalogue and must not be read as the
+    authoritative tool classification — use this reference or the service code for that.
