@@ -72,19 +72,9 @@ from excel_vba_mcp.api.name_tools import (
     name_read,
 )
 from excel_vba_mcp.api.pivot_tools import (
-    pivot_cache_get,
-    pivot_cache_refresh,
-    pivot_field_apply_filter,
-    pivot_field_clear_filters,
-    pivot_field_get_filters,
-    pivot_field_set_aggregation,
-    pivot_field_set_layout,
-    pivot_field_set_position,
-    pivot_field_set_properties,
-    pivot_fields_list,
-    pivot_table_get,
-    pivot_table_refresh,
-    pivot_tables_list,
+    pivot_field,
+    pivot_read,
+    pivot_refresh,
 )
 from excel_vba_mcp.api.range_tools import (
     range_delete,
@@ -977,120 +967,80 @@ _DESC_WORKBOOK_GET_MODEL = (
     "unavailable, locked or VBOM trust is disabled the other sections are still "
     "returned and vba_access reports the state."
 )
-_DESC_PIVOT_TABLES_LIST = (
-    "List every PivotTable and its cache across all worksheets of an open "
-    "workbook. Enumeration is worksheet-scoped (a full-workbook sweep) because "
-    "Workbook.PivotTables is not a usable inventory on the target build. Each "
-    "PivotTable reports its name, sheet, cache index, TableRange1/TableRange2 "
-    "addresses, source type and supported/unsupported status; shared caches are "
-    "reported once with their affected tables. Read-only. background=true returns "
-    "{status:'running', job_id, poll_after_s} promptly; retrieve the inventory "
-    "with job_get."
+_DESC_PIVOT_READ = (
+    "Purpose: Read PivotTables, PivotCaches and PivotFields of an open workbook "
+    "through one read-only dispatch tool. "
+    "Use when: you need the PivotTable/Cache inventory, one PivotTable's or "
+    "PivotCache's metadata, a PivotTable's field layout, or one field's current "
+    "filter state. "
+    "Do not use when: you need to refresh a PivotTable/Cache — use "
+    "pivot_refresh; you need to change a field's layout/aggregation/filter — use "
+    "pivot_field. "
+    "Preconditions: an open workbook_id; pivot_table is required for table-get / "
+    "fields-list / field-get-filters; cache_index is required for cache-get; "
+    "field is required for field-get-filters. "
+    "Parameters: action='tables-list'|'table-get'|'cache-get'|'fields-list'|"
+    "'field-get-filters'; workbook_id; pivot_table; cache_index; field; "
+    "background (tables-list only). "
+    "Behavior: read-only; only worksheet/Table-backed caches are supported — "
+    "external, OLAP and Data Model sources are reported as unsupported_source "
+    "rather than refreshed; shared caches are reported once with their affected "
+    "tables; a missing required argument surfaces as a structured "
+    "ExcelVbaMcpError. "
+    "Result: PivotInventory (tables-list), PivotTableInfo (table-get), "
+    "PivotCacheInfo (cache-get), list[PivotFieldInfo] (fields-list), "
+    "PivotFieldFilters (field-get-filters) or a RunningJob handle (tables-list "
+    "with background=true). "
+    "Next actions: pivot_refresh to refresh; pivot_field to reconfigure a field."
 )
-_DESC_PIVOT_TABLE_GET = (
-    "Return one PivotTable's metadata by its stable Name: sheet, index, cache "
-    "index, TableRange1/TableRange2/DataBodyRange addresses, row/column/page/"
-    "hidden/data field layout, source type and supported/unsupported status. "
-    "Read-only; never materializes the PivotTable cell output."
+_DESC_PIVOT_REFRESH = (
+    "Purpose: Refresh one PivotTable or one PivotCache through one dispatch "
+    "tool (never Workbook.RefreshAll). "
+    "Use when: you need to refresh a single PivotTable (table-scoped) or a "
+    "shared PivotCache (cache-scoped, affects every table using it). "
+    "Do not use when: you need to read pivot metadata — use pivot_read; you "
+    "need to change a field — use pivot_field. "
+    "Preconditions: writable session + snapshot + approval Approval gate (see "
+    "xlvba://glossary) + postcondition re-read; pivot_table is required for "
+    "refresh-table; cache_index is required for refresh-cache. "
+    "Parameters: action='refresh-table'|'refresh-cache'; workbook_id; "
+    "pivot_table (refresh-table); cache_index (refresh-cache). "
+    "Behavior: the cache source type is checked first — external, OLAP and Data "
+    "Model sources return unsupported_source and are not refreshed; success is "
+    "confirmed by Excel's truth signal (RefreshTable Boolean and/or an advanced "
+    "RefreshDate), never by the absence of a COM exception. This tool is NOT "
+    "idempotent: a re-refresh may read different source data. "
+    "Guarded mutation (see xlvba://glossary). "
+    "Result: PivotRefreshResult (affected_pivot_tables, RefreshDate before/after, "
+    "refreshed status). "
+    "Next actions: pivot_read action='table-get' to verify the refreshed state."
 )
-_DESC_PIVOT_CACHE_GET = (
-    "Return one PivotCache's metadata by its 1-based CacheIndex: source type "
-    "(database/external/consolidation/scenario/pivot_table/olap/data_model/"
-    "unknown), SourceData, RefreshDate, RefreshOnFileOpen, EnableRefresh, OLAP "
-    "indicator, shared-cache flag and the list of PivotTables that share this "
-    "cache. Read-only."
-)
-_DESC_PIVOT_FIELDS_LIST = (
-    "List a PivotTable's fields with source name, caption, orientation "
-    "(hidden/row/column/page/data), 1-based position within the orientation "
-    "(null when hidden), data-field aggregation function (from DataFields), "
-    "ShowAllItems, manual filter state and data-field caption/number format. "
-    "Read-only."
-)
-_DESC_PIVOT_TABLE_REFRESH = (
-    "Refresh one PivotTable via PivotTable.RefreshTable (table-scoped, no "
-    "Workbook.RefreshAll). The cache source type is checked first; external, OLAP and Data "
-    "Model sources return unsupported_source and are not refreshed. The result reports every "
-    "table sharing the cache (affected_pivot_tables), the RefreshDate before/after and a "
-    "refreshed status confirmed by Excel's truth signal (the RefreshTable Boolean and/or an "
-    "advanced RefreshDate), never by the absence of a COM exception. Guarded mutation (see "
-    "xlvba://glossary)."
-)
-_DESC_PIVOT_CACHE_REFRESH = (
-    "Refresh one PivotCache via PivotCache.Refresh (cache-scoped). A cache is shared N:1 with "
-    "PivotTables, so affected_pivot_tables reports every table using the cache. Only a "
-    "database/Table-backed cache is refreshed; external/OLAP/Data Model sources return "
-    "unsupported_source. PivotCache.Refresh returns no Boolean, so success is confirmed by the "
-    "shared RefreshDate advancing. Never touches Workbook.RefreshAll or unrelated "
-    "connections/queries. Guarded mutation (see xlvba://glossary)."
-)
-_DESC_PIVOT_FIELD_SET_LAYOUT = (
-    "Set one PivotField's orientation bucket, or remove it. orientation is limited "
-    "to hidden/row/column/page; 'data' is not accepted (assigning xlDataField does "
-    "not create a data field, so use pivot_field_set_aggregation "
-    "(PivotTable.AddDataField) for the data area). Removal is explicit: "
-    "orientation='hidden' (default) is the non-destructive "
-    "PivotField.Orientation=0 (the field and its items/filter state stay), "
-    "while orientation='hidden' with delete=true is the destructive "
-    "PivotField.Delete. External/OLAP/Data Model sources are rejected with "
-    "unsupported_source. The returned PivotFieldInfo is the post-mutation state "
-    "re-read from the PivotTable. Guarded mutation: writable session + snapshot "
-    "+ approval + audit + postcondition."
-)
-_DESC_PIVOT_FIELD_SET_POSITION = (
-    "Set one PivotField's 1-based position within its current orientation "
-    "(row/column/page/data). Out-of-range positions and hidden (unplaced) fields are rejected "
-    "before any COM mutation; the resulting orientation order is recorded in the audit entry. "
-    "External/OLAP/Data Model sources are rejected with unsupported_source. The returned "
-    "PivotFieldInfo is the post-mutation state re-read from the PivotTable. Guarded mutation "
-    "(see xlvba://glossary)."
-)
-_DESC_PIVOT_FIELD_SET_AGGREGATION = (
-    "Add or update one data field's aggregation. An existing data field on the same source "
-    "field is updated in place (DataFields[i].Function); a source field without a data field "
-    "is added with PivotTable.AddDataField (assigning Orientation=xlDataField does not create "
-    "one). Only the eleven accepted aggregation codes are allowed; legacy codes (9, -4114, "
-    "-4153, -4154) are rejected. caption must be unique when supplied (duplicates are "
-    "pre-validated here and rejected by Excel). External/OLAP/Data Model sources are rejected "
-    "with unsupported_source. The returned PivotFieldInfo is the post-mutation state re-read "
-    "from the PivotTable. Guarded mutation (see xlvba://glossary)."
-)
-_DESC_PIVOT_FIELD_SET_PROPERTIES = (
-    "Set bounded PivotField properties (caption / number_format / show_all_items). Only the "
-    "properties explicitly set on the patch are written: caption and number_format target the "
-    "data field (a source field without one is rejected) and show_all_items targets the source "
-    "PivotField. An empty patch, a blank caption/number format or a duplicate caption is "
-    "rejected before any COM mutation. External/OLAP/Data Model sources are rejected with "
-    "unsupported_source. The returned PivotFieldInfo is the post-mutation state re-read from "
-    "the PivotTable. Guarded mutation (see xlvba://glossary)."
-)
-
-_DESC_PIVOT_FIELD_GET_FILTERS = (
-    "Read one PivotField's current filter state: AllItemsVisible, the visible and "
-    "hidden PivotItems (the manual PivotItems.Visible filter), the classified "
-    "filter kind (none/manual) and any detected PivotFilters entries. Read-only; "
-    "PivotFilters.Add is never called."
-)
-_DESC_PIVOT_FIELD_APPLY_FILTER = (
-    "Apply a supported manual (visible-items) filter to one PivotField by setting "
-    "PivotItems[i].Visible. spec.kind is manual only; label, value, date and "
-    "top_bottom are not accepted (rejected at the request layer) — use "
-    "pivot_field_get_filters to read those filter kinds (reported with "
-    "filter.supported=false). A manual request on a page field returns an explicit "
-    "unsupported result and is never silently converted. The request "
-    "(field identity, item names, duplicates, size) is validated before any "
-    "mutation. External/OLAP/Data Model sources are rejected with "
-    "unsupported_source. The returned PivotFieldFilters is the post-mutation state "
-    "re-read from the PivotTable. Guarded mutation: writable session + snapshot + "
-    "approval + audit + postcondition."
-)
-_DESC_PIVOT_FIELD_CLEAR_FILTERS = (
-    "Clear PivotField filters with an explicit scope. scope='field' (default; requires field) "
-    "calls PivotField.ClearAllFilters on that field; scope='table' calls "
-    "PivotTable.ClearAllFilters for the whole PivotTable and returns a table-level result "
-    "whose field is empty. External/OLAP/Data Model sources are rejected with "
-    "unsupported_source. The result is confirmed by a post-mutation re-read. Guarded mutation "
-    "(see xlvba://glossary)."
+_DESC_PIVOT_FIELD = (
+    "Purpose: Configure one PivotField's layout, position, aggregation or "
+    "properties, or apply/clear its filter, through one dispatch tool. "
+    "Use when: you need to move/reorder a field, set its aggregation, patch its "
+    "caption/number format/show-all-items, or apply/clear a manual filter. "
+    "Do not use when: you need to read pivot metadata — use pivot_read; you "
+    "need to refresh — use pivot_refresh. "
+    "Preconditions: writable session + snapshot + approval Approval gate (see "
+    "xlvba://glossary) + postcondition re-read; pivot_table and field are "
+    "required for every action except field-clear-filters with scope='table' "
+    "(whole-PivotTable clear). "
+    "Parameters: action='field-set-layout'|'field-set-position'|"
+    "'field-set-aggregation'|'field-set-properties'|'field-apply-filter'|"
+    "'field-clear-filters'; workbook_id; pivot_table; field; orientation + "
+    "delete (field-set-layout); position (field-set-position); function + "
+    "caption (field-set-aggregation); properties (field-set-properties); spec "
+    "(field-apply-filter); scope (field-clear-filters: 'field' or 'table'). "
+    "Behavior: 'data' orientation is rejected (use field-set-aggregation); "
+    "field-set-layout with delete=true is destructive (PivotField.Delete); "
+    "unsupported sources are rejected; a missing required argument surfaces as a "
+    "structured ExcelVbaMcpError. "
+    "Guarded mutation (see xlvba://glossary). "
+    "Result: PivotFieldInfo (field-set-layout / field-set-position / "
+    "field-set-aggregation / field-set-properties) or PivotFieldFilters "
+    "(field-apply-filter / field-clear-filters). "
+    "Next actions: pivot_read action='fields-list' to verify the field state."
 )
 
 # Read-only MCP resource descriptions (spec §6.6). The URIs are per-workbook
@@ -1895,11 +1845,7 @@ _ANN_READ_ONLY = frozenset(
         "job_get",
         "sheet_read",
         "table_read",
-        "pivot_tables_list",
-        "pivot_table_get",
-        "pivot_cache_get",
-        "pivot_fields_list",
-        "pivot_field_get_filters",
+        "pivot_read",
         "range_read",
         "name_read",
     }
@@ -1921,6 +1867,7 @@ _ANN_DESTRUCTIVE = frozenset(
         "vba_insert_code",
         "macro_run",
         "test",
+        "pivot_field",
     }
 )
 _ANN_IDEMPOTENT = frozenset(
@@ -1930,14 +1877,8 @@ _ANN_IDEMPOTENT = frozenset(
         "range_merge",
         "table_read",
         "sheet_read",
-        "pivot_table_refresh",
-        "pivot_cache_refresh",
-        "pivot_field_set_layout",
-        "pivot_field_set_position",
-        "pivot_field_set_aggregation",
-        "pivot_field_set_properties",
-        "pivot_field_apply_filter",
-        "pivot_field_clear_filters",
+        "pivot_read",
+        "pivot_field",
         "name_read",
         "shape",
         "control",
@@ -2149,82 +2090,22 @@ def _register_tools(server: MCPServer) -> None:
         annotations=_annotations("table_delete_column"),
     )
     server.add_tool(
-        pivot_tables_list,
-        name="pivot_tables_list",
-        description=_DESC_PIVOT_TABLES_LIST,
-        annotations=_annotations("pivot_tables_list"),
+        pivot_read,
+        name="pivot_read",
+        description=_DESC_PIVOT_READ,
+        annotations=_annotations("pivot_read"),
     )
     server.add_tool(
-        pivot_table_get,
-        name="pivot_table_get",
-        description=_DESC_PIVOT_TABLE_GET,
-        annotations=_annotations("pivot_table_get"),
+        pivot_refresh,
+        name="pivot_refresh",
+        description=_DESC_PIVOT_REFRESH,
+        annotations=_annotations("pivot_refresh"),
     )
     server.add_tool(
-        pivot_cache_get,
-        name="pivot_cache_get",
-        description=_DESC_PIVOT_CACHE_GET,
-        annotations=_annotations("pivot_cache_get"),
-    )
-    server.add_tool(
-        pivot_fields_list,
-        name="pivot_fields_list",
-        description=_DESC_PIVOT_FIELDS_LIST,
-        annotations=_annotations("pivot_fields_list"),
-    )
-    server.add_tool(
-        pivot_table_refresh,
-        name="pivot_table_refresh",
-        description=_DESC_PIVOT_TABLE_REFRESH,
-        annotations=_annotations("pivot_table_refresh"),
-    )
-    server.add_tool(
-        pivot_cache_refresh,
-        name="pivot_cache_refresh",
-        description=_DESC_PIVOT_CACHE_REFRESH,
-        annotations=_annotations("pivot_cache_refresh"),
-    )
-    server.add_tool(
-        pivot_field_set_layout,
-        name="pivot_field_set_layout",
-        description=_DESC_PIVOT_FIELD_SET_LAYOUT,
-        annotations=_annotations("pivot_field_set_layout"),
-    )
-    server.add_tool(
-        pivot_field_set_position,
-        name="pivot_field_set_position",
-        description=_DESC_PIVOT_FIELD_SET_POSITION,
-        annotations=_annotations("pivot_field_set_position"),
-    )
-    server.add_tool(
-        pivot_field_set_aggregation,
-        name="pivot_field_set_aggregation",
-        description=_DESC_PIVOT_FIELD_SET_AGGREGATION,
-        annotations=_annotations("pivot_field_set_aggregation"),
-    )
-    server.add_tool(
-        pivot_field_set_properties,
-        name="pivot_field_set_properties",
-        description=_DESC_PIVOT_FIELD_SET_PROPERTIES,
-        annotations=_annotations("pivot_field_set_properties"),
-    )
-    server.add_tool(
-        pivot_field_get_filters,
-        name="pivot_field_get_filters",
-        description=_DESC_PIVOT_FIELD_GET_FILTERS,
-        annotations=_annotations("pivot_field_get_filters"),
-    )
-    server.add_tool(
-        pivot_field_apply_filter,
-        name="pivot_field_apply_filter",
-        description=_DESC_PIVOT_FIELD_APPLY_FILTER,
-        annotations=_annotations("pivot_field_apply_filter"),
-    )
-    server.add_tool(
-        pivot_field_clear_filters,
-        name="pivot_field_clear_filters",
-        description=_DESC_PIVOT_FIELD_CLEAR_FILTERS,
-        annotations=_annotations("pivot_field_clear_filters"),
+        pivot_field,
+        name="pivot_field",
+        description=_DESC_PIVOT_FIELD,
+        annotations=_annotations("pivot_field"),
     )
     server.add_tool(
         range_read,

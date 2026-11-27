@@ -15,6 +15,12 @@ PivotField configuration tools (``pivot_field_set_layout``,
 It imports **no Excel/COM** — only domain DTOs; all Excel access happens on the
 single-STA worker inside the pivot service/adapter.
 
+The WP8 surface exposes three flat-signature dispatchers over the per-verb
+handlers: ``pivot_read`` (read-only), ``pivot_refresh`` (targeted refresh) and
+``pivot_field`` (field configuration). Each dispatcher routes to the existing
+handlers unchanged and forwards only validated arguments; per-action required
+parameters are enforced handler-side (option (a)).
+
 Tool groups:
 
 * Read-only (no snapshot/approval): ``pivot_tables_list``, ``pivot_table_get``,
@@ -33,6 +39,7 @@ never refreshed or reconfigured. ``Workbook.RefreshAll`` is never used.
 from __future__ import annotations
 
 from functools import partial
+from typing import Literal, cast
 
 from excel_vba_mcp.api.job_tools import start_long_op
 from excel_vba_mcp.application.job_registry import RunningJob
@@ -552,10 +559,241 @@ async def pivot_field_clear_filters(
     )
 
 
+# ---------------------------------------------------------------------------
+# Flat-signature dispatchers (WP8, option (a))
+# ---------------------------------------------------------------------------
+async def pivot_read(
+    action: Literal[
+        "tables-list",
+        "table-get",
+        "cache-get",
+        "fields-list",
+        "field-get-filters",
+    ],
+    workbook_id: str | None = None,
+    pivot_table: str | None = None,
+    cache_index: int | None = None,
+    field: str | None = None,
+    background: bool = False,
+) -> (
+    PivotInventory
+    | PivotTableInfo
+    | PivotCacheInfo
+    | list[PivotFieldInfo]
+    | PivotFieldFilters
+    | RunningJob
+):
+    """Pivot read dispatch: ``tables-list``, ``table-get``, ``cache-get``,
+    ``fields-list`` or ``field-get-filters`` (WP8).
+
+    Thin flat-signature dispatcher (option (a) — flat args + handler
+    validation): routes to the existing :func:`pivot_tables_list` /
+    :func:`pivot_table_get` / :func:`pivot_cache_get` / :func:`pivot_fields_list`
+    / :func:`pivot_field_get_filters` handlers unchanged and forwards only the
+    validated arguments. Per-action required parameters are enforced by the
+    target handler (``cache-get`` needs ``cache_index``; ``table-get`` /
+    ``fields-list`` need ``pivot_table``; ``field-get-filters`` needs
+    ``pivot_table`` + ``field``; ``workbook_id`` is required for every action)
+    so a missing required argument surfaces as a structured
+    :class:`ExcelVbaMcpError` rather than a crash. This tool is read-only.
+
+    Args:
+        action: The read verb to perform.
+        workbook_id: The id returned by ``excel_open`` (required).
+        pivot_table: The stable PivotTable ``Name`` (``table-get`` /
+            ``fields-list`` / ``field-get-filters``).
+        cache_index: The 1-based ``CacheIndex`` (``cache-get``).
+        field: The field ``SourceName`` (``field-get-filters``).
+        background: When ``True`` (``tables-list`` only), schedule the inventory
+            sweep on the job registry and return a ``RunningJob`` handle.
+
+    Returns:
+        A :class:`PivotInventory` (``tables-list``), :class:`PivotTableInfo`
+        (``table-get``), :class:`PivotCacheInfo` (``cache-get``),
+        ``list[PivotFieldInfo]`` (``fields-list``), :class:`PivotFieldFilters`
+        (``field-get-filters``) or a ``RunningJob`` (``tables-list`` with
+        ``background=True``).
+    """
+
+    if action == "tables-list":
+        return await pivot_tables_list(workbook_id or "", background=background)
+    if action == "table-get":
+        return await pivot_table_get(workbook_id or "", pivot_table or "")
+    if action == "cache-get":
+        return await pivot_cache_get(workbook_id or "", cache_index or 0)
+    if action == "fields-list":
+        return await pivot_fields_list(workbook_id or "", pivot_table or "")
+    if action == "field-get-filters":
+        return await pivot_field_get_filters(
+            workbook_id or "", pivot_table or "", field or ""
+        )
+    raise ExcelVbaMcpError(
+        f"Unknown pivot_read action {action!r}; expected 'tables-list', "
+        "'table-get', 'cache-get', 'fields-list' or 'field-get-filters'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "pivot_read", "action": action},
+    )
+
+
+async def pivot_refresh(
+    action: Literal["refresh-table", "refresh-cache"],
+    workbook_id: str | None = None,
+    pivot_table: str | None = None,
+    cache_index: int | None = None,
+) -> PivotRefreshResult:
+    """Pivot refresh dispatch: ``refresh-table`` or ``refresh-cache`` (WP8).
+
+    Thin flat-signature dispatcher (option (a) — flat args + handler
+    validation): routes to the existing :func:`pivot_table_refresh` /
+    :func:`pivot_cache_refresh` handlers unchanged and forwards only the
+    validated arguments. Per-action required parameters are enforced by the
+    target handler (``refresh-table`` needs ``pivot_table``; ``refresh-cache``
+    needs ``cache_index``; ``workbook_id`` is required for every action) so a
+    missing required argument surfaces as a structured
+    :class:`ExcelVbaMcpError` rather than a crash.
+
+    This tool is **not** idempotent: a re-refresh may read different source data
+    (the cache source can change between calls), so a repeated call is not
+    guaranteed to be a no-op.
+
+    Args:
+        action: ``refresh-table`` (table-scoped ``PivotTable.RefreshTable``) or
+            ``refresh-cache`` (cache-scoped ``PivotCache.Refresh``).
+        workbook_id: The id returned by ``excel_open`` (required).
+        pivot_table: The stable PivotTable ``Name`` (``refresh-table``).
+        cache_index: The 1-based ``CacheIndex`` (``refresh-cache``).
+
+    Returns:
+        A :class:`PivotRefreshResult`.
+    """
+
+    if action == "refresh-table":
+        return await pivot_table_refresh(workbook_id or "", pivot_table or "")
+    if action == "refresh-cache":
+        return await pivot_cache_refresh(workbook_id or "", cache_index or 0)
+    raise ExcelVbaMcpError(
+        f"Unknown pivot_refresh action {action!r}; expected 'refresh-table' or "
+        "'refresh-cache'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "pivot_refresh", "action": action},
+    )
+
+
+async def pivot_field(
+    action: Literal[
+        "field-set-layout",
+        "field-set-position",
+        "field-set-aggregation",
+        "field-set-properties",
+        "field-apply-filter",
+        "field-clear-filters",
+    ],
+    workbook_id: str | None = None,
+    pivot_table: str | None = None,
+    field: str | None = None,
+    orientation: PivotFieldLayoutOrientation | None = None,
+    delete: bool = False,
+    position: int | None = None,
+    function: PivotAggregation | None = None,
+    caption: str | None = None,
+    properties: PivotFieldProperties | None = None,
+    spec: PivotFilterSpec | None = None,
+    scope: str = "field",
+) -> PivotFieldInfo | PivotFieldFilters:
+    """Pivot field dispatch: set layout/position/aggregation/properties, apply
+    or clear filters (WP8).
+
+    Thin flat-signature dispatcher (option (a) — flat args + handler
+    validation): routes to the existing :func:`pivot_field_set_layout` /
+    :func:`pivot_field_set_position` / :func:`pivot_field_set_aggregation` /
+    :func:`pivot_field_set_properties` / :func:`pivot_field_apply_filter` /
+    :func:`pivot_field_clear_filters` handlers unchanged and forwards only the
+    validated arguments. Every action requires ``pivot_table`` + ``field`` —
+    except ``field-clear-filters`` with ``scope='table'`` which clears the whole
+    PivotTable and does not need ``field`` (preserved behaviour) — and
+    ``workbook_id`` is required for every action; a missing required argument
+    surfaces as a structured :class:`ExcelVbaMcpError` rather than a crash.
+
+    This tool is **not** read-only and is destructive: ``field-set-layout`` with
+    ``delete=True`` discards a field (``PivotField.Delete``). It is idempotent
+    for the same target state (re-applying the same layout/position/aggregation/
+    properties/filter is a no-op).
+
+    Args:
+        action: The field verb to perform.
+        workbook_id: The id returned by ``excel_open`` (required).
+        pivot_table: The stable PivotTable ``Name`` (required for every action).
+        field: The field ``SourceName`` (required for every action except
+            ``field-clear-filters`` with ``scope='table'``).
+        orientation: Target orientation bucket (``field-set-layout``).
+        delete: ``True`` for the destructive ``PivotField.Delete`` removal
+            (``field-set-layout``; requires ``orientation='hidden'``).
+        position: New 1-based position (``field-set-position``).
+        function: Target aggregation (``field-set-aggregation``).
+        caption: Optional unique data-field caption (``field-set-aggregation``).
+        properties: Sparse property patch (``field-set-properties``).
+        spec: Manual filter request (``field-apply-filter``).
+        scope: ``'field'`` or ``'table'`` (``field-clear-filters``).
+
+    Returns:
+        A :class:`PivotFieldInfo` (``field-set-layout`` /
+        ``field-set-position`` / ``field-set-aggregation`` /
+        ``field-set-properties``) or :class:`PivotFieldFilters`
+        (``field-apply-filter`` / ``field-clear-filters``).
+    """
+
+    if action == "field-set-layout":
+        return await pivot_field_set_layout(
+            workbook_id or "",
+            pivot_table or "",
+            field or "",
+            cast(PivotFieldLayoutOrientation, orientation),
+            delete=delete,
+        )
+    if action == "field-set-position":
+        return await pivot_field_set_position(
+            workbook_id or "", pivot_table or "", field or "", position or 0
+        )
+    if action == "field-set-aggregation":
+        return await pivot_field_set_aggregation(
+            workbook_id or "",
+            pivot_table or "",
+            field or "",
+            cast(PivotAggregation, function),
+            caption=caption,
+        )
+    if action == "field-set-properties":
+        return await pivot_field_set_properties(
+            workbook_id or "",
+            pivot_table or "",
+            field or "",
+            cast(PivotFieldProperties, properties),
+        )
+    if action == "field-apply-filter":
+        return await pivot_field_apply_filter(
+            workbook_id or "",
+            pivot_table or "",
+            field or "",
+            cast(PivotFilterSpec, spec),
+        )
+    if action == "field-clear-filters":
+        return await pivot_field_clear_filters(
+            workbook_id or "", pivot_table or "", field, scope=scope
+        )
+    raise ExcelVbaMcpError(
+        f"Unknown pivot_field action {action!r}; expected 'field-set-layout', "
+        "'field-set-position', 'field-set-aggregation', 'field-set-properties', "
+        "'field-apply-filter' or 'field-clear-filters'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "pivot_field", "action": action},
+    )
+
+
 __all__ = [
     "get_pivot_tables_service",
     "pivot_cache_get",
     "pivot_cache_refresh",
+    "pivot_field",
     "pivot_field_apply_filter",
     "pivot_field_clear_filters",
     "pivot_field_get_filters",
@@ -564,6 +802,8 @@ __all__ = [
     "pivot_field_set_position",
     "pivot_field_set_properties",
     "pivot_fields_list",
+    "pivot_read",
+    "pivot_refresh",
     "pivot_table_get",
     "pivot_table_refresh",
     "pivot_tables_list",

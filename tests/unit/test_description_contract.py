@@ -30,6 +30,9 @@ _CRITICAL = [
     "sheet",
     "shape",
     "control",
+    "pivot_read",
+    "pivot_refresh",
+    "pivot_field",
     "snapshot_restore",
     "excel_recover",
     "job_request_cancel",
@@ -94,8 +97,10 @@ async def test_tool_count_is_92_exposed() -> None:
     # read/bookkeeping verbs into macro (macro_run stays standalone) and the two
     # test verbs into test: 71 -> 68. B8 (WP7) splits the sixteen range verbs
     # into range_read / range_write / range_structural (range_delete and
-    # range_merge stay standalone): 68 -> 57. B12 finalizes the count.
-    assert len(tools) == 57
+    # range_merge stay standalone): 68 -> 57. B9 (WP8) splits the thirteen pivot
+    # verbs into pivot_read / pivot_refresh / pivot_field: 57 -> 47 (the wp0
+    # baseline ledger lists 13 pivot old_names, not 14). B12 finalizes the count.
+    assert len(tools) == 47
 
 
 async def test_critical_tools_follow_template() -> None:
@@ -135,8 +140,8 @@ async def test_guarded_mutations_use_uniform_guard_sentence() -> None:
         "range_structural",
         "range_delete",
         "range_merge",
-        "pivot_table_refresh",
-        "pivot_cache_refresh",
+        "pivot_refresh",
+        "pivot_field",
     ]:
         assert guard in descriptions[name], f"{name} missing the uniform R-D3 guard token"
 
