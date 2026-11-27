@@ -29,8 +29,7 @@ _CRITICAL = [
     "table_append_rows",
     "name_create",
     "name_update",
-    "sheet_add",
-    "sheet_copy",
+    "sheet",
     "snapshot_restore",
     "excel_recover",
     "job_request_cancel",
@@ -83,9 +82,11 @@ async def _descriptions() -> dict[str, str]:
 
 async def test_tool_count_is_92_exposed() -> None:
     tools = await server.mcp.list_tools()
-    # B2 (WP1) consolidates the six workbook verbs into workbook + workbook_read
-    # (excel_save_as stays standalone): 92 -> 88. B12 finalizes the count.
-    assert len(tools) == 88
+    # B2 (WP1) consolidated the six workbook verbs into workbook + workbook_read
+    # (excel_save_as stays standalone): 92 -> 88. B3 (WP2) consolidates the six
+    # non-destructive sheet verbs into sheet + sheet_read (sheet_delete stays
+    # standalone): 88 -> 84. B12 finalizes the count.
+    assert len(tools) == 84
 
 
 async def test_critical_tools_follow_template() -> None:
@@ -114,9 +115,8 @@ async def test_guarded_mutations_use_uniform_guard_sentence() -> None:
     guard = "Guarded mutation (see xlvba://glossary)."
     # A representative set of guarded mutations (U3-owned enum tools excluded).
     for name in [
-        "sheet_rename",
+        "sheet",
         "sheet_delete",
-        "sheet_set_visibility",
         "table_add_column",
         "table_create",
         "table_resize",

@@ -1,9 +1,10 @@
 """Sheets inventory + worksheet operation MCP tools (task_024, spec §7.5/§6.5).
 
-Thin, async tool handlers for the sheet surface: ``sheets_list``, ``sheet_get``,
-``sheet_add``, ``sheet_rename``, ``sheet_copy``, ``sheet_delete`` and
-``sheet_set_visibility``. They are deliberately **thin**: each validates its
-arguments, delegates to
+Thin, async tool handlers for the sheet surface: the ``sheet`` /
+``sheet_read`` flat-signature dispatchers (WP2) over the per-verb handlers
+``sheets_list``, ``sheet_get``, ``sheet_add``, ``sheet_rename``, ``sheet_copy``,
+``sheet_delete`` and ``sheet_set_visibility``. They are deliberately **thin**:
+each validates its arguments, delegates to
 :class:`~excel_vba_mcp.application.sheets_service.SheetsService` and returns a
 domain DTO. They **never touch COM** (ARCH-009): no ``pythoncom`` / ``win32com``
 import lives in this module; all Excel access happens on the single-STA worker
@@ -21,8 +22,10 @@ Like the other tool modules, the active service is published here via
 
 from __future__ import annotations
 
+from typing import Literal
+
 from excel_vba_mcp.application.sheets_service import SheetsService
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import SheetInfo
 
 # The active sheets service, published by the server lifespan. ``None`` before
@@ -181,13 +184,106 @@ async def sheet_set_visibility(workbook_id: str, name: str, visible: bool) -> Sh
     return await service.set_visibility(workbook_id, name, bool(visible))
 
 
+async def sheet(
+    action: Literal["add", "rename", "copy", "set-visibility"],
+    workbook_id: str | None = None,
+    name: str | None = None,
+    new_name: str | None = None,
+    sheet_type: str = "worksheet",
+    visible: bool | None = None,
+) -> SheetInfo:
+    """Sheet mutation dispatch: ``add``, ``rename``, ``copy`` or ``set-visibility`` (WP2).
+
+    Thin flat-signature dispatcher (option (a) — flat args + handler
+    validation): routes to the existing :func:`sheet_add` / :func:`sheet_rename` /
+    :func:`sheet_copy` / :func:`sheet_set_visibility` handlers unchanged and
+    forwards only the validated arguments. Per-action required parameters are
+    enforced by the target handler (``add`` / ``rename`` / ``copy`` need
+    ``name``; ``rename`` also needs ``new_name``; ``set-visibility`` needs
+    ``name`` and ``visible``) so a missing required argument surfaces as a
+    structured :class:`ExcelVbaMcpError` rather than a crash. An unknown
+    ``action`` raises a structured :class:`ExcelVbaMcpError`.
+
+    Args:
+        action: ``add`` (new worksheet), ``rename``, ``copy`` or
+            ``set-visibility``.
+        workbook_id: The id returned by ``open``; required for every action.
+        name: The sheet name; required for every action.
+        new_name: The new sheet name; required for ``rename``.
+        sheet_type: Only ``"worksheet"`` is supported (``add`` only).
+        visible: ``True`` for ``xlSheetVisible``, ``False`` for ``xlSheetHidden``
+            (``set-visibility`` only).
+
+    Returns:
+        The affected :class:`SheetInfo` (the new sheet for ``add`` / ``copy``,
+        the renamed sheet for ``rename``, the updated sheet for
+        ``set-visibility``).
+    """
+
+    if action == "add":
+        return await sheet_add(workbook_id or "", name or "", sheet_type)
+    if action == "rename":
+        return await sheet_rename(workbook_id or "", name or "", new_name or "")
+    if action == "copy":
+        return await sheet_copy(workbook_id or "", name or "")
+    if action == "set-visibility":
+        if visible is None:
+            raise ExcelVbaMcpError(
+                "Argument 'visible' is required for the 'set-visibility' action.",
+                context={"tool": "sheet", "action": action, "field": "visible"},
+            )
+        return await sheet_set_visibility(workbook_id or "", name or "", visible)
+    raise ExcelVbaMcpError(
+        f"Unknown sheet action {action!r}; expected 'add', 'rename', 'copy' or "
+        "'set-visibility'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "sheet", "action": action},
+    )
+
+
+async def sheet_read(
+    action: Literal["list", "get"],
+    workbook_id: str | None = None,
+    name: str | None = None,
+) -> list[SheetInfo] | SheetInfo:
+    """Sheet read dispatch: ``list`` or ``get`` (WP2).
+
+    Thin flat-signature dispatcher (option (a)): routes to the existing
+    :func:`sheets_list` / :func:`sheet_get` handlers unchanged. ``list`` requires
+    only ``workbook_id``; ``get`` also requires ``name`` (enforced by the target
+    handler). An unknown ``action`` raises a structured
+    :class:`ExcelVbaMcpError`.
+
+    Args:
+        action: ``list`` (every sheet) or ``get`` (one sheet by name).
+        workbook_id: The id returned by ``open``; required for both actions.
+        name: The sheet name; required for ``get``.
+
+    Returns:
+        A list of :class:`SheetInfo` (``list``) or a single :class:`SheetInfo`
+        (``get``).
+    """
+
+    if action == "list":
+        return await sheets_list(workbook_id or "")
+    if action == "get":
+        return await sheet_get(workbook_id or "", name or "")
+    raise ExcelVbaMcpError(
+        f"Unknown sheet_read action {action!r}; expected 'list' or 'get'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "sheet_read", "action": action},
+    )
+
+
 __all__ = [
     "get_sheets_service",
     "set_sheets_service",
+    "sheet",
     "sheet_add",
     "sheet_copy",
     "sheet_delete",
     "sheet_get",
+    "sheet_read",
     "sheet_rename",
     "sheet_set_visibility",
     "sheets_list",
