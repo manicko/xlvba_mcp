@@ -215,6 +215,27 @@ close, `"not_requested"` when no previous copy was supplied). Restoring the snap
 already the active restored baseline for the same original is rejected (`reason="same_snapshot"`).
 The snapshot restores files only — it does **not** undo external macro side effects.
 
+**`snapshot_restore` caller contract (R1–R3).** This contract is binding when scripting a restore:
+
+- **`workbook_id` is required and is the OLD id.** Pass the **previous** working-copy id — the copy
+  to close. A missing/empty `workbook_id` is rejected with `INVALID_RANGE` (`isRetryable=false`)
+  **before** any close or open.
+- **Use the returned `workbook.id` for every later call.** The restore opens a **new** working copy
+  with a **new** id; `SnapshotRestoreResult.workbook.id` is that new active id. The old `workbook_id`
+  is closed and must not be reused.
+- **`previous_close` reports the old copy's disposition:** `"closed"` (clean close), `"failed"` (the
+  close raised — with safe `previous_close_error` text), or `"not_requested"` (no previous copy was
+  supplied).
+- **A failed previous-close does not invalidate the restored copy.** The restored copy is already
+  validated and active; on `"failed"` the old copy simply stays open.
+- **Repeating the same snapshot is a deterministic error.** Restoring the snapshot that is already
+  the active restored baseline for the same original is rejected with `reason="same_snapshot"`
+  (`isRetryable=false`); restore a different snapshot or close the restored copy first.
+- **Three distinct artifacts.** The **original source** (`source_path`, never modified) is what the
+  restored session rebinds to; the **immutable snapshot** is the read-only baseline file; the
+  **mutable working copy** (`work/<newid>.ext`) is the only thing edited. The snapshot file is never
+  the session identity.
+
 ## Jobs
 
 | Tool | Actions | Purpose | Parameters | Returns | Side effects | Errors | R/D/I |
@@ -303,13 +324,12 @@ explicit index or an unambiguous `where`; `table_delete_rows` requires exactly o
 (renumbering priorities). Structural operations that intersect an Excel Table (ListObject) are
 rejected with `LISTOBJECT_INTERSECTION` and must be performed through the table tools.
 
-**Cell cap (100,000).** A valid range whose `rows * cols` exceeds `MAX_RANGE_CELLS` (100,000) is
-rejected with an explicit limit-specific error — never silently truncated and never reported as a
-generic `INVALID_RANGE` for a well-formed address. (The dedicated limit error code is delivered by a
-separate work package; the rejection is already explicit today — oversized valid ranges fail rather
-than return clipped data.) Read large areas in chunks via `offset` / `limit`; a range clipped by the
-`offset`/`limit` window is reported with `truncated=true`, which is distinct from an over-cap
-rejection.
+**Cell cap (100,000).** A valid range whose `rows * cols` exceeds `MAX_RANGE_CELLS` (`100_000`) is
+rejected **before execution** with an explicit `RANGE_TOO_LARGE` error (category `validation`,
+`isRetryable=false`) — never silently truncated and never reported as a generic `INVALID_RANGE` for a
+well-formed address. The agent must split/paginate the work into smaller ranges via `offset` /
+`limit`. A range clipped by the `offset`/`limit` window is reported with `truncated=true`, which is
+distinct from an over-cap `RANGE_TOO_LARGE` rejection.
 
 ## Pivot
 
@@ -559,9 +579,10 @@ session's identity is rebound to the **original** source (`source_path`), so `li
 reopen reflect the original, never the immutable snapshot file. A `SnapshotRestoreResult` is
 returned: the restored `WorkbookInfo` plus `previous_close` (`"closed"` / `"failed"` /
 `"not_requested"`) and, on a failed close, safe `previous_close_error` text (the restore still
-succeeds and the previous copy stays open). Re-restoring the already-active baseline for the same
-original is rejected with `reason="same_snapshot"`. External macro effects are not rolled back.
-`confirm` is required.
+succeeds and the previous copy stays open). The returned `workbook.id` is the **new** active id —
+use it for every subsequent call; the old `workbook_id` is closed. Re-restoring the already-active
+baseline for the same original is rejected with `reason="same_snapshot"`. External macro effects
+are not rolled back. `confirm` is required.
 
 ### vba_replace_component_source
 
