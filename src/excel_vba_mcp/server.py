@@ -57,9 +57,7 @@ from excel_vba_mcp.api.compile_tools import (
     vba_get_compile_diagnostics,
 )
 from excel_vba_mcp.api.control_tools import (
-    control_get,
-    control_set_on_action,
-    controls_list,
+    control,
 )
 from excel_vba_mcp.api.environment_tools import xlvba_environment
 from excel_vba_mcp.api.health_tools import excel_health
@@ -110,9 +108,7 @@ from excel_vba_mcp.api.range_tools import (
 )
 from excel_vba_mcp.api.recovery_tools import excel_recover
 from excel_vba_mcp.api.shape_tools import (
-    shape_get,
-    shape_set_on_action,
-    shapes_list,
+    shape,
 )
 from excel_vba_mcp.api.sheet_tools import (
     sheet,
@@ -863,27 +859,46 @@ _DESC_NAME_DELETE = (
     "Delete a defined name in an explicit scope. Guarded mutation (see xlvba://glossary). "
     "Returns the pre-delete name."
 )
-_DESC_SHAPES_LIST = (
-    "List every drawing shape of an open workbook (all worksheets) with name, "
-    "kind (AutoShape / TextBox / Group / Picture / Line / Form Control / ActiveX "
-    "/ ...), on_action (the assigned macro, read verbatim and never executed), "
-    "visibility, position/size and best-effort text."
+_DESC_SHAPE = (
+    "Purpose: List, read or assign the OnAction of drawing shapes of an open "
+    "workbook. "
+    "Use when: you need the shape inventory, one shape's metadata, or you need "
+    "to set/clear a shape's OnAction macro (the macro is NOT executed). "
+    "Do not use when: you need Form/ActiveX controls — use control. "
+    "Preconditions: an open workbook_id; name is required for get and "
+    "set-on-action; macro_name is required for set-on-action; set-on-action is a "
+    "Guarded mutation (see xlvba://glossary). "
+    "Parameters: action='list'|'get'|'set-on-action'; workbook_id; name (get, "
+    "set-on-action); macro_name (set-on-action; \"\" clears it). "
+    "Behavior: list returns one entry per Worksheet.Shapes item (name, kind, "
+    "on_action read verbatim, visibility, position/size, best-effort text); get "
+    "returns one ShapeInfo; set-on-action writes Shape.OnAction only. "
+    "Result: list[ShapeInfo] (list) or ShapeInfo (get / set-on-action). "
+    "Next actions: shape action='get' to confirm; control for Form/ActiveX "
+    "controls. "
+    "Example: {\"action\": \"set-on-action\", \"workbook_id\": \"<id>\", "
+    "\"name\": \"btnSave\", \"macro_name\": \"SaveData\"}"
 )
-_DESC_SHAPE_GET = "Return one shape's ShapeInfo by name (case-insensitive)."
-_DESC_SHAPE_SET_ON_ACTION = (
-    "Assign OnAction to a shape (the macro is NOT executed). Guarded mutation (see "
-    "xlvba://glossary). An empty macro_name clears the assignment."
-)
-_DESC_CONTROLS_LIST = (
-    "List every Form Control and ActiveX control of an open workbook. Form "
-    "Controls report control_type, caption, linked_cell and on_action; ActiveX "
-    "controls report prog_id and an INFERRED/probable event procedure (never a "
-    "confirmed mapping)."
-)
-_DESC_CONTROL_GET = "Return one control's ControlEntry by name (case-insensitive)."
-_DESC_CONTROL_SET_ON_ACTION = (
-    "Assign OnAction to a Form Control (the macro is NOT executed; ActiveX controls are "
-    "rejected). Guarded mutation (see xlvba://glossary)."
+_DESC_CONTROL = (
+    "Purpose: List, read or assign the OnAction of Form Controls / ActiveX "
+    "controls of an open workbook. "
+    "Use when: you need the control inventory, one control's metadata, or you "
+    "need to set/clear a Form Control's OnAction macro (the macro is NOT "
+    "executed). "
+    "Do not use when: you need drawing shapes — use shape. "
+    "Preconditions: an open workbook_id; name is required for get and "
+    "set-on-action; macro_name is required for set-on-action; set-on-action is a "
+    "Guarded mutation (see xlvba://glossary). "
+    "Parameters: action='list'|'get'|'set-on-action'; workbook_id; name (get, "
+    "set-on-action); macro_name (set-on-action; \"\" clears it). "
+    "Behavior: list reports Form Controls (control_type, caption, linked_cell, "
+    "on_action) and ActiveX controls (prog_id, inferred/probable event "
+    "procedure); get returns one ControlEntry; set-on-action writes OnAction on "
+    "a Form Control only (ActiveX controls are rejected — no OnAction). "
+    "Result: list[ControlEntry] (list) or ControlEntry (get / set-on-action). "
+    "Next actions: control action='get' to confirm; shape for drawing shapes. "
+    "Example: {\"action\": \"set-on-action\", \"workbook_id\": \"<id>\", "
+    "\"name\": \"cmdRun\", \"macro_name\": \"RunReport\"}"
 )
 _DESC_WORKBOOK_GET_MODEL = (
     "Return the aggregated Stage 1 workbook model: sheets, tables, names, shapes, "
@@ -1825,10 +1840,6 @@ _ANN_READ_ONLY = frozenset(
         "range_get_validation",
         "range_get_conditional_formatting",
         "name_read",
-        "shapes_list",
-        "shape_get",
-        "controls_list",
-        "control_get",
     }
 )
 _ANN_DESTRUCTIVE = frozenset(
@@ -1869,8 +1880,8 @@ _ANN_IDEMPOTENT = frozenset(
         "pivot_field_apply_filter",
         "pivot_field_clear_filters",
         "name_read",
-        "shape_set_on_action",
-        "control_set_on_action",
+        "shape",
+        "control",
         "vba_replace_component_source",
     }
 )
@@ -2288,40 +2299,16 @@ def _register_tools(server: MCPServer) -> None:
         annotations=_annotations("name_delete"),
     )
     server.add_tool(
-        shapes_list,
-        name="shapes_list",
-        description=_DESC_SHAPES_LIST,
-        annotations=_annotations("shapes_list"),
+        shape,
+        name="shape",
+        description=_DESC_SHAPE,
+        annotations=_annotations("shape"),
     )
     server.add_tool(
-        shape_get,
-        name="shape_get",
-        description=_DESC_SHAPE_GET,
-        annotations=_annotations("shape_get"),
-    )
-    server.add_tool(
-        shape_set_on_action,
-        name="shape_set_on_action",
-        description=_DESC_SHAPE_SET_ON_ACTION,
-        annotations=_annotations("shape_set_on_action"),
-    )
-    server.add_tool(
-        controls_list,
-        name="controls_list",
-        description=_DESC_CONTROLS_LIST,
-        annotations=_annotations("controls_list"),
-    )
-    server.add_tool(
-        control_get,
-        name="control_get",
-        description=_DESC_CONTROL_GET,
-        annotations=_annotations("control_get"),
-    )
-    server.add_tool(
-        control_set_on_action,
-        name="control_set_on_action",
-        description=_DESC_CONTROL_SET_ON_ACTION,
-        annotations=_annotations("control_set_on_action"),
+        control,
+        name="control",
+        description=_DESC_CONTROL,
+        annotations=_annotations("control"),
     )
     server.add_tool(
         xlvba_environment,

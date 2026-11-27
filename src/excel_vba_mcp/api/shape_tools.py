@@ -19,8 +19,10 @@ Like the other tool modules, the active service is published here via
 
 from __future__ import annotations
 
+from typing import Literal
+
 from excel_vba_mcp.application.shapes_service import ShapesService
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import ShapeInfo
 
 # The active shapes service, published by the server lifespan. ``None`` before
@@ -113,9 +115,62 @@ async def shape_set_on_action(workbook_id: str, name: str, macro_name: str) -> S
     return await service.set_on_action(workbook_id, name, macro_name)
 
 
+# ---------------------------------------------------------------------------
+# Flat-signature dispatcher (WP5, option (a))
+# ---------------------------------------------------------------------------
+async def shape(
+    action: Literal["list", "get", "set-on-action"],
+    workbook_id: str | None = None,
+    name: str | None = None,
+    macro_name: str | None = None,
+) -> list[ShapeInfo] | ShapeInfo:
+    """Shape dispatch: ``list``, ``get`` or ``set-on-action`` (WP5).
+
+    Thin flat-signature dispatcher (option (a) — flat args + handler
+    validation): routes to the existing :func:`shapes_list` / :func:`shape_get`
+    / :func:`shape_set_on_action` handlers unchanged and forwards only the
+    validated arguments. Per-action required parameters are enforced by the
+    target handler (``get`` / ``set-on-action`` both need ``name``;
+    ``workbook_id`` is required for every action) so a missing required
+    argument surfaces as a structured :class:`ExcelVbaMcpError` rather than a
+    crash. ``macro_name`` is optional for ``set-on-action`` — an omitted value
+    clears the assignment (the target handler's contract). An unknown
+    ``action`` raises a structured :class:`ExcelVbaMcpError`.
+
+    ``list`` and ``get`` are reads; ``set-on-action`` is a guarded mutation that
+    writes ``Shape.OnAction`` only — the assigned macro is never executed.
+
+    Args:
+        action: ``list`` (every shape), ``get`` (one by name) or
+            ``set-on-action`` (assign/clear ``OnAction``).
+        workbook_id: The id returned by ``open``; required for every action.
+        name: The shape name (case-insensitive); required for ``get`` and
+            ``set-on-action``.
+        macro_name: The macro to assign; optional for ``set-on-action`` (``""``
+            or omitted clears the assignment).
+
+    Returns:
+        A list of :class:`ShapeInfo` (``list``) or a single :class:`ShapeInfo`
+        (``get`` / ``set-on-action``).
+    """
+
+    if action == "list":
+        return await shapes_list(workbook_id or "")
+    if action == "get":
+        return await shape_get(workbook_id or "", name or "")
+    if action == "set-on-action":
+        return await shape_set_on_action(workbook_id or "", name or "", macro_name or "")
+    raise ExcelVbaMcpError(
+        f"Unknown shape action {action!r}; expected 'list', 'get' or 'set-on-action'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "shape", "action": action},
+    )
+
+
 __all__ = [
     "get_shapes_service",
     "set_shapes_service",
+    "shape",
     "shape_get",
     "shape_set_on_action",
     "shapes_list",

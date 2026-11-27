@@ -28,6 +28,8 @@ _CRITICAL = [
     "table_delete_rows",
     "name",
     "sheet",
+    "shape",
+    "control",
     "snapshot_restore",
     "excel_recover",
     "job_request_cancel",
@@ -86,9 +88,10 @@ async def test_tool_count_is_92_exposed() -> None:
     # standalone): 88 -> 84. B4 (WP3) consolidates the nine non-destructive table
     # verbs into table + table_read (table_delete_rows and table_delete_column stay
     # standalone): 84 -> 77. B5 (WP4) consolidates the four non-destructive name
-    # verbs into name + name_read (name_delete stays standalone): 77 -> 75. B12
-    # finalizes the count.
-    assert len(tools) == 75
+    # verbs into name + name_read (name_delete stays standalone): 77 -> 75. B6
+    # (WP5) consolidates the three shape verbs into shape and the three control
+    # verbs into control: 75 -> 71. B12 finalizes the count.
+    assert len(tools) == 71
 
 
 async def test_critical_tools_follow_template() -> None:
@@ -122,8 +125,8 @@ async def test_guarded_mutations_use_uniform_guard_sentence() -> None:
         "table",
         "name",
         "name_delete",
-        "shape_set_on_action",
-        "control_set_on_action",
+        "shape",
+        "control",
         "range_set_format",
         "range_copy",
         "range_insert",

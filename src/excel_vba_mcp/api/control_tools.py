@@ -20,8 +20,10 @@ Like the other tool modules, the active service is published here via
 
 from __future__ import annotations
 
+from typing import Literal
+
 from excel_vba_mcp.application.controls_service import ControlsService
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import ControlEntry
 
 # The active controls service, published by the server lifespan. ``None`` before
@@ -116,7 +118,61 @@ async def control_set_on_action(workbook_id: str, name: str, macro_name: str) ->
     return await service.set_on_action(workbook_id, name, macro_name)
 
 
+# ---------------------------------------------------------------------------
+# Flat-signature dispatcher (WP5, option (a))
+# ---------------------------------------------------------------------------
+async def control(
+    action: Literal["list", "get", "set-on-action"],
+    workbook_id: str | None = None,
+    name: str | None = None,
+    macro_name: str | None = None,
+) -> list[ControlEntry] | ControlEntry:
+    """Control dispatch: ``list``, ``get`` or ``set-on-action`` (WP5).
+
+    Thin flat-signature dispatcher (option (a) — flat args + handler
+    validation): routes to the existing :func:`controls_list` /
+    :func:`control_get` / :func:`control_set_on_action` handlers unchanged and
+    forwards only the validated arguments. Per-action required parameters are
+    enforced by the target handler (``get`` / ``set-on-action`` both need
+    ``name``; ``workbook_id`` is required for every action) so a missing
+    required argument surfaces as a structured :class:`ExcelVbaMcpError` rather
+    than a crash. ``macro_name`` is optional for ``set-on-action`` — an omitted
+    value clears the assignment (the target handler's contract). An unknown
+    ``action`` raises a structured :class:`ExcelVbaMcpError`.
+
+    ``list`` and ``get`` are reads; ``set-on-action`` is a guarded mutation that
+    writes ``OnAction`` on a Form Control only (ActiveX controls are rejected) —
+    the assigned macro is never executed.
+
+    Args:
+        action: ``list`` (every control), ``get`` (one by name) or
+            ``set-on-action`` (assign/clear ``OnAction``).
+        workbook_id: The id returned by ``open``; required for every action.
+        name: The control name (case-insensitive); required for ``get`` and
+            ``set-on-action``.
+        macro_name: The macro to assign; optional for ``set-on-action`` (``""``
+            or omitted clears the assignment).
+
+    Returns:
+        A list of :class:`ControlEntry` (``list``) or a single
+        :class:`ControlEntry` (``get`` / ``set-on-action``).
+    """
+
+    if action == "list":
+        return await controls_list(workbook_id or "")
+    if action == "get":
+        return await control_get(workbook_id or "", name or "")
+    if action == "set-on-action":
+        return await control_set_on_action(workbook_id or "", name or "", macro_name or "")
+    raise ExcelVbaMcpError(
+        f"Unknown control action {action!r}; expected 'list', 'get' or 'set-on-action'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "control", "action": action},
+    )
+
+
 __all__ = [
+    "control",
     "control_get",
     "control_set_on_action",
     "controls_list",
