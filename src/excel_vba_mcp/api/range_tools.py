@@ -25,6 +25,8 @@ to the table tools; the Range API never changes table row/column structure.
 
 from __future__ import annotations
 
+from typing import Literal, cast
+
 from excel_vba_mcp.application.ranges_service import RangesService
 from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
@@ -588,6 +590,295 @@ async def range_set_conditional_formatting(
     return await service.set_conditional_formatting(workbook_id, sheet, address, spec, mode)
 
 
+# ---------------------------------------------------------------------------
+# Flat-signature dispatchers (WP7, option (a))
+# ---------------------------------------------------------------------------
+# The 16 range verbs are split into three cohesive dispatch tools plus two
+# standalone destructive tools (``range_delete`` / ``range_merge``). Each
+# dispatcher is a thin flat-signature router (option (a) — flat args + handler
+# validation): it forwards only the validated arguments to the existing
+# per-verb handlers unchanged (H5) and lets the target handler enforce its own
+# required parameters, so a missing required argument surfaces as a structured
+# :class:`ExcelVbaMcpError` rather than a crash. An unknown ``action`` raises a
+# structured :class:`ExcelVbaMcpError`.
+
+
+async def range_read(
+    action: Literal[
+        "get",
+        "read-values",
+        "read-formulas",
+        "get-format",
+        "get-validation",
+        "get-conditional-formatting",
+    ],
+    workbook_id: str | None = None,
+    sheet: str | None = None,
+    address: str | None = None,
+    offset: int = 0,
+    limit: int | None = None,
+) -> (
+    RangeAddress
+    | RangeValues
+    | RangeFormulas
+    | FormatInfo
+    | ValidationRule
+    | list[ConditionalFormatRule]
+):
+    """Range read dispatch: ``get``, ``read-values``, ``read-formulas``,
+    ``get-format``, ``get-validation`` or ``get-conditional-formatting`` (WP7).
+
+    Thin flat-signature dispatcher (option (a) — flat args + handler
+    validation): routes to the existing :func:`range_get` /
+    :func:`range_read_values` / :func:`range_read_formulas` /
+    :func:`range_get_format` / :func:`range_get_validation` /
+    :func:`range_get_conditional_formatting` handlers unchanged and forwards
+    only the validated arguments. ``workbook_id``, ``sheet`` and ``address`` are
+    required for every action and are enforced by the target handler, so a
+    missing required argument surfaces as a structured
+    :class:`ExcelVbaMcpError` rather than a crash. This tool is read-only.
+
+    Args:
+        action: The read verb to perform.
+        workbook_id: The id returned by ``excel_open`` (required).
+        sheet: The worksheet name (required).
+        address: An A1-style address (required).
+        offset: 0-based row index (``read-values`` / ``read-formulas``).
+        limit: Optional cap on returned rows (``read-values`` / ``read-formulas``).
+
+    Returns:
+        A :class:`RangeAddress` (``get``), :class:`RangeValues`
+        (``read-values``), :class:`RangeFormulas` (``read-formulas``),
+        :class:`FormatInfo` (``get-format``), :class:`ValidationRule`
+        (``get-validation``) or ``list[ConditionalFormatRule]``
+        (``get-conditional-formatting``).
+    """
+
+    if action == "get":
+        return await range_get(workbook_id or "", sheet or "", address or "")
+    if action == "read-values":
+        return await range_read_values(
+            workbook_id or "", sheet or "", address or "", offset, limit
+        )
+    if action == "read-formulas":
+        return await range_read_formulas(
+            workbook_id or "", sheet or "", address or "", offset, limit
+        )
+    if action == "get-format":
+        return await range_get_format(workbook_id or "", sheet or "", address or "")
+    if action == "get-validation":
+        return await range_get_validation(workbook_id or "", sheet or "", address or "")
+    if action == "get-conditional-formatting":
+        return await range_get_conditional_formatting(
+            workbook_id or "", sheet or "", address or ""
+        )
+    raise ExcelVbaMcpError(
+        f"Unknown range_read action {action!r}; expected 'get', 'read-values', "
+        "'read-formulas', 'get-format', 'get-validation' or "
+        "'get-conditional-formatting'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "range_read", "action": action},
+    )
+
+
+async def range_write(
+    action: Literal[
+        "write-values",
+        "write-formulas",
+        "set-format",
+        "set-validation",
+        "set-conditional-formatting",
+    ],
+    workbook_id: str | None = None,
+    sheet: str | None = None,
+    address: str | None = None,
+    payload: RangeWriteRequest | FormulaWriteRequest | None = None,
+    patch: RangeFormatPatch | None = None,
+    spec: ValidationSpec | ConditionalFormatSpec | None = None,
+    mode: str = "add",
+) -> RangeMutationResult | FormatMutationResult | ValidationRule | ConditionalFormatMutationResult:
+    """Range write dispatch: ``write-values``, ``write-formulas``,
+    ``set-format``, ``set-validation`` or ``set-conditional-formatting`` (WP7).
+
+    Thin flat-signature dispatcher (option (a) — flat args + handler
+    validation): routes to the existing :func:`range_write_values` /
+    :func:`range_write_formulas` / :func:`range_set_format` /
+    :func:`range_set_validation` / :func:`range_set_conditional_formatting`
+    handlers unchanged and forwards only the validated arguments. Per-action
+    required parameters are enforced here and by the target handler:
+    ``write-values`` / ``write-formulas`` require ``payload``;
+    ``set-format`` requires ``address`` + ``patch``; ``set-validation`` and
+    ``set-conditional-formatting`` require ``address`` + ``spec``. A missing
+    required argument surfaces as a structured :class:`ExcelVbaMcpError`
+    rather than a crash.
+
+    This tool is **not** idempotent: ``set-conditional-formatting`` with
+    ``mode='add'`` appends a rule and renumbers the sheet-wide priorities, so a
+    repeated call is not a no-op.
+
+    Args:
+        action: The write verb to perform.
+        workbook_id: The id returned by ``excel_open`` (required).
+        sheet: The worksheet name (required).
+        address: An A1-style target address (required).
+        payload: The bounded value/formula grid (``write-values`` /
+            ``write-formulas``).
+        patch: The sparse format update (``set-format``).
+        spec: The validation / conditional-formatting rule (``set-validation`` /
+            ``set-conditional-formatting``).
+        mode: ``add`` / ``modify`` / ``delete`` (``set-conditional-formatting``).
+
+    Returns:
+        A :class:`RangeMutationResult` (``write-values`` / ``write-formulas``),
+        :class:`FormatMutationResult` (``set-format``), :class:`ValidationRule`
+        (``set-validation``) or :class:`ConditionalFormatMutationResult`
+        (``set-conditional-formatting``).
+    """
+
+    if action == "write-values":
+        if payload is None:
+            raise ExcelVbaMcpError(
+                "Argument 'payload' is required for action 'write-values'.",
+                code=ErrorCode.INVALID_RANGE,
+                context={"tool": "range_write", "action": action, "field": "payload"},
+            )
+        return await range_write_values(
+            workbook_id or "",
+            sheet or "",
+            address or "",
+            cast(RangeWriteRequest, payload),
+        )
+    if action == "write-formulas":
+        if payload is None:
+            raise ExcelVbaMcpError(
+                "Argument 'payload' is required for action 'write-formulas'.",
+                code=ErrorCode.INVALID_RANGE,
+                context={"tool": "range_write", "action": action, "field": "payload"},
+            )
+        return await range_write_formulas(
+            workbook_id or "",
+            sheet or "",
+            address or "",
+            cast(FormulaWriteRequest, payload),
+        )
+    if action == "set-format":
+        if patch is None:
+            raise ExcelVbaMcpError(
+                "Argument 'patch' is required for action 'set-format'.",
+                code=ErrorCode.INVALID_RANGE,
+                context={"tool": "range_write", "action": action, "field": "patch"},
+            )
+        return await range_set_format(
+            workbook_id or "",
+            sheet or "",
+            address or "",
+            patch,
+        )
+    if action == "set-validation":
+        if spec is None:
+            raise ExcelVbaMcpError(
+                "Argument 'spec' is required for action 'set-validation'.",
+                code=ErrorCode.INVALID_RANGE,
+                context={"tool": "range_write", "action": action, "field": "spec"},
+            )
+        return await range_set_validation(
+            workbook_id or "",
+            sheet or "",
+            address or "",
+            cast(ValidationSpec, spec),
+        )
+    if action == "set-conditional-formatting":
+        if spec is None:
+            raise ExcelVbaMcpError(
+                "Argument 'spec' is required for action "
+                "'set-conditional-formatting'.",
+                code=ErrorCode.INVALID_RANGE,
+                context={"tool": "range_write", "action": action, "field": "spec"},
+            )
+        return await range_set_conditional_formatting(
+            workbook_id or "",
+            sheet or "",
+            address or "",
+            cast(ConditionalFormatSpec, spec),
+            mode=mode,
+        )
+    raise ExcelVbaMcpError(
+        f"Unknown range_write action {action!r}; expected 'write-values', "
+        "'write-formulas', 'set-format', 'set-validation' or "
+        "'set-conditional-formatting'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "range_write", "action": action},
+    )
+
+
+async def range_structural(
+    action: Literal["copy", "insert", "unmerge"],
+    workbook_id: str | None = None,
+    sheet: str | None = None,
+    address: str | None = None,
+    source: str | None = None,
+    destination_sheet: str | None = None,
+    destination: str | None = None,
+    shift: str | None = None,
+    *,
+    allow_merged: bool = False,
+) -> StructuralMutationResult:
+    """Range structural dispatch: ``copy``, ``insert`` or ``unmerge`` (WP7).
+
+    Thin flat-signature dispatcher (option (a) — flat args + handler
+    validation): routes to the existing :func:`range_copy` /
+    :func:`range_insert` / :func:`range_unmerge` handlers unchanged and forwards
+    only the validated arguments. Per-action required parameters are enforced by
+    the target handler: ``copy`` requires ``source`` / ``destination_sheet`` /
+    ``destination``; ``insert`` requires ``address`` + an explicit ``shift`` in
+    ``{right, down}`` (an omitted or disallowed shift is rejected, never
+    guessed); ``unmerge`` requires ``address``. A missing required argument
+    surfaces as a structured :class:`ExcelVbaMcpError` rather than a crash.
+
+    This tool is **not** idempotent (H4): re-``insert`` duplicates cells and
+    ``unmerge`` discards merges.
+
+    Args:
+        action: The structural verb to perform.
+        workbook_id: The id returned by ``excel_open`` (required).
+        sheet: The source worksheet name (required).
+        address: An A1-style target address (``insert`` / ``unmerge``).
+        source: The source A1-style address (``copy``).
+        destination_sheet: The destination worksheet (``copy``).
+        destination: The destination A1-style address (``copy``).
+        shift: ``right`` or ``down`` (``insert``; required, never guessed).
+        allow_merged: Permit inserting over merged cells after preview.
+
+    Returns:
+        A :class:`StructuralMutationResult`.
+    """
+
+    if action == "copy":
+        return await range_copy(
+            workbook_id or "",
+            sheet or "",
+            source or "",
+            destination_sheet or "",
+            destination or "",
+        )
+    if action == "insert":
+        return await range_insert(
+            workbook_id or "",
+            sheet or "",
+            address or "",
+            shift or "",
+            allow_merged=allow_merged,
+        )
+    if action == "unmerge":
+        return await range_unmerge(workbook_id or "", sheet or "", address or "")
+    raise ExcelVbaMcpError(
+        f"Unknown range_structural action {action!r}; expected 'copy', 'insert' "
+        "or 'unmerge'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "range_structural", "action": action},
+    )
+
+
 __all__ = [
     "range_copy",
     "range_delete",
@@ -597,12 +888,15 @@ __all__ = [
     "range_get_validation",
     "range_insert",
     "range_merge",
+    "range_read",
     "range_read_formulas",
     "range_read_values",
     "range_set_conditional_formatting",
     "range_set_format",
     "range_set_validation",
+    "range_structural",
     "range_unmerge",
+    "range_write",
     "range_write_formulas",
     "range_write_values",
 ]

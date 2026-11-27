@@ -87,22 +87,11 @@ from excel_vba_mcp.api.pivot_tools import (
     pivot_tables_list,
 )
 from excel_vba_mcp.api.range_tools import (
-    range_copy,
     range_delete,
-    range_get,
-    range_get_conditional_formatting,
-    range_get_format,
-    range_get_validation,
-    range_insert,
     range_merge,
-    range_read_formulas,
-    range_read_values,
-    range_set_conditional_formatting,
-    range_set_format,
-    range_set_validation,
-    range_unmerge,
-    range_write_formulas,
-    range_write_values,
+    range_read,
+    range_structural,
+    range_write,
 )
 from excel_vba_mcp.api.recovery_tools import excel_recover
 from excel_vba_mcp.api.shape_tools import (
@@ -819,6 +808,85 @@ _DESC_RANGE_SET_CONDITIONAL_FORMATTING = (
     "are not accepted — use range_get_conditional_formatting to read those rule "
     "types (reported supported=false). Guarded mutation: writable session + "
     "snapshot + approval + postcondition re-read."
+)
+_DESC_RANGE_READ = (
+    "Purpose: Read Range metadata, values, formulas, formatting, validation or "
+    "conditional formatting through one read-only dispatch tool. "
+    "Use when: you need to resolve an address, read typed cell values/formulas, "
+    "or inspect a Range's format/validation/conditional-format rules. "
+    "Do not use when: you need to write values/formulas or change formatting — "
+    "use range_write; you need to copy/insert/unmerge cells — use "
+    "range_structural. "
+    "Preconditions: an open workbook_id; sheet and address are required for "
+    "every action. "
+    "Parameters: action='get'|'read-values'|'read-formulas'|'get-format'|"
+    "'get-validation'|'get-conditional-formatting'; workbook_id; sheet; address; "
+    "offset + limit (read-values / read-formulas). "
+    "Behavior: read-only; values are typed (empty/string/number/boolean/date/"
+    "error) with no lossy string coercion; a mixed format/validation target is "
+    "reported (never flattened) and unsupported conditional-format rule types "
+    "are flagged rather than omitted. "
+    "Result: RangeAddress (get), RangeValues (read-values), RangeFormulas "
+    "(read-formulas), FormatInfo (get-format), ValidationRule (get-validation) "
+    "or list[ConditionalFormatRule] (get-conditional-formatting). "
+    "Next actions: range_write to change a value/format; range_structural to "
+    "copy/insert/unmerge. "
+    "Example: {\"action\": \"read-values\", \"workbook_id\": \"<id>\", "
+    "\"sheet\": \"Sheet1\", \"address\": \"A1:C10\", \"offset\": 0, "
+    "\"limit\": 50}"
+)
+_DESC_RANGE_WRITE = (
+    "Purpose: Write values/formulas or set formatting/validation/conditional "
+    "formatting through one mutation dispatch tool. "
+    "Use when: you need to set cell values or formulas, apply a partial format "
+    "update, or add/modify/delete a validation or conditional-format rule. "
+    "Do not use when: you need to read a Range — use range_read; you need to "
+    "copy/insert/unmerge cells — use range_structural; you need to delete cells "
+    "— use range_delete. "
+    "Preconditions: this tool does NOT snapshot — call snapshot_create first; "
+    "then writable session + snapshot + approval Approval gate (see "
+    "xlvba://glossary) + postcondition re-read. "
+    "Parameters: action='write-values'|'write-formulas'|'set-format'|"
+    "'set-validation'|'set-conditional-formatting'; workbook_id; sheet; address; "
+    "payload (write-values / write-formulas); patch (set-format); spec "
+    "(set-validation / set-conditional-formatting); mode (set-conditional-"
+    "formatting: add/modify/delete). "
+    "Behavior: write-values stores a leading '=' as text (use write-formulas for "
+    "real formulas); the payload shape is validated against the target before "
+    "any mutation; set-conditional-formatting mode='add' appends a rule and "
+    "renumbers the sheet-wide priorities, so this tool is NOT idempotent. "
+    "Guarded mutation (see xlvba://glossary). "
+    "Result: RangeMutationResult (write-values / write-formulas), "
+    "FormatMutationResult (set-format), ValidationRule (set-validation) or "
+    "ConditionalFormatMutationResult (set-conditional-formatting). "
+    "Next actions: range_read to verify. "
+    "Example: {\"action\": \"write-values\", \"workbook_id\": \"<id>\", "
+    "\"sheet\": \"Sheet1\", \"address\": \"A1\", \"payload\": {\"rows\": 1, "
+    "\"cols\": 2, \"values\": [[1, 2]]}}"
+)
+_DESC_RANGE_STRUCTURAL = (
+    "Purpose: Copy, insert or unmerge cells through one structural dispatch "
+    "tool. "
+    "Use when: you need to copy a Range to an explicit destination, insert cells "
+    "with an explicit shift direction, or unmerge a merged area. "
+    "Do not use when: you need to write values/formatting — use range_write; you "
+    "need to delete cells — use range_delete; you need to merge cells — use "
+    "range_merge. "
+    "Preconditions: writable session + snapshot + approval Approval gate (see "
+    "xlvba://glossary) + postcondition re-read. "
+    "Parameters: action='copy'|'insert'|'unmerge'; workbook_id; sheet; "
+    "source + destination_sheet + destination (copy); address + shift "
+    "(insert: 'right' or 'down', required, never guessed) + allow_merged "
+    "(insert); address (unmerge). "
+    "Behavior: copy requires a disjoint, shape-matched destination; insert "
+    "rejects an omitted/disallowed shift and any ListObject intersection; "
+    "unmerge discards merges. This tool is NOT idempotent (re-insert duplicates "
+    "cells; unmerge discards merges). "
+    "Guarded mutation (see xlvba://glossary). "
+    "Result: StructuralMutationResult. "
+    "Next actions: range_read to verify the resulting address. "
+    "Example: {\"action\": \"insert\", \"workbook_id\": \"<id>\", "
+    "\"sheet\": \"Sheet1\", \"address\": \"A1\", \"shift\": \"down\"}"
 )
 _DESC_NAME = (
     "Purpose: Create or update a defined name (Named Range) in an explicit scope. "
@@ -1832,12 +1900,7 @@ _ANN_READ_ONLY = frozenset(
         "pivot_cache_get",
         "pivot_fields_list",
         "pivot_field_get_filters",
-        "range_get",
-        "range_read_values",
-        "range_read_formulas",
-        "range_get_format",
-        "range_get_validation",
-        "range_get_conditional_formatting",
+        "range_read",
         "name_read",
     }
 )
@@ -1847,6 +1910,7 @@ _ANN_DESTRUCTIVE = frozenset(
         "excel_save_as",
         "sheet_delete",
         "range_merge",
+        "range_structural",
         "excel_recover",
         "snapshot_restore",
         "table_delete_rows",
@@ -1862,14 +1926,8 @@ _ANN_DESTRUCTIVE = frozenset(
 _ANN_IDEMPOTENT = frozenset(
     {
         "workbook_read",
-        "range_write_values",
-        "range_write_formulas",
-        "range_set_format",
-        "range_copy",
+        "range_read",
         "range_merge",
-        "range_unmerge",
-        "range_set_validation",
-        "range_set_conditional_formatting",
         "table_read",
         "sheet_read",
         "pivot_table_refresh",
@@ -2169,58 +2227,22 @@ def _register_tools(server: MCPServer) -> None:
         annotations=_annotations("pivot_field_clear_filters"),
     )
     server.add_tool(
-        range_get,
-        name="range_get",
-        description=_DESC_RANGE_GET,
-        annotations=_annotations("range_get"),
+        range_read,
+        name="range_read",
+        description=_DESC_RANGE_READ,
+        annotations=_annotations("range_read"),
     )
     server.add_tool(
-        range_read_values,
-        name="range_read_values",
-        description=_DESC_RANGE_READ_VALUES,
-        annotations=_annotations("range_read_values"),
+        range_write,
+        name="range_write",
+        description=_DESC_RANGE_WRITE,
+        annotations=_annotations("range_write"),
     )
     server.add_tool(
-        range_read_formulas,
-        name="range_read_formulas",
-        description=_DESC_RANGE_READ_FORMULAS,
-        annotations=_annotations("range_read_formulas"),
-    )
-    server.add_tool(
-        range_write_values,
-        name="range_write_values",
-        description=_DESC_RANGE_WRITE_VALUES,
-        annotations=_annotations("range_write_values"),
-    )
-    server.add_tool(
-        range_write_formulas,
-        name="range_write_formulas",
-        description=_DESC_RANGE_WRITE_FORMULAS,
-        annotations=_annotations("range_write_formulas"),
-    )
-    server.add_tool(
-        range_get_format,
-        name="range_get_format",
-        description=_DESC_RANGE_GET_FORMAT,
-        annotations=_annotations("range_get_format"),
-    )
-    server.add_tool(
-        range_set_format,
-        name="range_set_format",
-        description=_DESC_RANGE_SET_FORMAT,
-        annotations=_annotations("range_set_format"),
-    )
-    server.add_tool(
-        range_copy,
-        name="range_copy",
-        description=_DESC_RANGE_COPY,
-        annotations=_annotations("range_copy"),
-    )
-    server.add_tool(
-        range_insert,
-        name="range_insert",
-        description=_DESC_RANGE_INSERT,
-        annotations=_annotations("range_insert"),
+        range_structural,
+        name="range_structural",
+        description=_DESC_RANGE_STRUCTURAL,
+        annotations=_annotations("range_structural"),
     )
     server.add_tool(
         range_delete,
@@ -2233,36 +2255,6 @@ def _register_tools(server: MCPServer) -> None:
         name="range_merge",
         description=_DESC_RANGE_MERGE,
         annotations=_annotations("range_merge"),
-    )
-    server.add_tool(
-        range_unmerge,
-        name="range_unmerge",
-        description=_DESC_RANGE_UNMERGE,
-        annotations=_annotations("range_unmerge"),
-    )
-    server.add_tool(
-        range_get_validation,
-        name="range_get_validation",
-        description=_DESC_RANGE_GET_VALIDATION,
-        annotations=_annotations("range_get_validation"),
-    )
-    server.add_tool(
-        range_set_validation,
-        name="range_set_validation",
-        description=_DESC_RANGE_SET_VALIDATION,
-        annotations=_annotations("range_set_validation"),
-    )
-    server.add_tool(
-        range_get_conditional_formatting,
-        name="range_get_conditional_formatting",
-        description=_DESC_RANGE_GET_CONDITIONAL_FORMATTING,
-        annotations=_annotations("range_get_conditional_formatting"),
-    )
-    server.add_tool(
-        range_set_conditional_formatting,
-        name="range_set_conditional_formatting",
-        description=_DESC_RANGE_SET_CONDITIONAL_FORMATTING,
-        annotations=_annotations("range_set_conditional_formatting"),
     )
     server.add_tool(
         name,

@@ -19,9 +19,9 @@ _CRITICAL = [
     "workbook",
     "workbook_read",
     "excel_save_as",
-    "range_write_values",
-    "range_read_values",
-    "range_write_formulas",
+    "range_write",
+    "range_read",
+    "range_structural",
     "macro_run",
     "macro",
     "table",
@@ -42,7 +42,7 @@ _CRITICAL = [
 
 # Tools that must carry exactly one request example (R-D8).
 _EXAMPLE_TOOLS = [
-    "range_write_values",
+    "range_write",
     "table",
     "vba_replace_component_source",
     "test",
@@ -92,8 +92,10 @@ async def test_tool_count_is_92_exposed() -> None:
     # (WP5) consolidates the three shape verbs into shape and the three control
     # verbs into control: 75 -> 71. B7 (WP6) consolidates the three macro
     # read/bookkeeping verbs into macro (macro_run stays standalone) and the two
-    # test verbs into test: 71 -> 68. B12 finalizes the count.
-    assert len(tools) == 68
+    # test verbs into test: 71 -> 68. B8 (WP7) splits the sixteen range verbs
+    # into range_read / range_write / range_structural (range_delete and
+    # range_merge stay standalone): 68 -> 57. B12 finalizes the count.
+    assert len(tools) == 57
 
 
 async def test_critical_tools_follow_template() -> None:
@@ -129,13 +131,10 @@ async def test_guarded_mutations_use_uniform_guard_sentence() -> None:
         "name_delete",
         "shape",
         "control",
-        "range_set_format",
-        "range_copy",
-        "range_insert",
+        "range_write",
+        "range_structural",
         "range_delete",
         "range_merge",
-        "range_unmerge",
-        "range_set_validation",
         "pivot_table_refresh",
         "pivot_cache_refresh",
     ]:
