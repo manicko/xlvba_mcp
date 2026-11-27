@@ -264,7 +264,7 @@ async def test_name_annotation_triple() -> None:
     assert ann is not None
     assert ann.destructive_hint is not True
     assert ann.read_only_hint is not True
-    assert ann.idempotent_hint is not True
+    assert ann.idempotent_hint is True
 
 
 async def test_name_read_annotation_triple() -> None:

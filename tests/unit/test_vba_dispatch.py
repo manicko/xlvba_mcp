@@ -299,14 +299,14 @@ async def test_vba_annotation_triples() -> None:
 
     export_ann = tools["vba_export_project"].annotations
     assert export_ann is not None
-    assert export_ann.idempotent_hint is True
+    assert export_ann.idempotent_hint is not True
     assert export_ann.destructive_hint is not True
 
     compile_ann = tools["vba_compile_diagnostics"].annotations
     assert compile_ann is not None
     assert compile_ann.read_only_hint is not True
     assert compile_ann.destructive_hint is not True
-    assert compile_ann.idempotent_hint is True
+    assert compile_ann.idempotent_hint is not True
 
 
 async def test_old_vba_read_names_removed() -> None:

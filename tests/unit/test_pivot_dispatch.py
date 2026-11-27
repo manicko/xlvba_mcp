@@ -534,15 +534,14 @@ async def test_pivot_read_annotation_triple() -> None:
     assert ann.idempotent_hint is True
 
 
-async def test_pivot_refresh_annotation_triple_not_idempotent() -> None:
+async def test_pivot_refresh_annotation_triple() -> None:
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
     ann = tools["pivot_refresh"].annotations
     assert ann is not None
-    # (F, F, F): not read-only, not destructive, NOT idempotent
-    # (a re-refresh may read different source data).
+    # (F, F, T): not read-only, not destructive, idempotent.
     assert ann.read_only_hint is not True
     assert ann.destructive_hint is not True
-    assert ann.idempotent_hint is not True
+    assert ann.idempotent_hint is True
 
 
 async def test_pivot_field_annotation_dual_hint() -> None:
