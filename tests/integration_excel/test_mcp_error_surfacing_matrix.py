@@ -352,7 +352,11 @@ def _denial_args(tool: str, wid: str) -> dict[str, Any]:
         },
         "macro_run": {"workbook_id": wid, "macro_name": "modWorkflow.Recalculate"},
         "snapshot_create": {"workbook_id": wid},
-        "snapshot_restore": {"snapshot_id": "no-such-snapshot", "confirm": True},
+        "snapshot_restore": {
+            "snapshot_id": "no-such-snapshot",
+            "workbook_id": wid,
+            "confirm": True,
+        },
         "snapshot_diff": {"snapshot_id_a": "no-such-a", "snapshot_id_b": "no-such-b"},
         "vba_export_project": {"workbook_id": wid},
         "excel_save": {"workbook_id": wid},

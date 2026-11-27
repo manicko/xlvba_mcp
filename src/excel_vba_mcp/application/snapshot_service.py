@@ -35,7 +35,7 @@ import contextlib
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -45,11 +45,12 @@ from excel_vba_mcp.adapters.excel.com_worker import ExcelComWorker
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.domain.errors import (
     ApprovalDeniedError,
+    ErrorCode,
     ExcelVbaMcpError,
     SnapshotFailedError,
     WorkbookNotFoundError,
 )
-from excel_vba_mcp.domain.models import WorkbookInfo
+from excel_vba_mcp.domain.models import SnapshotRestoreResult, WorkbookInfo
 from excel_vba_mcp.domain.statuses import OperationClass, SessionMode
 from excel_vba_mcp.security.approval import ApprovalKey, ApprovalPolicy
 from excel_vba_mcp.security.audit import AuditLogger
@@ -120,6 +121,10 @@ class SnapshotService:
         self._latest_snapshot: dict[str, SnapshotManifest] = {}
         # Last-known canonical source path per workbook id (closed-branch lookup).
         self._known_sources: dict[str, str] = {}
+        # The snapshot id whose restored copy is currently active, keyed by the
+        # rebound canonical (the ORIGINAL source path). Used for a deterministic
+        # same-snapshot repeat error (plan_06 R3) instead of a generic COM_BUSY.
+        self._restored_snapshot_by_canonical: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Properties (non-COM)
@@ -287,7 +292,7 @@ class SnapshotService:
         *,
         workbook_id: str | None = None,
         timeout_s: float = _DEFAULT_TIMEOUT_S,
-    ) -> WorkbookInfo:
+    ) -> SnapshotRestoreResult:
         """Restore a working session from an immutable snapshot.
 
         Restore adds **no second approval gate**: its approval point is inherited
@@ -308,6 +313,25 @@ class SnapshotService:
         ``SNAPSHOT_FAILED`` error is raised (the failed restored copy is cleaned
         up best-effort so exactly one working copy — the previous one — remains).
 
+        Additive hardening (plan_06; the WP3 order above is unchanged):
+
+        * **R1 — ``previous_close`` status.** A failed previous-copy close never
+          fails the restore and never invalidates the restored session: the
+          result carries ``previous_close="failed"`` with safe ``previous_close_error``
+          text and the previous copy remains open. ``workbook_id=None`` (or the
+          restored id) yields ``previous_close="not_requested"``; a clean close
+          yields ``"closed"``.
+        * **R3 — identity rebind.** After a successful open+validate the restored
+          record's ``canonical`` is rebound to ``manifest.source_path`` (the
+          ORIGINAL) and its ``source_sha256`` to ``manifest.sha256`` (the
+          baseline), so ``list_workbooks`` / reopen reflect the original, never
+          the immutable snapshot file. The working copy stays ``work/<newid>.ext``.
+        * **R3 — same-snapshot repeat.** Restoring the snapshot that is already
+          the active restored baseline for the same original raises a
+          deterministic validation error (``reason="same_snapshot"``,
+          ``isRetryable=false``) instead of a generic ``COM_BUSY``. A different
+          snapshot is allowed.
+
         The freshly opened restored session is **execute mode** and **writable**
         (``read_only=False``), matching the default ``excel_open``; this lets the
         Full-Edit workflow continue editing and running macros after a restore
@@ -321,13 +345,16 @@ class SnapshotService:
         Args:
             snapshot_id: The snapshot to restore.
             workbook_id: The currently-open working copy to discard (no save) once
-                the restored copy has been validated.
+                the restored copy has been validated. ``None`` yields
+                ``previous_close="not_requested"`` (no previous copy is closed).
             timeout_s: Soft per-call ceiling for the STA open/close/validate.
 
         Returns:
-            A :class:`WorkbookInfo` describing the freshly opened working copy in
-            execute mode (``mode == SessionMode.EXECUTE``) and writable
-            (``read_only is False``).
+            A :class:`~excel_vba_mcp.domain.models.SnapshotRestoreResult` whose
+            ``workbook`` is the freshly opened working copy in execute mode
+            (``mode == SessionMode.EXECUTE``) and writable (``read_only is False``)
+            with ``source_path`` rebound to the original, plus the
+            ``previous_close`` disposition (R1).
 
         Raises:
             ApprovalDeniedError: If the inherited ``excel_open`` approval gate
@@ -335,10 +362,34 @@ class SnapshotService:
             SnapshotFailedError: If the snapshot does not exist, or the restored
                 working copy could not be validated as open (the previous copy is
                 kept open in that case).
+            ExcelVbaMcpError: With ``code='INVALID_RANGE'`` and
+                ``reason='same_snapshot'`` when the requested snapshot is already
+                the active restored baseline for the same original (R3).
         """
 
         manifest = self._store.load(snapshot_id)
         snapshot_file = self._store.path_for(snapshot_id) / manifest.file_name
+
+        # R3 (same-snapshot repeat): a deterministic validation error when the
+        # requested snapshot is already the active restored baseline for the same
+        # original. Raised BEFORE any open so no duplicate working copy is created.
+        previous_canonical = self._canonical_for(workbook_id)
+        if (
+            previous_canonical is not None
+            and self._restored_snapshot_by_canonical.get(previous_canonical) == snapshot_id
+        ):
+            raise ExcelVbaMcpError(
+                "This snapshot is already the active restored baseline for this "
+                "workbook; restore a different snapshot or close the restored copy "
+                "first.",
+                code=ErrorCode.INVALID_RANGE,
+                context={
+                    "reason": "same_snapshot",
+                    "snapshot_id": snapshot_id,
+                    "workbook_id": workbook_id,
+                    "canonical_path": previous_canonical,
+                },
+            )
 
         # 1. Open the restored working copy FIRST, while the previous copy (if any)
         #    is still open. If this open fails, the previous copy is untouched and
@@ -370,15 +421,25 @@ class SnapshotService:
 
         # 3. Validation succeeded: close the obsolete previous working copy
         #    WITHOUT saving (discard mutations). The restored copy remains the
-        #    single active session record (never both, never zero).
-        if workbook_id is not None and workbook_id != info.workbook_id:
-            with contextlib.suppress(ExcelVbaMcpError):
-                await self._session.close_workbook(
-                    workbook_id,
-                    save_changes=False,
-                    discard_changes=True,
-                    timeout_s=timeout_s,
-                )
+        #    single active session record (never both, never zero). R1: a close
+        #    failure is surfaced as previous_close="failed" and NEVER changes the
+        #    restore outcome (still success) or invalidates the restored session.
+        previous_close, previous_close_error = await self._close_previous_copy(
+            workbook_id, restored_id=info.workbook_id, timeout_s=timeout_s
+        )
+
+        # 4. R3: rebind the restored session identity to the ORIGINAL (the
+        #    manifest source path) so list_workbooks / reopen reflect the original,
+        #    never the immutable snapshot file. The working copy stays
+        #    work/<newid>.ext; the snapshot file is never the session identity.
+        #    Done AFTER close-previous so the original canonical key is free (no
+        #    collision in the session's per-path active/lock maps).
+        self._session.rebind_restored_identity(
+            info.workbook_id,
+            canonical=manifest.source_path,
+            source_sha256=manifest.sha256,
+        )
+        self._restored_snapshot_by_canonical[manifest.source_path] = snapshot_id
 
         self._latest_snapshot[info.workbook_id] = manifest
         self._known_sources[info.workbook_id] = manifest.source_path
@@ -392,9 +453,59 @@ class SnapshotService:
                 "restored_workbook_id": info.workbook_id,
                 "sha256": manifest.sha256,
                 "external_side_effects_not_undone": True,
+                "previous_close": previous_close,
+                "previous_close_error": previous_close_error,
             },
         )
-        return info
+        return SnapshotRestoreResult(
+            workbook=info,
+            previous_close=previous_close,
+            previous_close_error=previous_close_error,
+        )
+
+    async def _close_previous_copy(
+        self,
+        workbook_id: str | None,
+        *,
+        restored_id: str,
+        timeout_s: float,
+    ) -> tuple[Literal["closed", "failed", "not_requested"], str | None]:
+        """Close the previous working copy without saving; never fail the restore (R1).
+
+        Returns ``(previous_close, previous_close_error)``:
+
+        * ``("not_requested", None)`` when no distinct previous copy was supplied
+          (``workbook_id is None`` or it equals the restored id);
+        * ``("closed", None)`` when the previous copy was closed without saving;
+        * ``("failed", <safe text>)`` when the close raised — the restore outcome
+          is unchanged (still success) and the previous copy remains open.
+
+        A close failure is caught broadly (never leaks out) so a transient COM
+        failure on close cannot turn a successful restore into an error.
+        """
+
+        if workbook_id is None or workbook_id == restored_id:
+            return "not_requested", None
+        try:
+            await self._session.close_workbook(
+                workbook_id,
+                save_changes=False,
+                discard_changes=True,
+                timeout_s=timeout_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - R1: a close failure never fails restore
+            return "failed", _safe_error_text(exc)
+        return "closed", None
+
+    def _canonical_for(self, workbook_id: str | None) -> str | None:
+        """Return the rebound canonical (original source path) for an open workbook id."""
+
+        if workbook_id is None:
+            return None
+        for info in self._session.list_workbooks_sync():
+            if info.workbook_id == workbook_id:
+                return info.source_path or info.path
+        return None
 
     async def _validate_restored_copy(self, info: WorkbookInfo, *, timeout_s: float) -> None:
         """Confirm the restored working copy is actually open in the owned instance.
@@ -613,6 +724,18 @@ def _find_open_workbook(app_adapter: ExcelAppAdapter, working_path: str) -> Any 
     except Exception:  # noqa: BLE001 - defensive COM read
         return None
     return None
+
+
+def _safe_error_text(exc: Exception) -> str:
+    """Return safe, human-readable text for a close failure (R1; no secrets).
+
+    Uses the domain ``message`` when available (never the context, which may hold
+    paths), falling back to ``str(exc)`` for a generic exception, capped to a
+    reasonable length so a volatile COM string cannot bloat the result.
+    """
+
+    text = getattr(exc, "message", None) or str(exc) or exc.__class__.__name__
+    return text[:500]
 
 
 def _model_from_info(info: WorkbookInfo) -> dict[str, Any]:

@@ -562,6 +562,42 @@ class SnapshotInfo(DomainModel):
     manifest: SnapshotManifest | None = None
 
 
+class SnapshotRestoreResult(DomainModel):
+    """Result of ``snapshot_restore`` (plan_06 R1/R3; additive).
+
+    An additive wrapper over the freshly opened restored :class:`WorkbookInfo`
+    plus the disposition of the previous working copy's close (R1):
+
+    * ``previous_close`` is ``"closed"`` when the previous working copy was
+      closed without saving, ``"failed"`` when the close raised (the restore
+      **still succeeds** and the restored session stays valid — the previous
+      copy remains open and the agent is told via ``previous_close_error``), or
+      ``"not_requested"`` when no previous ``workbook_id`` was supplied.
+    * ``previous_close_error`` is safe, human-readable text (no secrets) when
+      ``previous_close == "failed"``, else ``None``.
+
+    The restored ``workbook.source_path`` is rebound to the snapshot manifest's
+    ``source_path`` (the ORIGINAL), so identity / ``list_workbooks`` / reopen
+    reflect the original, never the immutable snapshot file (plan_06 R3). The
+    working copy itself stays ``work/<newid>.ext``; the snapshot file is never
+    the session identity.
+    """
+
+    workbook: WorkbookInfo
+    previous_close: Literal["closed", "failed", "not_requested"] = Field(
+        description=(
+            "Disposition of the previous working copy's close: 'closed' (closed "
+            "without saving), 'failed' (close raised; restore still succeeds and "
+            "the previous copy remains open), or 'not_requested' (no previous "
+            "workbook_id supplied)."
+        )
+    )
+    previous_close_error: str | None = Field(
+        default=None,
+        description="Safe, human-readable close-failure text when previous_close == 'failed'.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Workbook model (spec §6.1, §7.5, §7.6, §7.7, §7.4, Appendix A)
 # ---------------------------------------------------------------------------

@@ -437,11 +437,17 @@ async def test_snapshot_create_open_and_restore(tmp_path: Path) -> None:
             manifest.snapshot_id, workbook_id=old_workbook_id
         )
 
-        assert restored.workbook_id != old_workbook_id, "restore opens a fresh working copy"
-        restored_working_path = restored.path
+        assert restored.workbook.workbook_id != old_workbook_id, (
+            "restore opens a fresh working copy"
+        )
+        restored_working_path = restored.workbook.path
         assert Path(restored_working_path) != snapshot_file.resolve(), (
             "restore must open a working copy, not the snapshot file itself"
         )
+        # R1: a clean previous-copy close is reported as "closed".
+        assert restored.previous_close == "closed"
+        # R3: the restored identity is rebound to the ORIGINAL source path.
+        assert restored.workbook.source_path == manifest.source_path
 
         # The restored working copy shows the BASELINE A1 (mutation discarded).
         def read_restored_a1() -> str:
@@ -468,7 +474,7 @@ async def test_snapshot_create_open_and_restore(tmp_path: Path) -> None:
         _assert_no_visible_owned_windows(owned_pid, "after-restore")
 
         # Cleanup the restored working copy.
-        await rig.session.close_workbook(restored.workbook_id)
+        await rig.session.close_workbook(restored.workbook.workbook_id)
 
         print(
             f"[snapshot] snapshot_id={manifest.snapshot_id} method={manifest.snapshot_method} "
@@ -705,13 +711,15 @@ async def test_restore_after_mutation(tmp_path: Path) -> None:
         restored = await rig.snapshot.restore_snapshot(
             manifest.snapshot_id, workbook_id=info.workbook_id
         )
-        assert isinstance(restored, WorkbookInfo)
-        assert restored.workbook_id != info.workbook_id, "restore opens a fresh working copy"
-        assert Path(restored.path) != snapshot_file.resolve(), (
+        assert isinstance(restored.workbook, WorkbookInfo)
+        assert restored.workbook.workbook_id != info.workbook_id, (
+            "restore opens a fresh working copy"
+        )
+        assert Path(restored.workbook.path) != snapshot_file.resolve(), (
             "restore must open a working copy, not the snapshot file itself"
         )
         restored_a1 = await rig.worker.submit(
-            lambda: _read_a1(rig.app_adapter, restored.path),
+            lambda: _read_a1(rig.app_adapter, restored.workbook.path),
             timeout=_CALL_TIMEOUT_S,
             op_class=OperationClass.READ_ONLY,
         )
@@ -739,7 +747,7 @@ async def test_restore_after_mutation(tmp_path: Path) -> None:
 
         _assert_owned_never_foreground(owned_pid, "after-restore")
         _assert_no_visible_owned_windows(owned_pid, "after-restore")
-        await rig.session.close_workbook(restored.workbook_id)
+        await rig.session.close_workbook(restored.workbook.workbook_id)
 
         # --- Part B: crash recovery (abnormal end of ONLY the owned EXCEL.exe) ---
         info2 = await rig.session.open_workbook(
@@ -779,9 +787,11 @@ async def test_restore_after_mutation(tmp_path: Path) -> None:
         )
         fresh.grant_open_for(snapshot_file)
         recovered = await fresh.snapshot.restore_snapshot(manifest.snapshot_id)
-        assert isinstance(recovered, WorkbookInfo)
+        assert isinstance(recovered.workbook, WorkbookInfo)
+        # No previous workbook_id was supplied -> previous_close is not_requested (R1).
+        assert recovered.previous_close == "not_requested"
         recovered_a1 = await fresh.worker.submit(
-            lambda: _read_a1(fresh.app_adapter, recovered.path),
+            lambda: _read_a1(fresh.app_adapter, recovered.workbook.path),
             timeout=_CALL_TIMEOUT_S,
             op_class=OperationClass.READ_ONLY,
         )
@@ -793,7 +803,7 @@ async def test_restore_after_mutation(tmp_path: Path) -> None:
 
         _assert_owned_never_foreground(fresh_pid, "fresh-recovery")
         _assert_no_visible_owned_windows(fresh_pid, "fresh-recovery")
-        await fresh.session.close_workbook(recovered.workbook_id)
+        await fresh.session.close_workbook(recovered.workbook.workbook_id)
 
         print(
             f"[restore] baseline_sha={baseline_sha[:12]}… restored_a1={restored_a1!r} "

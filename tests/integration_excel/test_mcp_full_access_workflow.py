@@ -791,10 +791,15 @@ async def test_persistence_roundtrip(tmp_path: Path) -> None:
             await _call(
                 session,
                 "snapshot_restore",
-                {"snapshot_id": edited_snapshot_id, "confirm": True},
+                {
+                    "snapshot_id": edited_snapshot_id,
+                    "workbook_id": workbook_id,
+                    "confirm": True,
+                },
             )
         )
-        workbook_id2 = restored["workbook_id"]
+        # R1/R3: the result wraps the restored WorkbookInfo plus previous_close.
+        workbook_id2 = restored["workbook"]["workbook_id"]
         assert workbook_id2 and workbook_id2 != workbook_id, f"expected a fresh id: {restored}"
 
         # FE-16: the restored session is execute-mode and writable, so macros keep

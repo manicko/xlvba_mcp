@@ -21,7 +21,7 @@ from excel_vba_mcp.api import test_tools, workbook_tools
 from excel_vba_mcp.api.recovery_tools import excel_recover
 from excel_vba_mcp.api.test_tools import snapshot_restore
 from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
-from excel_vba_mcp.domain.models import WorkbookInfo
+from excel_vba_mcp.domain.models import SnapshotRestoreResult, WorkbookInfo
 from excel_vba_mcp.domain.statuses import SessionMode
 
 pytestmark = pytest.mark.anyio
@@ -48,16 +48,16 @@ def _info() -> WorkbookInfo:
 
 
 class _FakeSnapshotService:
-    """Records ``restore_snapshot`` calls; returns a canned WorkbookInfo."""
+    """Records ``restore_snapshot`` calls; returns a canned restore result."""
 
     def __init__(self) -> None:
         self.restore_calls: list[tuple[str, str | None]] = []
 
     async def restore_snapshot(
         self, snapshot_id: str, *, workbook_id: str | None = None
-    ) -> WorkbookInfo:
+    ) -> SnapshotRestoreResult:
         self.restore_calls.append((snapshot_id, workbook_id))
-        return _info()
+        return SnapshotRestoreResult(workbook=_info(), previous_close="closed")
 
 
 class _FakeSessionService:
@@ -119,8 +119,27 @@ async def test_snapshot_restore_true_confirm_delegates() -> None:
     finally:
         test_tools.set_snapshot_service(None)
 
-    assert isinstance(result, WorkbookInfo)
+    assert isinstance(result, SnapshotRestoreResult)
+    assert result.previous_close == "closed"
     assert fake.restore_calls == [("snap-1", "wb1")]
+
+
+async def test_snapshot_restore_missing_workbook_id_rejected() -> None:
+    """R2: a missing ``workbook_id`` is a validation error before any action."""
+
+    fake = _FakeSnapshotService()
+    test_tools.set_snapshot_service(fake)  # type: ignore[arg-type]
+    try:
+        with pytest.raises(ExcelVbaMcpError) as excinfo:
+            await snapshot_restore("snap-1", confirm=True)
+    finally:
+        test_tools.set_snapshot_service(None)
+
+    assert excinfo.value.code is ErrorCode.INVALID_RANGE
+    assert excinfo.value.context.get("field") == "workbook_id"
+    # Validation errors are not retryable.
+    assert excinfo.value.to_dict()["isRetryable"] is False
+    assert fake.restore_calls == [], "delegate must not be called on reject"
 
 
 # ---------------------------------------------------------------------------

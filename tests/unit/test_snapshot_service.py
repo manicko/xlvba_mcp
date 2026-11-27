@@ -349,16 +349,20 @@ async def test_restore_closes_without_save_and_opens_baseline(tmp_path: Path) ->
     assert wb.closed is True
     assert wb.saved_on_close is False
 
+    # R1: a clean previous-copy close is reported as "closed".
+    assert restored.previous_close == "closed"
+    assert restored.previous_close_error is None
+
     # The restored session is execute-mode and writable (FE-16): this is what lets
     # the Full-Edit workflow continue running macros after a restore instead of
     # failing with MACRO_BLOCKED on an inspect-mode session.
-    assert isinstance(restored, WorkbookInfo)
-    assert restored.mode == SessionMode.EXECUTE
-    assert restored.read_only is False
+    assert isinstance(restored.workbook, WorkbookInfo)
+    assert restored.workbook.mode == SessionMode.EXECUTE
+    assert restored.workbook.read_only is False
 
     # A fresh working copy was opened from the snapshot baseline.
-    assert restored.workbook_id != info.workbook_id
-    new_wb = next(w for w in rig.app.Workbooks.items if w.FullName == restored.path)
+    assert restored.workbook.workbook_id != info.workbook_id
+    new_wb = next(w for w in rig.app.Workbooks.items if w.FullName == restored.workbook.path)
     assert new_wb.Range("A1").Value is None  # baseline (unmutated)
     assert new_wb.closed is False
 
@@ -397,7 +401,7 @@ async def test_restore_closes_only_previous_and_keeps_restored_active(tmp_path: 
     # Exactly one open workbook after the restore: the restored one.
     open_infos = await rig.session.list_workbooks()
     assert len(open_infos) == 1
-    assert open_infos[0].workbook_id == restored.workbook_id
+    assert open_infos[0].workbook_id == restored.workbook.workbook_id
     assert all(w.workbook_id != info.workbook_id for w in open_infos)
 
     # The previous working copy was closed WITHOUT saving.
@@ -406,7 +410,7 @@ async def test_restore_closes_only_previous_and_keeps_restored_active(tmp_path: 
     assert previous_wb.saved_on_close is False
 
     # The restored working copy is open and active in the owned instance.
-    restored_wb = next(w for w in rig.app.Workbooks.items if w.FullName == restored.path)
+    restored_wb = next(w for w in rig.app.Workbooks.items if w.FullName == restored.workbook.path)
     assert restored_wb.closed is False
     open_in_app = [w for w in rig.app.Workbooks.items if not w.closed]
     assert len(open_in_app) == 1
@@ -470,6 +474,206 @@ async def test_restore_confirm_false_rejects_before_any_change(tmp_path: Path) -
     assert open_infos[0].workbook_id == info.workbook_id
     previous_wb = next(w for w in rig.app.Workbooks.items if w.FullName == info.path)
     assert previous_wb.closed is False
+
+
+# ---------------------------------------------------------------------------
+# R1 — previous_close status (never fail restore on close failure)
+# ---------------------------------------------------------------------------
+async def _grant_restore_open(rig: Rig, manifest) -> None:
+    """Grant the writable open the restore performs on the snapshot baseline."""
+
+    snapshot_file = rig.store.path_for(manifest.snapshot_id) / manifest.file_name
+    snapshot_canonical = str(
+        rig.path_policy.validate_path(str(snapshot_file), OperationClass.MUTATING)
+    )
+    rig.grant("excel_open", canonical=snapshot_canonical)
+
+
+async def test_restore_previous_close_failed_surfaces_but_succeeds(tmp_path: Path) -> None:
+    """R1: a failed previous-copy close does NOT fail the restore.
+
+    The restore still succeeds (``previous_close="failed"`` with safe text), the
+    restored copy is active, and the previous copy remains open (never closed).
+    """
+
+    rig = Rig(tmp_path)
+    info = await rig.open(read_only=False)
+    manifest = await rig.service.create_snapshot(info.workbook_id)
+    await _grant_restore_open(rig, manifest)
+
+    # Inject a close failure on the STA worker (the previous-copy close).
+    rig.worker.fail_names.add("close_workbook")
+
+    restored = await rig.service.restore_snapshot(
+        manifest.snapshot_id, workbook_id=info.workbook_id
+    )
+
+    assert restored.previous_close == "failed"
+    assert restored.previous_close_error, "a failed close must carry safe error text"
+    # The restore still succeeded and the restored copy is active.
+    assert isinstance(restored.workbook, WorkbookInfo)
+    open_infos = await rig.session.list_workbooks()
+    assert any(w.workbook_id == restored.workbook.workbook_id for w in open_infos)
+
+    # The previous copy was NOT closed (close failed) and is still open.
+    previous_wb = next(w for w in rig.app.Workbooks.items if w.FullName == info.path)
+    assert previous_wb.closed is False
+    previous_infos = [w for w in open_infos if w.workbook_id == info.workbook_id]
+    assert previous_infos, "the previous session record must remain open"
+
+
+async def test_restore_without_workbook_id_reports_not_requested(tmp_path: Path) -> None:
+    """R1: ``workbook_id=None`` yields ``previous_close="not_requested"``."""
+
+    rig = Rig(tmp_path)
+    info = await rig.open(read_only=False)
+    manifest = await rig.service.create_snapshot(info.workbook_id)
+    await _grant_restore_open(rig, manifest)
+
+    restored = await rig.service.restore_snapshot(manifest.snapshot_id)
+
+    assert restored.previous_close == "not_requested"
+    assert restored.previous_close_error is None
+    # No previous copy was closed: the original session stays open.
+    open_infos = await rig.session.list_workbooks()
+    assert any(w.workbook_id == info.workbook_id for w in open_infos)
+    previous_wb = next(w for w in rig.app.Workbooks.items if w.FullName == info.path)
+    assert previous_wb.closed is False
+
+
+# ---------------------------------------------------------------------------
+# R3 — canonical / session identity rebind + same-snapshot repeat
+# ---------------------------------------------------------------------------
+async def test_restore_rebinds_canonical_to_original(tmp_path: Path) -> None:
+    """R3: after restore the session identity is the ORIGINAL, not the snapshot file."""
+
+    rig = Rig(tmp_path)
+    info = await rig.open(read_only=False)
+    manifest = await rig.service.create_snapshot(info.workbook_id)
+    await _grant_restore_open(rig, manifest)
+
+    snapshot_file = rig.store.path_for(manifest.snapshot_id) / manifest.file_name
+    restored = await rig.service.restore_snapshot(
+        manifest.snapshot_id, workbook_id=info.workbook_id
+    )
+
+    # The returned info and the live record both reflect the original source path.
+    assert restored.workbook.source_path == manifest.source_path
+    assert Path(restored.workbook.path) != snapshot_file.resolve(), (
+        "the working copy is work/<id>.ext, never the snapshot file"
+    )
+    record = rig.session._records[restored.workbook.workbook_id]
+    assert record.canonical == manifest.source_path
+    assert record.source_sha256 == manifest.sha256
+
+    # list_workbooks shows the ORIGINAL, not the snapshot file path.
+    open_infos = await rig.session.list_workbooks()
+    assert len(open_infos) == 1
+    assert open_infos[0].source_path == manifest.source_path
+    assert open_infos[0].workbook_id == restored.workbook.workbook_id
+
+
+async def test_restore_same_snapshot_repeat_rejected(tmp_path: Path) -> None:
+    """R3: repeating the SAME snapshot while its copy is active is a clear error."""
+
+    rig = Rig(tmp_path)
+    info = await rig.open(read_only=False)
+    manifest = await rig.service.create_snapshot(info.workbook_id)
+    await _grant_restore_open(rig, manifest)
+
+    first = await rig.service.restore_snapshot(
+        manifest.snapshot_id, workbook_id=info.workbook_id
+    )
+    assert first.previous_close == "closed"
+
+    # Re-restoring the same snapshot (now the active baseline) is rejected.
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        await rig.service.restore_snapshot(
+            manifest.snapshot_id, workbook_id=first.workbook.workbook_id
+        )
+    assert exc_info.value.code is ErrorCode.INVALID_RANGE
+    assert exc_info.value.context.get("reason") == "same_snapshot"
+    assert exc_info.value.to_dict()["isRetryable"] is False
+
+    # The restored copy is still the single active session (no duplicate opened).
+    open_infos = await rig.session.list_workbooks()
+    assert len(open_infos) == 1
+    assert open_infos[0].workbook_id == first.workbook.workbook_id
+
+
+async def test_restore_different_snapshot_allowed(tmp_path: Path) -> None:
+    """R3: a DIFFERENT snapshot is allowed (new working copy; previous closed)."""
+
+    rig = Rig(tmp_path)
+    info = await rig.open(read_only=False)
+    snap_a = await rig.service.create_snapshot(info.workbook_id)
+    snap_b = await rig.service.create_snapshot(info.workbook_id)
+    await _grant_restore_open(rig, snap_a)
+    await _grant_restore_open(rig, snap_b)
+
+    first = await rig.service.restore_snapshot(snap_a.snapshot_id, workbook_id=info.workbook_id)
+    second = await rig.service.restore_snapshot(
+        snap_b.snapshot_id, workbook_id=first.workbook.workbook_id
+    )
+
+    assert second.previous_close == "closed"
+    assert second.workbook.workbook_id not in (info.workbook_id, first.workbook.workbook_id)
+    # Exactly one open copy: the second restored one, bound to the original.
+    open_infos = await rig.session.list_workbooks()
+    assert len(open_infos) == 1
+    assert open_infos[0].workbook_id == second.workbook.workbook_id
+    assert open_infos[0].source_path == snap_b.source_path
+
+
+async def test_restore_noop_yields_valid_copy_bound_to_original(tmp_path: Path) -> None:
+    """R3: a true no-op restore still yields a valid copy bound to the original."""
+
+    rig = Rig(tmp_path)
+    info = await rig.open(read_only=False)
+    manifest = await rig.service.create_snapshot(info.workbook_id)
+    await _grant_restore_open(rig, manifest)
+    original_hash = rig.original.read_bytes()
+
+    restored = await rig.service.restore_snapshot(
+        manifest.snapshot_id, workbook_id=info.workbook_id
+    )
+
+    assert restored.previous_close == "closed"
+    assert restored.workbook.source_path == manifest.source_path
+    # The restored working copy content equals the (unchanged) snapshot baseline.
+    snapshot_file = rig.store.path_for(manifest.snapshot_id) / manifest.file_name
+    assert Path(restored.workbook.path).read_bytes() == snapshot_file.read_bytes()
+    # The original file is untouched.
+    assert rig.original.read_bytes() == original_hash
+
+
+async def test_restore_rollback_replaces_working_content(tmp_path: Path) -> None:
+    """R3: restoring an OLDER snapshot replaces the working content; original untouched."""
+
+    rig = Rig(tmp_path)
+    info = await rig.open(read_only=False)
+    # Baseline snapshot of the pristine working copy.
+    base = await rig.service.create_snapshot(info.workbook_id)
+    base_file = rig.store.path_for(base.snapshot_id) / base.file_name
+    # Mutate the working copy in memory, then snapshot the mutated state.
+    wb = rig.app.Workbooks.items[-1]
+    wb.Range("A1").Value = "CHANGED"
+    await rig.service.create_snapshot(info.workbook_id)
+    original_hash = rig.original.read_bytes()
+    await _grant_restore_open(rig, base)
+
+    # Roll back to the OLDER baseline snapshot.
+    restored = await rig.service.restore_snapshot(base.snapshot_id, workbook_id=info.workbook_id)
+
+    # The working copy content is the older baseline, not the mutated state.
+    assert Path(restored.workbook.path).read_bytes() == base_file.read_bytes()
+    assert restored.workbook.source_path == base.source_path
+    # The mutated previous working copy was closed without saving.
+    previous_wb = next(w for w in rig.app.Workbooks.items if w.FullName == info.path)
+    assert previous_wb.closed is True
+    assert previous_wb.saved_on_close is False
+    # The original fixture is never modified by a rollback.
+    assert rig.original.read_bytes() == original_hash
 
 
 # ---------------------------------------------------------------------------

@@ -242,6 +242,48 @@ class SessionService:
 
         self._snapshot_gate = gate
 
+    def rebind_restored_identity(
+        self,
+        workbook_id: str,
+        *,
+        canonical: str,
+        source_sha256: str,
+    ) -> None:
+        """Rebind a restored session's identity to the ORIGINAL source (plan_06 R3).
+
+        After a snapshot restore the freshly opened working copy is initially
+        registered under the snapshot **file** path (its open source). This method
+        rebinds the live record so its ``canonical`` (and the ``source_path`` on
+        the cached :class:`WorkbookInfo`) is the manifest's ``source_path`` — the
+        ORIGINAL — and its ``source_sha256`` is the snapshot baseline. The working
+        copy on disk (``work/<id>.ext``) is unchanged and the snapshot file is
+        never the session identity, so ``list_workbooks`` / reopen reflect the
+        original.
+
+        The per-canonical-path active map and lock are migrated to the rebound
+        canonical so a later ``excel_open`` of the original fast-rejects against
+        the restored id and ``close_workbook`` releases the right lock. The caller
+        must invoke this only AFTER the previous working copy has been closed (so
+        the original canonical key is free).
+
+        Args:
+            workbook_id: The restored (open) workbook id.
+            canonical: The original source path to rebind to.
+            source_sha256: The baseline source hash to record.
+        """
+
+        record = self._require_record(workbook_id)
+        old_canonical = record.canonical
+        record.canonical = canonical
+        record.source_sha256 = source_sha256
+        record.info = record.info.model_copy(update={"source_path": canonical})
+        if old_canonical != canonical:
+            # Migrate the per-path active map + lock to the rebound canonical.
+            self._active_by_canonical.pop(old_canonical, None)
+            self._locks.pop(old_canonical, None)
+            self._active_by_canonical[canonical] = workbook_id
+            self._locks[canonical] = record.lock
+
     # ------------------------------------------------------------------
     # Open
     # ------------------------------------------------------------------

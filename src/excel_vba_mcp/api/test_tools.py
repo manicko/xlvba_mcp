@@ -34,7 +34,7 @@ from excel_vba_mcp.application.job_registry import RunningJob
 from excel_vba_mcp.application.snapshot_service import SnapshotDiff, SnapshotService
 from excel_vba_mcp.application.test_runner import TestRunner
 from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
-from excel_vba_mcp.domain.models import TestRunResult, WorkbookInfo
+from excel_vba_mcp.domain.models import SnapshotRestoreResult, TestRunResult
 from excel_vba_mcp.domain.statuses import OperationClass
 from excel_vba_mcp.domain.test_spec import TestSuiteSpec
 from excel_vba_mcp.storage.snapshot_store import SnapshotManifest
@@ -121,11 +121,16 @@ async def snapshot_restore(
     workbook_id: str | None = None,
     *,
     confirm: bool = False,
-) -> WorkbookInfo:
+) -> SnapshotRestoreResult:
     """Restore a working session from an immutable snapshot.
 
-    Closes the current working copy without saving (when ``workbook_id`` is
-    given) and opens a fresh working copy from the snapshot baseline.
+    Closes the current working copy (``workbook_id``) without saving and opens a
+    fresh working copy from the snapshot baseline.
+
+    ``workbook_id`` is **required** (R2): it identifies the current working copy
+    to discard so the restore leaves exactly one active copy. A missing/empty
+    ``workbook_id`` is rejected with a validation error (``INVALID_RANGE``,
+    ``isRetryable=false``) **before** any close/open.
 
     This is destructive to the current working copy, so it is **gated by
     ``confirm``**: a missing or ``False`` ``confirm`` raises
@@ -137,16 +142,30 @@ async def snapshot_restore(
     Args:
         snapshot_id: The snapshot to restore.
         workbook_id: The currently-open working copy to discard (no save).
+            Required (R2).
         confirm: Must be ``True`` to proceed; otherwise the call is rejected
             with ``CONFIRMATION_REQUIRED`` before any destructive action.
 
     Returns:
-        A :class:`WorkbookInfo` describing the freshly opened working copy.
+        A :class:`~excel_vba_mcp.domain.models.SnapshotRestoreResult` describing
+        the freshly opened working copy (with ``source_path`` rebound to the
+        original) and the ``previous_close`` disposition (R1).
     """
 
     _require_non_empty(snapshot_id, "snapshot_id")
-    if workbook_id is not None:
-        _require_non_empty(workbook_id, "workbook_id")
+    # R2: workbook_id is required for a deterministic single-active-copy contract.
+    if workbook_id is None or not str(workbook_id).strip():
+        raise ExcelVbaMcpError(
+            "Argument 'workbook_id' is required for snapshot_restore: it identifies "
+            "the current working copy to discard so exactly one active copy remains.",
+            code=ErrorCode.INVALID_RANGE,
+            context={
+                "tool": "snapshot_restore",
+                "field": "workbook_id",
+                "reason": "workbook_id_required",
+            },
+        )
+    _require_non_empty(workbook_id, "workbook_id")
     if not confirm:
         raise ExcelVbaMcpError(
             "snapshot_restore requires confirm=true: it discards the current "
@@ -155,10 +174,7 @@ async def snapshot_restore(
             code=ErrorCode.CONFIRMATION_REQUIRED,
             context={
                 "tool": "snapshot_restore",
-                "discard": (
-                    "the current working copy (unsaved changes) when workbook_id "
-                    "is given"
-                ),
+                "discard": "the current working copy (unsaved changes) identified by workbook_id",
             },
         )
     service = get_snapshot_service()
