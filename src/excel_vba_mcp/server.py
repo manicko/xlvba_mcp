@@ -1819,15 +1819,30 @@ def _configure_logging() -> None:
     )
 
 
-# Truthful MCP ``ToolAnnotations`` (U3; plan_03 §11). Derived from each tool's
-# access class; emitted on every ``add_tool`` call. These are hints only (client
-# display is best-effort; Kilo approval is name-glob based) — they never change
-# enforcement. ``macro_run`` and ``vba_compile_diagnostics`` are intentionally NOT read-only.
+# Truthful MCP ``ToolAnnotations`` (U3; plan_03 §11; B11 / WP10). The three
+# frozensets encode the per-tool triple derived from the WP0 truth matrix
+# (``tests/fixtures/wp0_baseline.json`` -> ``tool_annotations``) using MCP default
+# semantics: readOnly = all actions read-only; destructive = any action
+# destructive; idempotent = all actions idempotent. Every ``add_tool`` call emits
+# all three hints as explicit booleans (never ``None`` — R-Q12 / A2), so an
+# additive tool is not mis-advertised as destructive under the MCP
+# ``destructiveHint=true`` default. These are hints only (client display is
+# best-effort; Kilo approval is name-glob based) — they never change enforcement.
+#
+# ``range_structural`` is destructive-only (NOT idempotent — H4: re-insert
+# duplicates; unmerge discards merges). ``vba_replace_component_source`` is
+# destructive-only (NOT idempotent — R-Q3: re-call with the same hash fails the
+# revision guard). The dual-hint set (destructive AND idempotent) is exactly
+# ``{range_merge, pivot_field}`` (R-Q4).
+#
+# ``xlvba_environment`` and ``server_health`` are (read_only=True,
+# destructive=False, idempotent=True) but carry INLINE annotations at their own
+# call sites (A1 / R-Q10); they are intentionally NOT members of these frozensets
+# and do not flow through ``_annotations``.
 _ANN_READ_ONLY = frozenset(
     {
         "workbook_read",
         "excel_health",
-        "xlvba_environment",
         "snapshot_list",
         "snapshot_diff",
         "vba_read",
@@ -1862,30 +1877,41 @@ _ANN_DESTRUCTIVE = frozenset(
 _ANN_IDEMPOTENT = frozenset(
     {
         "workbook_read",
+        "excel_health",
+        "snapshot_list",
+        "snapshot_diff",
+        "vba_read",
+        "job_get",
+        "job_request_cancel",
+        "sheet_read",
+        "table_read",
+        "pivot_read",
+        "pivot_refresh",
+        "pivot_field",
         "range_read",
         "range_merge",
-        "table_read",
-        "sheet_read",
-        "pivot_read",
-        "pivot_field",
+        "name",
         "name_read",
         "shape",
         "control",
-        "vba_read",
-        "vba_export_project",
-        "vba_compile_diagnostics",
         "macro",
     }
 )
 
 
 def _annotations(name: str) -> ToolAnnotations:
-    """Build truthful :class:`ToolAnnotations` for one tool by name (U3 §11)."""
+    """Build truthful :class:`ToolAnnotations` for one tool by name (U3 §11).
+
+    All three hints are emitted as explicit booleans derived from the WP0 truth
+    matrix frozensets (R-Q12 / A2): an absent hint is ``False``, never ``None``,
+    so the MCP ``destructiveHint=true`` default cannot mis-advertise an additive
+    tool as destructive.
+    """
 
     return ToolAnnotations(
-        read_only_hint=True if name in _ANN_READ_ONLY else None,
-        destructive_hint=True if name in _ANN_DESTRUCTIVE else None,
-        idempotent_hint=True if name in _ANN_IDEMPOTENT else None,
+        read_only_hint=name in _ANN_READ_ONLY,
+        destructive_hint=name in _ANN_DESTRUCTIVE,
+        idempotent_hint=name in _ANN_IDEMPOTENT,
     )
 
 
@@ -2126,7 +2152,9 @@ def _register_tools(server: MCPServer) -> None:
         xlvba_environment,
         name="xlvba_environment",
         description=_DESC_ENVIRONMENT,
-        annotations=ToolAnnotations(read_only_hint=True),
+        annotations=ToolAnnotations(
+            read_only_hint=True, destructive_hint=False, idempotent_hint=True
+        ),
     )
 
 
@@ -2297,7 +2325,11 @@ _configure_logging()
 mcp: ExcelVbaMcpServer = ExcelVbaMcpServer("excel-vba-mcp", version=__version__, lifespan=lifespan)
 
 
-@mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
+@mcp.tool(
+    annotations=ToolAnnotations(
+        read_only_hint=True, destructive_hint=False, idempotent_hint=True
+    )
+)
 def server_health() -> dict[str, str]:
     """Purpose: Read-only liveness probe (never touches Excel/COM).
 
