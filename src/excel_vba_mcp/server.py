@@ -158,13 +158,9 @@ from excel_vba_mcp.api.vba_tools import (
     vba_search_code,
 )
 from excel_vba_mcp.api.workbook_tools import (
-    excel_close,
-    excel_get_status,
-    excel_list_workbooks,
-    excel_open,
-    excel_save,
     excel_save_as,
-    workbook_get_model,
+    workbook,
+    workbook_read,
 )
 from excel_vba_mcp.application.compile_service import CompileService
 from excel_vba_mcp.application.controls_service import ControlsService
@@ -237,14 +233,51 @@ _DESC_OPEN = (
     "\"read_only\": false}"
 )
 _DESC_CLOSE = (
-    "Purpose: Close an open workbook. "
-    "Use when: you are done with a workbook and want to release the working copy. "
-    "Preconditions: an open workbook_id. "
-    "Parameters: workbook_id; save_changes=False. "
-    "Behavior: Defaults to NOT saving — unsaved edits are lost unless "
-    "save_changes=true. "
-    "Result: SessionStatus. "
-    "Next actions: excel_list_workbooks to confirm the workbook is gone."
+    "close refuses by default when the workbook has unsaved changes: a clean "
+    "workbook closes normally, while a dirty workbook is refused unless "
+    "save_changes=true (save then close) or discard_changes=true (discard) is "
+    "passed; save_changes and discard_changes together are rejected as "
+    "contradictory. "
+)
+_DESC_WORKBOOK = (
+    "Purpose: Open, close or save an open workbook through one lifecycle tool. "
+    "Use when: you need to open an allowlisted workbook as a hidden working "
+    "copy, close a workbook you are done with, or persist the working copy in "
+    "place. "
+    "Do not use when: you need Save As to a new path — use excel_save_as; the "
+    "workbook is already open — reuse its workbook_id (workbook_read "
+    "action='list'). "
+    "Preconditions: an open workbook_id for close/save; path under an allowlisted "
+    "root (EXCEL_VBA_MCP_ROOTS, default cwd + temp) for open; the original file "
+    "is never modified. "
+    "Parameters: action='open'|'close'|'save'; path (open); workbook_id "
+    "(close/save); mode='execute' (default) or 'inspect'; read_only; "
+    "save_changes; discard_changes; background. "
+    "Behavior: open copies the file into work/ and opens it hidden; save writes "
+    "the working copy in place (no path argument); " + _DESC_CLOSE + "Result: "
+    "WorkbookInfo (open/save), SessionStatus (close), or RunningJob when "
+    "background=true. "
+    "Next actions: workbook_read action='status' to confirm state; "
+    "snapshot_create before further mutations. "
+    "Example: {\"action\": \"open\", \"path\": \"C:/data/report.xlsm\"}"
+)
+_DESC_WORKBOOK_READ = (
+    "Purpose: Read workbook/session state without mutating the workbook. "
+    "Use when: you need session/workbook status, the list of open workbooks, or "
+    "the aggregated Stage 1 workbook model. "
+    "Do not use when: you need to open/close/save — use workbook; you need VBA "
+    "source — use vba_read. "
+    "Preconditions: an open workbook_id for model (required) and status "
+    "(optional); none for list. "
+    "Parameters: action='status'|'list'|'model'; workbook_id; include_vba. "
+    "Behavior: read-only; status/list never touch COM and model never executes "
+    "VBA — when VBA is unavailable the other sections are still returned and "
+    "vba_access reports the state. "
+    "Result: SessionStatus (status), list[WorkbookInfo] (list), WorkbookModel "
+    "(model). "
+    "Next actions: workbook action='open' to open a workbook; excel_health for "
+    "worker state. "
+    "Example: {\"action\": \"model\", \"workbook_id\": \"<id>\"}"
 )
 _DESC_SAVE = (
     "Purpose: Save an open workbook's working copy in place. "
@@ -260,8 +293,8 @@ _DESC_SAVE_AS = (
     "Purpose: Save an open workbook's working copy to a (possibly new) target path without "
     "rebinding the session. Use when: you need the working copy written to a different/new "
     "file (Save As), including overwriting the original source. Do not use when: you only need "
-    "to persist the working copy in place — use excel_save; the target is the open working "
-    "copy (rejected); the source changed since open (STALE_TARGET). Preconditions: an open "
+    "to persist the working copy in place — use workbook action='save'; the target is the open "
+    "working copy (rejected); the source changed since open (STALE_TARGET). Preconditions: an open "
     "workbook_id; MUTATING approval on the target Approval gate (see xlvba://glossary). "
     "Parameters: workbook_id, path, overwrite_existing=false, overwrite_source=false. "
     "Behavior: flushes the working copy with wb.Save on the STA worker, then a pure-filesystem "
@@ -271,7 +304,8 @@ _DESC_SAVE_AS = (
     "source needs overwrite_source=true plus a matching source hash; skips the snapshot gate "
     "(Save As does not mutate the open working copy). Result: SaveAsResult (outcome 'ok' only "
     "after a final size+SHA-256 verify; 'unknown'/'error' fail-closed with backup_path). Next "
-    "actions: excel_save to persist the working copy; snapshot_create before further mutations."
+    "actions: workbook action='save' to persist the working copy; snapshot_create before further "
+    "mutations."
 )
 _DESC_STATUS = (
     "Purpose: Return session/workbook status (busy, read-only, dirty, active operation). "
@@ -335,7 +369,7 @@ _DESC_TEST_SUITE_RUN = (
     "new use). "
     "Use when: you have a suite object or a plain JSON-style mapping, or you need "
     "background=true. "
-    "Preconditions: suite.workbook_id must be an open workbook (call excel_open "
+    "Preconditions: suite.workbook_id must be an open workbook (call workbook action='open' "
     "first); a baseline snapshot is created automatically unless "
     "baseline='use_existing'. "
     "Parameters: suite:TestSuiteSpec or mapping; background=False. The closed "
@@ -937,7 +971,7 @@ _DESC_ENVIRONMENT = (
     "null (no 4-part source); excel.available=false when the worker is down. "
     "Result: EnvironmentReport (server, excel, capabilities, policy, "
     "glossary_uri, workbooks). "
-    "Next actions: excel_open / snapshot_create as the policy requires. "
+    "Next actions: workbook action='open' / snapshot_create as the policy requires. "
     "Capabilities (this server provides): VBA project access, macros, pivot "
     "tables (database-source; manual filters), background jobs, recovery, and "
     "non-activating compile diagnostics — NOT compilation (sourced from "
@@ -1685,8 +1719,7 @@ def _configure_logging() -> None:
 # enforcement. ``macro_run`` and ``vba_compile_diagnostics`` are intentionally NOT read-only.
 _ANN_READ_ONLY = frozenset(
     {
-        "excel_get_status",
-        "excel_list_workbooks",
+        "workbook_read",
         "excel_health",
         "xlvba_environment",
         "snapshot_list",
@@ -1724,11 +1757,12 @@ _ANN_READ_ONLY = frozenset(
         "shape_get",
         "controls_list",
         "control_get",
-        "workbook_get_model",
     }
 )
 _ANN_DESTRUCTIVE = frozenset(
     {
+        "workbook",
+        "excel_save_as",
         "sheet_delete",
         "range_merge",
         "excel_recover",
@@ -1742,6 +1776,7 @@ _ANN_DESTRUCTIVE = frozenset(
 )
 _ANN_IDEMPOTENT = frozenset(
     {
+        "workbook_read",
         "range_write_values",
         "range_write_formulas",
         "range_set_format",
@@ -1784,40 +1819,22 @@ def _annotations(name: str) -> ToolAnnotations:
 def _register_tools(server: MCPServer) -> None:
     """Register the base workbook/session tools on ``server``."""
     server.add_tool(
-        excel_open,
-        name="excel_open",
-        description=_DESC_OPEN,
-        annotations=_annotations("excel_open"),
+        workbook,
+        name="workbook",
+        description=_DESC_WORKBOOK,
+        annotations=_annotations("workbook"),
     )
     server.add_tool(
-        excel_close,
-        name="excel_close",
-        description=_DESC_CLOSE,
-        annotations=_annotations("excel_close"),
-    )
-    server.add_tool(
-        excel_save,
-        name="excel_save",
-        description=_DESC_SAVE,
-        annotations=_annotations("excel_save"),
+        workbook_read,
+        name="workbook_read",
+        description=_DESC_WORKBOOK_READ,
+        annotations=_annotations("workbook_read"),
     )
     server.add_tool(
         excel_save_as,
         name="excel_save_as",
         description=_DESC_SAVE_AS,
         annotations=_annotations("excel_save_as"),
-    )
-    server.add_tool(
-        excel_get_status,
-        name="excel_get_status",
-        description=_DESC_STATUS,
-        annotations=_annotations("excel_get_status"),
-    )
-    server.add_tool(
-        excel_list_workbooks,
-        name="excel_list_workbooks",
-        description=_DESC_LIST,
-        annotations=_annotations("excel_list_workbooks"),
     )
     server.add_tool(
         excel_health,
@@ -2313,12 +2330,6 @@ def _register_tools(server: MCPServer) -> None:
         name="control_set_on_action",
         description=_DESC_CONTROL_SET_ON_ACTION,
         annotations=_annotations("control_set_on_action"),
-    )
-    server.add_tool(
-        workbook_get_model,
-        name="workbook_get_model",
-        description=_DESC_WORKBOOK_GET_MODEL,
-        annotations=_annotations("workbook_get_model"),
     )
     server.add_tool(
         xlvba_environment,

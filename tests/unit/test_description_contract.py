@@ -16,11 +16,9 @@ pytestmark = pytest.mark.anyio
 # Workflow-critical tools that must follow the §5.1 template (Purpose / Use when /
 # Do not use when / Preconditions / Parameters / Behavior / Result / Next actions).
 _CRITICAL = [
-    "excel_open",
-    "excel_close",
-    "excel_save",
+    "workbook",
+    "workbook_read",
     "excel_save_as",
-    "excel_get_status",
     "range_write_values",
     "range_read_values",
     "range_write_formulas",
@@ -85,8 +83,9 @@ async def _descriptions() -> dict[str, str]:
 
 async def test_tool_count_is_92_exposed() -> None:
     tools = await server.mcp.list_tools()
-    # U7 adds excel_save_as (91 -> 92); U6-A had removed the duplicate test_run_suite.
-    assert len(tools) == 92
+    # B2 (WP1) consolidates the six workbook verbs into workbook + workbook_read
+    # (excel_save_as stays standalone): 92 -> 88. B12 finalizes the count.
+    assert len(tools) == 88
 
 
 async def test_critical_tools_follow_template() -> None:

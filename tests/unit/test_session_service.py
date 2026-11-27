@@ -398,6 +398,91 @@ async def test_close_with_save_changes_requires_grant(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Close disposition (D1 / R-Q1 / R-Q8 / R-Q9): refuse-by-default on dirty
+# ---------------------------------------------------------------------------
+async def test_close_refuses_dirty_workbook_by_default(tmp_path: Path) -> None:
+    service, app, _worker, original, _work_dir = _make_service(
+        tmp_path, approval=ApprovalPolicy(mode=AccessMode.FULL)
+    )
+
+    info = await service.open_workbook(str(original), mode=SessionMode.INSPECT, read_only=False)
+    # Mark the live workbook dirty (the real signal is ``not wb.Saved``).
+    app.Workbooks.items[-1].Saved = False
+
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        await service.close_workbook(info.workbook_id)
+    assert exc_info.value.code is ErrorCode.CONFIRMATION_REQUIRED
+    # The workbook is still open (refused close must not release it).
+    assert [w.workbook_id for w in await service.list_workbooks()] == [info.workbook_id]
+
+    # Cleanup: discard so the held lock / temp file do not leak across tests.
+    await service.close_workbook(info.workbook_id, discard_changes=True)
+
+
+async def test_close_discard_changes_closes_dirty_workbook(tmp_path: Path) -> None:
+    service, app, _worker, original, _work_dir = _make_service(
+        tmp_path, approval=ApprovalPolicy(mode=AccessMode.FULL)
+    )
+
+    info = await service.open_workbook(str(original), mode=SessionMode.INSPECT, read_only=False)
+    app.Workbooks.items[-1].Saved = False
+
+    status = await service.close_workbook(info.workbook_id, discard_changes=True)
+
+    wb = app.Workbooks.items[-1]
+    assert wb.closed is True
+    assert wb.saved_on_close is False, "discard must close WITHOUT saving"
+    assert status.workbook_id is None
+    assert await service.list_workbooks() == []
+
+
+async def test_close_save_changes_saves_dirty_workbook(tmp_path: Path) -> None:
+    service, app, _worker, original, _work_dir = _make_service(
+        tmp_path, approval=ApprovalPolicy(mode=AccessMode.FULL)
+    )
+
+    info = await service.open_workbook(str(original), mode=SessionMode.INSPECT, read_only=False)
+    app.Workbooks.items[-1].Saved = False
+
+    await service.close_workbook(info.workbook_id, save_changes=True)
+
+    wb = app.Workbooks.items[-1]
+    assert wb.closed is True
+    assert wb.saved_on_close is True, "save_changes must close WITH saving"
+    assert await service.list_workbooks() == []
+
+
+async def test_close_rejects_contradictory_flags(tmp_path: Path) -> None:
+    service, _app, _worker, original, _work_dir = _make_service(tmp_path)
+
+    info = await service.open_workbook(str(original), mode=SessionMode.INSPECT, read_only=True)
+
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        await service.close_workbook(
+            info.workbook_id, save_changes=True, discard_changes=True
+        )
+    assert exc_info.value.code is ErrorCode.INVALID_RANGE
+    # The workbook is still open (contradiction rejected before any close).
+    assert [w.workbook_id for w in await service.list_workbooks()] == [info.workbook_id]
+
+    await service.close_workbook(info.workbook_id)
+
+
+async def test_close_clean_workbook_closes_normally(tmp_path: Path) -> None:
+    service, app, _worker, original, _work_dir = _make_service(
+        tmp_path, approval=ApprovalPolicy(mode=AccessMode.FULL)
+    )
+
+    info = await service.open_workbook(str(original), mode=SessionMode.INSPECT, read_only=False)
+    # A freshly opened working copy is clean (Saved == True): closes with no flags.
+    status = await service.close_workbook(info.workbook_id)
+
+    assert app.Workbooks.items[-1].closed is True
+    assert status.workbook_id is None
+    assert await service.list_workbooks() == []
+
+
+# ---------------------------------------------------------------------------
 # Save: explicit save clears dirty
 # ---------------------------------------------------------------------------
 async def test_save_workbook_persists_explicitly(tmp_path: Path) -> None:

@@ -66,8 +66,20 @@ class FakeSessionService:
         self.calls.append(("open", (path,), {"mode": mode, "read_only": read_only}))
         return self._info
 
-    async def close_workbook(self, workbook_id: str, *, save_changes: bool) -> SessionStatus:
-        self.calls.append(("close", (workbook_id,), {"save_changes": save_changes}))
+    async def close_workbook(
+        self,
+        workbook_id: str,
+        *,
+        save_changes: bool,
+        discard_changes: bool = False,
+    ) -> SessionStatus:
+        self.calls.append(
+            (
+                "close",
+                (workbook_id,),
+                {"save_changes": save_changes, "discard_changes": discard_changes},
+            )
+        )
         return self._status
 
     async def save_workbook(self, workbook_id: str) -> WorkbookInfo:
@@ -129,7 +141,7 @@ async def test_excel_close_defaults_to_no_save(
     name, args, kwargs = _install_fake_service.calls[-1]
     assert name == "close"
     assert args == ("wb1",)
-    assert kwargs == {"save_changes": False}
+    assert kwargs == {"save_changes": False, "discard_changes": False}
 
 
 async def test_excel_close_passes_save_changes(
@@ -137,7 +149,15 @@ async def test_excel_close_passes_save_changes(
 ) -> None:
     await excel_close("wb1", save_changes=True)
     _name, _args, kwargs = _install_fake_service.calls[-1]
-    assert kwargs == {"save_changes": True}
+    assert kwargs == {"save_changes": True, "discard_changes": False}
+
+
+async def test_excel_close_passes_discard_changes(
+    _install_fake_service: FakeSessionService,
+) -> None:
+    await excel_close("wb1", discard_changes=True)
+    _name, _args, kwargs = _install_fake_service.calls[-1]
+    assert kwargs == {"save_changes": False, "discard_changes": True}
 
 
 async def test_excel_save_delegates(_install_fake_service: FakeSessionService) -> None:

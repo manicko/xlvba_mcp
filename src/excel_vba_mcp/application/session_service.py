@@ -434,27 +434,72 @@ class SessionService:
         workbook_id: str,
         *,
         save_changes: bool = False,
+        discard_changes: bool = False,
         timeout_s: float = _DEFAULT_TIMEOUT_S,
     ) -> SessionStatus:
-        """Close an open workbook (default: no save) and release its lock.
+        """Close an open workbook and release its lock (refuse-by-default).
+
+        Unsaved-change disposition (D1 / R-Q1 / R-Q8 / R-Q9), decided from the
+        **real** dirty signal (:meth:`WorkbookAdapter.is_dirty` -> ``not
+        wb.Saved``), never ``record.dirty`` (which is never set ``True``):
+
+        * **clean** workbook -> closes normally;
+        * dirty + ``save_changes`` -> save then close;
+        * dirty + ``discard_changes`` -> discard (close without saving);
+        * dirty + neither -> **refuse** with a structured
+          :class:`ExcelVbaMcpError` (refuse-by-default);
+        * ``save_changes`` and ``discard_changes`` together -> rejected as
+          contradictory (:class:`ExcelVbaMcpError`).
 
         Args:
             workbook_id: The id returned by :meth:`open_workbook`.
             save_changes: Persist changes on close. Default ``False`` so an open
                 is never silently saved (spec §7.1).
+            discard_changes: Discard unsaved changes on close. Default
+                ``False``; mutually exclusive with ``save_changes``.
             timeout_s: Soft per-call ceiling for the STA close.
 
         Returns:
             A :class:`SessionStatus` describing the session after close.
 
         Raises:
-            ExcelVbaMcpError: If ``workbook_id`` is unknown.
+            ExcelVbaMcpError: If ``workbook_id`` is unknown, the flags are
+                contradictory, or the workbook has unsaved changes and neither
+                ``save_changes`` nor ``discard_changes`` was given.
             ApprovalDeniedError: If a save-on-close is not approved.
         """
 
         record = self._require_record(workbook_id)
 
-        # A save-on-close is a mutation; a plain close is read-only (auto-allowed).
+        # Contradictory flags are a caller error — reject before any COM work.
+        if save_changes and discard_changes:
+            raise ExcelVbaMcpError(
+                "save_changes and discard_changes are contradictory; pass at most one.",
+                code=ErrorCode.INVALID_RANGE,
+                context={
+                    "reason": "contradictory_flags",
+                    "workbook_id": workbook_id,
+                },
+            )
+
+        # Refuse-by-default: a dirty workbook needs an explicit disposition. The
+        # dirty check is a STA-local read of the live ``wb.Saved`` (R-Q8).
+        dirty = await self._is_workbook_dirty(record, timeout_s)
+        if dirty and not save_changes and not discard_changes:
+            raise ExcelVbaMcpError(
+                "The workbook has unsaved changes; close refuses by default. "
+                "Pass save_changes=true to save then close, or discard_changes=true "
+                "to discard them.",
+                code=ErrorCode.CONFIRMATION_REQUIRED,
+                context={
+                    "reason": "unsaved_changes_refused",
+                    "workbook_id": workbook_id,
+                },
+            )
+
+        # A save-on-close is a mutation; a plain close / discard is read-only
+        # (auto-allowed). Discarding only drops the disposable working copy, so
+        # the original is never touched.
         close_op = OperationClass.MUTATING if save_changes else OperationClass.READ_ONLY
         self._require_approval(
             self._approval_key(record.canonical, "excel_close"),
@@ -488,9 +533,18 @@ class SessionService:
         self._record_audit(
             tool="excel_close",
             operation_class="mutating" if save_changes else "read_only",
-            params={"workbook_id": workbook_id, "save_changes": save_changes},
+            params={
+                "workbook_id": workbook_id,
+                "save_changes": save_changes,
+                "discard_changes": discard_changes,
+            },
             workbook={"canonical_path": record.canonical},
-            result={"workbook_id": workbook_id, "closed": True, "saved": save_changes},
+            result={
+                "workbook_id": workbook_id,
+                "closed": True,
+                "saved": save_changes,
+                "discarded": discard_changes and not save_changes,
+            },
         )
         return self._build_status(
             workbook_id=None,
@@ -498,6 +552,32 @@ class SessionService:
             read_only=record.read_only,
             dirty=False,
             notes=["workbook closed"],
+        )
+
+    async def _is_workbook_dirty(self, record: _SessionRecord, timeout_s: float) -> bool:
+        """Return whether the live workbook has unsaved changes (STA-local read).
+
+        Uses the real :meth:`WorkbookAdapter.is_dirty` (``not wb.Saved``); a
+        workbook that is no longer open in the owned instance is treated as
+        clean (nothing to lose). Runs on the single-STA worker; never touches the
+        event loop with a COM proxy.
+        """
+
+        app_adapter = self._app_adapter
+        workbook_adapter = self._workbook_adapter
+
+        def dirty_fn() -> bool:
+            wb = _find_open_workbook(app_adapter, record.working_path)
+            if wb is None:
+                return False
+            return workbook_adapter.is_dirty(wb)
+
+        dirty_fn.__name__ = "is_workbook_dirty"
+        return await self._worker.submit(
+            dirty_fn,
+            timeout=timeout_s,
+            section="diagnostic",
+            op_class=OperationClass.READ_ONLY,
         )
 
     # ------------------------------------------------------------------

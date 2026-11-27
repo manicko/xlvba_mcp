@@ -19,12 +19,13 @@ straightforward to unit-test with fake services.
 from __future__ import annotations
 
 from functools import partial
+from typing import Literal
 
 from excel_vba_mcp.api.job_tools import start_long_op
 from excel_vba_mcp.application.job_registry import RunningJob
 from excel_vba_mcp.application.session_service import SessionService
 from excel_vba_mcp.application.workbook_model_service import WorkbookModelService
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
     SaveAsResult,
     SessionStatus,
@@ -132,13 +133,30 @@ async def excel_open(
     return await service.open_workbook(path, mode=session_mode, read_only=read_only)
 
 
-async def excel_close(workbook_id: str, save_changes: bool = False) -> SessionStatus:
-    """Close an open workbook (default: no save).
+async def excel_close(
+    workbook_id: str,
+    save_changes: bool = False,
+    discard_changes: bool = False,
+) -> SessionStatus:
+    """Close an open workbook (refuse-by-default when there are unsaved changes).
+
+    The unsaved-change disposition is enforced in the application service
+    (:meth:`SessionService.close_workbook`) using the real dirty signal
+    (``WorkbookAdapter.is_dirty`` -> ``not wb.Saved``):
+
+    * a clean workbook closes normally;
+    * dirty + ``save_changes`` saves then closes;
+    * dirty + ``discard_changes`` discards (closes without saving);
+    * dirty + neither **refuses** with a structured :class:`ExcelVbaMcpError`;
+    * ``save_changes`` and ``discard_changes`` together are rejected as
+      contradictory.
 
     Args:
         workbook_id: The id returned by :func:`excel_open`.
         save_changes: Persist changes on close. Default ``False`` so an open is
             never silently saved.
+        discard_changes: Discard unsaved changes on close. Default ``False``.
+            Mutually exclusive with ``save_changes``.
 
     Returns:
         A :class:`SessionStatus` describing the session after close.
@@ -146,7 +164,11 @@ async def excel_close(workbook_id: str, save_changes: bool = False) -> SessionSt
 
     _require_non_empty(workbook_id, "workbook_id")
     service = get_session_service()
-    return await service.close_workbook(workbook_id, save_changes=save_changes)
+    return await service.close_workbook(
+        workbook_id,
+        save_changes=save_changes,
+        discard_changes=discard_changes,
+    )
 
 
 async def excel_save(workbook_id: str) -> WorkbookInfo:
@@ -247,6 +269,107 @@ async def workbook_get_model(workbook_id: str, include_vba: bool = True) -> Work
     return await service.get_workbook_model(workbook_id, include_vba=include_vba)
 
 
+async def workbook(
+    action: Literal["open", "close", "save"],
+    path: str | None = None,
+    workbook_id: str | None = None,
+    mode: SessionMode = SessionMode.EXECUTE,
+    read_only: bool = False,
+    save_changes: bool = False,
+    discard_changes: bool = False,
+    *,
+    background: bool = False,
+) -> WorkbookInfo | SessionStatus | RunningJob:
+    """Workbook lifecycle dispatch: ``open``, ``close`` or ``save`` (WP1).
+
+    Thin flat-signature dispatcher (option (a) — flat args + handler
+    validation): routes to the existing :func:`excel_open` /
+    :func:`excel_close` / :func:`excel_save` handlers unchanged and forwards
+    only the validated arguments. Per-action required parameters are enforced by
+    the target handler (``open`` needs ``path``; ``close`` / ``save`` need
+    ``workbook_id``) so a missing required argument surfaces as a structured
+    :class:`ExcelVbaMcpError` rather than a crash. An unknown ``action`` raises
+    a structured :class:`ExcelVbaMcpError`.
+
+    Args:
+        action: ``open`` (open a working copy), ``close`` (release it) or
+            ``save`` (persist it in place).
+        path: Workbook path; required for ``open``.
+        workbook_id: The id returned by ``open``; required for ``close`` /
+            ``save``.
+        mode: ``execute`` (default) or ``inspect`` (macros disabled) for
+            ``open``.
+        read_only: Open the working copy read-only (for ``open``).
+        save_changes: Save then close (for ``close``).
+        discard_changes: Discard unsaved changes (for ``close``).
+        background: Schedule the ``open`` on the job registry (for ``open``).
+
+    Returns:
+        A :class:`WorkbookInfo` (``open`` / ``save``), a :class:`SessionStatus`
+        (``close``), or a :class:`RunningJob` when ``background=True``.
+    """
+
+    if action == "open":
+        return await excel_open(
+            path or "",
+            mode=mode,
+            read_only=read_only,
+            background=background,
+        )
+    if action == "close":
+        return await excel_close(
+            workbook_id or "",
+            save_changes=save_changes,
+            discard_changes=discard_changes,
+        )
+    if action == "save":
+        return await excel_save(workbook_id or "")
+    raise ExcelVbaMcpError(
+        f"Unknown workbook action {action!r}; expected 'open', 'close' or 'save'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "workbook", "action": action},
+    )
+
+
+async def workbook_read(
+    action: Literal["status", "list", "model"],
+    workbook_id: str | None = None,
+    include_vba: bool = True,
+) -> SessionStatus | list[WorkbookInfo] | WorkbookModel:
+    """Workbook read dispatch: ``status``, ``list`` or ``model`` (WP1).
+
+    Thin flat-signature dispatcher (option (a)): routes to the existing
+    :func:`excel_get_status` / :func:`excel_list_workbooks` /
+    :func:`workbook_get_model` handlers unchanged. ``status`` accepts an
+    optional ``workbook_id``; ``model`` requires one (enforced by the target
+    handler). An unknown ``action`` raises a structured
+    :class:`ExcelVbaMcpError`.
+
+    Args:
+        action: ``status`` (session/workbook state), ``list`` (open workbooks)
+            or ``model`` (aggregated Stage 1 model).
+        workbook_id: The id returned by ``open``; required for ``model``,
+            optional for ``status``.
+        include_vba: Aggregate the VBA project into the model (``model`` only).
+
+    Returns:
+        A :class:`SessionStatus` (``status``), a list of :class:`WorkbookInfo`
+        (``list``) or a :class:`WorkbookModel` (``model``).
+    """
+
+    if action == "status":
+        return await excel_get_status(workbook_id)
+    if action == "list":
+        return await excel_list_workbooks()
+    if action == "model":
+        return await workbook_get_model(workbook_id or "", include_vba=include_vba)
+    raise ExcelVbaMcpError(
+        f"Unknown workbook_read action {action!r}; expected 'status', 'list' or 'model'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "workbook_read", "action": action},
+    )
+
+
 __all__ = [
     "excel_close",
     "excel_get_status",
@@ -258,5 +381,7 @@ __all__ = [
     "get_workbook_model_service",
     "set_session_service",
     "set_workbook_model_service",
+    "workbook",
     "workbook_get_model",
+    "workbook_read",
 ]

@@ -621,7 +621,7 @@ async def test_server_registers_model_tool_and_resources() -> None:
     import excel_vba_mcp.server as server
 
     tools = {tool.name for tool in await server.mcp.list_tools()}
-    assert "workbook_get_model" in tools
+    assert "workbook_read" in tools
 
     templates = {template.uri_template for template in await server.mcp.list_resource_templates()}
     assert "excel://workbooks/{workbook_id}/model" in templates
