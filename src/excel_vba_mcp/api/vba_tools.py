@@ -17,8 +17,11 @@ read via :func:`get_vba_project_service`.
 
 from __future__ import annotations
 
+from typing import Literal
+
+from excel_vba_mcp.application.compile_service import CompileDiagnostics
 from excel_vba_mcp.application.vba_project_service import VBAProjectService
-from excel_vba_mcp.domain.errors import ExcelVbaMcpError
+from excel_vba_mcp.domain.errors import ErrorCode, ExcelVbaMcpError
 from excel_vba_mcp.domain.models import (
     VbaComponentInfo,
     VbaComponentSource,
@@ -188,6 +191,87 @@ async def vba_search_code(
     return await service.search_code(workbook_id, pattern, regex=regex)
 
 
+async def vba_read(
+    action: Literal[
+        "project-info",
+        "list-components",
+        "list-procedures",
+        "read-component",
+        "get-references",
+        "search-code",
+        "get-compile-diagnostics",
+    ],
+    workbook_id: str | None = None,
+    component: str | None = None,
+    pattern: str | None = None,
+    regex: bool = False,
+) -> (
+    VbaProjectInfo
+    | list[VbaComponentInfo]
+    | list[VbaProcedureInfo]
+    | VbaComponentSource
+    | list[VbaReferenceInfo]
+    | list[VbaSearchMatch]
+    | CompileDiagnostics
+):
+    """VBA read/diagnostic dispatch (WP9).
+
+    Thin flat-signature dispatcher (option (a) — flat args + handler
+    validation): routes to the existing :func:`vba_project_info` /
+    :func:`vba_list_components` / :func:`vba_list_procedures` /
+    :func:`vba_read_component` / :func:`vba_get_references` /
+    :func:`vba_search_code` handlers and the compile service's cached
+    diagnostics unchanged, and forwards only the validated arguments. Per-action
+    required parameters are enforced handler-side (``workbook_id`` is required
+    for every action; ``list-procedures`` / ``read-component`` need
+    ``component``; ``search-code`` needs ``pattern``) so a missing required
+    argument surfaces as a structured :class:`ExcelVbaMcpError` rather than a
+    crash. This tool is read-only.
+
+    Args:
+        action: The read/diagnostic verb to perform.
+        workbook_id: The id returned by ``excel_open`` (required).
+        component: The ``VBComponent.Name`` (``list-procedures`` /
+            ``read-component``).
+        pattern: Substring or regular expression (``search-code``).
+        regex: Treat ``pattern`` as a regular expression (``search-code``).
+
+    Returns:
+        A :class:`VbaProjectInfo` (``project-info``), ``list[VbaComponentInfo]``
+        (``list-components``), ``list[VbaProcedureInfo]`` (``list-procedures``),
+        a :class:`VbaComponentSource` (``read-component``),
+        ``list[VbaReferenceInfo]`` (``get-references``),
+        ``list[VbaSearchMatch]`` (``search-code``) or a
+        :class:`CompileDiagnostics` (``get-compile-diagnostics``).
+    """
+
+    if action == "project-info":
+        return await vba_project_info(workbook_id or "")
+    if action == "list-components":
+        return await vba_list_components(workbook_id or "")
+    if action == "list-procedures":
+        return await vba_list_procedures(workbook_id or "", component or "")
+    if action == "read-component":
+        return await vba_read_component(workbook_id or "", component or "")
+    if action == "get-references":
+        return await vba_get_references(workbook_id or "")
+    if action == "search-code":
+        return await vba_search_code(workbook_id or "", pattern or "", regex=regex)
+    if action == "get-compile-diagnostics":
+        from excel_vba_mcp.api.compile_tools import get_compile_service
+
+        _require_non_empty(workbook_id or "", "workbook_id")
+        service = get_compile_service()
+        return await service.get_last_diagnostics(workbook_id or "")
+    raise ExcelVbaMcpError(
+        f"Unknown vba_read action {action!r}; expected 'project-info', "
+        "'list-components', 'list-procedures', 'read-component', "
+        "'get-references', 'search-code' or 'get-compile-diagnostics'.",
+        code=ErrorCode.INVALID_RANGE,
+        context={"tool": "vba_read", "action": action},
+    )
+
+
 async def vba_replace_component_source(
     workbook_id: str,
     component: str,
@@ -273,6 +357,7 @@ __all__ = [
     "vba_list_components",
     "vba_list_procedures",
     "vba_project_info",
+    "vba_read",
     "vba_read_component",
     "vba_replace_component_source",
     "vba_search_code",

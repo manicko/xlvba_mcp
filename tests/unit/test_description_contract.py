@@ -37,6 +37,7 @@ _CRITICAL = [
     "excel_recover",
     "job_request_cancel",
     "job_get",
+    "vba_read",
     "vba_compile_diagnostics",
     "vba_replace_component_source",
     "vba_insert_code",
@@ -99,8 +100,12 @@ async def test_tool_count_is_92_exposed() -> None:
     # into range_read / range_write / range_structural (range_delete and
     # range_merge stay standalone): 68 -> 57. B9 (WP8) splits the thirteen pivot
     # verbs into pivot_read / pivot_refresh / pivot_field: 57 -> 47 (the wp0
-    # baseline ledger lists 13 pivot old_names, not 14). B12 finalizes the count.
-    assert len(tools) == 47
+    # baseline ledger lists 13 pivot old_names, not 14). B10 (WP9) collapses the
+    # seven VBA read/diagnostic verbs into vba_read (vba_get_compile_diagnostics
+    # folded in as get-compile-diagnostics); vba_replace_component_source,
+    # vba_insert_code, vba_export_project and vba_compile_diagnostics stay
+    # standalone: 47 -> 41. B12 finalizes the count.
+    assert len(tools) == 41
 
 
 async def test_critical_tools_follow_template() -> None:

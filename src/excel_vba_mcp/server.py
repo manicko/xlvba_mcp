@@ -54,7 +54,6 @@ from excel_vba_mcp.api import (
 )
 from excel_vba_mcp.api.compile_tools import (
     vba_compile_diagnostics,
-    vba_get_compile_diagnostics,
 )
 from excel_vba_mcp.api.control_tools import (
     control,
@@ -107,14 +106,9 @@ from excel_vba_mcp.api.test_tools import (
 )
 from excel_vba_mcp.api.vba_tools import (
     vba_export_project,
-    vba_get_references,
     vba_insert_code,
-    vba_list_components,
-    vba_list_procedures,
-    vba_project_info,
-    vba_read_component,
+    vba_read,
     vba_replace_component_source,
-    vba_search_code,
 )
 from excel_vba_mcp.api.workbook_tools import (
     excel_save_as,
@@ -350,31 +344,35 @@ _DESC_TEST = (
     "\"range_address\": \"A1\", \"values_grid\": {\"rows\": 1, \"cols\": 1, "
     "\"values\": [[1]]}}]}]}, \"background\": false}"
 )
-_DESC_VBA_PROJECT_INFO = (
-    "Return the VBA project summary: name, protection/lock state, component "
-    "inventory and references (missing references are reported)."
-)
-_DESC_VBA_LIST_COMPONENTS = (
-    "List VBA components with type (standard/class/user_form/document), line "
-    "count, normalized source hash and designer/export flags."
-)
-_DESC_VBA_LIST_PROCEDURES = (
-    "List the procedures of one VBA component via the VBIDE CodeModule API; "
-    "heuristic fallbacks are flagged is_heuristic=true."
-)
-_DESC_VBA_READ_COMPONENT = (
-    "Read the code module of one VBA component (code text + normalized source hash)."
+_DESC_VBA_READ = (
+    "Purpose: Read the VBA project surface of an open workbook through one "
+    "read-only dispatcher. "
+    "Use when: you need the project summary, component inventory, procedures, a "
+    "component's source, references, a code search, or the cached compile "
+    "diagnostics. "
+    "Do not use when: you need to mutate VBA source — use "
+    "vba_replace_component_source / vba_insert_code; you need to export the "
+    "project — use vba_export_project; you need a fresh compile diagnostic — use "
+    "vba_compile_diagnostics. "
+    "Preconditions: an open workbook_id (required for every action). "
+    "Parameters: action='project-info'|'list-components'|'list-procedures'|"
+    "'read-component'|'get-references'|'search-code'|'get-compile-diagnostics'; "
+    "workbook_id; component (list-procedures / read-component); pattern + regex "
+    "(search-code). "
+    "Behavior: read-only; routes to the existing per-verb handlers unchanged and "
+    "forwards only validated arguments; a missing per-action required parameter "
+    "surfaces as a structured ExcelVbaMcpError. "
+    "Result: VbaProjectInfo (project-info), list[VbaComponentInfo] "
+    "(list-components), list[VbaProcedureInfo] (list-procedures), "
+    "VbaComponentSource (read-component), list[VbaReferenceInfo] "
+    "(get-references), list[VbaSearchMatch] (search-code) or CompileDiagnostics "
+    "(get-compile-diagnostics). "
+    "Next actions: vba_replace_component_source / vba_insert_code to mutate; "
+    "vba_export_project to export."
 )
 _DESC_VBA_EXPORT_PROJECT = (
     "Export every VBA component (.bas/.cls/.frm+.frx) and return the export "
     "manifest with per-file hashes; Document modules are never removed."
-)
-_DESC_VBA_GET_REFERENCES = (
-    "List VBA project references with Name/GUID/version/path; broken references "
-    "are flagged is_broken=true."
-)
-_DESC_VBA_SEARCH_CODE = (
-    "Search every VBA component's code for a substring or regular expression (bounded results)."
 )
 _DESC_VBA_REPLACE_COMPONENT_SOURCE = (
     "Purpose: Replace the entire code module of a Standard/Class VBA component. Use when: you "
@@ -416,9 +414,6 @@ _DESC_VBA_COMPILE_DIAGNOSTICS = (
     "shows or activates UI (see xlvba://glossary: indeterminate). "
     "Result: a compile diagnostic DTO (status indeterminate). "
     "Next actions: vba_get_compile_diagnostics for the cached result."
-)
-_DESC_VBA_GET_COMPILE_DIAGNOSTICS = (
-    "Return the last compile diagnostics (is_compile=false) without forcing a compile re-run."
 )
 _DESC_MACRO_RUN = (
     "Purpose: Run one approved, background-safe macro of an execute-mode workbook. "
@@ -1835,13 +1830,7 @@ _ANN_READ_ONLY = frozenset(
         "xlvba_environment",
         "snapshot_list",
         "snapshot_diff",
-        "vba_project_info",
-        "vba_list_components",
-        "vba_list_procedures",
-        "vba_read_component",
-        "vba_get_references",
-        "vba_search_code",
-        "vba_get_compile_diagnostics",
+        "vba_read",
         "job_get",
         "sheet_read",
         "table_read",
@@ -1882,7 +1871,9 @@ _ANN_IDEMPOTENT = frozenset(
         "name_read",
         "shape",
         "control",
-        "vba_replace_component_source",
+        "vba_read",
+        "vba_export_project",
+        "vba_compile_diagnostics",
         "macro",
     }
 )
@@ -1961,46 +1952,16 @@ def _register_tools(server: MCPServer) -> None:
         annotations=_annotations("test"),
     )
     server.add_tool(
-        vba_project_info,
-        name="vba_project_info",
-        description=_DESC_VBA_PROJECT_INFO,
-        annotations=_annotations("vba_project_info"),
-    )
-    server.add_tool(
-        vba_list_components,
-        name="vba_list_components",
-        description=_DESC_VBA_LIST_COMPONENTS,
-        annotations=_annotations("vba_list_components"),
-    )
-    server.add_tool(
-        vba_list_procedures,
-        name="vba_list_procedures",
-        description=_DESC_VBA_LIST_PROCEDURES,
-        annotations=_annotations("vba_list_procedures"),
-    )
-    server.add_tool(
-        vba_read_component,
-        name="vba_read_component",
-        description=_DESC_VBA_READ_COMPONENT,
-        annotations=_annotations("vba_read_component"),
+        vba_read,
+        name="vba_read",
+        description=_DESC_VBA_READ,
+        annotations=_annotations("vba_read"),
     )
     server.add_tool(
         vba_export_project,
         name="vba_export_project",
         description=_DESC_VBA_EXPORT_PROJECT,
         annotations=_annotations("vba_export_project"),
-    )
-    server.add_tool(
-        vba_get_references,
-        name="vba_get_references",
-        description=_DESC_VBA_GET_REFERENCES,
-        annotations=_annotations("vba_get_references"),
-    )
-    server.add_tool(
-        vba_search_code,
-        name="vba_search_code",
-        description=_DESC_VBA_SEARCH_CODE,
-        annotations=_annotations("vba_search_code"),
     )
     server.add_tool(
         vba_replace_component_source,
@@ -2019,12 +1980,6 @@ def _register_tools(server: MCPServer) -> None:
         name="vba_compile_diagnostics",
         description=_DESC_VBA_COMPILE_DIAGNOSTICS,
         annotations=_annotations("vba_compile_diagnostics"),
-    )
-    server.add_tool(
-        vba_get_compile_diagnostics,
-        name="vba_get_compile_diagnostics",
-        description=_DESC_VBA_GET_COMPILE_DIAGNOSTICS,
-        annotations=_annotations("vba_get_compile_diagnostics"),
     )
     server.add_tool(
         macro,
