@@ -42,7 +42,7 @@ not by `config.load_config()`; they are still read only at startup.
 |----------|---------|---------|----------------|--------|
 | `EXCEL_VBA_MCP_ACCESS_MODE` | Server access policy (approval behavior) | `full` | `full`, `restricted` | `full` authorizes `MUTATING`/`EXECUTING` operations without a per-action grant; `restricted` keeps deny-by-default approval. Any other value fails startup fast (Pydantic `ValidationError`). |
 | `EXCEL_VBA_MCP_MACRO_TIMEOUT_S` | Macro dispatch deadline (seconds) | `90` | Positive number | Soft per-call ceiling for the `Application.Run` dispatch inside `macro_run` (F2b). Exceeding it classifies the run `MACRO_TIMEOUT` (or `MACRO_RUNTIME_ERROR` when the owned PID shows a modal), terminates only the owned Excel PID and recovers the session in-process. A non-positive value fails startup fast (Pydantic `ValidationError`). |
-| `EXCEL_VBA_MCP_OPEN_TIMEOUT_S` | Server-side deadline for the `excel_open` STA open (seconds) | `300` | Positive number | The per-op-class server authority for the open path (Block E). A non-positive value fails startup fast (Pydantic `ValidationError`). |
+| `EXCEL_VBA_MCP_OPEN_TIMEOUT_S` | Server-side deadline for the `workbook` (`open`) STA open (seconds) | `300` | Positive number | The per-op-class server authority for the open path (Block E). A non-positive value fails startup fast (Pydantic `ValidationError`). |
 | `EXCEL_VBA_MCP_LIVENESS_CEILING_S` | Server-wide upper bound applied to every per-call COM deadline (seconds) | `600` | Positive number | Every per-call timeout is clamped to this ceiling so no single operation's deadline exceeds it (Block E). A non-positive value fails startup fast (Pydantic `ValidationError`). |
 | `EXCEL_VBA_MCP_ROOTS` | Allowlist of root directories for workbook paths | CWD + system temp | A path string separated by `os.pathsep` (on Windows `;`) | Paths outside the roots are rejected with `PATH_NOT_ALLOWED`. Empty/missing value → default. |
 | `EXCEL_VBA_MCP_WORK_DIR` | Working-copy directory | `<temp>/excel_vba_mcp/work` | Absolute path | Where working copies of opened workbooks are created. |
@@ -125,7 +125,7 @@ environment variables), so UNC and device paths are denied by default.
 
 ## Session Parameters
 
-`excel_open(path, mode, read_only)` accepts:
+`workbook` (`open`) accepts:
 
 | Parameter | Values | Meaning |
 |----------|--------|---------|
@@ -134,9 +134,9 @@ environment variables), so UNC and device paths are denied by default.
 
 Effect on approval (depends on `EXCEL_VBA_MCP_ACCESS_MODE`):
 
-- In the default `full` mode, `excel_open` with `read_only: false` or `mode: "execute"` is
+- In the default `full` mode, `workbook` (`open`) with `read_only: false` or `mode: "execute"` is
   authorized by policy; no per-action grant is needed.
-- In `restricted` mode, `excel_open` with `read_only: false` or `mode: "execute"` requires an
+- In `restricted` mode, `workbook` (`open`) with `read_only: false` or `mode: "execute"` requires an
   allowlist entry or live grant and is otherwise **denied** with `APPROVAL_DENIED`.
 - `mode: "inspect"` + `read_only: true` passes as read-only and requires no grant in either mode.
 - Neither `inspect` nor `execute` changes Trust Center or registry settings.

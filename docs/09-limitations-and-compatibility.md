@@ -45,7 +45,7 @@ Two labels are used throughout:
 | Python | `>=3.11,<3.15` (project floor 3.11); validated on 3.14 x64 | `.python-version` pins 3.14. `pywin32` 312 ships a `cp314` wheel. |
 | Package manager | [uv](https://docs.astral.sh/uv/) | `uv sync --locked` creates `.venv/` and the `excel-vba-mcp` console script. |
 | Transport | MCP over STDIO | Protocol on `stdout`; logs and tracebacks on `stderr`. No network listener. |
-| MCP clients | Kilo, Claude Desktop / generic MCP clients | The client spawns the server as a local child process; tools are exposed with a client prefix (for example `xlvba_excel_open`). |
+| MCP clients | Kilo, Claude Desktop / generic MCP clients | The client spawns the server as a local child process; tools are exposed with a client prefix (for example `xlvba_workbook`). |
 | Workbook formats | `.xlsm` validated; `.xlsb`, `.xlsa`, `.xlam`, `.xltm`, `.xltx`, `.xlsx`, `.xls` allowed by the path policy but **not** verified | Only `.xlsm` is the validated scope. Behavior with other extensions is not verified. |
 | VBA project access | VBOM trust enabled manually per machine | Without it VBA tools return `ACCESS_VBOM_DISABLED`. Locked projects return `VBA_PROJECT_LOCKED`. |
 | Desktop integration | Hidden, non-activating Excel instance via `DispatchEx` | No GUI, no `.Activate`/`.Select`, no `SendKeys`. |
@@ -72,17 +72,17 @@ behavior as unproven until tested on a copy.
 
 | Limitation | Detail | Verified/Suspected |
 |------------|--------|--------------------|
-| No workbook creation | There is no new-workbook tool. `excel_open` opens an existing file only. | Verified |
+| No workbook creation | There is no new-workbook tool. `workbook` (`open`) opens an existing file only. | Verified |
 | No PivotTable/PivotCache create or delete | Only existing PivotTables and caches can be inspected, refreshed and reconfigured. | Verified |
-| No charts, PivotCharts or slicers | No tool lists, creates, formats or deletes them. A chart sheet appears only as a `chart` entry in `sheets_list`. | Verified |
-| No row/column sizing, freeze panes or page setup | No tool exposes row height, column width, freeze panes, print/page setup or zoom. `range_get_format` covers cells only. | Verified |
-| No worksheet protection changes | `sheets_list` / `sheet_get` report a read-only `protected` flag. There is no protect/unprotect tool; mutating a protected target returns `PROTECTED_TARGET`. | Verified |
-| No forced recalculation | `Application.Calculate` (and `CalculateFull` / `CalculateRow` / calculation properties) is not exposed. `range_read_values` returns whatever Excel currently holds; nothing forces a recalculation. | Verified |
-| No clipboard / cross-workbook copy | `range_copy` is same-workbook and never uses the clipboard. Sheet copy is in-workbook only. | Verified |
+| No charts, PivotCharts or slicers | No tool lists, creates, formats or deletes them. A chart sheet appears only as a `chart` entry in `sheet_read` (`list`). | Verified |
+| No row/column sizing, freeze panes or page setup | No tool exposes row height, column width, freeze panes, print/page setup or zoom. `range_read` (`get-format`) covers cells only. | Verified |
+| No worksheet protection changes | `sheet_read` (`list` / `get`) report a read-only `protected` flag. There is no protect/unprotect tool; mutating a protected target returns `PROTECTED_TARGET`. | Verified |
+| No forced recalculation | `Application.Calculate` (and `CalculateFull` / `CalculateRow` / calculation properties) is not exposed. `range_read` (`read-values`) returns whatever Excel currently holds; nothing forces a recalculation. | Verified |
+| No clipboard / cross-workbook copy | `range_structural` (`copy`) is same-workbook and never uses the clipboard. Sheet copy is in-workbook only. | Verified |
 | No external links, connections or queries | No tool lists, refreshes or edits external links, data connections or Power Query definitions. | Verified |
 | No import/export, print, PDF or email | No CSV import/export, PDF export, print, email or file-conversion tool. `vba_export_project` exports VBA source only. | Verified |
 | No events | No tool registers, lists or edits workbook/worksheet events. ActiveX event procedures are only inferred for reading. | Verified |
-| No approval-grant tool | Approval grants and allowlist entries cannot be granted or edited over MCP. `background_safe` classification **is** available through `macro_classify_background`. | Verified |
+| No approval-grant tool | Approval grants and allowlist entries cannot be granted or edited over MCP. `background_safe` classification **is** available through `macro` (`classify-background`). | Verified |
 | Compile is always `indeterminate` | On the validated build `vba_compile_diagnostics` returns `status="indeterminate"`, `reason="NON_ACTIVATING_COMPILE_UNAVAILABLE"`, `diagnostics.is_compile=false`. It never returns `compiled` or `compile_error`. | Verified on 16.0.14332; suspected on other builds |
 | Macros require `background_safe` classification | `macro_run` runs only a procedure classified `background_safe` for the current workbook hash and VBA source revision. An unclassified procedure returns `BACKGROUND_SAFETY_NOT_VERIFIED`; an interactive one returns `INTERACTIVE_UI_NOT_SUPPORTED`. | Verified |
 | `EXCEL_VBA_MCP_LOG_LEVEL` is parsed but not applied | Logging is configured at import time with a fixed `INFO` level on `stderr`; the variable has no effect in this revision. | Verified |
@@ -145,8 +145,9 @@ behavior as unproven until tested on a copy.
   times for `RPC_E_CALL_REJECTED` (0.5 / 1.0 / 2.0-second pauses). `MUTATING` and
   `EXECUTING` calls are never replayed.
 - **Bounded reads.** Range reads are capped at 100,000 cells per target and
-  50,000 cells per response; table row reads are additionally capped at 2,000
-  cells per response. Oversized requests are rejected, not silently clipped.
+  50,000 cells per response; table row reads are additionally capped at 50,000
+  cells per response (config-driven `max_table_cells`). Oversized requests are rejected, not
+  silently clipped.
 - **Large-workbook limits.** Very large workbooks increase memory use and COM
   call latency; a call that exceeds its soft deadline moves the worker to
   `running/deadline_exceeded` and raises `EXCEL_HUNG` (the call is not cancelled
@@ -213,12 +214,32 @@ changed and `structuredContent` is preserved by construction. The consumer-inven
 (plan_03 §18.3) — no in-repo inventory of clients parsing specific nested fields — is the reason the
 `$ref` dedupe/field-removal trade-off is not taken.
 
-## Verified vs suspected
+## Implemented, tested and untested
 
-| Category | Items |
-|----------|-------|
-| Verified (code or validated build) | Tool inventory; path policy; approval modes; snapshot-before-mutation; compile `indeterminate`; macro gating; timeouts; bounded reads; hidden non-activating instance; no GUI automation |
-| Suspected / not verified | Non-`.xlsm` formats; ActiveX event mapping; compile behavior on builds other than 16.0.14332; behavior under non-English Office UI; behavior when corporate policy blocks VBOM or macros |
+**Implemented** means the code path exists; **Tested** means it was exercised by a unit or
+real-workbook test; **Untested** means it is allowed or inferred but not validated on the target
+build.
+
+| Status | Items |
+|--------|-------|
+| Implemented and tested (unit + real-workbook where noted) | Tool inventory (43); path policy; approval modes; snapshot-before-mutation; guard chain; bounded reads; hidden non-activating instance; no GUI automation; large-range paging (200,000 × 20 read in ~105 pages); PivotTable result read on an external source (50 × 20); `data_export` (peak 33.9 MB / 5,000 rows); save-as copy; recovery |
+| Implemented, unit-tested only | Table paging; OOXML snapshot streaming; PivotCache record read; completeness/truncation (`STALE_CURSOR`); `xlvba_environment`; jobs/cancel |
+| Untested / not verified | Non-`.xlsm` formats; ActiveX event mapping; compile behavior on builds other than 16.0.14332; non-English Office UI; external/OLAP/Data-Model **member/CubeField enumeration** (fail-closed, inferred); the MCP-transport run of `workbook_snapshot_read` / `data_export` (validated in-process only); additive-enum tolerance of external clients |
+
+**PivotTable source behaviour (explicit):**
+
+- **Displayed-result read (`pivot_read` `result-read`) = Verified** on a real external-source
+  PivotTable (50 × 20 read); it works for every source type, including external / OLAP / Data Model.
+- **Member / CubeField enumeration = Suspected / not verified** for external / OLAP / Data-Model
+  sources (fail-closed; hang evidence inferred, not executed on this runtime). Database/Table member
+  enumeration is implemented and bounded (≤10,000, `truncated`).
+
+**Compile honesty.** `vba_compile_diagnostics` is always `indeterminate`
+(`reason="NON_ACTIVATING_COMPILE_UNAVAILABLE"`, `is_compile=false`) on the validated build; it never
+returns `compiled` or `compile_error`. A clean `indeterminate` result is not proof of compilation.
+
+**Safety contract in one line.** Open a copy (the original is never modified) → snapshot before a
+mutation → approval gate → verified postcondition re-read → fail-closed, originals-safe recovery.
 
 If a behavior is not listed here and not in the code, treat it as unsupported
 rather than assumed. When in doubt, verify with a read-only session on a copy of
@@ -229,19 +250,19 @@ the workbook.
 These behaviors follow from the session model in
 [Architecture](04-architecture.md):
 
-- **Originals are never modified.** `excel_open` copies the source into `work/`
+- **Originals are never modified.** `workbook` (`open`) copies the source into `work/`
   and opens only the copy.
 - **Two paths per workbook.** `WorkbookInfo.path` is the materialized **working
   copy** actually opened (`wb.FullName`); `WorkbookInfo.source_path` is the
   **original** allowlisted path it was copied from (`null` when there is no
   on-disk source). There is no `original_name` field — it would be redundant with
   `name`, which is identical for the working copy and its source.
-- **Edits live in the working copy.** `excel_close` deletes it; a later
-  `excel_open` re-copies the untouched original. Use
-  `snapshot_create` → `excel_close` → `snapshot_restore` to persist and return to
+- **Edits live in the working copy.** `workbook` (`close`) deletes it; a later
+  `workbook` (`open`) re-copies the untouched original. Use
+  `snapshot_create` → `workbook` (`close`) → `snapshot_restore` to persist and return to
   an earlier state.
-- **Saves are explicit.** `excel_close` does not save by default; `excel_save` or
-  `excel_close(save_changes=true)` writes the working copy only. `workbook_save_copy` writes the
+- **Saves are explicit.** `workbook` (`close`) does not save by default; `workbook` (`save`) or
+  `workbook` (`close` with `save_changes=true`) writes the working copy only. `workbook_save_copy` writes the
   working copy to a new (or the original) path via an atomic copy + single `<target>.bak`
   without rebinding the session; it is fail-closed (`PROTECTED_TARGET` / `STALE_TARGET`,
   `outcome="ok"` only after a final size+SHA-256 verify) and never uses `wb.SaveAs`.
@@ -263,7 +284,7 @@ These behaviors follow from the session model in
 - [ ] Python 3.11–3.14 x64 and `uv` on `PATH`.
 - [ ] `EXCEL_VBA_MCP_ROOTS` points at a dedicated directory.
 - [ ] VBOM trust enabled if VBA tools are required.
-- [ ] A read-only `excel_open` → `range_read_values` → `excel_close` smoke test
+- [ ] A read-only `workbook` (`open`) → `range_read` (`read-values`) → `workbook` (`close`) smoke test
   passes.
 
 ## Related

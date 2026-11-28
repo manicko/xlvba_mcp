@@ -338,7 +338,7 @@ distinct from an over-cap `RANGE_TOO_LARGE` rejection.
 
 | Tool | Actions | Purpose | Parameters | Returns | Side effects | Errors | R/D/I |
 |------|---------|---------|------------|---------|--------------|--------|-------|
-| `pivot_read` | `tables-list`, `table-get`, `cache-get`, `fields-list`, `field-get-filters` | PivotTable/cache inventory; table/cache metadata; field list; field filter state. | `action`, `workbook_id`, `pivot_table?`, `cache_index?`, `field?`, `background?=false` | `PivotInventory` / `PivotTableInfo` / `PivotCacheInfo` / `list[PivotFieldInfo]` / `PivotFieldFilters` (or `RunningJob`) | — | `COM_BUSY`, `AMBIGUOUS_FILTER` | T/F/T |
+| `pivot_read` | `tables-list`, `table-get`, `cache-get`, `fields-list`, `field-get-filters`, `result-read` | PivotTable/cache inventory; table/cache metadata; field list; field filter state; paged rendered result. | `action`, `workbook_id`, `pivot_table?`, `cache_index?`, `field?`, `offset?=0`, `limit?`, `cursor_version?`, `background?=false` | `PivotInventory` / `PivotTableInfo` / `PivotCacheInfo` / `list[PivotFieldInfo]` / `PivotFieldFilters` / `PivotResultPage` (or `RunningJob`) | — | `COM_BUSY`, `AMBIGUOUS_FILTER`, `STALE_CURSOR` (result-read) | T/F/T |
 | `pivot_refresh` | `refresh-table`, `refresh-cache` | Refreshes one PivotTable or one PivotCache. | `action`, `workbook_id`, `pivot_table?`, `cache_index?` | `PivotRefreshResult` | PivotTable/cache data; audit | `UNSUPPORTED_PIVOT_SOURCE`, `REFRESH_FAILED`, `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/F/T |
 | `pivot_field` | `field-set-layout`, `field-set-position`, `field-set-aggregation`, `field-set-properties`, `field-apply-filter`, `field-clear-filters` | Sets a field's orientation/position/aggregation/properties; applies/clears filters. | `action`, `workbook_id`, `pivot_table`, `field?`, `orientation?`, `delete?=false`, `position?`, `function?`, `caption?`, `properties?`, `spec?`, `scope?=field` | `PivotFieldInfo` / `PivotFieldFilters` | PivotTable structure/data; audit | `UNSUPPORTED_PIVOT_SOURCE`, `AMBIGUOUS_FILTER`, `INVALID_RANGE`, `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/T/T |
 
@@ -346,11 +346,15 @@ distinct from an over-cap `RANGE_TOO_LARGE` rejection.
 `destructive=true` **and** `idempotent=true` (dual-hint): `field-set-layout(delete=True)` discards a
 field, while re-applying the same layout/position/aggregation is idempotent. `cache-get` /
 `refresh-cache` require `cache_index`; field actions require `pivot_table` + `field`
-(`field-clear-filters` also accepts table scope). Creating/deleting PivotTables/PivotCaches is not
-supported. `PivotFilters.Add` (label/value/date/top-bottom) is not supported on the validated build:
-it returns an explicit `unsupported` result rather than silently converting to a manual filter. A
-page (report-filter) field's state is classified from `CurrentPage` / `AllItemsVisible`;
-`field-apply-filter` on a page field is rejected before any COM mutation.
+(`field-clear-filters` also accepts table scope). `result-read` returns a paged **rendered** result
+(`PivotResultPage`) of the PivotTable's current output (`TableRange1`); it works for **any** source
+type, including external / OLAP / Data Model. `offset` is 0-based, `limit` is optional, and a stale
+`cursor_version` (the prior `page.version`) returns `STALE_CURSOR` — restart the read at `offset` 0.
+Creating/deleting PivotTables/PivotCaches is not supported. `PivotFilters.Add` (label/value/date/top-bottom)
+is not supported on the validated build: it returns an explicit `unsupported` result rather than
+silently converting to a manual filter. A page (report-filter) field's state is classified from
+`CurrentPage` / `AllItemsVisible`; `field-apply-filter` on a page field is rejected before any COM
+mutation.
 
 ## Objects
 
@@ -797,12 +801,16 @@ subsequent calls using the same `workbook_id` — after closing, the identifier 
 
 ## Read-only resources
 
+xlvba exposes **5 read-only resources**: 4 data-resource templates (below) plus 1 static glossary
+resource. All are read-only.
+
 | URI template | Name | MIME | Content |
 |--------------|------|------|---------|
 | `excel://workbooks/{workbook_id}/model` | `workbook_model` | `application/json` | Stage 1 workbook model (sheets, tables, names, shapes, controls, optional VBA) |
 | `excel://workbooks/{workbook_id}/vba/components` | `workbook_vba_components` | `application/json` | VBA component inventory + `vba_access` |
 | `excel://workbooks/{workbook_id}/vba/components/{component_name}` | `workbook_vba_component_source` | `text/plain` | Source text of one VBA component |
 | `excel://test-runs/{run_id}` | `test_run_summary` | `application/json` | Persisted declarative test run |
+| `xlvba://glossary` | `glossary` | `text/markdown` | Static jargon glossary (R13, BG06, preflight, fail-closed, working copy, snapshot gate, and related terms) |
 
 Resources are read-only: they do not mutate the workbook and do not execute VBA.
 

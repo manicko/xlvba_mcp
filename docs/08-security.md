@@ -65,7 +65,7 @@ or install a service. Consequently it needs:
 
 If the runtime directories are not writable, tools fail with a structured
 `SNAPSHOT_FAILED` or a filesystem error; they do not silently fall back to
-another location. If the user cannot read a workbook, `excel_open` fails when
+another location. If the user cannot read a workbook, `workbook` (`open`) fails when
 copying the file. The server never runs elevated and never writes to the
 original workbook.
 
@@ -117,7 +117,7 @@ This is the highest-risk capability in the server:
   files, call Win32 APIs, access the network, send email, or modify anything the
   Windows user can reach.
 - `vba_replace_component_source` and `vba_insert_code` modify the real VBA
-  project stored in the working copy. A later `excel_save` persists those changes
+  project stored in the working copy. A later `workbook` (`save`) persists those changes
   into the working-copy file (never the original).
 - **Snapshots do not undo external macro side effects.** A snapshot restores the
   workbook file only; database writes, emails, network calls, files and printing
@@ -181,8 +181,8 @@ The server has two access modes, selected by `EXCEL_VBA_MCP_ACCESS_MODE`:
 
 | Mode | Behavior | Benefit | Risk |
 |------|----------|---------|------|
-| `full` (default) | `MUTATING` and `EXECUTING` operations are authorized by policy without a per-action grant. `excel_open` opens writable/execute by default; guarded mutations run after a snapshot; `macro_run` needs no per-run grant. | Usable out of the box; no in-band grant step is needed. | Any client that can call the tools can mutate workbooks and run classified macros without a human approval step. |
-| `restricted` (opt-in) | Deny-by-default: `MUTATING`/`EXECUTING` operations are refused with `APPROVAL_DENIED` unless an in-process allowlist entry or live grant matches. | Strong default-deny posture for untrusted automation. | No MCP tool grants approval or edits the allowlist, so through MCP alone only read-only work is available; `excel_open` with `mode="execute"` or `read_only=false` surfaces as `APPROVAL_DENIED`. |
+| `full` (default) | `MUTATING` and `EXECUTING` operations are authorized by policy without a per-action grant. `workbook` (`open`) opens writable/execute by default; guarded mutations run after a snapshot; `macro_run` needs no per-run grant. | Usable out of the box; no in-band grant step is needed. | Any client that can call the tools can mutate workbooks and run classified macros without a human approval step. |
+| `restricted` (opt-in) | Deny-by-default: `MUTATING`/`EXECUTING` operations are refused with `APPROVAL_DENIED` unless an in-process allowlist entry or live grant matches. | Strong default-deny posture for untrusted automation. | No MCP tool grants approval or edits the allowlist, so through MCP alone only read-only work is available; `workbook` (`open`) with `mode="execute"` or `read_only=false` surfaces as `APPROVAL_DENIED`. |
 
 What applies in **both** modes:
 
@@ -243,17 +243,18 @@ Tool arguments are validated before any Excel call:
 - **Bounded 2-D range payloads** (`RangeWriteRequest`, `FormulaWriteRequest`):
   the payload shape must match the target, and the cell count is capped
   (`MAX_WRITE_PAYLOAD_CELLS = 100_000`).
-- **Explicit `shift`** for `range_insert` / `range_delete` (`right`/`down` and
+- **Explicit `shift`** for `range_structural` (`insert`) / `range_delete` (`right`/`down` and
   `left`/`up`). A missing or unknown shift is rejected and never guessed.
 - **255-character cap** on `Formula1`/`Formula2` for data validation; the
   formulas are treated as opaque strings and never evaluated in Python.
-- **Unique-header / unambiguous-filter checks**: `table_add_column` and
-  `table_delete_column` resolve one unique header; `table_update_rows` /
+- **Unique-header / unambiguous-filter checks**: `table` (`add-column`) and
+  `table_delete_column` resolve one unique header; `table` (`update-rows`) /
   `table_delete_rows` reject a `where` filter that matches zero or multiple rows
   with `AMBIGUOUS_FILTER` instead of guessing.
 - **Size ceilings**: range reads are capped at 100,000 cells per target and
-  50,000 cells per response; table row reads are additionally capped at 2,000
-  cells per response. Oversized requests are rejected, not silently clipped.
+  50,000 cells per response; table row reads are additionally capped at 50,000
+  cells per response (config-driven `max_table_cells`). Oversized requests are rejected, not
+  silently clipped.
 
 ## Logging and sensitive data
 
@@ -316,7 +317,7 @@ These are **not enforced** by the application; they are operator choices:
 - Use `EXCEL_VBA_MCP_ACCESS_MODE=restricted` for untrusted or automated callers,
   accepting that only read-only work is available over MCP.
 - **Review VBA before running it.** Classify a procedure `background_safe` only
-  after reading it (`vba_read_component` / `vba_list_procedures`).
+  after reading it (`vba_read` `read-component` / `list-procedures`).
 - Keep Excel and Windows **patched**; macro and Protected View behavior changes
   across builds.
 - Protect the runtime directories and `audit.jsonl` from tampering (filesystem

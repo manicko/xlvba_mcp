@@ -212,7 +212,7 @@ You can now give your agent a VBA development or testing task.
 
 ## Tool catalog
 
-xlvba_mcp provides **43 MCP tools** and **4 read-only MCP resources**, covering VBA development, workbook automation, macro execution, and testing.
+xlvba_mcp provides **43 MCP tools** and **5 read-only MCP resources** (4 data-resource templates plus a static glossary resource), covering VBA development, workbook automation, macro execution, and testing.
 
 | Group | Count | Tools |
 |---|---:|---|
@@ -236,12 +236,16 @@ xlvba_mcp provides **43 MCP tools** and **4 read-only MCP resources**, covering 
 
 ### Read-only MCP resources
 
+xlvba_mcp exposes **5 read-only resources**: 4 data-resource templates (below) plus 1 static
+glossary resource. All are read-only: they never modify a workbook and never run VBA.
+
 | URI template | Name | MIME type |
 |---|---|---|
 | `excel://workbooks/{workbook_id}/model` | `workbook_model` | `application/json` |
 | `excel://workbooks/{workbook_id}/vba/components` | `workbook_vba_components` | `application/json` |
 | `excel://workbooks/{workbook_id}/vba/components/{component_name}` | `workbook_vba_component_source` | `text/plain` |
 | `excel://test-runs/{run_id}` | `test_run_summary` | `application/json` |
+| `xlvba://glossary` | `glossary` | `text/markdown` |
 
 For tool parameters, return values, and usage examples, see the [complete MCP tools reference](docs/05-mcp-tools-reference.md).
 
@@ -252,14 +256,20 @@ Detailed documentation is available in the `docs/` directory.
 - [Overview](docs/01-overview.md) — project goals, concepts, and scope
 - [Installation and setup](docs/02-installation-and-setup.md) — Windows/Excel preparation, installation, and first run
 - [Configuration](docs/03-configuration.md) — environment variables, paths, and runtime settings
-- [Architecture](docs/04-architecture.md) — MCP transport, Excel COM worker, and internal design
-- [MCP tools reference](docs/05-mcp-tools-reference.md) — all 43 tools and 4 resources
+- [Architecture](docs/04-architecture.md) — how xlvba behaves: one managed Excel session, safety, status and recovery
+- [MCP tools reference](docs/05-mcp-tools-reference.md) — all 43 tools and 5 resources
 - [Excel capabilities](docs/06-excel-capabilities.md) — supported Excel and VBA operations
 - [Workflows and examples](docs/07-workflows-and-examples.md) — practical automation recipes
 - [Security](docs/08-security.md) — access policies, trust boundaries, and risk management
 - [Limitations and compatibility](docs/09-limitations-and-compatibility.md) — supported environments and technical constraints
 - [Troubleshooting](docs/10-troubleshooting.md) — errors, diagnostics, and recovery
 - [Development and maintenance](docs/11-development-and-maintenance.md) — testing, contributions, and maintenance
+
+**Why xlvba vs alternatives.** xlvba is built for agent-driven, safety-first automation on real
+Excel files where the original must stay untouched, writes are verified, and macros are gated. It is
+not universally better: openpyxl-based servers fit no-Excel/cross-platform work, and COM-based
+servers fit the broadest live-Excel feature set. The objective, side-by-side comparison is in
+[Overview](docs/01-overview.md).
 
 **Additional resources**
 

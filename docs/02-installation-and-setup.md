@@ -55,7 +55,7 @@ Why Windows only: the server drives Excel via COM (`pywin32`) and uses VBIDE
    the Internet"). This affects execute mode and macro execution.
 
 > [!NOTE]
-> `excel_open` defaults to `mode="execute", read_only=False` — a writable, execution-capable
+> `workbook` (`open`) defaults to `mode="execute", read_only=False` — a writable, execution-capable
 > session. Pass `mode="inspect"` and/or `read_only=True` to opt into a macros-disabled or
 > read-only session. `inspect` opens with macros disabled
 > (`AutomationSecurity = ForceDisable`); `execute` applies `ByUI` immediately before
@@ -160,7 +160,7 @@ install (`uv tool install --editable <repo>`).
 
 ## First Launch
 
-The server runs in **full access mode** by default: `excel_open` opens a writable,
+The server runs in **full access mode** by default: `workbook` (`open`) opens a writable,
 execution-capable session and mutating tools and `macro_run` are authorized without a per-action
 grant (a baseline snapshot is still required before any mutation). To opt into the
 deny-by-default policy, set `EXCEL_VBA_MCP_ACCESS_MODE=restricted` before starting the server; any
@@ -169,41 +169,42 @@ other value for that variable fails startup fast. See [Configuration](03-configu
 Minimal read-only sequence (all arguments are JSON). Pass `mode="inspect", read_only=true` to open
 read-only even though the default open is writable:
 
-1. Open the workbook as a read-only inspect session. Call **`excel_open`** with arguments:
+1. Open the workbook as a read-only inspect session. Call **`workbook`** with `action="open"` and
+   arguments:
 
-   ```json
-   { "path": "C:/data/report.xlsm", "mode": "inspect", "read_only": true }
-   ```
+    ```json
+    { "action": "open", "path": "C:/data/report.xlsm", "mode": "inspect", "read_only": true }
+    ```
 
-   Expected response contains: `workbook_id` (a server-assigned identifier),
-   `source_path` (the original path), `path` (the working-copy path) and `read_only: true`.
-   The path must be inside the allowed roots (by default CWD and system temp;
-   see [Configuration](03-configuration.md)).
+    Expected response contains: `workbook_id` (a server-assigned identifier),
+    `source_path` (the original path), `path` (the working-copy path) and `read_only: true`.
+    The path must be inside the allowed roots (by default CWD and system temp;
+    see [Configuration](03-configuration.md)).
 
-2. Get the list of sheets. Call **`sheets_list`** with arguments:
+2. Get the list of sheets. Call **`sheet_read`** with `action="list"` and arguments:
 
-   ```json
-   { "workbook_id": "<workbook_id>" }
-   ```
+    ```json
+    { "action": "list", "workbook_id": "<workbook_id>" }
+    ```
 
-   Expected response — an array of sheets with fields `name`, `index`, `object_type`,
-   `visibility`, and for worksheets also `code_name`, `protected`, `table_count`, `used_range`.
+    Expected response — an array of sheets with fields `name`, `index`, `object_type`,
+    `visibility`, and for worksheets also `code_name`, `protected`, `table_count`, `used_range`.
 
-3. Read a bounded range. Call **`range_read_values`** with arguments:
+3. Read a bounded range. Call **`range_read`** with `action="read-values"` and arguments:
 
-   ```json
-   { "workbook_id": "<workbook_id>", "sheet": "Sheet1", "address": "A1:C10", "offset": 0, "limit": 10 }
-   ```
+    ```json
+    { "action": "read-values", "workbook_id": "<workbook_id>", "sheet": "Sheet1", "address": "A1:C10", "offset": 0, "limit": 10 }
+    ```
 
-   Expected response — typed cell values and a `truncated` flag.
+    Expected response — typed cell values and a `truncated` flag.
 
-4. Close the workbook without saving. Call **`excel_close`** with arguments:
+4. Close the workbook without saving. Call **`workbook`** with `action="close"` and arguments:
 
-   ```json
-   { "workbook_id": "<workbook_id>", "save_changes": false }
-   ```
+    ```json
+    { "action": "close", "workbook_id": "<workbook_id>", "save_changes": false }
+    ```
 
-   Expected response confirms the session is closed.
+    Expected response confirms the session is closed.
 
 ## Health Checks
 
@@ -211,7 +212,7 @@ read-only even though the default open is writable:
   Shows that the server is alive and responding.
 - **`excel_health`** — worker/session state (`state`, `accepting`, `owned Excel pid`,
   `active operation`, `needs_recovery`) without a forced restart and without touching COM.
-- **`excel_list_workbooks`** — the list of open workbooks from session bookkeeping.
+- **`workbook_read`** (`action="list"`) — the list of open workbooks from session bookkeeping.
 
 What "Excel unavailable" means: the server still starts over STDIO (a worker start failure is
 logged to `stderr`, but the process does not crash), `server_health` and the tool listing keep
