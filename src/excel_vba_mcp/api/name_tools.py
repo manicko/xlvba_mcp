@@ -281,7 +281,7 @@ async def name(
     raise ExcelVbaMcpError(
         f"Unknown name action {action!r}; expected 'create' or 'update'.",
         code=ErrorCode.INVALID_RANGE,
-        context={"tool": "name", "action": action},
+        context={"tool": "defined_name", "action": action},
     )
 
 
@@ -319,7 +319,7 @@ async def name_read(
     raise ExcelVbaMcpError(
         f"Unknown name_read action {action!r}; expected 'list' or 'get'.",
         code=ErrorCode.INVALID_RANGE,
-        context={"tool": "name_read", "action": action},
+        context={"tool": "defined_name_read", "action": action},
     )
 
 

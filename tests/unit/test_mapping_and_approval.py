@@ -26,7 +26,11 @@ pytestmark = pytest.mark.anyio
 _FIXTURE = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "wp0_baseline.json"
 
 # The three high-risk tools that stay standalone with unchanged names (H1).
-_STANDALONE_HIGH_RISK = {"macro_run", "excel_save_as", "table_delete_column"}
+_STANDALONE_HIGH_RISK = {
+    "macro_run": "macro_run",
+    "excel_save_as": "workbook_save_copy",
+    "table_delete_column": "table_delete_column",
+}
 # The fourth high-risk tool is excel_close, folded into the workbook close action
 # with the D1 refuse-by-default disposition (protected, not standalone).
 _CLOSE_OLD_NAME = "excel_close"
@@ -43,7 +47,7 @@ _NON_GATED_PROFILES = {"P_READ", "P_BOOK"}
 # ``shape`` / ``control`` (R-Q5: guarded set-on-action P_MUT + list/get P_READ).
 # ``macro`` merges P_BOOK (ungated bookkeeping) + P_READ and therefore does NOT
 # cross the boundary — classify-background never grants run permission.
-_EXPECTED_BOUNDARY_MERGES = {"test", "shape", "control"}
+_EXPECTED_BOUNDARY_MERGES = {"test_suite", "shape", "control"}
 
 
 @pytest.fixture(scope="module")
@@ -89,10 +93,10 @@ def test_security_matrix_covers_all_92_tools(baseline: dict) -> None:
 def test_high_risk_tools_have_explicit_disposition(baseline: dict) -> None:
     by_name = {row["tool"]: row for row in baseline["security"]}
 
-    for name in _STANDALONE_HIGH_RISK:
-        row = by_name[name]
-        assert row["risk"] == "high-risk", f"{name} must be high-risk"
-        assert row["new_name"] == name, f"{name} must stay standalone (new_name == tool)"
+    for old_name, new_name in _STANDALONE_HIGH_RISK.items():
+        row = by_name[old_name]
+        assert row["risk"] == "high-risk", f"{old_name} must be high-risk"
+        assert row["new_name"] == new_name, f"{old_name} standalone mismatch"
 
     close = by_name[_CLOSE_OLD_NAME]
     assert close["risk"] == "high-risk", "excel_close must carry the high-risk disposition"
@@ -126,7 +130,7 @@ def test_no_consolidation_merges_approval_boundary(baseline: dict) -> None:
 
     # Raw distinct-profile tools are exactly the three documented exceptions plus
     # ``macro`` (whose extra profile is the ungated P_BOOK bookkeeping class).
-    assert raw_multi_profile == {"test", "shape", "control", "macro"}, (
+    assert raw_multi_profile == {"test_suite", "shape", "control", "macro"}, (
         f"unexpected raw multi-profile tools: {sorted(raw_multi_profile)}"
     )
     # Only test/shape/control cross the gated <-> non-gated approval boundary; the

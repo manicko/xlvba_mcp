@@ -161,7 +161,7 @@ Add the following to your Kilo configuration:
 }
 ```
 
-The permission setting asks for confirmation before tool calls.
+The permission setting asks for confirmation before tool calls. The `xlvba_*` server-name glob matches every tool regardless of its published name, so the renamed tools (`xlvba_workbook_save_copy`, `xlvba_test_suite`, `xlvba_defined_name`, `xlvba_defined_name_read`, `xlvba_defined_name_delete`, `xlvba_workbook_snapshot_read`, …) remain covered without any configuration change.
 
 In the Kilo TUI, use `/mcps` to view and manage loaded MCP servers.
 
@@ -212,27 +212,25 @@ You can now give your agent a VBA development or testing task.
 
 ## Tool catalog
 
-xlvba_mcp provides **88 MCP tools** and **4 read-only MCP resources**, covering VBA development, workbook automation, macro execution, and testing.
+xlvba_mcp provides **43 MCP tools** and **4 read-only MCP resources**, covering VBA development, workbook automation, macro execution, and testing.
 
 | Group | Count | Tools |
 |---|---:|---|
-| **Workbook / session** | 6 | `excel_open`, `excel_close`, `excel_save`, `excel_get_status`, `excel_list_workbooks`, `excel_health` |
-| **Snapshots** | 4 | `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff` |
-| **VBA inventory / editing** | 9 | `vba_project_info`, `vba_list_components`, `vba_list_procedures`, `vba_read_component`, `vba_export_project`, `vba_get_references`, `vba_search_code`, `vba_replace_component_source`, `vba_insert_code` |
-| **Compile** | 2 | `vba_compile`, `vba_get_compile_diagnostics` |
-| **Macros** | 4 | `macro_list`, `macro_run`, `macro_get_last_result`, `macro_classify_background` |
-| **Sheets** | 7 | `sheets_list`, `sheet_get`, `sheet_add`, `sheet_rename`, `sheet_copy`, `sheet_delete`, `sheet_set_visibility` |
-| **Tables** | 11 | `tables_list`, `table_get`, `table_read_rows`, `table_append_rows`, `table_insert_row`, `table_update_rows`, `table_delete_rows`, `table_add_column`, `table_delete_column`, `table_create`, `table_resize` |
-| **Ranges & cells** | 16 | `range_get`, `range_read_values`, `range_read_formulas`, `range_write_values`, `range_write_formulas`, `range_get_format`, `range_set_format`, `range_copy`, `range_insert`, `range_delete`, `range_merge`, `range_unmerge`, `range_get_validation`, `range_set_validation`, `range_get_conditional_formatting`, `range_set_conditional_formatting` |
-| **PivotTables** | 13 | `pivot_tables_list`, `pivot_table_get`, `pivot_cache_get`, `pivot_fields_list`, `pivot_table_refresh`, `pivot_cache_refresh`, `pivot_field_set_layout`, `pivot_field_set_position`, `pivot_field_set_aggregation`, `pivot_field_set_properties`, `pivot_field_get_filters`, `pivot_field_apply_filter`, `pivot_field_clear_filters` |
-| **Names** | 5 | `names_list`, `name_get`, `name_create`, `name_update`, `name_delete` |
-| **Shapes & controls** | 6 | `shapes_list`, `shape_get`, `shape_set_on_action`, `controls_list`, `control_get`, `control_set_on_action` |
-| **Workbook model** | 1 | `workbook_get_model` |
-| **Test runner** | 3 | `test_run_suite`, `test_suite_run`, `test_get_run` |
-| **Health** | 1 | `server_health` |
+| **Workbook / session** | 5 | `workbook`, `workbook_read`, `workbook_save_copy`, `excel_health`, `excel_recover` |
+| **Snapshots** | 5 | `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff`, `workbook_snapshot_read` |
+| **Jobs** | 2 | `job_get`, `job_request_cancel` |
+| **VBA** | 5 | `vba_read`, `vba_export_project`, `vba_replace_component_source`, `vba_insert_code`, `vba_compile_diagnostics` |
+| **Macro / test** | 3 | `macro`, `macro_run`, `test_suite` |
+| **Sheets / tables / names** | 10 | `sheet`, `sheet_read`, `sheet_delete`, `table`, `table_read`, `table_delete_rows`, `table_delete_column`, `defined_name`, `defined_name_read`, `defined_name_delete` |
+| **Ranges** | 5 | `range_read`, `range_write`, `range_structural`, `range_delete`, `range_merge` |
+| **Pivot** | 3 | `pivot_read`, `pivot_refresh`, `pivot_field` |
+| **Objects** | 2 | `shape`, `control` |
+| **Capability / health** | 2 | `xlvba_environment`, `server_health` |
+| **Data export** | 1 | `data_export` |
+| **Total** | **43** | — |
 
 > [!NOTE]
-> Tool names shown above are MCP registration names. Some clients, including Kilo, display them with a server prefix, such as `xlvba_excel_open`.
+> Tool names shown above are MCP registration names. Some clients, including Kilo, display them with a server prefix, such as `xlvba_workbook`.
 >
 > The compile tools expose diagnostics; availability of a conclusive compilation result depends on the Excel environment.
 
@@ -255,7 +253,7 @@ Detailed documentation is available in the `docs/` directory.
 - [Installation and setup](docs/02-installation-and-setup.md) — Windows/Excel preparation, installation, and first run
 - [Configuration](docs/03-configuration.md) — environment variables, paths, and runtime settings
 - [Architecture](docs/04-architecture.md) — MCP transport, Excel COM worker, and internal design
-- [MCP tools reference](docs/05-mcp-tools-reference.md) — all 88 tools and 4 resources
+- [MCP tools reference](docs/05-mcp-tools-reference.md) — all 43 tools and 4 resources
 - [Excel capabilities](docs/06-excel-capabilities.md) — supported Excel and VBA operations
 - [Workflows and examples](docs/07-workflows-and-examples.md) — practical automation recipes
 - [Security](docs/08-security.md) — access policies, trust boundaries, and risk management

@@ -131,7 +131,7 @@ Why Windows only: the server drives Excel via COM (`pywin32`) and uses VBIDE
 ```
 
 - Replace `<absolute-path-to-repo>` with the absolute path to the repository root.
-- Tools are shown with the `xlvba_` prefix (for example, `xlvba_excel_open`).
+- Tools are shown with the `xlvba_` prefix (for example, `xlvba_workbook`).
 - The `permission` block sets the client's access policy for the tools: `"ask"` asks for
   permission before each call. Read-only tools can be added to an allowlist later,
   for example `"xlvba_server_health": "allow"`.
@@ -247,8 +247,8 @@ modified: only the copy from `work/` is opened.
 
 ## Tool-surface migration (single switchover)
 
-The MCP tool surface was consolidated from **92 tools to 41 tools** in a **single switchover**
-(no dual-run). Production `tools/list` goes directly 92 → 41: there are **no** `meta.deprecated`
+The MCP tool surface was consolidated from **92 tools to 43 tools** in a **single switchover**
+(no dual-run). Production `tools/list` goes directly 92 → 43: there are **no** `meta.deprecated`
 aliases and **no** compatibility window. Clients that match the old per-verb tool names must migrate
 to the consolidated tool + `action` form.
 
@@ -259,28 +259,31 @@ to the consolidated tool + `action` form.
 | `range_read_values` | `range_read` `action="read-values"` |
 | `table_update_rows` | `table` `action="update-rows"` |
 | `macro_classify_background` | `macro` `action="classify-background"` |
-| `test_suite_run` | `test` `action="run-suite"` |
+| `test_suite_run` | `test_suite` `action="run"` |
 
 **Approval globs.** Kilo approval remains the `xlvba_*` name-glob; tool annotations
-(`readOnly` / `destructive` / `idempotent`) are **hints, not enforcement**. High-risk standalone
-names are unchanged and keep their own permission: `macro_run`, `excel_save_as`,
-`table_delete_column`. `workbook` `close` is a protected action: it **refuses by default** when
+(`readOnly` / `destructive` / `idempotent`) are **hints, not enforcement**. The `xlvba_*` glob
+matches every published tool name, so the renamed tools (`xlvba_workbook_save_copy`,
+`xlvba_test_suite`, `xlvba_defined_name`, `xlvba_workbook_snapshot_read`, …) stay covered without a
+config change. High-risk standalone names are unchanged and keep their own permission: `macro_run`,
+`workbook_save_copy`, `table_delete_column`. `workbook` `close` is a protected action: it **refuses by default** when
 there are unsaved changes; pass `discard_changes=true` to discard (or `save_changes=true` to save on
 close). See [Configuration](03-configuration.md) and the
 [MCP Tools Reference](05-mcp-tools-reference.md).
 
-**Final tool groups (41):**
+**Final tool groups (43):**
 
-- **Lifecycle / session:** `workbook`, `workbook_read`, `excel_save_as`, `excel_health`, `excel_recover`
-- **Snapshots:** `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff`
+- **Lifecycle / session:** `workbook`, `workbook_read`, `workbook_save_copy`, `excel_health`, `excel_recover`
+- **Snapshots:** `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff`, `workbook_snapshot_read`
 - **Jobs:** `job_get`, `job_request_cancel`
 - **VBA:** `vba_read`, `vba_export_project`, `vba_replace_component_source`, `vba_insert_code`, `vba_compile_diagnostics`
-- **Macro / test:** `macro`, `macro_run`, `test`
-- **Sheets / tables / names:** `sheet`, `sheet_read`, `sheet_delete`, `table`, `table_read`, `table_delete_rows`, `table_delete_column`, `name`, `name_read`, `name_delete`
+- **Macro / test:** `macro`, `macro_run`, `test_suite`
+- **Sheets / tables / names:** `sheet`, `sheet_read`, `sheet_delete`, `table`, `table_read`, `table_delete_rows`, `table_delete_column`, `defined_name`, `defined_name_read`, `defined_name_delete`
 - **Ranges:** `range_read`, `range_write`, `range_structural`, `range_delete`, `range_merge`
 - **Pivot:** `pivot_read`, `pivot_refresh`, `pivot_field`
 - **Objects:** `shape`, `control`
 - **Capability / health:** `xlvba_environment`, `server_health`
+- **Data export:** `data_export`
 
 ## Uninstalling
 

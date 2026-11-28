@@ -42,7 +42,7 @@ def get_ooxml_service() -> OoxmlService:
     if _ooxml_service is None:
         raise ExcelVbaMcpError(
             "The OOXML read service is not initialized.",
-            context={"tool": "workbook_file_read"},
+            context={"tool": "workbook_snapshot_read"},
         )
     return _ooxml_service
 
@@ -157,10 +157,10 @@ async def workbook_file_read(
         )
 
     raise ExcelVbaMcpError(
-        f"Unknown workbook_file_read action {action!r}; expected 'metadata', "
+        f"Unknown workbook_snapshot_read action {action!r}; expected 'metadata', "
         "'sheet-rows' or 'pivot-cache-records'.",
         code=ErrorCode.INVALID_RANGE,
-        context={"tool": "workbook_file_read", "action": action},
+        context={"tool": "workbook_snapshot_read", "action": action},
     )
 
 

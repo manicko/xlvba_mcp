@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "baseline": {
-    "tool_count": 94,
+    "tool_count": 43,
     "serialized_bytes": 352155,
     "measured_at": "2026-11-27T19:13:53.775526+00:00",
     "command": "& .\\.venv\\Scripts\\python.exe -c \"import asyncio,json,excel_vba_mcp.server as s; t=asyncio.run(s.mcp.list_tools()); data=[x.model_dump(by_alias=True) for x in t]; print('count',len(t)); print('bytes',len(json.dumps(data,default=str).encode()))\"",
@@ -184,7 +184,7 @@
       "old_name": "name_create",
       "target": {
         "kind": "consolidated",
-        "tool": "name",
+        "tool": "defined_name",
         "action": "create"
       }
     },
@@ -192,7 +192,7 @@
       "old_name": "name_update",
       "target": {
         "kind": "consolidated",
-        "tool": "name",
+        "tool": "defined_name",
         "action": "update"
       }
     },
@@ -200,7 +200,7 @@
       "old_name": "names_list",
       "target": {
         "kind": "consolidated",
-        "tool": "name_read",
+        "tool": "defined_name_read",
         "action": "list"
       }
     },
@@ -208,7 +208,7 @@
       "old_name": "name_get",
       "target": {
         "kind": "consolidated",
-        "tool": "name_read",
+        "tool": "defined_name_read",
         "action": "get"
       }
     },
@@ -288,15 +288,15 @@
       "old_name": "test_suite_run",
       "target": {
         "kind": "consolidated",
-        "tool": "test",
-        "action": "run-suite"
+        "tool": "test_suite",
+        "action": "run"
       }
     },
     {
       "old_name": "test_get_run",
       "target": {
         "kind": "consolidated",
-        "tool": "test",
+        "tool": "test_suite",
         "action": "get-run"
       }
     },
@@ -576,7 +576,7 @@
       "old_name": "excel_save_as",
       "target": {
         "kind": "standalone",
-        "tool": "excel_save_as"
+        "tool": "workbook_save_copy"
       }
     },
     {
@@ -709,7 +709,7 @@
       "old_name": "name_delete",
       "target": {
         "kind": "standalone",
-        "tool": "name_delete"
+        "tool": "defined_name_delete"
       }
     },
     {
@@ -730,7 +730,7 @@
       "old_name": "workbook_file_read",
       "target": {
         "kind": "standalone",
-        "tool": "workbook_file_read"
+        "tool": "workbook_snapshot_read"
       }
     },
     {
@@ -775,7 +775,7 @@
       "tool": "excel_save_as",
       "risk": "high-risk",
       "kilo_policy": "ask (xlvba_*)",
-      "new_name": "excel_save_as",
+      "new_name": "workbook_save_copy",
       "permission_profile": "P_HIGH",
       "note": "standalone; own permission/overwrite policy (H1)"
     },
@@ -840,7 +840,7 @@
       "tool": "test_suite_run",
       "risk": "destructive",
       "kilo_policy": "ask (xlvba_*)",
-      "new_name": "test",
+      "new_name": "test_suite",
       "permission_profile": "P_EXEC",
       "note": "H1 deviation (accepted, R-Q2): test is a mixed-profile tool (run-suite P_EXEC + get-run P_READ); run-suite's real approval gate is macro_run EXECUTING class + xlvba_* name glob"
     },
@@ -848,7 +848,7 @@
       "tool": "test_get_run",
       "risk": "read",
       "kilo_policy": "ask (xlvba_*)",
-      "new_name": "test",
+      "new_name": "test_suite",
       "permission_profile": "P_READ",
       "note": "H1 deviation (accepted, R-Q2): test is a mixed-profile tool (run-suite P_EXEC + get-run P_READ)"
     },
@@ -1318,35 +1318,35 @@
       "tool": "names_list",
       "risk": "read",
       "kilo_policy": "ask (xlvba_*)",
-      "new_name": "name_read",
+      "new_name": "defined_name_read",
       "permission_profile": "P_READ"
     },
     {
       "tool": "name_get",
       "risk": "read",
       "kilo_policy": "ask (xlvba_*)",
-      "new_name": "name_read",
+      "new_name": "defined_name_read",
       "permission_profile": "P_READ"
     },
     {
       "tool": "name_create",
       "risk": "additive-mutation",
       "kilo_policy": "ask (xlvba_*)",
-      "new_name": "name",
+      "new_name": "defined_name",
       "permission_profile": "P_MUT"
     },
     {
       "tool": "name_update",
       "risk": "additive-mutation",
       "kilo_policy": "ask (xlvba_*)",
-      "new_name": "name",
+      "new_name": "defined_name",
       "permission_profile": "P_MUT"
     },
     {
       "tool": "name_delete",
       "risk": "destructive",
       "kilo_policy": "ask (xlvba_*)",
-      "new_name": "name_delete",
+      "new_name": "defined_name_delete",
       "permission_profile": "P_MUT",
       "note": "standalone destructive (H1)"
     },
@@ -1411,7 +1411,7 @@
       "tool": "workbook_file_read",
       "risk": "read",
       "kilo_policy": "ask (xlvba_*)",
-      "new_name": "workbook_file_read",
+      "new_name": "workbook_snapshot_read",
       "permission_profile": "P_READ"
     },
     {
@@ -1466,8 +1466,8 @@
       "idempotent": true
     },
     {
-      "tool": "excel_save_as",
-      "action": "excel_save_as",
+      "tool": "workbook_save_copy",
+      "action": "workbook_save_copy",
       "read_only": false,
       "destructive": true,
       "idempotent": false
@@ -1515,14 +1515,14 @@
       "idempotent": true
     },
     {
-      "tool": "test",
-      "action": "run-suite",
+      "tool": "test_suite",
+      "action": "run",
       "read_only": false,
       "destructive": true,
       "idempotent": false
     },
     {
-      "tool": "test",
+      "tool": "test_suite",
       "action": "get-run",
       "read_only": true,
       "destructive": false,
@@ -1977,36 +1977,36 @@
       "idempotent": true
     },
     {
-      "tool": "name",
+      "tool": "defined_name",
       "action": "create",
       "read_only": false,
       "destructive": false,
       "idempotent": true
     },
     {
-      "tool": "name",
+      "tool": "defined_name",
       "action": "update",
       "read_only": false,
       "destructive": false,
       "idempotent": true
     },
     {
-      "tool": "name_read",
+      "tool": "defined_name_read",
       "action": "list",
       "read_only": true,
       "destructive": false,
       "idempotent": true
     },
     {
-      "tool": "name_read",
+      "tool": "defined_name_read",
       "action": "get",
       "read_only": true,
       "destructive": false,
       "idempotent": true
     },
     {
-      "tool": "name_delete",
-      "action": "name_delete",
+      "tool": "defined_name_delete",
+      "action": "defined_name_delete",
       "read_only": false,
       "destructive": true,
       "idempotent": false
@@ -2068,8 +2068,8 @@
       "idempotent": true
     },
     {
-      "tool": "workbook_file_read",
-      "action": "workbook_file_read",
+      "tool": "workbook_snapshot_read",
+      "action": "workbook_snapshot_read",
       "read_only": true,
       "destructive": false,
       "idempotent": true
@@ -2096,7 +2096,7 @@
       "idempotent": true
     },
     {
-      "tool": "excel_save_as",
+      "tool": "workbook_save_copy",
       "read_only": false,
       "destructive": true,
       "idempotent": false
@@ -2138,7 +2138,7 @@
       "idempotent": true
     },
     {
-      "tool": "test",
+      "tool": "test_suite",
       "read_only": false,
       "destructive": true,
       "idempotent": false
@@ -2288,19 +2288,19 @@
       "idempotent": true
     },
     {
-      "tool": "name",
+      "tool": "defined_name",
       "read_only": false,
       "destructive": false,
       "idempotent": true
     },
     {
-      "tool": "name_read",
+      "tool": "defined_name_read",
       "read_only": true,
       "destructive": false,
       "idempotent": true
     },
     {
-      "tool": "name_delete",
+      "tool": "defined_name_delete",
       "read_only": false,
       "destructive": true,
       "idempotent": false
@@ -2330,7 +2330,7 @@
       "idempotent": true
     },
     {
-      "tool": "workbook_file_read",
+      "tool": "workbook_snapshot_read",
       "read_only": true,
       "destructive": false,
       "idempotent": true

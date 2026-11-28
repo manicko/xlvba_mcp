@@ -18,11 +18,12 @@ application services; the per-page reads are ``await``-ed.
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
 from collections.abc import Sequence
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 from excel_vba_mcp.adapters.excel.tables_adapter import TableRows
@@ -63,6 +64,12 @@ class DataExportService:
         pivots: The PivotTable read service (``read_pivot_result``).
         artifacts: The filesystem artifact store (streaming writer + index).
         limits: The unified large-data limits (``max_export_rows`` ceiling).
+        session: The workbook session service; its content ``version`` is captured
+            at export start and threaded as ``cursor_version`` into every page read
+            so a concurrent mutation fails the export with ``STALE_CURSOR``.
+        snapshot: The snapshot service; an immutable snapshot (SaveCopyAs) is
+            created at export start and its ``sha256`` is recorded on the result so
+            the export is bound to a stable input (contract §5).
     """
 
     def __init__(
@@ -72,12 +79,19 @@ class DataExportService:
         pivots: PivotTablesService,
         artifacts: ArtifactStore,
         limits: LargeDataConfig,
+        *,
+        session: Any,
+        snapshot: Any,
     ) -> None:
         self._ranges = ranges
         self._tables = tables
         self._pivots = pivots
         self._artifacts = artifacts
         self._limits = limits
+        self._session = session
+        self._snapshot = snapshot
+        # Bound concurrent large-file exports (contract §5 / ``max_file_jobs``).
+        self._file_jobs = asyncio.Semaphore(max(1, limits.max_file_jobs))
 
     async def export(
         self,
@@ -115,7 +129,9 @@ class DataExportService:
             A :class:`DataExportResult` (path, rows, bytes, sha256, completeness).
 
         Raises:
-            ExcelVbaMcpError: ``INVALID_RANGE`` for a missing/invalid argument.
+            ExcelVbaMcpError: ``INVALID_RANGE`` for a missing/invalid argument;
+                ``STALE_CURSOR`` when the workbook content version advances between
+                pages (the partial artifact is aborted, never reported complete).
         """
 
         normalized_kind = _require_source_kind(source_kind)
@@ -123,84 +139,99 @@ class DataExportService:
         _validate_source_args(normalized_kind, sheet, address, table, pivot_table)
         _require_limit_rows(limit_rows)
 
-        artifact_type = ArtifactType.CSV if normalized_fmt == "csv" else ArtifactType.JSONL
-        stream = self._artifacts.open_stream(
-            artifact_type,
-            suggested_name=f"data-export-{normalized_kind}-{uuid4().hex}",
-            workbook_id=workbook_id,
-        )
+        # Bound concurrent large-file exports (contract §5 / ``max_file_jobs``).
+        async with self._file_jobs:
+            # Bind the export to an immutable snapshot + a fixed content version
+            # BEFORE the first page: the snapshot sha256 is recorded on the result
+            # and the version is threaded as ``cursor_version`` into every page read
+            # so a concurrent mutation fails the export with ``STALE_CURSOR`` rather
+            # than silently mixing versions (contract §3 / §5).
+            source_version = self._session.get_version(workbook_id)
+            manifest = await self._snapshot.create_snapshot(workbook_id)
+            input_sha256 = manifest.sha256
 
-        max_rows = self._limits.max_export_rows
-        rows_written = 0
-        last_version = 0
-        headers: list[str] | None = None
-        truncated = False
-        complete = False
-        offset = 0
+            artifact_type = (
+                ArtifactType.CSV if normalized_fmt == "csv" else ArtifactType.JSONL
+            )
+            stream = self._artifacts.open_stream(
+                artifact_type,
+                suggested_name=f"data-export-{normalized_kind}-{uuid4().hex}",
+                workbook_id=workbook_id,
+            )
 
-        try:
-            while True:
-                page_rows, cols, page_info, page_headers = await self._read_page(
-                    workbook_id,
-                    normalized_kind,
-                    sheet,
-                    address,
-                    table,
-                    pivot_table,
-                    offset,
-                )
-                if headers is None:
-                    headers = page_headers or [f"col{index}" for index in range(cols)]
-                    if normalized_fmt == "csv":
-                        stream.write_text(_csv_line(headers))
-                for row in page_rows:
-                    if limit_rows is not None and rows_written >= limit_rows:
-                        truncated = True
-                        break
-                    if rows_written >= max_rows:
-                        truncated = True
-                        break
-                    scalar_row = [_cell_to_scalar(cell) for cell in row]
-                    stream.write_text(
-                        _format_row(normalized_fmt, headers, scalar_row)
+            max_rows = self._limits.max_export_rows
+            rows_written = 0
+            headers: list[str] | None = None
+            truncated = False
+            complete = False
+            offset = 0
+
+            try:
+                while True:
+                    page_rows, cols, page_info, page_headers = await self._read_page(
+                        workbook_id,
+                        normalized_kind,
+                        sheet,
+                        address,
+                        table,
+                        pivot_table,
+                        offset,
+                        cursor_version=source_version,
                     )
-                    rows_written += 1
-                last_version = page_info.version
-                if truncated:
-                    break
-                if not page_info.has_more:
-                    complete = True
-                    break
-                if page_info.returned <= 0:
-                    # No progress possible (defensive): stop rather than spin.
-                    break
-                offset += page_info.returned
-        except BaseException:
-            stream.abort()
-            raise
+                    if headers is None:
+                        headers = page_headers or [
+                            f"col{index}" for index in range(cols)
+                        ]
+                        if normalized_fmt == "csv":
+                            stream.write_text(_csv_line(headers))
+                    for row in page_rows:
+                        if limit_rows is not None and rows_written >= limit_rows:
+                            truncated = True
+                            break
+                        if rows_written >= max_rows:
+                            truncated = True
+                            break
+                        scalar_row = [_cell_to_scalar(cell) for cell in row]
+                        stream.write_text(
+                            _format_row(normalized_fmt, headers, scalar_row)
+                        )
+                        rows_written += 1
+                    if truncated:
+                        break
+                    if not page_info.has_more:
+                        complete = True
+                        break
+                    if page_info.returned <= 0:
+                        # No progress possible (defensive): stop rather than spin.
+                        break
+                    offset += page_info.returned
+            except BaseException:
+                stream.abort()
+                raise
 
-        info = stream.finalize(
-            kind="data_export",
-            source={
-                "source_kind": normalized_kind,
-                "format": normalized_fmt,
-                "rows": rows_written,
-                "complete": complete,
-                "truncated": truncated,
-            },
-        )
-        return DataExportResult(
-            artifact_id=info.artifact_id,
-            path=info.stored_path,
-            format=normalized_fmt,
-            rows=rows_written,
-            bytes=info.size,
-            sha256=info.sha256,
-            complete=complete,
-            source=normalized_kind,
-            source_version=last_version,
-            truncated=truncated,
-        )
+            info = stream.finalize(
+                kind="data_export",
+                source={
+                    "source_kind": normalized_kind,
+                    "format": normalized_fmt,
+                    "rows": rows_written,
+                    "complete": complete,
+                    "truncated": truncated,
+                },
+            )
+            return DataExportResult(
+                artifact_id=info.artifact_id,
+                path=info.stored_path,
+                format=normalized_fmt,
+                rows=rows_written,
+                bytes=info.size,
+                sha256=info.sha256,
+                complete=complete,
+                source=normalized_kind,
+                source_version=source_version,
+                truncated=truncated,
+                input_sha256=input_sha256,
+            )
 
     # ------------------------------------------------------------------
     # Per-page read (delegated to the injected services; no COM here)
@@ -214,12 +245,16 @@ class DataExportService:
         table: str | None,
         pivot_table: str | None,
         offset: int,
+        *,
+        cursor_version: int,
     ) -> tuple[list[list[CellValue]], int, PageInfo, list[str] | None]:
         """Read one bounded page and normalize it to rows / cols / PageInfo / headers.
 
         ``headers`` is the Table column names for a ``table`` source (so the export
         carries real headers) and ``None`` for ``range`` / ``pivot-result`` (the
-        caller synthesizes ``col0..colN``).
+        caller synthesizes ``col0..colN``). ``cursor_version`` is the export's bound
+        content version; each underlying read raises ``STALE_CURSOR`` if the workbook
+        version advanced since the export started.
         """
 
         if source_kind == "range":
@@ -229,6 +264,7 @@ class DataExportService:
                 address or "",
                 offset=offset,
                 limit=_PAGE_ROWS,
+                cursor_version=cursor_version,
             )
             return result.values, result.cols, _coalesce_page(result.page, result.values), None
 
@@ -238,6 +274,7 @@ class DataExportService:
                 table or "",
                 offset=offset,
                 limit=_PAGE_ROWS,
+                cursor_version=cursor_version,
             )
             return (
                 table_result.rows,
@@ -251,6 +288,7 @@ class DataExportService:
             pivot_table or "",
             offset=offset,
             limit=_PAGE_ROWS,
+            cursor_version=cursor_version,
         )
         return pivot_result.values, pivot_result.cols, pivot_result.page, None
 

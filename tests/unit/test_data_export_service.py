@@ -9,6 +9,7 @@ artifact with bounded memory, returns only compact metadata, reports
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
@@ -21,6 +22,7 @@ import pytest
 
 from excel_vba_mcp.application.data_export_service import DataExportService
 from excel_vba_mcp.config import LargeDataConfig
+from excel_vba_mcp.domain.errors import ErrorCode, StaleCursorError
 from excel_vba_mcp.domain.models import CellValue, PageInfo, RangeAddress, RangeValues
 from excel_vba_mcp.domain.statuses import CellValueKind, RangeShape
 from excel_vba_mcp.security.audit import AuditLogger
@@ -128,11 +130,41 @@ class FakePivots:
         raise AssertionError("not used in these tests")
 
 
+class FakeSession:
+    """Fake session exposing the content version the export binds to (no COM)."""
+
+    def __init__(self, version: int) -> None:
+        self._version = version
+
+    def get_version(self, workbook_id: str) -> int:
+        return self._version
+
+
+class FakeSnapshotManifest:
+    def __init__(self, sha256: str) -> None:
+        self.sha256 = sha256
+
+
+class FakeSnapshot:
+    """Fake snapshot service returning a fixed-sha manifest (no COM/STA)."""
+
+    def __init__(self, sha256: str = "snap-sha-0001") -> None:
+        self._sha = sha256
+        self.calls = 0
+
+    async def create_snapshot(self, workbook_id: str) -> FakeSnapshotManifest:
+        self.calls += 1
+        return FakeSnapshotManifest(self._sha)
+
+
 def _build_service(
     store_rig: StoreRig,
     ranges: Any,
     tables: Any | None = None,
     pivots: Any | None = None,
+    *,
+    version: int = 7,
+    snapshot: Any | None = None,
 ) -> DataExportService:
     return DataExportService(
         ranges,
@@ -140,6 +172,8 @@ def _build_service(
         pivots if pivots is not None else FakePivots(),
         store_rig.store,
         LargeDataConfig(),
+        session=FakeSession(version),
+        snapshot=snapshot if snapshot is not None else FakeSnapshot(),
     )
 
 
@@ -279,3 +313,129 @@ async def test_export_memory_is_bounded(store_rig: StoreRig) -> None:
     assert result.complete is True
     # Light bounded-memory assertion: peak stays well under 5 MiB for 5000 rows.
     assert peak < 5 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# Snapshot / version binding (Fix 2)
+# ---------------------------------------------------------------------------
+async def test_export_records_snapshot_sha_and_source_version(
+    store_rig: StoreRig,
+) -> None:
+    ranges = FakeRanges(_three_pages())
+    snapshot = FakeSnapshot("deadbeefcafe")
+    service = _build_service(store_rig, ranges, version=7, snapshot=snapshot)
+
+    result = await service.export(
+        "wb1", source_kind="range", sheet="S", address="A1:B100", fmt="csv"
+    )
+
+    assert result.input_sha256 == "deadbeefcafe"
+    assert result.source_version == 7
+    # A fresh immutable snapshot is created exactly once, at export start.
+    assert snapshot.calls == 1
+    # The bound version is threaded into every page read as ``cursor_version``.
+    assert ranges.offsets == [0, 2, 4]
+
+
+class VersionChangingRanges:
+    """Fake range service whose version advances after page 1 (no COM).
+
+    Page 1 serves with ``version == cursor_version`` and ``has_more=True`` then
+    bumps the version, so page 2 sees ``cursor_version != current`` and raises
+    ``STALE_CURSOR`` — mirroring a concurrent mutation between pages.
+    """
+
+    def __init__(self) -> None:
+        self._version = 7
+        self.offsets: list[int] = []
+
+    async def read_values(
+        self,
+        workbook_id: str,
+        sheet: str,
+        address: str,
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+        cursor_version: int | None = None,
+    ) -> RangeValues:
+        self.offsets.append(offset)
+        if cursor_version is not None and cursor_version != self._version:
+            raise StaleCursorError(
+                "The workbook changed since the first page; restart paging.",
+                context={
+                    "expected_version": cursor_version,
+                    "actual_version": self._version,
+                    "kind": "range",
+                },
+            )
+        page = _range_page(offset, 2, has_more=True, version=self._version)
+        self._version += 1
+        return page
+
+
+async def test_export_version_change_between_pages_raises_stale(
+    store_rig: StoreRig,
+) -> None:
+    ranges = VersionChangingRanges()
+    service = _build_service(store_rig, ranges, version=7)
+
+    with pytest.raises(StaleCursorError) as exc_info:
+        await service.export(
+            "wb1", source_kind="range", sheet="S", address="A1:B100", fmt="csv"
+        )
+
+    assert exc_info.value.code is ErrorCode.STALE_CURSOR
+    # No finalized data-export artifact: the partial temp file was aborted.
+    assert not list((store_rig.artifacts).glob("*.csv"))
+
+
+# ---------------------------------------------------------------------------
+# max_file_jobs bound (Fix 4)
+# ---------------------------------------------------------------------------
+class ConcurrencyRanges:
+    """Fake range service that records the peak concurrent in-flight reads."""
+
+    def __init__(self, page: RangeValues) -> None:
+        self._page = page
+        self.active = 0
+        self.max_active = 0
+
+    async def read_values(
+        self,
+        workbook_id: str,
+        sheet: str,
+        address: str,
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+        cursor_version: int | None = None,
+    ) -> RangeValues:
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            await asyncio.sleep(0.01)
+            return self._page
+        finally:
+            self.active -= 1
+
+
+async def test_export_file_jobs_bound_serializes(store_rig: StoreRig) -> None:
+    ranges = ConcurrencyRanges(_range_page(0, 2, has_more=False, version=7))
+    service = DataExportService(
+        ranges,
+        FakeTables({}),
+        FakePivots(),
+        store_rig.store,
+        LargeDataConfig(max_file_jobs=1),
+        session=FakeSession(7),
+        snapshot=FakeSnapshot(),
+    )
+
+    await asyncio.gather(
+        service.export("wb1", source_kind="range", sheet="S", address="A1:B100"),
+        service.export("wb1", source_kind="range", sheet="S", address="A1:B100"),
+    )
+
+    # max_file_jobs=1 serializes the two concurrent exports (no overlap).
+    assert ranges.max_active == 1

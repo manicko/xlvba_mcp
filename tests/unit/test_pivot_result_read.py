@@ -271,6 +271,50 @@ async def test_service_stale_cursor_raises(tmp_path: Path) -> None:
     assert exc_info.value.context["kind"] == "pivot_result"
 
 
+async def test_service_stale_fingerprint_without_version_bump_raises(
+    tmp_path: Path,
+) -> None:
+    # Page version matches the cursor (no version bump), but the structural
+    # fingerprint differs -> STALE_CURSOR (contract §3.2 out-of-band refresh).
+    service, adapter = _build_service(
+        tmp_path, page_version=7, large_data=LargeDataConfig()
+    )
+    actual_fingerprint = adapter._page.fingerprint  # type: ignore[attr-defined]
+
+    with pytest.raises(ExcelVbaMcpError) as exc_info:
+        await service.read_pivot_result(
+            "wb1",
+            "pt",
+            cursor_version=7,
+            cursor_fingerprint="$A$1:$Z$99|2026-01-01T00:00:00+00:00",
+        )
+
+    assert exc_info.value.code is ErrorCode.STALE_CURSOR
+    assert exc_info.value.context["kind"] == "pivot"
+    assert (
+        exc_info.value.context["expected_fingerprint"]
+        == "$A$1:$Z$99|2026-01-01T00:00:00+00:00"
+    )
+    assert exc_info.value.context["actual_fingerprint"] == actual_fingerprint
+
+
+async def test_service_matching_fingerprint_does_not_raise(tmp_path: Path) -> None:
+    # A matching fingerprint (and version) passes; the no-cursor first page also
+    # passes (both cursor args default to None).
+    service, adapter = _build_service(
+        tmp_path, page_version=7, large_data=LargeDataConfig()
+    )
+    fingerprint = adapter._page.fingerprint  # type: ignore[attr-defined]
+
+    page = await service.read_pivot_result(
+        "wb1", "pt", cursor_version=7, cursor_fingerprint=fingerprint
+    )
+    assert page.page.version == 7
+
+    first_page = await service.read_pivot_result("wb1", "pt")
+    assert first_page.page.version == 7
+
+
 # ---------------------------------------------------------------------------
 # DTO: bounds + fingerprint
 # ---------------------------------------------------------------------------

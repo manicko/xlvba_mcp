@@ -338,6 +338,7 @@ class PivotTablesService:
         offset: int = 0,
         limit: int | None = None,
         cursor_version: int | None = None,
+        cursor_fingerprint: str | None = None,
     ) -> PivotResultPage:
         """Read a bounded page of a PivotTable's rendered output (read-only).
 
@@ -349,6 +350,13 @@ class PivotTablesService:
         ``has_more`` / ``complete`` / ``total`` and the workbook content
         ``version``. Pass ``cursor_version`` (the prior page's ``page.version``)
         to fail with ``STALE_CURSOR`` when the workbook changed between pages.
+
+        Pass ``cursor_fingerprint`` (the prior page's ``fingerprint``) to also
+        fail with ``STALE_CURSOR`` when the PivotTable's structure changed
+        without a version bump (an out-of-band refresh that does not go through a
+        mutating service call, contract §3.2). The version check is preserved and
+        runs first; the fingerprint check only fires when a fingerprint cursor is
+        supplied (the first page has none).
         """
 
         record = self._resolve_record(workbook_id)
@@ -372,6 +380,15 @@ class PivotTablesService:
                     "expected_version": cursor_version,
                     "actual_version": result.page.version,
                     "kind": "pivot_result",
+                },
+            )
+        if cursor_fingerprint is not None and result.fingerprint != cursor_fingerprint:
+            raise StaleCursorError(
+                "The PivotTable structure changed since the first page; restart paging.",
+                context={
+                    "expected_fingerprint": cursor_fingerprint,
+                    "actual_fingerprint": result.fingerprint,
+                    "kind": "pivot",
                 },
             )
         self._record_audit(

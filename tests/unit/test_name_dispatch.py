@@ -260,7 +260,7 @@ async def test_name_delete_missing_name_errors() -> None:
 # ---------------------------------------------------------------------------
 async def test_name_annotation_triple() -> None:
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
-    ann = tools["name"].annotations
+    ann = tools["defined_name"].annotations
     assert ann is not None
     assert ann.destructive_hint is not True
     assert ann.read_only_hint is not True
@@ -269,7 +269,7 @@ async def test_name_annotation_triple() -> None:
 
 async def test_name_read_annotation_triple() -> None:
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
-    ann = tools["name_read"].annotations
+    ann = tools["defined_name_read"].annotations
     assert ann is not None
     assert ann.read_only_hint is True
     assert ann.idempotent_hint is True
@@ -278,7 +278,7 @@ async def test_name_read_annotation_triple() -> None:
 
 async def test_name_delete_is_destructive_standalone() -> None:
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
-    ann = tools["name_delete"].annotations
+    ann = tools["defined_name_delete"].annotations
     assert ann is not None
     assert ann.destructive_hint is True
 

@@ -249,8 +249,8 @@ Kilo также принимает модульную форму (`uv run --dire
 
 ## Миграция поверхности инструментов (single switchover)
 
-Поверхность MCP-инструментов была консолидирована с **92 инструментов до 41** за **один переход**
-(single switchover, без dual-run). Продакшн `tools/list` идёт напрямую 92 → 41: **нет**
+Поверхность MCP-инструментов была консолидирована с **92 инструментов до 43** за **один переход**
+(single switchover, без dual-run). Продакшн `tools/list` идёт напрямую 92 → 43: **нет**
 `meta.deprecated`-алиасов и **нет** окна совместимости. Клиенты, которые сопоставляют старые
 per-verb имена инструментов, должны мигрировать на консолидированный инструмент + форму `action`.
 
@@ -261,28 +261,32 @@ per-verb имена инструментов, должны мигрироват�
 | `range_read_values` | `range_read` `action="read-values"` |
 | `table_update_rows` | `table` `action="update-rows"` |
 | `macro_classify_background` | `macro` `action="classify-background"` |
-| `test_suite_run` | `test` `action="run-suite"` |
+| `test_suite_run` | `test_suite` `action="run"` |
 
 **Approval globs.** Approval в Kilo остаётся name-glob'ом `xlvba_*`; аннотации инструментов
-(`readOnly` / `destructive` / `idempotent`) — это **подсказки, а не энфорсмент**. Высокорисковые
-standalone-имена не изменились и сохраняют own permission: `macro_run`, `excel_save_as`,
+(`readOnly` / `destructive` / `idempotent`) — это **подсказки, а не энфорсмент**. Glob `xlvba_*`
+совпадает с любым опубликованным именем инструмента, поэтому переименованные инструменты
+(`xlvba_workbook_save_copy`, `xlvba_test_suite`, `xlvba_defined_name`, `xlvba_workbook_snapshot_read`, …)
+остаются покрыты без изменения конфигурации. Высокорисковые
+standalone-имена не изменились и сохраняют own permission: `macro_run`, `workbook_save_copy`,
 `table_delete_column`. `workbook` `close` — защищённое действие: при несохранённых изменениях оно
 **по умолчанию отказывает**; передайте `discard_changes=true`, чтобы отбросить (или
 `save_changes=true`, чтобы сохранить при закрытии). См. [Конфигурация](03-configuration.md) и
 [Справочник инструментов MCP](05-mcp-tools-reference.md).
 
-**Финальные группы инструментов (41):**
+**Финальные группы инструментов (43):**
 
-- **Lifecycle / сессия:** `workbook`, `workbook_read`, `excel_save_as`, `excel_health`, `excel_recover`
-- **Снапшоты:** `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff`
+- **Lifecycle / сессия:** `workbook`, `workbook_read`, `workbook_save_copy`, `excel_health`, `excel_recover`
+- **Снапшоты:** `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff`, `workbook_snapshot_read`
 - **Jobs:** `job_get`, `job_request_cancel`
 - **VBA:** `vba_read`, `vba_export_project`, `vba_replace_component_source`, `vba_insert_code`, `vba_compile_diagnostics`
-- **Macro / test:** `macro`, `macro_run`, `test`
-- **Листы / таблицы / имена:** `sheet`, `sheet_read`, `sheet_delete`, `table`, `table_read`, `table_delete_rows`, `table_delete_column`, `name`, `name_read`, `name_delete`
+- **Macro / test:** `macro`, `macro_run`, `test_suite`
+- **Листы / таблицы / имена:** `sheet`, `sheet_read`, `sheet_delete`, `table`, `table_read`, `table_delete_rows`, `table_delete_column`, `defined_name`, `defined_name_read`, `defined_name_delete`
 - **Диапазоны:** `range_read`, `range_write`, `range_structural`, `range_delete`, `range_merge`
 - **Pivot:** `pivot_read`, `pivot_refresh`, `pivot_field`
 - **Объекты:** `shape`, `control`
 - **Возможности / здоровье:** `xlvba_environment`, `server_health`
+- **Экспорт данных:** `data_export`
 
 ## Удаление
 

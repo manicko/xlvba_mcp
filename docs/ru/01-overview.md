@@ -36,7 +36,7 @@ related:
 Ключевые факты:
 
 - Пакет: `excel-vba-mcp`, версия `0.1.0` (лицензия Proprietary).
-- Сервер регистрирует **91 инструмент** (91 опубликовано) и **5 read-only ресурсов** (четыре
+- Сервер регистрирует **43 инструмента** и **5 read-only ресурсов** (четыре
   per-workbook URI-шаблона плюс статический `xlvba://glossary`). Плановый read-only инструмент
   `xlvba_environment` (режим доступа / политика / сборка / возможности) ещё не добавлен; enum-схемы
   запросов для `range_set_conditional_formatting`, `pivot_field_set_layout` и
@@ -71,7 +71,7 @@ related:
   управление полями (ориентация, позиция, агрегация, свойства), фильтры через видимые элементы
   и очистка фильтров. Создание и удаление PivotTables/PivotCaches не поддерживается.
 - **Имена (Named Ranges).** `names_list`, `name_get` и мутирующие `name_create`,
-  `name_update`, `name_delete`.
+  `name_update`, `defined_name_delete`.
 - **Фигуры и элементы управления.** `shapes_list`, `shape_get`, `shape_set_on_action`,
   `controls_list`, `control_get`, `control_set_on_action`.
 - **VBA.** Инвентаризация проекта и компонентов, чтение исходников, поиск по коду, экспорт проекта,
@@ -85,8 +85,8 @@ related:
   также действует approval-гейт.
 - **Снапшоты.** `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff`
   с манифестом и SHA-256.
-- **Декларативный тестовый раннер.** `test_suite_run`, `test_get_run`
-  с закрытым словарём действий и проверок. `test_suite_run` — единственная каноническая точка входа
+- **Декларативный тестовый раннер.** `test_suite` (действия `run` / `get-run`)
+  с закрытым словарём действий и проверок. `test_suite` `run` — единственная каноническая точка входа
   (принимает mapping или typed-spec, плюс `background`).
 - **Аудит и безопасность.** Журнал `audit.jsonl` (append-only), allowlist путей и
   политика доступа: полный доступ по умолчанию, режим `restricted` (deny-by-default approval)
@@ -122,8 +122,8 @@ related:
 4. **Снапшот перед изменением.** `snapshot_create` (для открытой книги используется
    `Workbook.SaveCopyAs`, для закрытой — копирование файла).
 5. **Экспорт VBA.** `vba_export_project` с сохранением манифеста и хэшей файлов.
-6. **Запуск декларативного теста.** `test_suite_run` → при необходимости
-   `test_get_run` для чтения сохранённого прогона.
+6. **Запуск декларативного теста.** `test_suite` (`action="run"`) → при необходимости
+   `test_suite` (`action="get-run"`) для чтения сохранённого прогона.
 7. **Диагностика состояния компиляции.** `vba_compile_diagnostics` / `vba_get_compile_diagnostics` —
    получение статуса и частичных диагностических данных без запуска UI.
 

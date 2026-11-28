@@ -106,9 +106,85 @@ def classify_cell_kind_name(value: Any) -> str:
     return "string"
 
 
+#: Cell kinds whose ``value`` is free text subject to ``max_text_len`` truncation.
+_TEXT_KINDS: frozenset[CellValueKind] = frozenset(
+    {CellValueKind.STRING, CellValueKind.ERROR}
+)
+
+
+def _cell_text_bytes(cell: CellValue) -> int:
+    """Estimated UTF-8 payload size of one cell's value (0 for empty)."""
+
+    value = cell.value
+    if value is None:
+        return 0
+    return len(str(value).encode("utf-8"))
+
+
+def bound_value_grid(
+    rows: list[list[CellValue]],
+    *,
+    max_text_len: int,
+    max_response_bytes: int,
+) -> tuple[list[list[CellValue]], bool, bool]:
+    """Enforce the per-field text cap and a page byte budget on a value grid.
+
+    Returns ``(rows, text_truncated, bytes_truncated)``:
+
+    * ``text_truncated`` — a text field longer than ``max_text_len`` was cut to
+      ``max_text_len`` characters (the caller marks the page ``truncated`` so the
+      cut is never silent, contract §6).
+    * ``bytes_truncated`` — trailing rows were dropped so the estimated UTF-8
+      value payload stays within ``max_response_bytes`` (at least one row is
+      always kept; a single oversized row is bounded only by ``max_text_len``).
+
+    The byte estimate is the sum of the UTF-8 length of each non-empty cell value
+    (the value payload, not the full JSON envelope) — a conservative proxy for the
+    serialized response size (``max_response_bytes``). A non-positive limit
+    disables that bound.
+    """
+
+    text_truncated = False
+    if max_text_len > 0:
+        bounded: list[list[CellValue]] = []
+        for row in rows:
+            new_row: list[CellValue] = []
+            for cell in row:
+                if (
+                    cell.kind in _TEXT_KINDS
+                    and isinstance(cell.value, str)
+                    and len(cell.value) > max_text_len
+                ):
+                    new_row.append(
+                        cell.model_copy(update={"value": cell.value[:max_text_len]})
+                    )
+                    text_truncated = True
+                else:
+                    new_row.append(cell)
+            bounded.append(new_row)
+        rows = bounded
+
+    bytes_truncated = False
+    if max_response_bytes > 0 and rows:
+        row_bytes = [sum(_cell_text_bytes(cell) for cell in row) for row in rows]
+        if sum(row_bytes) > max_response_bytes:
+            bytes_truncated = True
+            kept = 0
+            running = 0
+            for size in row_bytes:
+                if kept >= 1 and running + size > max_response_bytes:
+                    break
+                running += size
+                kept += 1
+            rows = rows[:kept]
+
+    return rows, text_truncated, bytes_truncated
+
+
 __all__ = [
     "EXCEL_ERROR_CODES",
     "EXCEL_ERROR_CODE_TO_LITERAL",
+    "bound_value_grid",
     "classify_cell_kind_name",
     "classify_cell_value",
 ]

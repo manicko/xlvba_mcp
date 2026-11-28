@@ -201,6 +201,8 @@ class RangesService:
                 cursor_version=cursor_version,
                 version_getter=lambda: self._session.get_version(workbook_id),
                 max_response_cells=self._large_data.max_response_cells,
+                max_text_len=self._large_data.max_text_len,
+                max_response_bytes=self._large_data.max_response_bytes,
             ),
             record,
         )

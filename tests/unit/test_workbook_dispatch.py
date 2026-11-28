@@ -250,9 +250,9 @@ async def test_workbook_read_annotation_triple() -> None:
     assert ann.destructive_hint is not True
 
 
-async def test_excel_save_as_is_destructive_standalone() -> None:
+async def test_workbook_save_copy_is_destructive_standalone() -> None:
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
-    ann = tools["excel_save_as"].annotations
+    ann = tools["workbook_save_copy"].annotations
     assert ann is not None
     assert ann.destructive_hint is True
 

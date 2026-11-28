@@ -196,7 +196,7 @@ uv run excel-vba-mcp
 
 ### Local project tree (`C:\py_exp\mko_treport`)
 
-Allowlist the whole `mko_treport` tree so `xlvba_excel_open` accepts workbooks under it. Set the
+Allowlist the whole `mko_treport` tree so `xlvba_workbook` accepts workbooks under it. Set the
 variable **before** starting the server, then start/reload the MCP server:
 
 ```powershell
@@ -214,7 +214,7 @@ $env:EXCEL_VBA_MCP_ROOTS = "$env:TEMP;C:\py_exp\mko_treport"
 
 > [!NOTE]
 > Restart / reload the MCP server after setting the variable. The value is read at startup only;
-> a live session continues to use its original allowlist. If `xlvba_excel_open` still returns
+> a live session continues to use its original allowlist. If `xlvba_workbook` still returns
 > `PATH_NOT_ALLOWED / outside_roots`, confirm the server was restarted and that the path is under
 > one of the configured roots (see `context.allowed_roots` in the error).
 

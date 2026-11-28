@@ -36,7 +36,7 @@ and resources that an MCP client (for example, Kilo or Claude Desktop) invokes.
 Key facts:
 
 - Package: `excel-vba-mcp`, version `0.1.0` (Proprietary license).
-- The server registers **91 tools** (91 exposed) and **5 read-only resources** (four
+- The server registers **43 tools** and **5 read-only resources** (four
   per-workbook URI templates plus the static `xlvba://glossary`). A read-only
   `xlvba_environment` tool (access mode / policy / build / capabilities) is planned; the
   request enums for `range_set_conditional_formatting`, `pivot_field_set_layout` and
@@ -71,7 +71,7 @@ and of Excel capabilities in [Excel Capabilities](06-excel-capabilities.md).
   field management (orientation, position, aggregation, properties), filters via visible items
   and clearing filters. Creating and deleting PivotTables/PivotCaches is not supported.
 - **Names (Named Ranges).** `names_list`, `name_get` and the mutating `name_create`,
-  `name_update`, `name_delete`.
+  `name_update`, `defined_name_delete`.
 - **Shapes and controls.** `shapes_list`, `shape_get`, `shape_set_on_action`,
   `controls_list`, `control_get`, `control_set_on_action`.
 - **VBA.** Project and component inventory, source reading, code search, project export,
@@ -85,8 +85,8 @@ and of Excel capabilities in [Excel Capabilities](06-excel-capabilities.md).
   in `restricted` mode the approval gate also applies.
 - **Snapshots.** `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff`
   with a manifest and SHA-256.
-- **Declarative test runner.** `test_suite_run`, `test_get_run`
-  with a closed vocabulary of actions and assertions. `test_suite_run` is the single canonical
+- **Declarative test runner.** `test_suite` (actions `run` / `get-run`)
+  with a closed vocabulary of actions and assertions. `test_suite` `run` is the single canonical
   entry point (accepts a mapping or a typed spec, plus `background`).
 - **Audit and security.** The `audit.jsonl` journal (append-only), a path allowlist and an
   access-mode policy: full access by default, restricted mode (deny-by-default approval) as an
@@ -123,8 +123,8 @@ described in [Architecture](04-architecture.md).
 4. **Snapshot before a change.** `snapshot_create` (for an open workbook `Workbook.SaveCopyAs`
    is used, for a closed one a file copy).
 5. **Export VBA.** `vba_export_project` with a manifest and file hashes saved.
-6. **Run a declarative test.** `test_suite_run` → if needed
-   `test_get_run` to read a persisted run.
+6. **Run a declarative test.** `test_suite` (`action="run"`) → if needed
+   `test_suite` (`action="get-run"`) to read a persisted run.
 7. **Diagnose compile state.** `vba_compile_diagnostics` / `vba_get_compile_diagnostics` —
    obtaining status and partial diagnostic data without launching the UI.
 

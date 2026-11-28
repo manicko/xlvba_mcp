@@ -101,3 +101,23 @@ def test_not_a_zip_raises(tmp_path: Path) -> None:
 
     with pytest.raises(OoxmlSafetyError):
         open_safe(str(path), _limits())
+
+
+def test_file_size_pre_open_rejected(tmp_path: Path) -> None:
+    # max_file_mb=0 -> any non-empty file exceeds the byte ceiling and is
+    # rejected BEFORE the central directory is opened (contract §1 max_file_mb).
+    path = tmp_path / "toobig.xlsx"
+    path.write_bytes(b"x" * 4096)
+
+    with pytest.raises(OoxmlSafetyError, match="exceeds the limit"):
+        open_safe(str(path), _limits(max_file_mb=0))
+
+
+def test_file_size_within_limit_passes(tmp_path: Path) -> None:
+    # A small file under a 1 MiB cap opens normally (size pre-check passes).
+    path = tmp_path / "small.xlsx"
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("xl/workbook.xml", b"<workbook/>")
+
+    with open_safe(str(path), _limits(max_file_mb=1)) as zf:
+        assert "xl/workbook.xml" in zf.namelist()

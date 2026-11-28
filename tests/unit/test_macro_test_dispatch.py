@@ -169,7 +169,7 @@ async def test_macro_run_is_not_a_macro_action() -> None:
 async def test_test_run_suite_routes(_install_fakes: tuple[Any, Any]) -> None:
     _, runner = _install_fakes
     suite = {"suite": "smoke", "workbook_id": "wb1", "cases": [{"id": "c1", "steps": []}]}
-    result = await test_tools.test("run-suite", suite=suite)
+    result = await test_tools.test("run", suite=suite)
 
     assert result == "run-result"
     verb, args = runner.calls[-1]
@@ -193,7 +193,7 @@ async def test_test_get_run_routes(_install_fakes: tuple[Any, Any]) -> None:
 # ---------------------------------------------------------------------------
 async def test_test_run_suite_missing_suite_errors() -> None:
     with pytest.raises(ExcelVbaMcpError):
-        await test_tools.test("run-suite")
+        await test_tools.test("run")
 
 
 async def test_test_get_run_missing_run_id_errors() -> None:
@@ -211,7 +211,7 @@ async def test_test_unknown_action_errors() -> None:
 # ---------------------------------------------------------------------------
 async def test_macro_and_test_registered_old_names_removed() -> None:
     names = {tool.name for tool in await server.mcp.list_tools()}
-    for present in ("macro", "macro_run", "test"):
+    for present in ("macro", "macro_run", "test_suite"):
         assert present in names
     for removed in (
         "macro_list",
@@ -246,7 +246,7 @@ async def test_macro_annotation_triple() -> None:
 
 async def test_test_annotation_triple() -> None:
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
-    ann = tools["test"].annotations
+    ann = tools["test_suite"].annotations
     assert ann is not None
     # (F, T, F): not read-only, destructive, not idempotent.
     assert ann.read_only_hint is not True

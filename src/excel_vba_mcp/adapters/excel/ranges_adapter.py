@@ -111,6 +111,7 @@ from typing import Any
 
 from excel_vba_mcp.adapters.excel.cell_values import (
     EXCEL_ERROR_CODE_TO_LITERAL,
+    bound_value_grid,
     classify_cell_value,
 )
 from excel_vba_mcp.domain.errors import (
@@ -121,7 +122,9 @@ from excel_vba_mcp.domain.errors import (
 )
 from excel_vba_mcp.domain.models import (
     MAX_RANGE_CELLS,
+    MAX_RESPONSE_BYTES,
     MAX_RESPONSE_CELLS,
+    MAX_TEXT_LEN,
     MAX_VALIDATION_FORMULA_LENGTH,
     AlignmentFormat,
     CellValue,
@@ -868,6 +871,8 @@ class RangesAdapter:
         cursor_version: int | None = None,
         version_getter: Callable[[], int] | None = None,
         max_response_cells: int = MAX_RESPONSE_CELLS,
+        max_text_len: int = MAX_TEXT_LEN,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
     ) -> RangeValues:
         """Read typed cell values from a bounded ``Range.Value2`` window.
 
@@ -876,6 +881,12 @@ class RangesAdapter:
         (``max_response_cells``): a large logical range is paged through
         successive reads rather than rejected, and ``truncated`` marks a response
         cut short. The full-range ``MAX_RANGE_CELLS`` cap applies only to writes.
+
+        The returned grid is additionally bounded at the serialization boundary by
+        ``max_text_len`` (a single text field longer than the cap is truncated and
+        the page is marked ``truncated``) and ``max_response_bytes`` (trailing rows
+        are dropped so the estimated UTF-8 value payload fits the byte budget, also
+        marking the page ``truncated``) — never silently (contract §6).
 
         The workbook content version is captured **atomically with the read** (at
         the start of this STA-worker call, before the range is opened) and attached
@@ -926,6 +937,22 @@ class RangesAdapter:
         values = _classify_grid(
             grid, sub_range=sub_range, top_row=top_row + start, left_col=left_col
         )
+        values, text_truncated, bytes_truncated = bound_value_grid(
+            values, max_text_len=max_text_len, max_response_bytes=max_response_bytes
+        )
+        row_count = len(values)
+        end = start + row_count
+        truncated = truncated or text_truncated or bytes_truncated
+        notes: list[str] = []
+        if text_truncated:
+            notes.append(
+                f"text_truncated: a field exceeded max_text_len ({max_text_len})."
+            )
+        if bytes_truncated:
+            notes.append(
+                "bytes_truncated: page shrank to fit max_response_bytes "
+                f"({max_response_bytes})."
+            )
 
         return RangeValues(
             range=resolved,
@@ -934,6 +961,7 @@ class RangesAdapter:
             cols=total_cols,
             values=values,
             truncated=truncated,
+            notes=notes,
             page=PageInfo(
                 offset=start,
                 limit=limit,

@@ -452,7 +452,7 @@ Call `range_read_values` and confirm the expected value.
 
 Write a new value with `range_write_values` (or `table_update_rows`), then call `macro_run` again
 for a second procedure. Each guarded step is independent; the sequence is exactly what a
-declarative `test_suite_run` expresses with `macro_run` steps carrying an optional `background_safe`
+declarative `test_suite` (`action="run"`) expresses with `macro_run` steps carrying an optional `background_safe`
 field.
 
 **Expected outcome.** Each `macro_run` returns `success` (or `blocked` with
@@ -536,7 +536,7 @@ unclassified procedure is `blocked` (`BACKGROUND_SAFETY_NOT_VERIFIED`) in either
 }
 ```
 
-Call `test_suite_run` with this object as the `suite` argument. `test_suite_run` is the
+Call `test_suite` with `action="run"` and this object as the `suite` argument. `test_suite` is the
 single canonical test entry point (it accepts a mapping or a typed spec, plus `background`).
 The vocabularies are closed:
 
@@ -553,7 +553,7 @@ The closed vocabularies contain **37 actions** and **29 assertions**, defined in
 { "run_id": "<test_run_id>" }
 ```
 
-Call `test_get_run` with the `test_run_id` from the `TestRunResult`. It returns per-case and
+Call `test_suite` with `action="get-run"` and the `test_run_id` from the `TestRunResult`. It returns per-case and
 per-step statuses without touching Excel.
 
 **Expected outcome.** A `TestRunResult` with one entry per case and step, plus a persisted run
@@ -624,9 +624,9 @@ codes most likely to appear and the correct response.
 | `PATH_NOT_ALLOWED` | `excel_open`, `vba_export_project` | Path outside `EXCEL_VBA_MCP_ROOTS`, a device/UNC path, traversal, symlink escape, or a disallowed extension. `context.reason` names the category (`outside_roots`, `extension_not_allowed`, `unc_denied`, `symlink_escape`, `root_mismatch`, `traversal`, `empty_path`, `device_path_denied`); `context.allowed_roots` lists the loaded roots. | Put the workbook inside an allowed root or extend `EXCEL_VBA_MCP_ROOTS` and restart the server; use a plain path and an allowed extension. See [Configuration](03-configuration.md). |
 | `LISTOBJECT_INTERSECTION` | `range_write_values`, `range_write_formulas`, `range_copy`, `range_insert`, `range_delete`, `range_merge`, `range_unmerge` | The target intersects an Excel Table (ListObject). `context.tables` lists the intersecting tables. | Use the Tables tools (`table_append_rows`, `table_update_rows`, `table_add_column`, and so on) instead of structural range operations. |
 | `ACCESS_VBOM_DISABLED` | `vba_*`, `macro_list`, `vba_compile_diagnostics` | Excel cannot read the VBA project object model; Trust Center VBOM trust is off. | Enable **Trust access to the VBA project object model** in Excel Trust Center → Macro Settings, close Excel and retry. Corporate policy may block this. |
-| `APPROVAL_DENIED` | `excel_open` (writable/execute), any mutating tool, `macro_run`, `test_suite_run` | The server runs in `restricted` mode (`EXCEL_VBA_MCP_ACCESS_MODE=restricted`) and no allowlist entry or live grant matches. | Unset `EXCEL_VBA_MCP_ACCESS_MODE` (or set `full`) for the default full-access behavior; a restricted server exposes only read-only work over MCP. |
+| `APPROVAL_DENIED` | `excel_open` (writable/execute), any mutating tool, `macro_run`, `test_suite` | The server runs in `restricted` mode (`EXCEL_VBA_MCP_ACCESS_MODE=restricted`) and no allowlist entry or live grant matches. | Unset `EXCEL_VBA_MCP_ACCESS_MODE` (or set `full`) for the default full-access behavior; a restricted server exposes only read-only work over MCP. |
 | `BACKGROUND_SAFETY_NOT_VERIFIED` | `macro_run` (in `MacroRunResult.error_code`, status `blocked`) | The procedure is not classified `background_safe` for the current workbook hash and VBA source revision. | The macro was **not** started. Classify it with `macro_classify_background` (re-classify after any VBA source change) and retry. Do not retry blindly. |
-| `INTERACTIVE_UI_NOT_SUPPORTED` | `macro_run`, `macro_classify_background`, `test_suite_run` | The procedure references interactive UI, is heuristic, or was classified `background_safe` while unsafe. | Inspect the procedure and remove the interactive UI, or leave it unclassified. Do not bypass the preflight. |
+| `INTERACTIVE_UI_NOT_SUPPORTED` | `macro_run`, `macro_classify_background`, `test_suite` | The procedure references interactive UI, is heuristic, or was classified `background_safe` while unsafe. | Inspect the procedure and remove the interactive UI, or leave it unclassified. Do not bypass the preflight. |
 | `COM_BUSY` | Any mutating tool; `vba_replace_component_source`/`vba_insert_code` | Genuine COM contention (server busy). Approval denial is a separate code (`APPROVAL_DENIED`), a VBA `source_hash` revision conflict is `REVISION_CONFLICT`, and a missing shape/control is `NOT_FOUND`. | Read `context.reason`; retry a read after the operation completes. Do not blindly retry a mutation. |
 | `REVISION_CONFLICT` | `vba_replace_component_source` / `vba_insert_code` | A stale `expected_source_hash` (`context.reason="revision_conflict"`); note the guard token is the normalized `source_hash` from `vba_read_component`, not the snapshot export file hash. | Re-read the component with `vba_read_component` and pass the current `expected_source_hash`. |
 | `NOT_FOUND` | `shape_get`, `shape_set_on_action`, `control_get`, `control_set_on_action` | A shape or control addressed by `name` does not exist (F6); `context.name` carries the requested name. Genuine COM contention still reports `COM_BUSY`. | List the objects (`shapes_list` / `controls_list`) and use an exact name. Do not retry — this is a caller error. |

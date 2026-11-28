@@ -79,6 +79,8 @@ class OoxmlService:
         self._snapshot = snapshot
         self._limits = limits
         self._zip_limits = ZipLimits.from_config(limits)
+        # Bound concurrent non-COM file reads (contract §5 / ``max_file_jobs``).
+        self._file_jobs = asyncio.Semaphore(max(1, limits.max_file_jobs))
 
     # ------------------------------------------------------------------
     # Input resolution (async: create_snapshot runs on the STA worker)
@@ -118,10 +120,11 @@ class OoxmlService:
     ) -> OoxmlMetadata:
         """Read workbook metadata (sheets, defined names, table count) from a snapshot."""
 
-        path, sha, used_id = await self._resolve_input(workbook_id, snapshot_id)
-        return await asyncio.to_thread(
-            self._read_metadata_sync, path, sha, used_id, workbook_id
-        )
+        async with self._file_jobs:
+            path, sha, used_id = await self._resolve_input(workbook_id, snapshot_id)
+            return await asyncio.to_thread(
+                self._read_metadata_sync, path, sha, used_id, workbook_id
+            )
 
     async def read_sheet_rows(
         self,
@@ -134,17 +137,18 @@ class OoxmlService:
         """Read a bounded page of typed worksheet rows from a snapshot."""
 
         resolved_limit = limit if (limit is not None and limit > 0) else _DEFAULT_ROW_LIMIT
-        path, sha, used_id = await self._resolve_input(workbook_id, snapshot_id)
-        return await asyncio.to_thread(
-            self._read_sheet_rows_sync,
-            path,
-            sha,
-            used_id,
-            workbook_id,
-            sheet,
-            offset,
-            resolved_limit,
-        )
+        async with self._file_jobs:
+            path, sha, used_id = await self._resolve_input(workbook_id, snapshot_id)
+            return await asyncio.to_thread(
+                self._read_sheet_rows_sync,
+                path,
+                sha,
+                used_id,
+                workbook_id,
+                sheet,
+                offset,
+                resolved_limit,
+            )
 
     async def read_pivot_cache_records(
         self,
@@ -163,17 +167,18 @@ class OoxmlService:
         """
 
         resolved_limit = limit if (limit is not None and limit > 0) else _DEFAULT_ROW_LIMIT
-        path, sha, used_id = await self._resolve_input(workbook_id, snapshot_id)
-        return await asyncio.to_thread(
-            self._read_pivot_cache_records_sync,
-            path,
-            sha,
-            used_id,
-            workbook_id,
-            cache_index,
-            offset,
-            resolved_limit,
-        )
+        async with self._file_jobs:
+            path, sha, used_id = await self._resolve_input(workbook_id, snapshot_id)
+            return await asyncio.to_thread(
+                self._read_pivot_cache_records_sync,
+                path,
+                sha,
+                used_id,
+                workbook_id,
+                cache_index,
+                offset,
+                resolved_limit,
+            )
 
     # ------------------------------------------------------------------
     # Sync parsing helpers (pure file parsing; run via asyncio.to_thread)

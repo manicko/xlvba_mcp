@@ -912,6 +912,9 @@ MAX_RANGE_COLS = 512  # practical default; the hard Excel ceiling is XFD (16,384
 MAX_RANGE_COLS_HARD = 16_384
 MAX_RESPONSE_CELLS = 50_000
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+# Excel's per-cell text ceiling; a returned text field longer than this is
+# truncated with an explicit marker (never silently), contract §6 / max_text_len.
+MAX_TEXT_LEN = 32_767
 MAX_WRITE_PAYLOAD_CELLS = 100_000
 MAX_VALIDATION_FORMULA_LENGTH = 255
 # Upper bound on the cells a single PivotTable rendered-result page returns. The
@@ -1876,7 +1879,9 @@ class DataExportResult(DomainModel):
     every source row was delivered, ``truncated`` is ``True`` iff the export was cut
     by ``limit_rows`` or the ``max_export_rows`` ceiling, ``source`` is the source
     kind (``"range"`` / ``"table"`` / ``"pivot-result"``) and ``source_version`` is
-    the workbook content version of the last page read.
+    the workbook content version the export was bound to (captured at start).
+    ``input_sha256`` is the SHA-256 of the immutable snapshot file the export read
+    from (``None`` only on a legacy path that did not bind a snapshot).
     """
 
     artifact_id: str
@@ -1889,3 +1894,4 @@ class DataExportResult(DomainModel):
     source: str
     source_version: int
     truncated: bool = False
+    input_sha256: str | None = None

@@ -207,7 +207,7 @@ _DESC_WORKBOOK = (
     "Use when: you need to open an allowlisted workbook as a hidden working "
     "copy, close a workbook you are done with, or persist the working copy in "
     "place. "
-    "Do not use when: you need Save As to a new path — use excel_save_as; the "
+    "Do not use when: you need Save As to a new path — use workbook_save_copy; the "
     "workbook is already open — reuse its workbook_id (workbook_read "
     "action='list'). "
     "Preconditions: an open workbook_id for close/save; path under an allowlisted "
@@ -245,7 +245,7 @@ _DESC_WORKBOOK_READ = (
 _DESC_SAVE = (
     "Purpose: Save an open workbook's working copy in place. "
     "Use when: you want to persist mutations to the working-copy file. "
-    "Do not use when: you need a new output path — use excel_save_as instead "
+    "Do not use when: you need a new output path — use workbook_save_copy instead "
     "(see xlvba://glossary / docs 09). "
     "Preconditions: an open, writable workbook_id. "
     "Behavior: writes the working copy in place (no path argument). "
@@ -254,11 +254,12 @@ _DESC_SAVE = (
 )
 _DESC_SAVE_AS = (
     "Purpose: Save an open workbook's working copy to a (possibly new) target path without "
-    "rebinding the session. Use when: you need the working copy written to a different/new "
-    "file (Save As), including overwriting the original source. Do not use when: you only need "
-    "to persist the working copy in place — use workbook action='save'; the target is the open "
-    "working copy (rejected); the source changed since open (STALE_TARGET). Preconditions: an open "
-    "workbook_id; MUTATING approval on the target Approval gate (see xlvba://glossary). "
+    "rebinding the session (workbook_save_copy). Use when: you need the working copy written to "
+    "a different/new file (Save As), including overwriting the original source. Do not use when: "
+    "you only need to persist the working copy in place — use workbook action='save'; the target "
+    "is the open working copy (rejected); the source changed since open (STALE_TARGET). "
+    "Preconditions: an open workbook_id; MUTATING approval on the target Approval gate (see "
+    "xlvba://glossary). "
     "Parameters: workbook_id, path, overwrite_existing=false, overwrite_source=false. "
     "Behavior: flushes the working copy with wb.Save on the STA worker, then a pure-filesystem "
     "atomic temp->replace copy (never wb.SaveAs, so the session stays bound to its working "
@@ -268,7 +269,9 @@ _DESC_SAVE_AS = (
     "(Save As does not mutate the open working copy). Result: SaveAsResult (outcome 'ok' only "
     "after a final size+SHA-256 verify; 'unknown'/'error' fail-closed with backup_path). Next "
     "actions: workbook action='save' to persist the working copy; snapshot_create before further "
-    "mutations."
+    "mutations. "
+    "Example: {\"workbook_id\": \"<id>\", \"path\": \"C:/data/report_copy.xlsm\", "
+    "\"overwrite_existing\": false, \"overwrite_source\": false}"
 )
 _DESC_STATUS = (
     "Purpose: Return session/workbook status (busy, read-only, dirty, active operation). "
@@ -334,34 +337,38 @@ _DESC_SNAPSHOT_RESTORE = (
 _DESC_SNAPSHOT_DIFF = "Compare two snapshots by manifest metadata and file hash."
 _DESC_TEST = (
     "Purpose: Validate and run a declarative test suite, or read a previously "
-    "persisted run, through one dispatch tool. "
+    "persisted run, through one dispatch tool (test_suite). "
     "Use when: you have a suite object or a plain JSON-style mapping and want to "
-    "run it (run-suite), or you need to read back a persisted run by id "
-    "(get-run). "
-    "Do not use when: you need to run a single macro — use macro_run; run-suite "
+    "run it (action='run'), or you need to read back a persisted run by id "
+    "(action='get-run'). "
+    "Do not use when: you need to run a single macro — use macro_run; action='run' "
     "executes on disposable working copies and is not read-only. "
     "Preconditions: suite.workbook_id must be an open workbook (call workbook "
-    "action='open' first) for run-suite; a baseline snapshot is created "
+    "action='open' first) for action='run'; a baseline snapshot is created "
     "automatically unless baseline='use_existing'; run_id is required for "
-    "get-run. "
-    "Parameters: action='run-suite'|'get-run'; suite (run-suite): TestSuiteSpec "
-    "or mapping; run_id (get-run); background (run-suite). The closed Range/Pivot "
-    "action and assertion vocabularies are validated before any Excel call, so an "
-    "unknown action/assertion or an arbitrary-code/unbounded payload is rejected "
-    "up front. "
-    "Behavior: run-suite uses one immutable baseline snapshot, one disposable "
+    "action='get-run'. "
+    "Parameters: action='run'|'get-run'; suite (action='run'): TestSuiteSpec "
+    "or mapping; run_id (action='get-run'); background (action='run'). The closed "
+    "Range/Pivot action and assertion vocabularies are validated before any Excel "
+    "call, so an unknown action/assertion or an arbitrary-code/unbounded payload is "
+    "rejected up front. "
+    "Behavior: action='run' uses one immutable baseline snapshot, one disposable "
     "working copy per case, external macro side effects are NOT rolled back, and "
-    "background=true returns a RunningJob handle; get-run never touches Excel and "
-    "never re-runs anything. "
-    "Result: TestRunResult (run-suite / get-run), or RunningJob when "
+    "background=true returns a RunningJob handle; action='get-run' never touches "
+    "Excel and never re-runs anything. "
+    "Relationship: a suite definition is the input you pass to action='run' (the "
+    "cases/steps/assertions to execute); a run is the persisted output that "
+    "action='run' produces and that action='get-run' reads back by its run_id. "
+    "Result: TestRunResult (action='run' / action='get-run'), or RunningJob when "
     "background=true. "
-    "Next actions: job_get to retrieve a background result; test action='get-run' "
-    "to read a persisted run. "
-    "Example: {\"action\": \"run-suite\", \"suite\": {\"suite\": \"smoke\", "
+    "Next actions: job_get to retrieve a background result; test_suite "
+    "action='get-run' to read a persisted run. "
+    "Example: run action -> {\"action\": \"run\", \"suite\": {\"suite\": \"smoke\", "
     "\"workbook_id\": \"<id>\", \"cases\": [{\"id\": \"c1\", \"steps\": "
     "[{\"action\": \"range_write_values\", \"sheet\": \"Sheet1\", "
     "\"range_address\": \"A1\", \"values_grid\": {\"rows\": 1, \"cols\": 1, "
-    "\"values\": [[1]]}}]}]}, \"background\": false}"
+    "\"values\": [[1]]}}]}]}, \"background\": false}. "
+    "Example: get-run action -> {\"action\": \"get-run\", \"run_id\": \"<test_run_id>\"}"
 )
 _DESC_VBA_READ = (
     "Purpose: Read the VBA project surface of an open workbook through one "
@@ -902,11 +909,12 @@ _DESC_RANGE_STRUCTURAL = (
     "\"sheet\": \"Sheet1\", \"address\": \"A1\", \"shift\": \"down\"}"
 )
 _DESC_NAME = (
-    "Purpose: Create or update a defined name (Named Range) in an explicit scope. "
+    "Purpose: Create or update a defined name (Named Range) in an explicit scope "
+    "(defined_name). "
     "Use when: you need a named range or constant in an open workbook, or you need "
     "to repoint an existing name's RefersTo. "
-    "Do not use when: you need to delete a name — use name_delete; you need to "
-    "read names — use name_read. "
+    "Do not use when: you need to delete a name — use defined_name_delete; you need "
+    "to read names — use defined_name_read. "
     "Preconditions: an open workbook_id; writable session + snapshot + approval "
     "Approval gate (see xlvba://glossary) + postcondition re-read. "
     "Parameters: action='create'|'update'; workbook_id; name; refers_to (may be "
@@ -915,16 +923,16 @@ _DESC_NAME = (
     "Behavior: create rejects duplicate and cross-scope conflicts; update preserves "
     "scope and only rewrites RefersTo. Guarded mutation (see xlvba://glossary). "
     "Result: DefinedNameInfo. "
-    "Next actions: name_read action='get' to confirm. "
+    "Next actions: defined_name_read action='get' to confirm. "
     "Example: {\"action\": \"create\", \"workbook_id\": \"<id>\", \"name\": "
     "\"Sales\", \"refers_to\": \"=Sheet1!$A$1\", \"scope\": \"workbook\"}"
 )
 _DESC_NAME_READ = (
     "Purpose: Read the defined names (Named Ranges) of an open workbook without "
-    "mutating it. "
+    "mutating it (defined_name_read). "
     "Use when: you need every defined name or one name's metadata by name + scope. "
-    "Do not use when: you need to create/update a name — use name; you need to "
-    "delete a name — use name_delete. "
+    "Do not use when: you need to create/update a name — use defined_name; you need "
+    "to delete a name — use defined_name_delete. "
     "Preconditions: an open workbook_id; name + scope are required for get (sheet "
     "also required for a worksheet scope). "
     "Parameters: action='list'|'get'; workbook_id; name (get); scope (get); sheet "
@@ -934,13 +942,14 @@ _DESC_NAME_READ = (
     "and target_kind (range with sheet+address, constant, formula, external, error "
     "or unknown); get returns one DefinedNameInfo. "
     "Result: list[DefinedNameInfo] (list) or DefinedNameInfo (get). "
-    "Next actions: name action='create' to add a name; name_delete to remove one. "
+    "Next actions: defined_name action='create' to add a name; defined_name_delete "
+    "to remove one. "
     "Example: {\"action\": \"get\", \"workbook_id\": \"<id>\", \"name\": "
     "\"Sales\", \"scope\": \"workbook\"}"
 )
 _DESC_NAME_DELETE = (
-    "Delete a defined name in an explicit scope. Guarded mutation (see xlvba://glossary). "
-    "Returns the pre-delete name."
+    "Delete a defined name in an explicit scope (defined_name_delete). Guarded "
+    "mutation (see xlvba://glossary). Returns the pre-delete name."
 )
 _DESC_SHAPE = (
     "Purpose: List, read or assign the OnAction of drawing shapes of an open "
@@ -1127,7 +1136,7 @@ _DESC_ENVIRONMENT = (
 _DESC_WORKBOOK_FILE_READ = (
     "Purpose: Read workbook metadata, a page of worksheet rows, or saved "
     "PivotCache records from an immutable snapshot file via non-COM streaming "
-    "OOXML parsing. "
+    "OOXML parsing (workbook_snapshot_read). "
     "Use when: you need large-sheet rows, workbook structure, or saved "
     "pivot-cache records without materializing the sheet or occupying the "
     "single-STA COM worker. "
@@ -1165,7 +1174,7 @@ _DESC_DATA_EXPORT = (
     "non-destructive and idempotent (each call writes a new artifact). "
     "Result: DataExportResult (artifact path, rows, bytes, sha256, "
     "truncated/complete). "
-    "Next actions: workbook_file_read to page the source; range_read for a "
+    "Next actions: workbook_snapshot_read to page the source; range_read for a "
     "bounded inline view. "
     "Example: {\"workbook_id\": \"<id>\", \"source_kind\": \"range\", "
     "\"sheet\": \"Sheet1\", \"address\": \"A1:C100000\", \"fmt\": \"csv\"}"
@@ -1345,7 +1354,15 @@ def _build_runtime(config: Config) -> _Runtime:
     # snapshot, and bounded-memory file export. Constructed after ranges/tables/
     # pivots/artifacts exist (data_export delegates per-page reads to them).
     ooxml = OoxmlService(session, snapshot, config.large_data)
-    data_export = DataExportService(ranges, tables, pivots, artifacts, config.large_data)
+    data_export = DataExportService(
+        ranges,
+        tables,
+        pivots,
+        artifacts,
+        config.large_data,
+        session=session,
+        snapshot=snapshot,
+    )
     runs = RunRepository(_resolve_runtime_path(_ENV_RUN_DIR, _default_run_dir()))
     # Job persistence (Block F): a RUNNING marker is written at job start and the
     # record is finalized on terminal. The store reconciles any non-terminal record
@@ -1943,14 +1960,14 @@ _ANN_READ_ONLY = frozenset(
         "table_read",
         "pivot_read",
         "range_read",
-        "name_read",
-        "workbook_file_read",
+        "defined_name_read",
+        "workbook_snapshot_read",
     }
 )
 _ANN_DESTRUCTIVE = frozenset(
     {
         "workbook",
-        "excel_save_as",
+        "workbook_save_copy",
         "sheet_delete",
         "range_merge",
         "range_structural",
@@ -1958,12 +1975,12 @@ _ANN_DESTRUCTIVE = frozenset(
         "snapshot_restore",
         "table_delete_rows",
         "table_delete_column",
-        "name_delete",
+        "defined_name_delete",
         "range_delete",
         "vba_replace_component_source",
         "vba_insert_code",
         "macro_run",
-        "test",
+        "test_suite",
         "pivot_field",
     }
 )
@@ -1983,12 +2000,12 @@ _ANN_IDEMPOTENT = frozenset(
         "pivot_field",
         "range_read",
         "range_merge",
-        "name",
-        "name_read",
+        "defined_name",
+        "defined_name_read",
         "shape",
         "control",
         "macro",
-        "workbook_file_read",
+        "workbook_snapshot_read",
         "data_export",
     }
 )
@@ -2026,9 +2043,9 @@ def _register_tools(server: MCPServer) -> None:
     )
     server.add_tool(
         excel_save_as,
-        name="excel_save_as",
+        name="workbook_save_copy",
         description=_DESC_SAVE_AS,
-        annotations=_annotations("excel_save_as"),
+        annotations=_annotations("workbook_save_copy"),
     )
     server.add_tool(
         excel_health,
@@ -2068,9 +2085,9 @@ def _register_tools(server: MCPServer) -> None:
     )
     server.add_tool(
         test,
-        name="test",
+        name="test_suite",
         description=_DESC_TEST,
-        annotations=_annotations("test"),
+        annotations=_annotations("test_suite"),
     )
     server.add_tool(
         vba_read,
@@ -2215,21 +2232,21 @@ def _register_tools(server: MCPServer) -> None:
     )
     server.add_tool(
         name,
-        name="name",
+        name="defined_name",
         description=_DESC_NAME,
-        annotations=_annotations("name"),
+        annotations=_annotations("defined_name"),
     )
     server.add_tool(
         name_read,
-        name="name_read",
+        name="defined_name_read",
         description=_DESC_NAME_READ,
-        annotations=_annotations("name_read"),
+        annotations=_annotations("defined_name_read"),
     )
     server.add_tool(
         name_delete,
-        name="name_delete",
+        name="defined_name_delete",
         description=_DESC_NAME_DELETE,
-        annotations=_annotations("name_delete"),
+        annotations=_annotations("defined_name_delete"),
     )
     server.add_tool(
         shape,
@@ -2253,9 +2270,9 @@ def _register_tools(server: MCPServer) -> None:
     )
     server.add_tool(
         workbook_file_read,
-        name="workbook_file_read",
+        name="workbook_snapshot_read",
         description=_DESC_WORKBOOK_FILE_READ,
-        annotations=_annotations("workbook_file_read"),
+        annotations=_annotations("workbook_snapshot_read"),
     )
     server.add_tool(
         data_export,

@@ -94,7 +94,7 @@ behavior as unproven until tested on a copy.
 | `macro_run` has no snapshot precondition | Unlike content-mutating tools, `macro_run` does not require a prior `snapshot_create` (documented spec deviation). | Verified |
 | R13 preflight is heuristic | The token scan is a veto, not static proof; dynamic `CallByName`/`ExecuteGlobal`/`Eval` indirection and transitive UI are not fully covered. | Verified |
 | The macro dialog guard is defense-in-depth, not a dialog blocker | F2a sets `Application.Interactive=False` / `DisplayAlerts=False` around the single `Application.Run` dispatch and restores them in `finally`; it suppresses only Excel's built-in alerts, not `MsgBox`/`UserForm.Show`/`FileDialog`/add-in UI/Win32 dialogs. | Verified |
-| Macros that show UI cannot run headless | `macro_run` and the declarative test runner (`test` `run-suite`, including any `macro_run` step) cannot execute a procedure that shows UI (`MsgBox`, `InputBox`, `UserForm.Show`, `FileDialog` and the other R13 tokens). The R13 preflight vetoes the procedure **before** dispatch with `INTERACTIVE_UI_NOT_SUPPORTED`; the macro is not started. This is expected — the server owns a hidden, non-activating Excel instance with no GUI — and the veto is not weakened. | Verified |
+| Macros that show UI cannot run headless | `macro_run` and the declarative test runner (`test_suite` `run`, including any `macro_run` step) cannot execute a procedure that shows UI (`MsgBox`, `InputBox`, `UserForm.Show`, `FileDialog` and the other R13 tokens). The R13 preflight vetoes the procedure **before** dispatch with `INTERACTIVE_UI_NOT_SUPPORTED`; the macro is not started. This is expected — the server owns a hidden, non-activating Excel instance with no GUI — and the veto is not weakened. | Verified |
 | An oversized valid range fails with `RANGE_TOO_LARGE` | A well-formed range whose cell count exceeds the 100,000-cell cap (`MAX_RANGE_CELLS = 100_000`) is rejected **before execution** with an explicit `RANGE_TOO_LARGE` error (category `validation`, `isRetryable=false`) — never silently truncated and never the generic `INVALID_RANGE` for a valid address. The agent must split/paginate the work into smaller ranges via `offset` / `limit`. | Verified |
 | `excel_health` can lag a dead worker when the Win32 layer is unavailable | The owned-pid liveness probe requires the Win32 layer; where it is unavailable the check degrades to state-based reporting. | Verified |
 
@@ -241,7 +241,7 @@ These behaviors follow from the session model in
   `snapshot_create` → `excel_close` → `snapshot_restore` to persist and return to
   an earlier state.
 - **Saves are explicit.** `excel_close` does not save by default; `excel_save` or
-  `excel_close(save_changes=true)` writes the working copy only. `excel_save_as` writes the
+  `excel_close(save_changes=true)` writes the working copy only. `workbook_save_copy` writes the
   working copy to a new (or the original) path via an atomic copy + single `<target>.bak`
   without rebinding the session; it is fail-closed (`PROTECTED_TARGET` / `STALE_TARGET`,
   `outcome="ok"` only after a final size+SHA-256 verify) and never uses `wb.SaveAs`.

@@ -18,14 +18,15 @@ related:
 
 ## Назначение
 
-Справочник описывает **41 инструмент** MCP-сервера `xlvba`: назначение, значения `action`,
+Справочник описывает **43 инструмента** MCP-сервера `xlvba`: назначение, значения `action`,
 параметры, возвращаемое значение, побочные эффекты, типовые ошибки и правдивые аннотации. Документ
 основан на фактических схемах инструментов, полученных с живого `MCPServer`, и на исходных модулях
 `api/*`, `application/*` и `adapters/*`.
 
 Поверхность инструментов была консолидирована из прежнего каталога из **92 инструментов**
 (промежуточный счёт «91 опубликовано» в старых редакциях был сведён к 92, как только был учтён
-`server_health`) до финальных **41 инструментов** за один переход (single switchover).
+`server_health`) до **41 инструмента** за один переход (single switchover), затем расширена до
+текущих **43 инструментов** за счёт не-COM инструментов `workbook_snapshot_read` и `data_export`.
 Недеструктивные глаголы по доменам были объединены в инструменты с диспетчеризацией по `action`
 (с `_read`-компаньонами там, где есть чтения); разрушительные, высокорисковые и lifecycle-операции
 оставлены отдельными инструментами с неизменными именами. См.
@@ -81,13 +82,13 @@ related:
 Каждый инструмент advertise-ит тройку MCP `readOnlyHint` / `destructiveHint` / `idempotentHint`,
 вычисленную из матрицы правды по действиям (семантика MCP по умолчанию: отсутствие не нейтрально).
 Подсказки — это **подсказки, а не энфорсмент**: approval в Kilo остаётся name-glob'ом `xlvba_*`
-(см. [Конфигурация](03-configuration.md) и заметку о миграции). Распределение по 41 инструменту:
+(см. [Конфигурация](03-configuration.md) и заметку о миграции). Распределение по 43 инструментам:
 
 | Аннотация | Кол-во | Инструменты |
 |-----------|--------|-------------|
-| `readOnly=true` | 13 | `workbook_read`, `excel_health`, `snapshot_list`, `snapshot_diff`, `vba_read`, `job_get`, `sheet_read`, `table_read`, `pivot_read`, `range_read`, `name_read`, `server_health`, `xlvba_environment` |
-| `destructive=true` | 16 | `workbook`, `excel_save_as`, `excel_recover`, `snapshot_restore`, `test`, `vba_replace_component_source`, `vba_insert_code`, `macro_run`, `sheet_delete`, `table_delete_rows`, `table_delete_column`, `pivot_field`, `range_structural`, `range_delete`, `range_merge`, `name_delete` |
-| `idempotent=true` | 21 | `workbook_read`, `excel_health`, `snapshot_list`, `snapshot_diff`, `vba_read`, `job_get`, `job_request_cancel`, `sheet_read`, `table_read`, `pivot_read`, `pivot_refresh`, `range_read`, `range_merge`, `name`, `name_read`, `shape`, `control`, `server_health`, `xlvba_environment`, `macro`, `pivot_field` |
+| `readOnly=true` | 14 | `workbook_read`, `excel_health`, `snapshot_list`, `snapshot_diff`, `workbook_snapshot_read`, `vba_read`, `job_get`, `sheet_read`, `table_read`, `pivot_read`, `range_read`, `defined_name_read`, `server_health`, `xlvba_environment` |
+| `destructive=true` | 16 | `workbook`, `workbook_save_copy`, `excel_recover`, `snapshot_restore`, `test_suite`, `vba_replace_component_source`, `vba_insert_code`, `macro_run`, `sheet_delete`, `table_delete_rows`, `table_delete_column`, `pivot_field`, `range_structural`, `range_delete`, `range_merge`, `defined_name_delete` |
+| `idempotent=true` | 23 | `workbook_read`, `excel_health`, `snapshot_list`, `snapshot_diff`, `workbook_snapshot_read`, `vba_read`, `job_get`, `job_request_cancel`, `sheet_read`, `table_read`, `pivot_read`, `pivot_refresh`, `range_read`, `range_merge`, `defined_name`, `defined_name_read`, `shape`, `control`, `server_health`, `xlvba_environment`, `macro`, `pivot_field`, `data_export` |
 
 Заметные, доказанные матрицей случаи:
 
@@ -123,19 +124,20 @@ related:
 
 | Группа | Кол-во | Инструменты |
 |--------|--------|-------------|
-| Lifecycle / сессия | 5 | `workbook`, `workbook_read`, `excel_save_as`, `excel_health`, `excel_recover` |
-| Снапшоты | 4 | `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff` |
+| Lifecycle / сессия | 5 | `workbook`, `workbook_read`, `workbook_save_copy`, `excel_health`, `excel_recover` |
+| Снапшоты | 5 | `snapshot_create`, `snapshot_list`, `snapshot_restore`, `snapshot_diff`, `workbook_snapshot_read` |
 | Jobs | 2 | `job_get`, `job_request_cancel` |
 | VBA | 5 | `vba_read`, `vba_export_project`, `vba_replace_component_source`, `vba_insert_code`, `vba_compile_diagnostics` |
-| Macro / test | 3 | `macro`, `macro_run`, `test` |
-| Листы / таблицы / имена | 10 | `sheet`, `sheet_read`, `sheet_delete`, `table`, `table_read`, `table_delete_rows`, `table_delete_column`, `name`, `name_read`, `name_delete` |
+| Macro / test | 3 | `macro`, `macro_run`, `test_suite` |
+| Листы / таблицы / имена | 10 | `sheet`, `sheet_read`, `sheet_delete`, `table`, `table_read`, `table_delete_rows`, `table_delete_column`, `defined_name`, `defined_name_read`, `defined_name_delete` |
 | Диапазоны | 5 | `range_read`, `range_write`, `range_structural`, `range_delete`, `range_merge` |
 | Pivot | 3 | `pivot_read`, `pivot_refresh`, `pivot_field` |
 | Объекты | 2 | `shape`, `control` |
 | Возможности / здоровье | 2 | `xlvba_environment`, `server_health` |
-| **Итого** | **41** | — |
+| Экспорт данных | 1 | `data_export` |
+| **Итого** | **43** | — |
 
-Сумма по группам: 5 + 4 + 2 + 5 + 3 + 10 + 5 + 3 + 2 + 2 = **41**.
+Сумма по группам: 5 + 5 + 2 + 5 + 3 + 10 + 5 + 3 + 2 + 2 + 1 = **43**.
 
 ## Lifecycle / сессия
 
@@ -143,7 +145,7 @@ related:
 |------------|----------|------------|-----------|---------|------------------|--------|-------|
 | `workbook` | `open`, `close`, `save` | Открывает книгу как скрытую рабочую копию; закрывает; сохраняет. | `action`, `path?`, `mode?=execute`, `read_only?=false`, `background?=false`, `workbook_id?`, `save_changes?`, `discard_changes?` | `WorkbookInfo` / `SessionStatus` / `RunningJob` | Копия файла в `work/`; close удаляет копию; save записывает рабочую копию; аудит | `PATH_NOT_ALLOWED`, `APPROVAL_DENIED`, `EXCEL_HUNG`, `CONFIRMATION_REQUIRED` | F/T/F |
 | `workbook_read` | `status`, `list`, `model` | Состояние сессии/книги; список открытых книг; агрегированная модель книги. | `action`, `workbook_id?`, `include_vba?=true` | `SessionStatus` / `list[WorkbookInfo]` / `WorkbookModel` | — | — (состояние VBA — в `vba_access`) | T/F/T |
-| `excel_save_as` | (standalone) | Сохраняет рабочую копию по (возможно новому) целевому пути без перепривязки сессии. | `workbook_id`, `path`, `overwrite_existing?=false`, `overwrite_source?=false` | `SaveAsResult` | Сброс рабочей копии (`wb.Save`), затем атомарное temp→replace копирование + один `<target>.bak`; аудит | `PATH_NOT_ALLOWED`, `PROTECTED_TARGET`, `STALE_TARGET`, `APPROVAL_DENIED` | F/T/F |
+| `workbook_save_copy` | (standalone) | Сохраняет рабочую копию по (возможно новому) целевому пути без перепривязки сессии. | `workbook_id`, `path`, `overwrite_existing?=false`, `overwrite_source?=false` | `SaveAsResult` | Сброс рабочей копии (`wb.Save`), затем атомарное temp→replace копирование + один `<target>.bak`; аудит | `PATH_NOT_ALLOWED`, `PROTECTED_TARGET`, `STALE_TARGET`, `APPROVAL_DENIED` | F/T/F |
 | `excel_health` | (standalone) | Состояние воркера/сессии без принудительного перезапуска и без COM. | — | `ExcelHealth` | — | — (всегда payload) | T/F/T |
 | `excel_recover` | (standalone) | Agent-directed восстановление owned-процесса Excel (fail-closed; originals-safe). | `reason?=agent_directed`, `confirm?=false` | `RecoveryResult` | Завершение зависшего owned `EXCEL.EXE` через удерживаемый handle; отбрасывание рабочих копий; пересоздание свежего скрытого экземпляра; аудит | `CONFIRMATION_REQUIRED`; иначе сообщает `ok=false` / `recovery_possible=false` при отказе | F/T/F |
 
@@ -166,10 +168,10 @@ related:
 `workbook` — `readOnly=false, destructive=true, idempotent=false`: путь `discard_changes=true`
 разрушителен, поэтому инструмент несёт destructive-подсказку, хотя `open`/`save` недеструктивны.
 
-### excel_save_as
+### workbook_save_copy
 
 Сохраняет рабочую копию по новому (или исходному) пути — fail-closed Save As (standalone, own
-permission/overwrite policy). `excel_save_as` сбрасывает рабочую копию через `wb.Save` на
+permission/overwrite policy). `workbook_save_copy` сбрасывает рабочую копию через `wb.Save` на
 STA-воркере, затем копирует её по `path` чисто-файловым атомарным temp→`os.replace` (никогда
 `wb.SaveAs`, чтобы сессия оставалась привязана к своей рабочей копии). Один `<target>.bak`
 сохраняет любую предыдущую цель при перезаписи.
@@ -206,6 +208,7 @@ STA-воркере, затем копирует её по `path` чисто-фа
 | `snapshot_list` | (standalone) | Список снапшотов и их метаданных. | — | `list[SnapshotManifest]` | — | `SNAPSHOT_FAILED` | T/F/T |
 | `snapshot_restore` | (standalone) | Восстанавливает рабочую сессию из снапшота. | `snapshot_id`, `workbook_id`, `confirm?=false` | `SnapshotRestoreResult` | Закрытие текущей копии без сохранения; новая рабочая копия; аудит | `CONFIRMATION_REQUIRED`, `INVALID_RANGE`, `SNAPSHOT_FAILED`, `APPROVAL_DENIED`, `EXCEL_HUNG` | F/T/F |
 | `snapshot_diff` | (standalone) | Сравнивает два снапшота по метаданным и хэшу. | `snapshot_id_a`, `snapshot_id_b` | `SnapshotDiff` | — | `SNAPSHOT_FAILED` | T/F/T |
+| `workbook_snapshot_read` | `metadata`, `sheet-rows`, `pivot-cache-records` | Читает метаданные книги, страницу строк листа или сохранённые записи PivotCache из иммутабельного файла-снапшота через не-COM потоковый разбор OOXML. | `workbook_id`, `action`, `sheet?`, `address?`, `table?`, `pivot_table?`, `cache_index?`, `snapshot_id?`, `offset?=0`, `limit?` | `OoxmlMetadata` / `OoxmlSheetPage` / `OoxmlPivotCachePage` | Создаёт иммутабельный снапшот, если `snapshot_id` не задан; никогда не занимает единственный STA COM-воркер | `INVALID_RANGE`, `SNAPSHOT_FAILED` | T/F/T |
 
 `snapshot_create` и `vba_export_project` записывают файлы и гейтятся approval (F-4): авторизованы
 без гранта в `full`, отклоняются с `APPROVAL_DENIED` в `restricted`. `snapshot_restore` не
@@ -281,15 +284,15 @@ revision-guard, поэтому `vba_replace_component_source` **не** идем�
 |------------|----------|------------|-----------|---------|------------------|--------|-------|
 | `macro` | `list`, `classify-background`, `get-last-result` | Список вызываемых макросов с `background_safe`; запись классификации процедуры; кэш последнего запуска. | `action`, `workbook_id`, `procedure?`, `background_safe?`, `expected_project_source_hash?` | `list[MacroInfo]` / `BackgroundSafetyClassification` / `MacroRunResult` | `classify-background` меняет in-memory состояние классификации (bookkeeping); аудит | `ACCESS_VBOM_DISABLED`, `VBA_PROJECT_LOCKED`, `MACRO_NOT_FOUND`, `STALE_TARGET`, `INTERACTIVE_UI_NOT_SUPPORTED`, `EXCEL_HUNG` | F/F/T |
 | `macro_run` | (standalone) | Запускает один одобренный `background_safe` макрос. | `workbook_id`, `macro_name`, `args?`, `background?=false` | `MacroRunResult` или `RunningJob` | Исполнение VBA; возможные внешние эффекты; аудит | `APPROVAL_DENIED`, `MACRO_BLOCKED`, `MACRO_NOT_FOUND`, `MACRO_RUNTIME_ERROR`, `MACRO_TIMEOUT`, `BACKGROUND_SAFETY_NOT_VERIFIED`, `INTERACTIVE_UI_NOT_SUPPORTED` | F/T/F |
-| `test` | `run-suite`, `get-run` | Запускает декларативный тестовый набор (каноническая точка входа) или читает сохранённый прогон. | `action`, `suite?`, `background?=false`, `run_id?` | `TestRunResult` / `RunningJob` | Базовый снапшот, рабочая копия на кейс, артефакты, `runs/`, аудит | `INVALID_RANGE`, `APPROVAL_DENIED`, `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED` | F/T/F |
+| `test_suite` | `run`, `get-run` | Запускает декларативный тестовый набор (каноническая точка входа) или читает сохранённый прогон. | `action`, `suite?`, `background?=false`, `run_id?` | `TestRunResult` / `RunningJob` | Базовый снапшот, рабочая копия на кейс, артефакты, `runs/`, аудит | `INVALID_RANGE`, `APPROVAL_DENIED`, `SNAPSHOT_FAILED`, `BACKGROUND_SAFETY_NOT_VERIFIED` | F/T/F |
 
 `macro` в целом не read-only (`classify-background` — bookkeeping-запись), но и не разрушителен;
 `classify-background` **не гейтится** и не является границей безопасности — `macro_run` сохраняет
 approval-гейт и детерминированный вето R13. Классификация привязана к
 `(workbook_file_sha256, project_source_hash, procedure)` и инвалидируется при изменении исходников
-VBA. `test` — инструмент со смешанным профилем (`run-suite` исполняет, `get-run` читает) и
-`destructive=true`, поскольку `run-suite` может диспетчеризовать шаги `macro_run` с внешними
-эффектами. `test` принимает `background=true`, чтобы promptly вернуть `RunningJob`.
+VBA. `test_suite` — инструмент со смешанным профилем (`run` исполняет, `get-run` читает) и
+`destructive=true`, поскольку `run` может диспетчеризовать шаги `macro_run` с внешними
+эффектами. `test_suite` принимает `background=true`, чтобы promptly вернуть `RunningJob`.
 
 **Ограничение headless-UI (R13).** Ни `macro_run`, ни декларативный тест-раннер не могут выполнить
 процедуру, показывающую UI. Процедура, содержащая `MsgBox`, `InputBox`, `UserForm.Show`, `FileDialog`
@@ -311,15 +314,15 @@ VBA. `test` — инструмент со смешанным профилем (`
 | `table_read` | `list`, `get`, `read-rows` | Все таблицы, одна таблица или ограниченный срез строк. | `action`, `workbook_id`, `name?`, `offset?=0`, `limit?` | `list[TableInfo]` / `TableInfo` / `TableRows` | — | `COM_BUSY` | T/F/T |
 | `table_delete_rows` | (standalone) | Удаляет строки по индексам или однозначному `where` (XOR-guard). | `workbook_id`, `name`, `indices?`, `where?` | `TableMutationResult` | Строки таблицы; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/T/F |
 | `table_delete_column` | (standalone) | Удаляет колонку по уникальному заголовку (own permission). | `workbook_id`, `name`, `header` | `TableMutationResult` | Колонка таблицы; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/T/F |
-| `name` | `create`, `update` | Создаёт имя в явной области; обновляет `RefersTo` (область сохраняется). | `action`, `workbook_id`, `name`, `refers_to?`, `scope`, `sheet?` | `DefinedNameInfo` | Новое/обновлённое имя; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/F/T |
-| `name_read` | `list`, `get` | Все имена или одно имя по имени и явной области. | `action`, `workbook_id`, `name?`, `scope?`, `sheet?` | `list[DefinedNameInfo]` / `DefinedNameInfo` | — | `COM_BUSY` | T/F/T |
-| `name_delete` | (standalone) | Удаляет имя и возвращает его предыдущее значение. | `workbook_id`, `name`, `scope`, `sheet?` | `DefinedNameInfo` | Имя; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/T/F |
+| `defined_name` | `create`, `update` | Создаёт имя в явной области; обновляет `RefersTo` (область сохраняется). | `action`, `workbook_id`, `name`, `refers_to?`, `scope`, `sheet?` | `DefinedNameInfo` | Новое/обновлённое имя; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/F/T |
+| `defined_name_read` | `list`, `get` | Все имена или одно имя по имени и явной области. | `action`, `workbook_id`, `name?`, `scope?`, `sheet?` | `list[DefinedNameInfo]` / `DefinedNameInfo` | — | `COM_BUSY` | T/F/T |
+| `defined_name_delete` | (standalone) | Удаляет имя и возвращает его предыдущее значение. | `workbook_id`, `name`, `scope`, `sheet?` | `DefinedNameInfo` | Имя; аудит | `WORKBOOK_READ_ONLY`, `SNAPSHOT_FAILED`, `COM_BUSY` | F/T/F |
 
 `sheet_delete` отклоняется, если после удаления не останется ни одного видимого листа;
 `sheet set-visibility` отклоняет скрытие последнего видимого листа. `table update-rows` принимает
 явный индекс или однозначный `where`; `table_delete_rows` требует ровно один из `indices` /
-`where` (XOR). `name create` отклоняет дубликат (та же область) или кросс-областный конфликт;
-`name update` никогда не меняет область имени.
+`where` (XOR). `defined_name create` отклоняет дубликат (та же область) или кросс-областный конфликт;
+`defined_name update` никогда не меняет область имени.
 
 ## Диапазоны
 
@@ -385,6 +388,16 @@ Control. Отсутствующая фигура/элемент возвраща
 
 `xlvba_environment` регистрируется с **inline** `read_only`-аннотацией (не через общий набор
 аннотаций); `server_health` также inline. Оба read-only и никогда не трогают COM.
+
+## Экспорт данных
+
+| Инструмент | Действия | Назначение | Параметры | Возврат | Побочные эффекты | Ошибки | R/D/I |
+|------------|----------|------------|-----------|---------|------------------|--------|-------|
+| `data_export` | (standalone) | Потоково выгружает большой набор данных (диапазон листа, тело Excel-таблицы или отрендеренный результат PivotTable) в CSV / JSONL файл-артефакт с ограниченной памятью, возвращая только компактные метаданные. | `workbook_id`, `source_kind` (`range` / `table` / `pivot-result`), `sheet?`, `address?`, `table?`, `pivot_table?`, `fmt?=csv`, `limit_rows?` | `DataExportResult` | Записывает новый файл-артефакт (путь, строки, байты, sha256); аудит | `INVALID_RANGE`, `PATH_NOT_ALLOWED`, `SNAPSHOT_FAILED` | F/F/T |
+
+`data_export` не read-only (он пишет файл-артефакт), но недеструктивен и идемпотентен:
+каждый вызов пишет новый артефакт, а исходная книга никогда не изменяется. Он стримит
+постранично, поэтому в памяти удерживается только одна страница; данные никогда не возвращаются inline.
 
 ## Подробно о сложных инструментах
 
@@ -653,11 +666,11 @@ Control. Отсутствующая фигура/элемент возвраща
 отклоняется с `INTERACTIVE_UI_NOT_SUPPORTED` (вето R13). Инструмент **не гейтится** и не является
 границей безопасности — `macro_run` по-прежнему применяет approval-гейт и вето R13.
 
-### test `action="run-suite"`
+### test_suite `action="run"`
 
 ```json
 {
-  "action": "run-suite",
+  "action": "run",
   "suite": {
     "suite": "smoke",
     "workbook_id": "1f0c…",
@@ -682,7 +695,7 @@ Control. Отсутствующая фигура/элемент возвраща
 одноразовая рабочая копия на каждый кейс**. Шаг `macro_run` может нести необязательное поле только
 с данными `background_safe`, и раннер классифицирует процедуру через защищённый путь
 `MacroService.classify_background` перед запуском. Компиляция перед макросом явная — нужен шаг
-`vba_compile`. Прогон сохраняется (`runs/`), читается через `test` `action="get-run"`.
+`vba_compile`. Прогон сохраняется (`runs/`), читается через `test_suite` `action="get-run"`.
 
 ### vba_compile_diagnostics
 
@@ -719,7 +732,7 @@ Fail-closed ответ:
 ## Фоновые задачи
 
 Четыре долгоживущих инструмента принимают `background=true`: `workbook` (`open`), `macro_run`,
-`test` (`run-suite`) и `pivot_read` (`tables-list`). С `background=true` инструмент планирует
+`test_suite` (`run`) и `pivot_read` (`tables-list`). С `background=true` инструмент планирует
 операцию в in-process реестре задач и возвращает promptly `RunningJob`-handle:
 
 ```json
@@ -764,7 +777,7 @@ Fail-closed ответ:
    кэш; без первого вызова диагностика собирается заново (тот же результат).
 5. **`macro` `list` до `macro_run`.** Позволяет узнать точное имя `Module.Procedure` и статус
    `background_safe` до запуска.
-6. **`test` `get-run` после `test` `run-suite`.** `run_id` берётся из
+6. **`test_suite` `get-run` после `test_suite` `run`.** `run_id` берётся из
    `TestRunResult.test_run_id`; инструмент только читает сохранённый прогон.
 
 Дополнительно: `workbook` `close` (без сохранения) и `workbook` `save` несовместимы с последующими
@@ -777,7 +790,7 @@ Fail-closed ответ:
 | `workbook` `open` (writable/execute) | Создаёт рабочую копию и открывает её с макросами | Открытие по умолчанию; авторизовано в `full`, `APPROVAL_DENIED` в `restricted` | Использовать `mode="inspect", read_only=true` для read-only работы; `execute` применять только к проверенным копиям |
 | `workbook` `close` (`discard_changes=true`) | Отбрасывает несохранённые изменения и закрывает | Разрушительно; по умолчанию отказ (D1) | Предпочесть `save_changes=true` или предварительный `snapshot_create`; передавать `discard_changes=true` только осознанно |
 | `workbook` `save` | Записывает файл рабочей копии | Mutating | Комбинировать со снапшотом; не сохранять «на всякий случай» |
-| `excel_save_as` | Записывает рабочую копию по целевому пути (own permission) | Standalone high-risk; overwrite policy | Проверить цель; использовать `overwrite_existing` / `overwrite_source` только после ревью |
+| `workbook_save_copy` | Записывает рабочую копию по целевому пути (own permission) | Standalone high-risk; overwrite policy | Проверить цель; использовать `overwrite_existing` / `overwrite_source` только после ревью |
 | `snapshot_restore` | Отбрасывает текущую копию и открывает baseline | Mutating; требует `workbook_id` + `confirm=true` | Делать свежий `snapshot_create` сначала; отсутствующий `workbook_id` (`INVALID_RANGE`) или ложный `confirm` (`CONFIRMATION_REQUIRED`) отклоняется до отбрасывания; ошибка закрытия предыдущей копии сообщается (`previous_close="failed"`) и не ломает восстановление |
 | `sheet_delete` | Удаляет лист с данными | Разрушительно, standalone | Проверять `sheet_read` `list`; полагаться на снапшот |
 | `table_delete_rows` | Удаляет строки таблицы | Разрушительно, standalone (XOR-guard) | Использовать явные `indices`; `where` только при однозначности |
@@ -786,13 +799,13 @@ Fail-closed ответ:
 | `range_structural` | Копирует/вставляет/разъединяет ячейки | Разрушительно; не идемпотентно | Передавать `shift` явно для `insert`; проверять пересечение с таблицами |
 | `range_delete` | Удаляет ячейки со сдвигом | Разрушительно, standalone | Всегда задавать `shift` явно; проверять пересечение с таблицами |
 | `range_merge` | Объединяет ячейки, отбрасывая данные вне якоря | Разрушительно (двойная подсказка) | Просматривать preconditions; передавать `allow_data_loss=true` только после ревью |
-| `name_delete` | Удаляет определённое имя | Разрушительно, standalone | Проверять `name_read` и зависимости; полагаться на снапшот |
+| `defined_name_delete` | Удаляет определённое имя | Разрушительно, standalone | Проверять `defined_name_read` и зависимости; полагаться на снапшот |
 | `vba_replace_component_source` | Полностью заменяет код модуля | Разрушительно, standalone | Передавать точный `expected_source_hash`; проверять `vba_compile_diagnostics` после |
 | `vba_insert_code` | Вставляет код в модуль | Разрушительно, standalone | Указывать точную `position`; не вставлять код «наугад» |
 | `shape` `set-on-action` | Назначает макрос фигуре | Mutating | Проверять `shape` `list`; пустой `macro_name` снимает назначение |
 | `control` `set-on-action` | Назначает макрос Form Control | Mutating | Работать только с Form Control; ActiveX не поддерживается |
 | `macro_run` | Исполняет VBA-код | Executing; гейтится approval (restricted) + `background_safe` + R13 | Только после `macro` `list` / `macro` `classify-background` и preflight; не запускать макросы с внешними эффектами |
-| `test` `run-suite` | Запускает декларативный набор (может диспетчеризовать `macro_run`) | Executing; destructive | Просматривать кейсы; шагу `macro_run` нужна классифицированная процедура |
+| `test_suite` `run` | Запускает декларативный набор (может диспетчеризовать `macro_run`) | Executing; destructive | Просматривать кейсы; шагу `macro_run` нужна классифицированная процедура |
 | `excel_recover` | Завершает owned-процесс Excel и отбрасывает рабочие копии | Recovery; allow-by-default (оба режима), аудируется, pid-scoped, fail-closed; требует `confirm=true` | Использовать только когда `excel_health` показывает `needs_recovery` / `running/deadline_exceeded`; оригиналы никогда не изменяются, но открытые рабочие копии теряются |
 
 ## Read-only ресурсы
@@ -855,5 +868,5 @@ Fail-closed ответ:
 14. **`macro_policy.classify_operation` неавторитетен (мёртвая/иллюстративная таблица).** Функция
     `classify_operation` в `security/macro_policy.py` сохранена для иллюстрации и **не** подключена к
     пути рантайм-энфорсмента; живой класс операции каждого инструмента определён по-сервисному. Её
-    таблица предшествует текущему каталогу из 41 инструмента и не должна читаться как авторитетная
+    таблица предшествует текущему каталогу из 43 инструментов и не должна читаться как авторитетная
     классификация инструментов — используйте этот справочник или код сервисов.

@@ -14,6 +14,7 @@ service maps it to a structured :class:`~excel_vba_mcp.domain.errors.ExcelVbaMcp
 
 from __future__ import annotations
 
+import os
 import zipfile
 from dataclasses import dataclass
 
@@ -47,6 +48,8 @@ class ZipLimits:
     max_shared_strings: int
     max_xml_depth: int
     max_response_cells: int
+    max_text_len: int = 32_767
+    max_response_bytes: int = 8 * 1024 * 1024
 
     @classmethod
     def from_config(cls, config: LargeDataConfig) -> ZipLimits:
@@ -60,6 +63,8 @@ class ZipLimits:
             max_shared_strings=config.max_shared_strings,
             max_xml_depth=config.max_xml_depth,
             max_response_cells=config.max_response_cells,
+            max_text_len=config.max_text_len,
+            max_response_bytes=config.max_response_bytes,
         )
 
     @property
@@ -67,6 +72,12 @@ class ZipLimits:
         """Total uncompressed size ceiling in bytes."""
 
         return self.max_uncompressed_mb * _MIB
+
+    @property
+    def max_file_bytes(self) -> int:
+        """Input file size ceiling in bytes (``max_file_mb`` converted MiB -> bytes)."""
+
+        return self.max_file_mb * _MIB
 
 
 def _is_unsafe_member_name(name: str) -> bool:
@@ -111,6 +122,19 @@ def open_safe(path: str, limits: ZipLimits) -> zipfile.ZipFile:
         OoxmlSafetyError: On any violation (with a precise reason) or when the
             file is not a valid ZIP archive.
     """
+
+    # Pre-open size reject (contract §1 ``max_file_mb``): stat the file BEFORE
+    # opening the central directory so a pathologically large input is refused
+    # without scanning it.
+    try:
+        file_size = os.stat(path).st_size
+    except OSError as exc:
+        raise OoxmlSafetyError(f"Cannot stat OOXML input file {path!r}: {exc}") from exc
+    if file_size > limits.max_file_bytes:
+        raise OoxmlSafetyError(
+            f"OOXML input file size {file_size} bytes exceeds the limit "
+            f"({limits.max_file_mb} MiB)."
+        )
 
     try:
         zf = zipfile.ZipFile(path)

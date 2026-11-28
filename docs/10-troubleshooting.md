@@ -124,7 +124,7 @@ workbook call failed" from "the worker needs recovery".
 | Audit trail | `EXCEL_VBA_MCP_AUDIT_LOG` (default `<temp>/excel_vba_mcp/audit.jsonl`) | One JSON record per operation: tool, redacted params, approval, result |
 | Compile diagnostics | `vba_get_compile_diagnostics` | Cached compile evidence (always `is_compile=false` on the validated build) |
 | Last macro result | `macro_get_last_result` | Status, duration, return value and structured error of the last run |
-| Persisted test run | `test_get_run` (with `run_id`) | Per-case and per-step statuses without touching Excel |
+| Persisted test run | `test_suite` (`action="get-run"`, with `run_id`) | Per-case and per-step statuses without touching Excel |
 
 When reporting an issue, include the tool name, the structured error `code` and
 `context`, the `excel_health` payload, and the relevant `audit.jsonl` line

@@ -16,6 +16,7 @@ import io
 import xml.etree.ElementTree as ET
 import zipfile
 
+from excel_vba_mcp.adapters.excel.cell_values import bound_value_grid
 from excel_vba_mcp.adapters.ooxml.zip_safety import (
     OoxmlSafetyError,
     ZipLimits,
@@ -196,7 +197,16 @@ def iter_sheet_rows(
 
         depth -= 1
 
-    if stopped_early:
+    # Enforce the per-field text cap and the page byte budget at the
+    # serialization boundary (contract §6). A page cut here is reported as
+    # truncated with an unknown total so the caller pages on from
+    # ``offset + returned`` and no row is skipped.
+    collected, text_truncated, bytes_truncated = bound_value_grid(
+        collected,
+        max_text_len=limits.max_text_len,
+        max_response_bytes=limits.max_response_bytes,
+    )
+    if stopped_early or text_truncated or bytes_truncated:
         return collected, True, None
     return collected, False, rows_seen
 

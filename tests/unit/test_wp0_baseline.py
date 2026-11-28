@@ -19,7 +19,11 @@ import pytest
 _FIXTURE = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "wp0_baseline.json"
 
 # The four high-risk tools that must keep an explicit, standalone disposition (H1).
-_STANDALONE_HIGH_RISK = {"macro_run", "excel_save_as", "table_delete_column"}
+_STANDALONE_HIGH_RISK = {
+    "macro_run": "macro_run",
+    "excel_save_as": "workbook_save_copy",
+    "table_delete_column": "table_delete_column",
+}
 # The fourth high-risk tool is excel_close, folded into workbook with refuse-by-default.
 _CLOSE_HIGH_RISK = "excel_close"
 
@@ -38,7 +42,7 @@ def test_fixture_exists_and_has_schema_version(baseline: dict) -> None:
 
 def test_baseline_count_and_bytes(baseline: dict) -> None:
     meta = baseline["baseline"]
-    assert meta["tool_count"] == 94
+    assert meta["tool_count"] == 43
     # WP0 "before" ledger count is 94 (92 + the two justified large-data standalone
     # tools workbook_file_read / data_export); serialized_bytes is the live-recomputed
     # 43-tool surface measurement (the consolidated live surface, not the 92-tool WP0
@@ -92,10 +96,10 @@ def test_security_new_name_matches_ledger_target(baseline: dict) -> None:
 def test_high_risk_tools_have_explicit_disposition(baseline: dict) -> None:
     by_name = {row["tool"]: row for row in baseline["security"]}
 
-    for name in _STANDALONE_HIGH_RISK:
-        row = by_name[name]
-        assert row["risk"] == "high-risk", f"{name} must be high-risk"
-        assert row["new_name"] == name, f"{name} must stay standalone (new_name == tool)"
+    for old_name, new_name in _STANDALONE_HIGH_RISK.items():
+        row = by_name[old_name]
+        assert row["risk"] == "high-risk", f"{old_name} must be high-risk"
+        assert row["new_name"] == new_name, f"{old_name} standalone mismatch"
 
     close = by_name[_CLOSE_HIGH_RISK]
     assert close["risk"] == "high-risk", "excel_close must carry the high-risk disposition"
@@ -107,7 +111,7 @@ def test_test_tool_is_documented_mixed_profile(baseline: dict) -> None:
     by_name = {row["tool"]: row for row in baseline["security"]}
     run = by_name["test_suite_run"]
     get = by_name["test_get_run"]
-    assert run["new_name"] == get["new_name"] == "test"
+    assert run["new_name"] == get["new_name"] == "test_suite"
     assert run["permission_profile"] == "P_EXEC"
     assert get["permission_profile"] == "P_READ"
     assert run.get("note"), "the accepted H1 mixed-profile deviation must be noted"
@@ -181,7 +185,7 @@ def test_locked_annotation_triples(baseline: dict) -> None:
         return row["read_only"], row["destructive"], row["idempotent"]
 
     assert triple("workbook") == (False, True, False)
-    assert triple("test") == (False, True, False)
+    assert triple("test_suite") == (False, True, False)
     assert triple("range_write") == (False, False, False)
     assert triple("vba_replace_component_source") == (False, True, False)
     assert triple("shape") == (False, False, True)
@@ -192,7 +196,7 @@ def test_locked_annotation_triples(baseline: dict) -> None:
         "table_read",
         "pivot_read",
         "range_read",
-        "name_read",
+        "defined_name_read",
         "vba_read",
     ):
         assert triple(read_tool) == (True, False, True), f"{read_tool} must be (T,F,T)"

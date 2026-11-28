@@ -23,7 +23,7 @@ _FIXTURE = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "wp0_bas
 _CRITICAL = [
     "workbook",
     "workbook_read",
-    "excel_save_as",
+    "workbook_save_copy",
     "range_write",
     "range_read",
     "range_structural",
@@ -31,7 +31,7 @@ _CRITICAL = [
     "macro",
     "table",
     "table_delete_rows",
-    "name",
+    "defined_name",
     "sheet",
     "shape",
     "control",
@@ -46,7 +46,7 @@ _CRITICAL = [
     "vba_compile_diagnostics",
     "vba_replace_component_source",
     "vba_insert_code",
-    "test",
+    "test_suite",
 ]
 
 # Tools that must carry exactly one request example (R-D8).
@@ -54,7 +54,7 @@ _EXAMPLE_TOOLS = [
     "range_write",
     "table",
     "vba_replace_component_source",
-    "test",
+    "test_suite",
 ]
 
 # Truthful, non-negotiable phrases (R-D1).
@@ -162,8 +162,8 @@ async def test_guarded_mutations_use_uniform_guard_sentence() -> None:
         "sheet",
         "sheet_delete",
         "table",
-        "name",
-        "name_delete",
+        "defined_name",
+        "defined_name_delete",
         "shape",
         "control",
         "range_write",
@@ -195,3 +195,30 @@ async def test_environment_and_glossary_constants_exist() -> None:
     annotations = tools["xlvba_environment"].annotations
     assert annotations is not None
     assert annotations.read_only_hint is True
+
+
+async def test_annotation_totals_are_14_16_23() -> None:
+    tools = await server.mcp.list_tools()
+    ro = sum(1 for t in tools if t.annotations and t.annotations.read_only_hint)
+    de = sum(1 for t in tools if t.annotations and t.annotations.destructive_hint)
+    idem = sum(1 for t in tools if t.annotations and t.annotations.idempotent_hint)
+    assert (ro, de, idem) == (14, 16, 23)
+
+
+_CANONICAL = [
+    "workbook_save_copy",
+    "test_suite",
+    "defined_name",
+    "defined_name_read",
+    "defined_name_delete",
+    "workbook_snapshot_read",
+]
+_OLD = ["excel_save_as", "test", "name", "name_read", "name_delete", "workbook_file_read"]
+
+
+async def test_canonical_names_present_and_old_absent() -> None:
+    names = {t.name for t in await server.mcp.list_tools()}
+    for n in _CANONICAL:
+        assert n in names, f"missing canonical tool {n}"
+    for n in _OLD:
+        assert n not in names, f"retired tool name still registered: {n}"

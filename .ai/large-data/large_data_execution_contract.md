@@ -15,13 +15,13 @@ they are **not** raised to make tests pass — capability comes from bounded/str
 
 | Limit | Env suffix | Default | Applies to | Notes |
 |---|---|---|---|---|
-| `max_range_cells` | `MAX_RANGE_CELLS` | 100 000 | per **request window** (read) / per write payload | full-range pre-reject removed for reads (see §3.1) |
+| `max_range_cells` | `MAX_RANGE_CELLS` | 100 000 | per **request window** (read) / per write payload | full-range pre-reject removed for reads (see §3.1); the **write** cap is the module constant `MAX_RANGE_CELLS` (default 100 000), not a separately-wired config value — `max_range_cells` is the read-window default |
 | `max_response_cells` | `MAX_RESPONSE_CELLS` | 50 000 | cells returned in one MCP response | hard response cap |
-| `max_response_bytes` | `MAX_RESPONSE_BYTES` | 8 MiB | serialized response budget | text-heavy pages shrink rows |
+| `max_response_bytes` | `MAX_RESPONSE_BYTES` | 8 MiB | serialized response budget | enforced at the value-serialization boundary (range + OOXML): trailing rows are dropped so the estimated UTF-8 value payload fits, page marked `truncated` |
 | `max_table_cells` | `MAX_TABLE_CELLS` | 50 000 | table `read-rows` response | was 2 000; aligned + configurable |
 | `max_pivot_result_cells` | `MAX_PIVOT_RESULT_CELLS` | 50 000 | pivot result page | one page of rendered output |
 | `max_pivot_members` | `MAX_PIVOT_MEMBERS` | 10 000 | field/member enumeration | existing |
-| `max_text_len` | `MAX_TEXT_LEN` | 32 767 | per returned text field | Excel cell max; longer is truncated with a note |
+| `max_text_len` | `MAX_TEXT_LEN` | 32 767 | per returned text field | enforced at the value-serialization boundary (range + OOXML): a longer text field is truncated to the cap and the page is marked `truncated` (never silent) |
 | `max_file_mb` | `MAX_FILE_MB` | 100 | OOXML input file size | reject larger before open |
 | `max_uncompressed_mb` | `MAX_UNCOMPRESSED_MB` | 1024 | total uncompressed OOXML size | ZIP-bomb guard |
 | `max_compression_ratio` | `MAX_COMPRESSION_RATIO` | 1000 | per-member ratio | ZIP-bomb guard |
@@ -34,6 +34,15 @@ they are **not** raised to make tests pass — capability comes from bounded/str
 Derivation rules (avoid duplicate settings): the response **byte** budget is independent of the
 **cell** budget because text cells vary; everything else is 1:1. No per-tool limit is introduced;
 tools reference these.
+
+Enforcement scope of the text/byte bounds: `max_text_len` and `max_response_bytes` are enforced
+at the **value-serialization boundary** of the range reader (`RangesAdapter.read_values`, also used
+by the PivotTable rendered-result reader) and the OOXML worksheet reader
+(`iter_sheet_rows`). The byte budget is a conservative estimate (sum of the UTF-8 length of each
+non-empty cell value, not the full JSON envelope); a page that would exceed it drops trailing rows
+and is marked `truncated`, and the next page resumes at `offset + returned` so no row is skipped.
+Table reads are bounded by `max_table_cells` (cell count); PivotTable results inherit the range
+reader's bounds.
 
 ## 2. Response / completeness contract
 

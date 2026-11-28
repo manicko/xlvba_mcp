@@ -63,7 +63,7 @@ change under `docs/`.
 
 | Module | Responsibility |
 |--------|----------------|
-| `server.py` | Builds `MCPServer`, owns the runtime via `lifespan`, registers 91 tools and 4 resources, re-raises structured `ToolError`s, configures `stderr` logging |
+| `server.py` | Builds `MCPServer`, owns the runtime via `lifespan`, registers 43 tools and 4 resources, re-raises structured `ToolError`s, configures `stderr` logging |
 | `config.py` | Loads `EXCEL_VBA_MCP_LOG_LEVEL`, `EXCEL_VBA_MCP_ACCESS_MODE`, `EXCEL_VBA_MCP_MACRO_TIMEOUT_S`, `EXCEL_VBA_MCP_OPEN_TIMEOUT_S` and `EXCEL_VBA_MCP_LIVENESS_CEILING_S` into a Pydantic `Config`; validates them together |
 | `api/*_tools.py` | One module per tool group; each handler is thin: validate arguments, delegate to a service, return a DTO |
 | `application/session_service.py` | Open/close/save working copies, per-path lock, session status, recovery |

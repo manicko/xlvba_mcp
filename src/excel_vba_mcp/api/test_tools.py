@@ -308,56 +308,56 @@ async def test_get_run(run_id: str) -> TestRunResult:
 # Flat-signature dispatcher (WP6, option (a))
 # ---------------------------------------------------------------------------
 async def test(
-    action: Literal["run-suite", "get-run"],
+    action: Literal["run", "get-run"],
     suite: TestSuiteSpec | dict[str, Any] | None = None,
     run_id: str | None = None,
     *,
     background: bool = False,
 ) -> TestRunResult | RunningJob:
-    """Test dispatch: ``run-suite`` or ``get-run`` (WP6).
+    """Test dispatch: ``run`` or ``get-run`` (WP6).
 
     Thin flat-signature dispatcher (option (a) — flat args + handler
     validation): routes to the existing :func:`test_suite_run` /
     :func:`test_get_run` handlers unchanged and forwards only the validated
     arguments. Per-action required parameters are enforced here and by the
-    target handler (``suite`` is required for ``run-suite``; ``run_id`` is
+    target handler (``suite`` is required for ``run``; ``run_id`` is
     required for ``get-run``) so a missing required argument surfaces as a
     structured :class:`ExcelVbaMcpError` rather than a crash. An unknown
     ``action`` raises a structured :class:`ExcelVbaMcpError`.
 
-    ``run-suite`` is **not** read-only: it executes a bounded declarative suite
+    ``run`` is **not** read-only: it executes a bounded declarative suite
     on disposable working copies (and can dispatch ``macro_run`` steps), so it
     carries external side effects. ``get-run`` is a read of a persisted run.
 
     Args:
-        action: ``run-suite`` (validate and run a declarative suite) or
+        action: ``run`` (validate and run a declarative suite) or
             ``get-run`` (read a persisted run by id).
         suite: The declarative suite document (or an already-built
-            :class:`TestSuiteSpec`); required for ``run-suite``.
-        run_id: The ``test_run_id`` reported by ``run-suite``; required for
+            :class:`TestSuiteSpec`); required for ``run``.
+        run_id: The ``test_run_id`` reported by ``run``; required for
             ``get-run``.
-        background: When ``True`` (``run-suite`` only), schedule the run on the
+        background: When ``True`` (``run`` only), schedule the run on the
             job registry and return a :class:`RunningJob` handle promptly.
 
     Returns:
-        A :class:`~excel_vba_mcp.domain.models.TestRunResult` (``run-suite`` /
+        A :class:`~excel_vba_mcp.domain.models.TestRunResult` (``run`` /
         ``get-run``), or a :class:`RunningJob` handle when ``background=True``.
     """
 
-    if action == "run-suite":
+    if action == "run":
         if suite is None:
             raise ExcelVbaMcpError(
-                "Argument 'suite' is required for action 'run-suite'.",
+                "Argument 'suite' is required for action 'run'.",
                 code=ErrorCode.INVALID_RANGE,
-                context={"tool": "test", "action": action, "field": "suite"},
+                context={"tool": "test_suite", "action": action, "field": "suite"},
             )
         return await test_suite_run(suite, background=background)
     if action == "get-run":
         return await test_get_run(run_id or "")
     raise ExcelVbaMcpError(
-        f"Unknown test action {action!r}; expected 'run-suite' or 'get-run'.",
+        f"Unknown test action {action!r}; expected 'run' or 'get-run'.",
         code=ErrorCode.INVALID_RANGE,
-        context={"tool": "test", "action": action},
+        context={"tool": "test_suite", "action": action},
     )
 
 
